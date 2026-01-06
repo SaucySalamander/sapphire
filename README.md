@@ -1,7 +1,7 @@
 # Sapphire
 
-Sapphire is a C18 playground for Large Language Model building blocks. It includes
-quantized matrix–vector kernels (Q4_0/Q8_0), a small tensor abstraction, key/value
+Sapphire is a C17 playground for Large Language Model building blocks. It includes
+quantized matrix-vector kernels (Q4_0/Q8_0), a small tensor abstraction, key/value
 cache management, and transformer components such as RoPE, ALiBi, activations,
 normalization layers, and pluggable attention strategies. Everything is built with
 straightforward C and comes with focused tests and micro-benchmarks.
@@ -18,20 +18,20 @@ straightforward C and comes with focused tests and micro-benchmarks.
 - Demo/validation harness for transformer components (`src/main.c`).
 
 ## Repository layout
-- `include/` – Public headers for the tensor, transformer, kv_cache, GEMV, and
+- `include/` - Public headers for the tensor, transformer, kv_cache, GEMV, and
   sapphire kernels.
-- `src/transformer/` – RoPE/ALiBi positional encodings, attention strategies,
+- `src/transformer/` - RoPE/ALiBi positional encodings, attention strategies,
   activations, normalization, and their tests.
-- `src/sapphire/` – Quantized GEMV kernels, GGML-compatible loader, thread-pool
+- `src/sapphire/` - Quantized GEMV kernels, GGML-compatible loader, thread-pool
   context, and benchmarks.
-- `src/tensor/` – Tensor core implementation and tests.
-- `src/gemv/` – GEMV helpers and tests built on the tensor layer and sapphire
+- `src/tensor/` - Tensor core implementation and tests.
+- `src/gemv/` - GEMV helpers and tests built on the tensor layer and sapphire
   kernels.
-- `src/kv_cache/` – KV cache implementation and tests for attention contexts.
-- `src/bitnet/` – BitNet ternary linear layer and its test.
-- `src/main.c` – Standalone transformer component demo invoked by
+- `src/kv_cache/` - KV cache implementation and tests for attention contexts.
+- `src/bitnet/` - BitNet ternary linear layer and its test.
+- `src/main.c` - Standalone transformer component demo invoked by
   `make test-transformer`.
-- `out/` – Build artifacts (created automatically).
+- `out/` - Build artifacts (created automatically).
 
 ## Building and running
 Prerequisites: `make` and a compiler with AVX2/FMA support (the Makefile uses
