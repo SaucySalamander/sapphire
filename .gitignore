@@ -1,0 +1,98 @@
+# .gitignore for the sapphire C project
+# Ignore build outputs, object files, editor files, OS cruft, and temporary files
+
+# Build artifacts and common output directories
+out/
+/out/
+build/
+bin/
+dist/
+ai_docs/
+/ai_docs/
+
+# Object and library files
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.lo
+*.la
+
+# Coverage, profiling and sanitizer outputs
+*.gcno
+*.gcda
+*.gcov
+coverage/
+*.profraw
+*.profdata
+*.prof
+asan.*
+*sanitizer*.log
+
+# Build system / generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+Makefile.user
+
+# Tags / indexes
+tags
+TAGS
+cscope.*
+ctags
+
+# Editor & IDE
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+
+# Python / virtualenvs (docs/tools may use python)
+venv/
+.venv/
+env/
+.env
+__pycache__/
+.pytest_cache/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Swap / temp / backup files
+*~
+.*.swp
+*.swp
+*.swo
+*.tmp
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and caches
+*.log
+.cache/
+
+# Archives
+*.tgz
+*.tar.gz
+*.zip
+
+# Local environment files
+.envrc
+
+# Temporary phase documentation (to be removed after review)
+PHASE_*.md
+PHASE_*.txt
+
+# End of .gitignore
