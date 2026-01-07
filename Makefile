@@ -1,111 +1,51 @@
 CC = gcc
-# project layout
 SRCDIR = src
 INCDIR = include
+OUTDIR = out
 
+# Compilation flags
 CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma
 LDFLAGS = -lm -pthread
 
+# HIP configuration (optional ROCm support)
 HIPCC = hipcc
-# Compile HIP sources as C++ and ensure AMD platform macro is defined so hip headers work
-HIPCFLAGS_COMPILE = -O3 -fPIC -D__HIP_PLATFORM_AMD__ -x hip -std=c++14
-HIPCFLAGS_LINK = -O3 -fPIC -D__HIP_PLATFORM_AMD__ -std=c++14
-
-# detect common ROCm include/lib locations and add to flags if present
 HIP_INCLUDES = $(shell for p in /opt/rocm/include /opt/rocm/hip/include /usr/include/hip /usr/local/include/hip; do [ -d $$p ] && { echo -I$$p; break; }; done)
 HIP_LIBDIRS = $(shell for p in /opt/rocm/lib /opt/rocm/lib64 /usr/lib64 /usr/lib; do [ -d $$p ] && { echo -L$$p; break; }; done)
+HIPCFLAGS_COMPILE = -O3 -fPIC -D__HIP_PLATFORM_AMD__ -x hip -std=c++14 $(HIP_INCLUDES)
+HIPCFLAGS_LINK = -O3 -fPIC -D__HIP_PLATFORM_AMD__ -std=c++14 $(HIP_LIBDIRS)
 
-HIPCFLAGS_COMPILE += $(HIP_INCLUDES)
-HIPCFLAGS_LINK += $(HIP_LIBDIRS)
+# Target binaries
+TARGETS = \
+	$(OUTDIR)/sapphire_end_to_end_bench \
+	$(OUTDIR)/bench_q4 \
+	$(OUTDIR)/bench_q8 \
+	$(OUTDIR)/test_bitnet \
+	$(OUTDIR)/test_sapphire \
+	$(OUTDIR)/transformer_test \
+	$(OUTDIR)/test_tensor \
+	$(OUTDIR)/test_activations \
+	$(OUTDIR)/test_normalization \
+	$(OUTDIR)/test_kv_cache \
+	$(OUTDIR)/test_tensor_gemv \
+	$(OUTDIR)/test_ggml_model \
+	$(OUTDIR)/test_ggml_reader \
+	$(OUTDIR)/test_inference
 
-# try common include locations for ROCm/HIP
-HIP_INCLUDES = $(shell for p in /opt/rocm/include /opt/rocm/hip/include /usr/include/hip /usr/local/include/hip; do [ -d $$p ] && { echo -I$$p; break; }; done)
-HIP_LIBDIRS = $(shell for p in /opt/rocm/lib /opt/rocm/lib64 /usr/lib64 /usr/lib; do [ -d $$p ] && { echo -L$$p; break; }; done)
+# Common object dependencies
+TRANSFORMER_OBJS = $(filter $(OUTDIR)/activations.o $(OUTDIR)/attention.o $(OUTDIR)/attention_strategy.o $(OUTDIR)/normalization.o $(OUTDIR)/positional_encoding.o $(OUTDIR)/rope.o, $(wildcard $(OUTDIR)/*.o))
 
-HIPCFLAGS += $(HIP_INCLUDES) $(HIP_LIBDIRS)
+.PHONY: all bench test test-sapphire test-transformer test-tensor test-activations test-normalization test-kv-cache test-tensor-gemv test-ggml-model test-ggml-reader test-inference hip check-hip check-hip-setup clean asan-test asan-all
 
-OUTDIR = out
+all: $(TARGETS)
 
-# Core benchmark and test targets
-SAPP_END_TO_END_BIN = $(OUTDIR)/sapphire_end_to_end_bench
-BENCH_Q4_BIN = $(OUTDIR)/bench_q4
-BENCH_Q8_BIN = $(OUTDIR)/bench_q8
-TEST_BITNET_BIN = $(OUTDIR)/test_bitnet
-TEST_SAPPHIRE_BIN = $(OUTDIR)/test_sapphire
-TRANSFORMER_BIN = $(OUTDIR)/transformer_test
-TENSOR_TEST_BIN = $(OUTDIR)/test_tensor
-ACTIVATIONS_TEST_BIN = $(OUTDIR)/test_activations
-NORMALIZATION_TEST_BIN = $(OUTDIR)/test_normalization
-KV_CACHE_TEST_BIN = $(OUTDIR)/test_kv_cache
-TENSOR_GEMV_TEST_BIN = $(OUTDIR)/test_tensor_gemv
-PHASE4_TEST_BIN = $(OUTDIR)/test_phase4
-
-# HIP targets (optional)
-BITNET_HIP_BIN = $(OUTDIR)/bitnet_hip
-
-.PHONY: all bench test test-sapphire test-transformer test-tensor test-activations test-normalization test-kv-cache test-tensor-gemv test-phase4 hip check-hip check-hip-setup clean
-
-
-all: $(SAPP_END_TO_END_BIN) $(BENCH_Q4_BIN) $(BENCH_Q8_BIN) $(TEST_BITNET_BIN) $(TEST_SAPPHIRE_BIN) $(TRANSFORMER_BIN) $(TENSOR_TEST_BIN) $(ACTIVATIONS_TEST_BIN) $(NORMALIZATION_TEST_BIN) $(KV_CACHE_TEST_BIN) $(TENSOR_GEMV_TEST_BIN) $(PHASE4_TEST_BIN)
-
-# ensure output directory exists
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
 
-# Core sapphire library object files
-$(OUTDIR)/sapphire.o: $(SRCDIR)/sapphire/sapphire.c | $(OUTDIR)
+# Generic compilation rule for all C files
+$(OUTDIR)/%.o: $(SRCDIR)/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTDIR)/sapphire_pool.o: $(SRCDIR)/sapphire/sapphire_pool.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OUTDIR)/sapphire_q4_0.o: $(SRCDIR)/sapphire/q4_0.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OUTDIR)/sapphire_q8_0.o: $(SRCDIR)/sapphire/q8_0.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OUTDIR)/ggml_reader.o: $(SRCDIR)/ggml_reader.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Bitnet object files
-$(OUTDIR)/bitnet.o: $(SRCDIR)/bitnet/bitnet.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OUTDIR)/test_bitnet.o: $(SRCDIR)/bitnet/test_bitnet.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Sapphire test
-$(OUTDIR)/test_sapphire.o: $(SRCDIR)/sapphire/test_sapphire.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(TEST_SAPPHIRE_BIN): $(OUTDIR)/test_sapphire.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/ggml_reader.o
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-
-# Bitnet test
-$(TEST_BITNET_BIN): $(OUTDIR)/bitnet.o $(OUTDIR)/test_bitnet.o
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-
-# Module-aware source lists
-TRANSFORMER_SRCS := $(wildcard $(SRCDIR)/transformer/*.c)
-TRANSFORMER_OBJS := $(patsubst $(SRCDIR)/transformer/%.c,$(OUTDIR)/%.o,$(TRANSFORMER_SRCS))
-
-# Other module source lists
-KV_CACHE_SRCS := $(wildcard $(SRCDIR)/kv_cache/*.c)
-KV_CACHE_OBJS := $(patsubst $(SRCDIR)/kv_cache/%.c,$(OUTDIR)/%.o,$(KV_CACHE_SRCS))
-
-TENSOR_SRCS := $(wildcard $(SRCDIR)/tensor/*.c)
-TENSOR_OBJS := $(patsubst $(SRCDIR)/tensor/%.c,$(OUTDIR)/%.o,$(TENSOR_SRCS))
-
-GEMV_SRCS := $(wildcard $(SRCDIR)/gemv/*.c)
-GEMV_OBJS := $(patsubst $(SRCDIR)/gemv/%.c,$(OUTDIR)/%.o,$(GEMV_SRCS))
-
-BITNET_SRCS := $(wildcard $(SRCDIR)/bitnet/*.c)
-BITNET_OBJS := $(patsubst $(SRCDIR)/bitnet/%.c,$(OUTDIR)/%.o,$(BITNET_SRCS))
-
-# Module pattern rules (compile per-module sources to flat objects in $(OUTDIR))
 $(OUTDIR)/%.o: $(SRCDIR)/transformer/%.c | $(OUTDIR)
-	@mkdir -p $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/kv_cache/%.c | $(OUTDIR)
@@ -120,198 +60,172 @@ $(OUTDIR)/%.o: $(SRCDIR)/gemv/%.c | $(OUTDIR)
 $(OUTDIR)/%.o: $(SRCDIR)/bitnet/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTDIR)/utils.o: $(SRCDIR)/utils.c | $(OUTDIR)
+$(OUTDIR)/%.o: $(SRCDIR)/sapphire/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTDIR)/positional_encoding.o: $(SRCDIR)/transformer/positional_encoding.c | $(OUTDIR)
+$(OUTDIR)/%.o: $(SRCDIR)/sapphire/bench/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTDIR)/rope.o: $(SRCDIR)/transformer/rope.c | $(OUTDIR)
+# Explicit rules for quantization implementations
+$(OUTDIR)/sapphire_q4_0.o: $(SRCDIR)/sapphire/q4_0.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTDIR)/attention.o: $(SRCDIR)/transformer/attention.c | $(OUTDIR)
+$(OUTDIR)/sapphire_q8_0.o: $(SRCDIR)/sapphire/q8_0.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTDIR)/attention_strategy.o: $(SRCDIR)/transformer/attention_strategy.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
+# Rename main.c to transformer_main.o for disambiguation
 $(OUTDIR)/transformer_main.o: $(SRCDIR)/main.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TRANSFORMER_BIN): $(OUTDIR)/transformer_main.o $(TRANSFORMER_OBJS) $(OUTDIR)/utils.o
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-
-# Tensor test
-$(OUTDIR)/tensor.o: $(SRCDIR)/tensor/tensor.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OUTDIR)/test_tensor.o: $(SRCDIR)/tensor/test_tensor.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(TENSOR_TEST_BIN): $(OUTDIR)/test_tensor.o $(OUTDIR)/tensor.o
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-
-# Activations test (moved into transformer module)
+# Compile test_activations from transformer module
 $(OUTDIR)/test_activations.o: $(SRCDIR)/transformer/test_activations.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(ACTIVATIONS_TEST_BIN): $(OUTDIR)/test_activations.o $(OUTDIR)/activations.o
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-
-# Normalization test (moved into transformer module)
+# Compile test_normalization from transformer module
 $(OUTDIR)/test_normalization.o: $(SRCDIR)/transformer/test_normalization.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(NORMALIZATION_TEST_BIN): $(OUTDIR)/test_normalization.o $(OUTDIR)/normalization.o
+# ============================================================================
+# Benchmark Targets
+# ============================================================================
+
+$(OUTDIR)/bench_q4: $(OUTDIR)/bench_q4.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-# KV Cache test
-$(OUTDIR)/test_kv_cache.o: $(SRCDIR)/kv_cache/test_kv_cache.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(KV_CACHE_TEST_BIN): $(OUTDIR)/test_kv_cache.o $(OUTDIR)/kv_cache.o $(OUTDIR)/tensor.o
+$(OUTDIR)/bench_q8: $(OUTDIR)/bench_q8.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-# Tensor GEMV test
-$(OUTDIR)/test_tensor_gemv.o: $(SRCDIR)/gemv/test_tensor_gemv.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(TENSOR_GEMV_TEST_BIN): $(OUTDIR)/test_tensor_gemv.o $(OUTDIR)/tensor_gemv.o $(OUTDIR)/tensor.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/ggml_reader.o
+$(OUTDIR)/sapphire_end_to_end_bench: $(OUTDIR)/bench_sapphire_end_to_end.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-# Sapphire end-to-end benchmark
-$(OUTDIR)/sapphire_end_to_end_bench.o: $(SRCDIR)/sapphire/bench/bench_sapphire_end_to_end.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+# ============================================================================
+# Test Targets
+# ============================================================================
 
-$(SAPP_END_TO_END_BIN): $(OUTDIR)/sapphire_end_to_end_bench.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/ggml_reader.o
+$(OUTDIR)/test_bitnet: $(OUTDIR)/test_bitnet.o $(OUTDIR)/bitnet.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-# Q4 benchmark
-$(OUTDIR)/bench_q4.o: $(SRCDIR)/sapphire/bench/bench_q4.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(BENCH_Q4_BIN): $(OUTDIR)/bench_q4.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/ggml_reader.o
+$(OUTDIR)/test_sapphire: $(OUTDIR)/test_sapphire.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-# Q8 benchmark
-$(OUTDIR)/bench_q8.o: $(SRCDIR)/sapphire/bench/bench_q8.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(BENCH_Q8_BIN): $(OUTDIR)/bench_q8.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/ggml_reader.o
+$(OUTDIR)/transformer_test: $(OUTDIR)/transformer_main.o $(OUTDIR)/rope.o $(OUTDIR)/positional_encoding.o $(OUTDIR)/attention.o $(OUTDIR)/attention_strategy.o $(OUTDIR)/activations.o $(OUTDIR)/normalization.o $(OUTDIR)/utils.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-# Phase 4: GGML Model Loading & Inference
-$(OUTDIR)/ggml_model.o: $(SRCDIR)/ggml_model.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OUTDIR)/inference.o: $(SRCDIR)/inference.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(OUTDIR)/test_phase4.o: $(SRCDIR)/test_phase4.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(PHASE4_TEST_BIN): $(OUTDIR)/test_phase4.o $(OUTDIR)/ggml_model.o $(OUTDIR)/inference.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o $(OUTDIR)/kv_cache.o $(OUTDIR)/activations.o $(OUTDIR)/attention.o $(OUTDIR)/attention_strategy.o $(OUTDIR)/normalization.o $(OUTDIR)/positional_encoding.o $(OUTDIR)/rope.o $(OUTDIR)/utils.o
+$(OUTDIR)/test_tensor: $(OUTDIR)/test_tensor.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-.PHONY: bench
-bench: $(BENCH_Q4_BIN) $(BENCH_Q8_BIN) $(SAPP_END_TO_END_BIN)
-	@echo "Running Q4 benchmark..."
-	@$(BENCH_Q4_BIN)
-	@echo "\nRunning Q8 benchmark..."
-	@$(BENCH_Q8_BIN)
-	@echo "\nRunning Sapphire end-to-end benchmark..."
-	@$(SAPP_END_TO_END_BIN)
+$(OUTDIR)/test_activations: $(OUTDIR)/test_activations.o $(OUTDIR)/activations.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-test: $(TEST_BITNET_BIN) $(TEST_SAPPHIRE_BIN) $(TENSOR_TEST_BIN) $(ACTIVATIONS_TEST_BIN) $(NORMALIZATION_TEST_BIN) $(KV_CACHE_TEST_BIN) $(TENSOR_GEMV_TEST_BIN) $(PHASE4_TEST_BIN)
-	@echo "Running bitnet test..."
-	@$(TEST_BITNET_BIN)
-	@echo "\nRunning sapphire test..."
-	@$(TEST_SAPPHIRE_BIN)
-	@echo "\nRunning tensor test..."
-	@$(TENSOR_TEST_BIN)
-	@echo "\nRunning activations test..."
-	@$(ACTIVATIONS_TEST_BIN)
-	@echo "\nRunning normalization test..."
-	@$(NORMALIZATION_TEST_BIN)
-	@echo "\nRunning kv_cache test..."
-	@$(KV_CACHE_TEST_BIN)
-	@echo "\nRunning tensor_gemv test..."
-	@$(TENSOR_GEMV_TEST_BIN)
-	@echo "\nRunning phase4 (GGML & inference) test..."
-	@$(PHASE4_TEST_BIN)
+$(OUTDIR)/test_normalization: $(OUTDIR)/test_normalization.o $(OUTDIR)/normalization.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-transformer: $(TRANSFORMER_BIN)
-	@echo "Running transformer components test..."
-	@$(TRANSFORMER_BIN)
+$(OUTDIR)/test_kv_cache: $(OUTDIR)/test_kv_cache.o $(OUTDIR)/kv_cache.o $(OUTDIR)/tensor.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-tensor: $(TENSOR_TEST_BIN)
-	@echo "Running tensor test..."
-	@$(TENSOR_TEST_BIN)
+$(OUTDIR)/test_tensor_gemv: $(OUTDIR)/test_tensor_gemv.o $(OUTDIR)/tensor_gemv.o $(OUTDIR)/tensor.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/ggml_reader.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-activations: $(ACTIVATIONS_TEST_BIN)
-	@echo "Running activations test..."
-	@$(ACTIVATIONS_TEST_BIN)
+$(OUTDIR)/test_ggml_model: $(OUTDIR)/test_ggml_model.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-normalization: $(NORMALIZATION_TEST_BIN)
-	@echo "Running normalization test..."
-	@$(NORMALIZATION_TEST_BIN)
+$(OUTDIR)/test_ggml_reader: $(OUTDIR)/test_ggml_reader.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-kv-cache: $(KV_CACHE_TEST_BIN)
-	@echo "Running kv_cache test..."
-	@$(KV_CACHE_TEST_BIN)
+$(OUTDIR)/test_inference: $(OUTDIR)/test_inference.o $(OUTDIR)/inference.o $(OUTDIR)/tensor.o $(OUTDIR)/kv_cache.o $(OUTDIR)/rope.o $(OUTDIR)/attention.o $(OUTDIR)/attention_strategy.o $(OUTDIR)/activations.o $(OUTDIR)/normalization.o $(OUTDIR)/tensor_gemv.o $(OUTDIR)/positional_encoding.o $(OUTDIR)/utils.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-test-tensor-gemv: $(TENSOR_GEMV_TEST_BIN)
-	@echo "Running tensor_gemv test..."
-	@$(TENSOR_GEMV_TEST_BIN)
+# ============================================================================
+# Test & Benchmark Rules
+# ============================================================================
 
-test-sapphire: $(TEST_SAPPHIRE_BIN)
-	$(TEST_SAPPHIRE_BIN)
+bench: $(OUTDIR)/bench_q4 $(OUTDIR)/bench_q8 $(OUTDIR)/sapphire_end_to_end_bench
+	@echo "Running Q4 benchmark..." && $(OUTDIR)/bench_q4
+	@echo "\nRunning Q8 benchmark..." && $(OUTDIR)/bench_q8
+	@echo "\nRunning Sapphire end-to-end benchmark..." && $(OUTDIR)/sapphire_end_to_end_bench
 
-test-phase4: $(PHASE4_TEST_BIN)
-	@echo "Running phase4 (GGML & inference) test..."
-	@$(PHASE4_TEST_BIN)
+test: $(TARGETS)
+	@echo "Running bitnet test..." && $(OUTDIR)/test_bitnet
+	@echo "\nRunning sapphire test..." && $(OUTDIR)/test_sapphire
+	@echo "\nRunning tensor test..." && $(OUTDIR)/test_tensor
+	@echo "\nRunning activations test..." && $(OUTDIR)/test_activations
+	@echo "\nRunning normalization test..." && $(OUTDIR)/test_normalization
+	@echo "\nRunning kv_cache test..." && $(OUTDIR)/test_kv_cache
+	@echo "\nRunning tensor_gemv test..." && $(OUTDIR)/test_tensor_gemv
+	@echo "\nRunning ggml_model test..." && $(OUTDIR)/test_ggml_model
+	@echo "\nRunning ggml_reader test..." && $(OUTDIR)/test_ggml_reader
+	@echo "\nRunning inference test..." && $(OUTDIR)/test_inference
 
-# HIP build: compile bitnet_hip.c into object and link with hipcc
+test-transformer: $(OUTDIR)/transformer_test
+	@echo "Running transformer components test..." && $(OUTDIR)/transformer_test
+
+test-tensor: $(OUTDIR)/test_tensor
+	@echo "Running tensor test..." && $(OUTDIR)/test_tensor
+
+test-activations: $(OUTDIR)/test_activations
+	@echo "Running activations test..." && $(OUTDIR)/test_activations
+
+test-normalization: $(OUTDIR)/test_normalization
+	@echo "Running normalization test..." && $(OUTDIR)/test_normalization
+
+test-kv-cache: $(OUTDIR)/test_kv_cache
+	@echo "Running kv_cache test..." && $(OUTDIR)/test_kv_cache
+
+test-tensor-gemv: $(OUTDIR)/test_tensor_gemv
+	@echo "Running tensor_gemv test..." && $(OUTDIR)/test_tensor_gemv
+
+test-sapphire: $(OUTDIR)/test_sapphire
+	@echo "Running sapphire test..." && $(OUTDIR)/test_sapphire
+
+test-ggml-model: $(OUTDIR)/test_ggml_model
+	@echo "Running ggml_model test..." && $(OUTDIR)/test_ggml_model
+
+test-ggml-reader: $(OUTDIR)/test_ggml_reader
+	@echo "Running ggml_reader test..." && $(OUTDIR)/test_ggml_reader
+
+test-inference: $(OUTDIR)/test_inference
+	@echo "Running inference test..." && $(OUTDIR)/test_inference
+
+# ============================================================================
+# HIP/ROCm Targets (Optional)
+# ============================================================================
+
 $(OUTDIR)/bitnet_hip.o: $(SRCDIR)/bitnet_hip.c | $(OUTDIR)
-	@which $(HIPCC) >/dev/null 2>&1 || { echo "ERROR: hipcc not found in PATH. Install ROCm/hip-sdk or add hipcc to PATH."; exit 1; }
-	$(HIPCC) $(HIPCFLAGS_COMPILE) -c $< -o $(OUTDIR)/bitnet_hip.o
+	@which $(HIPCC) >/dev/null 2>&1 || { echo "ERROR: hipcc not found. Install ROCm/hip-sdk"; exit 1; }
+	$(HIPCC) $(HIPCFLAGS_COMPILE) -c $< -o $@
 
-$(BITNET_HIP_BIN): $(OUTDIR)/bitnet_hip.o
-	$(HIPCC) $(HIPCFLAGS_LINK) $(OUTDIR)/bitnet_hip.o -o $(BITNET_HIP_BIN)
+$(OUTDIR)/bitnet_hip: $(OUTDIR)/bitnet_hip.o
+	$(HIPCC) $(HIPCFLAGS_LINK) $^ -o $@
 
-hip: $(BITNET_HIP_BIN)
+hip: $(OUTDIR)/bitnet_hip
 
-# optionally run a tiny smoke test if hip binary exists
 check-hip: hip
-	@echo "Attempting to run hip binary (may fail if ROCm runtime not available)..."
-	@$(OUTDIR)/bitnet_hip || echo "hip binary ran but returned non-zero or ROCm runtime not available"
+	@echo "Attempting to run HIP binary (may fail if ROCm runtime unavailable)..." && $(OUTDIR)/bitnet_hip || echo "HIP binary ran but returned non-zero or ROCm runtime not available"
 
-# diagnostic target to help locate hipcc and headers
 check-hip-setup:
 	@echo "hipcc ->" $$(which hipcc 2>/dev/null || echo "NOT FOUND")
 	@echo "hip_runtime.h locations:"
 	@find /opt /usr -name hip_runtime.h 2>/dev/null || echo "no hip_runtime.h found in /opt or /usr"
 	@echo "Detected HIP include flags: $(HIP_INCLUDES)"
 	@echo "Detected HIP lib flags: $(HIP_LIBDIRS)"
-	@echo "If ROCm is installed under a custom prefix, either:"
-	@echo " - export PATH to include the hipcc bin dir, e.g. export PATH=/opt/rocm/bin:$$PATH"
-	@echo " - or run: source /opt/rocm/hip/bin/hipvars.sh (if present) to set env vars"
+	@echo "If ROCm installed under custom prefix, either:"
+	@echo " - export PATH to include hipcc bin dir"
+	@echo " - or run: source /opt/rocm/hip/bin/hipvars.sh (if present)"
 
-clean:
-	rm -rf $(OUTDIR)
+# ============================================================================
+# Sanitizer Targets
+# ============================================================================
 
-# -------------------------
-# AddressSanitizer (ASan) targets
-# -------------------------
-.PHONY: asan-test asan-all
 asan-test:
-	@echo "Building and running tensor_gemv test with AddressSanitizer (ASan)..."
+	@echo "Building and running tensor_gemv test with AddressSanitizer..."
 	$(MAKE) clean
 	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=address -fno-omit-frame-pointer -g -O1" LDFLAGS="$(LDFLAGS) -fsanitize=address" test-tensor-gemv
-	@echo "Running ASan-enabled tensor_gemv test"
-	@$(TENSOR_GEMV_TEST_BIN)
+	@echo "Running ASan-enabled tensor_gemv test" && $(OUTDIR)/test_tensor_gemv
 
 asan-all:
 	@echo "Building and running full test suite with AddressSanitizer (may be slow)..."
 	$(MAKE) clean
 	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=address -fno-omit-frame-pointer -g -O1" LDFLAGS="$(LDFLAGS) -fsanitize=address" test
+
+clean:
+	rm -rf $(OUTDIR)
