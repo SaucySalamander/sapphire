@@ -38,14 +38,15 @@ ACTIVATIONS_TEST_BIN = $(OUTDIR)/test_activations
 NORMALIZATION_TEST_BIN = $(OUTDIR)/test_normalization
 KV_CACHE_TEST_BIN = $(OUTDIR)/test_kv_cache
 TENSOR_GEMV_TEST_BIN = $(OUTDIR)/test_tensor_gemv
+PHASE4_TEST_BIN = $(OUTDIR)/test_phase4
 
 # HIP targets (optional)
 BITNET_HIP_BIN = $(OUTDIR)/bitnet_hip
 
-.PHONY: all bench test test-sapphire test-transformer test-tensor test-activations test-normalization test-kv-cache test-tensor-gemv hip check-hip check-hip-setup clean
+.PHONY: all bench test test-sapphire test-transformer test-tensor test-activations test-normalization test-kv-cache test-tensor-gemv test-phase4 hip check-hip check-hip-setup clean
 
 
-all: $(SAPP_END_TO_END_BIN) $(BENCH_Q4_BIN) $(BENCH_Q8_BIN) $(TEST_BITNET_BIN) $(TEST_SAPPHIRE_BIN) $(TRANSFORMER_BIN) $(TENSOR_TEST_BIN) $(ACTIVATIONS_TEST_BIN) $(NORMALIZATION_TEST_BIN) $(KV_CACHE_TEST_BIN) $(TENSOR_GEMV_TEST_BIN)
+all: $(SAPP_END_TO_END_BIN) $(BENCH_Q4_BIN) $(BENCH_Q8_BIN) $(TEST_BITNET_BIN) $(TEST_SAPPHIRE_BIN) $(TRANSFORMER_BIN) $(TENSOR_TEST_BIN) $(ACTIVATIONS_TEST_BIN) $(NORMALIZATION_TEST_BIN) $(KV_CACHE_TEST_BIN) $(TENSOR_GEMV_TEST_BIN) $(PHASE4_TEST_BIN)
 
 # ensure output directory exists
 $(OUTDIR):
@@ -199,6 +200,19 @@ $(OUTDIR)/bench_q8.o: $(SRCDIR)/sapphire/bench/bench_q8.c | $(OUTDIR)
 $(BENCH_Q8_BIN): $(OUTDIR)/bench_q8.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/ggml_reader.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+# Phase 4: GGML Model Loading & Inference
+$(OUTDIR)/ggml_model.o: $(SRCDIR)/ggml_model.c | $(OUTDIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OUTDIR)/inference.o: $(SRCDIR)/inference.c | $(OUTDIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OUTDIR)/test_phase4.o: $(SRCDIR)/test_phase4.c | $(OUTDIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(PHASE4_TEST_BIN): $(OUTDIR)/test_phase4.o $(OUTDIR)/ggml_model.o $(OUTDIR)/inference.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o $(OUTDIR)/kv_cache.o $(OUTDIR)/activations.o $(OUTDIR)/attention.o $(OUTDIR)/attention_strategy.o $(OUTDIR)/normalization.o $(OUTDIR)/positional_encoding.o $(OUTDIR)/rope.o $(OUTDIR)/utils.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
 .PHONY: bench
 bench: $(BENCH_Q4_BIN) $(BENCH_Q8_BIN) $(SAPP_END_TO_END_BIN)
 	@echo "Running Q4 benchmark..."
@@ -208,7 +222,7 @@ bench: $(BENCH_Q4_BIN) $(BENCH_Q8_BIN) $(SAPP_END_TO_END_BIN)
 	@echo "\nRunning Sapphire end-to-end benchmark..."
 	@$(SAPP_END_TO_END_BIN)
 
-test: $(TEST_BITNET_BIN) $(TEST_SAPPHIRE_BIN) $(TENSOR_TEST_BIN) $(ACTIVATIONS_TEST_BIN) $(NORMALIZATION_TEST_BIN) $(KV_CACHE_TEST_BIN) $(TENSOR_GEMV_TEST_BIN)
+test: $(TEST_BITNET_BIN) $(TEST_SAPPHIRE_BIN) $(TENSOR_TEST_BIN) $(ACTIVATIONS_TEST_BIN) $(NORMALIZATION_TEST_BIN) $(KV_CACHE_TEST_BIN) $(TENSOR_GEMV_TEST_BIN) $(PHASE4_TEST_BIN)
 	@echo "Running bitnet test..."
 	@$(TEST_BITNET_BIN)
 	@echo "\nRunning sapphire test..."
@@ -223,6 +237,8 @@ test: $(TEST_BITNET_BIN) $(TEST_SAPPHIRE_BIN) $(TENSOR_TEST_BIN) $(ACTIVATIONS_T
 	@$(KV_CACHE_TEST_BIN)
 	@echo "\nRunning tensor_gemv test..."
 	@$(TENSOR_GEMV_TEST_BIN)
+	@echo "\nRunning phase4 (GGML & inference) test..."
+	@$(PHASE4_TEST_BIN)
 
 test-transformer: $(TRANSFORMER_BIN)
 	@echo "Running transformer components test..."
@@ -250,6 +266,10 @@ test-tensor-gemv: $(TENSOR_GEMV_TEST_BIN)
 
 test-sapphire: $(TEST_SAPPHIRE_BIN)
 	$(TEST_SAPPHIRE_BIN)
+
+test-phase4: $(PHASE4_TEST_BIN)
+	@echo "Running phase4 (GGML & inference) test..."
+	@$(PHASE4_TEST_BIN)
 
 # HIP build: compile bitnet_hip.c into object and link with hipcc
 $(OUTDIR)/bitnet_hip.o: $(SRCDIR)/bitnet_hip.c | $(OUTDIR)
