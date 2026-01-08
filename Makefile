@@ -25,13 +25,15 @@ TARGETS = \
 	$(OUTDIR)/test_tensor \
 	$(OUTDIR)/test_activations \
 	$(OUTDIR)/test_normalization \
+	$(OUTDIR)/test_transformer_block \
+	$(OUTDIR)/test_e2e_transformer \
 	$(OUTDIR)/test_kv_cache \
 	$(OUTDIR)/test_tensor_gemv \
 	$(OUTDIR)/test_ggml_model \
 	$(OUTDIR)/test_ggml_reader \
 	$(OUTDIR)/test_inference
 
-.PHONY: all bench test test-sapphire test-transformer test-tensor test-activations test-normalization test-kv-cache test-tensor-gemv test-ggml-model test-ggml-reader test-inference hip check-hip check-hip-setup clean asan-test asan-all
+.PHONY: all bench test test-sapphire test-transformer test-transformer-block test-e2e test-tensor test-activations test-normalization test-kv-cache test-tensor-gemv test-ggml-model test-ggml-reader test-inference hip check-hip check-hip-setup clean asan-test asan-all
 
 all: $(TARGETS)
 
@@ -113,6 +115,12 @@ $(OUTDIR)/test_activations: $(OUTDIR)/test_activations.o $(OUTDIR)/activations.o
 $(OUTDIR)/test_normalization: $(OUTDIR)/test_normalization.o $(OUTDIR)/normalization.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+$(OUTDIR)/test_transformer_block: $(OUTDIR)/test_transformer_block.o $(OUTDIR)/transformer.o $(OUTDIR)/normalization.o $(OUTDIR)/activations.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(OUTDIR)/test_e2e_transformer: $(OUTDIR)/test_e2e_transformer.o $(OUTDIR)/transformer.o $(OUTDIR)/normalization.o $(OUTDIR)/activations.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
 $(OUTDIR)/test_kv_cache: $(OUTDIR)/test_kv_cache.o $(OUTDIR)/kv_cache.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
@@ -143,6 +151,8 @@ test: $(TARGETS)
 	@echo "\nRunning tensor test..." && $(OUTDIR)/test_tensor
 	@echo "\nRunning activations test..." && $(OUTDIR)/test_activations
 	@echo "\nRunning normalization test..." && $(OUTDIR)/test_normalization
+	@echo "\nRunning transformer block test..." && $(OUTDIR)/test_transformer_block
+	@echo "\nRunning end-to-end transformer test..." && $(OUTDIR)/test_e2e_transformer
 	@echo "\nRunning kv_cache test..." && $(OUTDIR)/test_kv_cache
 	@echo "\nRunning tensor_gemv test..." && $(OUTDIR)/test_tensor_gemv
 	@echo "\nRunning ggml_model test..." && $(OUTDIR)/test_ggml_model

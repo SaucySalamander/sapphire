@@ -261,6 +261,247 @@ static void test_large_array_activation(void) {
 }
 
 // ============================================================================
+// GeGLU Tests
+// ============================================================================
+
+/**
+ * Test 1: Scalar geglu basic functionality
+ */
+static void test_geglu_scalar_basic(void) {
+    printf("TEST: geglu scalar basic functionality\n");
+    float result;
+    
+    // Test case 1: geglu(0, 0) = 0 * GELU(0) = 0
+    result = geglu(0.0f, 0.0f);
+    assert(fabsf(result - 0.0f) < 1e-5f);
+    
+    // Test case 2: geglu(1.0, 0.0) = 1.0 * GELU(0) = 0
+    result = geglu(1.0f, 0.0f);
+    assert(fabsf(result - 0.0f) < 1e-5f);
+    
+    // Test case 3: geglu(0, y) = 0 (regardless of y)
+    result = geglu(0.0f, 2.5f);
+    assert(fabsf(result - 0.0f) < 1e-5f);
+    
+    // Test case 4: geglu(x, y) = x * gelu(y)
+    float x = 2.0f, y = 1.0f;
+    result = geglu(x, y);
+    float expected = x * gelu(y);
+    assert(fabsf(result - expected) < 1e-5f);
+    
+    printf("  ✓ Scalar geglu basic tests passed\n");
+    tests_passed++;
+}
+
+/**
+ * Test 2: Vectorized geglu basic functionality
+ */
+static void test_sapphire_geglu_basic(void) {
+    printf("TEST: sapphire_geglu vectorized basic\n");
+    float input[] = {1.0f, 2.0f, 0.0f, 0.5f};  // [x_1, x_2, y_1, y_2]
+    float output[2];
+    
+    int ret = sapphire_geglu(output, input, 4);
+    assert(ret == 0);
+    
+    // output[0] = 1.0 * gelu(0.0) ≈ 0.0
+    assert(fabsf(output[0] - 0.0f) < 1e-4f);
+    
+    // output[1] = 2.0 * gelu(0.5)
+    float expected = 2.0f * gelu(0.5f);
+    assert(fabsf(output[1] - expected) < 1e-4f);
+    
+    printf("  ✓ Vectorized geglu basic tests passed\n");
+    tests_passed++;
+}
+
+/**
+ * Test 3: Invalid inputs (NULL pointers, bad size)
+ */
+static void test_sapphire_geglu_invalid_inputs(void) {
+    printf("TEST: sapphire_geglu invalid inputs\n");
+    float dummy_in[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float dummy_out[2];
+    
+    // Test NULL output
+    assert(sapphire_geglu(NULL, dummy_in, 4) == -1);
+    
+    // Test NULL input
+    assert(sapphire_geglu(dummy_out, NULL, 4) == -1);
+    
+    // Test zero size
+    assert(sapphire_geglu(dummy_out, dummy_in, 0) == -1);
+    
+    // Test odd size (not even)
+    assert(sapphire_geglu(dummy_out, dummy_in, 3) == -1);
+    
+    printf("  ✓ Invalid input handling passed\n");
+    tests_passed++;
+}
+
+/**
+ * Test 4: Correctness against scalar reference
+ */
+static void test_sapphire_geglu_vs_scalar(void) {
+    printf("TEST: sapphire_geglu vs scalar reference\n");
+    // Create test input with specific values
+    size_t n_pairs = 16;
+    size_t size = n_pairs * 2;
+    float input[32];
+    float output_vec[16];
+    
+    // Fill with test values
+    for (int i = 0; i < n_pairs; i++) {
+        input[i] = (float)i * 0.1f;           // x values: 0, 0.1, 0.2, ...
+        input[n_pairs + i] = (float)i * 0.05f; // y values: 0, 0.05, 0.1, ...
+    }
+    
+    // Vectorized
+    int ret = sapphire_geglu(output_vec, input, size);
+    assert(ret == 0);
+    
+    // Compare against scalar
+    for (int i = 0; i < n_pairs; i++) {
+        float expected = geglu(input[i], input[n_pairs + i]);
+        assert(fabsf(output_vec[i] - expected) < 1e-5f);
+    }
+    
+    printf("  ✓ Vectorized vs scalar correctness passed\n");
+    tests_passed++;
+}
+
+/**
+ * Test 5: Extreme values (very large, very small)
+ */
+static void test_sapphire_geglu_extreme_values(void) {
+    printf("TEST: sapphire_geglu extreme values\n");
+    
+    // Large positive
+    float x_large = 1e3f, y_large = 10.0f;
+    float result = geglu(x_large, y_large);
+    assert(!isnan(result) && !isinf(result));
+    
+    // Large negative
+    float x_neg = -1e3f, y_neg = -10.0f;
+    result = geglu(x_neg, y_neg);
+    assert(!isnan(result) && !isinf(result));
+    
+    // Very small (denormal range)
+    float x_small = 1e-6f, y_small = 1e-6f;
+    result = geglu(x_small, y_small);
+    assert(!isnan(result));
+    
+    printf("  ✓ Extreme value handling passed\n");
+    tests_passed++;
+}
+
+/**
+ * Test 6: In-place operation (input == output not typical, but test buffer correctness)
+ */
+static void test_sapphire_geglu_correctness(void) {
+    printf("TEST: sapphire_geglu buffer correctness\n");
+    float buffer[] = {1.0f, 2.0f, 0.0f, 0.5f};
+    float expected_0 = 1.0f * gelu(0.0f);
+    float expected_1 = 2.0f * gelu(0.5f);
+    
+    int ret = sapphire_geglu(buffer, buffer, 4);
+    assert(ret == 0);
+    
+    // Check only first half is modified (output size = input size / 2)
+    assert(fabsf(buffer[0] - expected_0) < 1e-4f);
+    assert(fabsf(buffer[1] - expected_1) < 1e-4f);
+    
+    printf("  ✓ Buffer correctness passed\n");
+    tests_passed++;
+}
+
+/**
+ * Test 7: Linearity property - geglu(k*x, y) = k * geglu(x, y)
+ */
+static void test_sapphire_geglu_linearity(void) {
+    printf("TEST: sapphire_geglu linearity property\n");
+    float x = 2.5f, y = 1.5f;
+    float k = 3.0f;
+    
+    // geglu(k*x, y)
+    float result1 = geglu(k * x, y);
+    
+    // k * geglu(x, y)
+    float result2 = k * geglu(x, y);
+    
+    // Should be equal (linearity in first argument)
+    assert(fabsf(result1 - result2) < 1e-5f);
+    
+    printf("  ✓ Linearity property passed\n");
+    tests_passed++;
+}
+
+/**
+ * Test 8: Large array processing (memory stress)
+ */
+static void test_sapphire_geglu_large_array(void) {
+    printf("TEST: sapphire_geglu large array processing\n");
+    size_t n_pairs = 10000;
+    size_t size = n_pairs * 2;
+    
+    // Allocate large arrays
+    float *input = (float *)malloc(size * sizeof(float));
+    float *output = (float *)malloc(n_pairs * sizeof(float));
+    
+    assert(input != NULL && output != NULL);
+    
+    // Fill with pattern
+    for (int i = 0; i < n_pairs; i++) {
+        input[i] = sinf((float)i * 0.01f);
+        input[n_pairs + i] = cosf((float)i * 0.01f);
+    }
+    
+    // Process
+    int ret = sapphire_geglu(output, input, size);
+    assert(ret == 0);
+    
+    // Spot-check some values
+    for (int i = 0; i < 100; i += 10) {
+        float expected = geglu(input[i], input[n_pairs + i]);
+        assert(fabsf(output[i] - expected) < 1e-4f);
+    }
+    
+    free(input);
+    free(output);
+    
+    printf("  ✓ Large array processing passed\n");
+    tests_passed++;
+}
+
+/**
+ * Test 9: Batch processing consistency
+ */
+static void test_sapphire_geglu_batch_consistency(void) {
+    printf("TEST: sapphire_geglu batch consistency\n");
+    // Process separately vs. together
+    float x1[] = {1.0f, 2.0f};
+    float y1[] = {0.5f, 1.5f};
+    float input_batch[] = {1.0f, 2.0f, 0.5f, 1.5f};
+    
+    float out_separate[2];
+    float out_batch[2];
+    
+    // Separate
+    out_separate[0] = geglu(x1[0], y1[0]);
+    out_separate[1] = geglu(x1[1], y1[1]);
+    
+    // Batch
+    sapphire_geglu(out_batch, input_batch, 4);
+    
+    // Should match
+    assert(fabsf(out_separate[0] - out_batch[0]) < 1e-5f);
+    assert(fabsf(out_separate[1] - out_batch[1]) < 1e-5f);
+    
+    printf("  ✓ Batch consistency passed\n");
+    tests_passed++;
+}
+
+// ============================================================================
 // Main test runner
 // ============================================================================
 
@@ -293,6 +534,18 @@ int main(void) {
     
     // Performance tests
     test_large_array_activation();
+    printf("\n");
+    
+    // GeGLU tests
+    test_geglu_scalar_basic();
+    test_sapphire_geglu_basic();
+    test_sapphire_geglu_invalid_inputs();
+    test_sapphire_geglu_vs_scalar();
+    test_sapphire_geglu_extreme_values();
+    test_sapphire_geglu_correctness();
+    test_sapphire_geglu_linearity();
+    test_sapphire_geglu_large_array();
+    test_sapphire_geglu_batch_consistency();
     printf("\n");
     
     PRINT_TEST_RESULTS_AND_EXIT();
