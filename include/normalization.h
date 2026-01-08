@@ -110,4 +110,58 @@ void rmsnorm_batch(float *matrix, const float *weight, int num_rows, int row_siz
 void layernorm_batch(float *matrix, const float *weight, const float *bias, 
                      int num_rows, int row_size, float eps);
 
+/**
+ * @brief Standardized RMSNorm (Root Mean Square Normalization).
+ *
+ * Computes: out[i] = (in[i] / (RMS(in) + epsilon)) * weight[i]
+ *
+ * This is the standardized API version of RMSNorm with separate output buffer.
+ * Used for implementing pre-norm and post-norm layer positioning in transformers.
+ *
+ * Formula:
+ *   RMS = sqrt(mean(in^2))
+ *   out[i] = (in[i] / (RMS + eps)) * weight[i]
+ *
+ * Key differences from in-place rmsnorm():
+ * - Separate input and output buffers (non-destructive)
+ * - Explicit output parameter
+ * - Enables pipelining without temporary buffers
+ *
+ * Algorithm:
+ *   1. Compute sum of squares: sum = Σ(in[i]^2)
+ *   2. Compute RMS: rms = sqrt(sum / dim)
+ *   3. Normalize and scale: out[i] = (in[i] / (rms + eps)) * weight[i]
+ *
+ * Optimization: Inner loop is unrolled (factor 4-8) for cache efficiency.
+ *
+ * @param out Output array where normalized values are written.
+ *            Must be pre-allocated and have size >= dim.
+ *            Must not overlap with 'in' (unless separate pointers needed).
+ * @param in Input array to normalize (not modified).
+ *           Must contain dim elements.
+ * @param weight Learnable scale factors (per-dimension).
+ *               Must contain dim elements.
+ *               Common initialization: all 1.0f
+ * @param epsilon Small constant to prevent division by zero.
+ *                 Typical value: 1e-6f
+ *                 Must be positive.
+ * @param dim Number of dimensions (elements).
+ *            Must be > 0 and match size of all arrays.
+ *
+ * @return 0 on success, -1 on error (NULL pointers, invalid dim, negative epsilon).
+ *
+ * @note All arrays must be pre-allocated with size >= dim.
+ * @note 'in' is read-only; 'out' receives normalized values.
+ * @note NULL checks are performed; function returns -1 on invalid input.
+ *
+ * Example:
+ *   float in[] = {1.0, 2.0, 3.0};
+ *   float weight[] = {1.0, 1.0, 1.0};
+ *   float out[3];
+ *   sapphire_rmsnorm(out, in, weight, 1e-6f, 3);
+ *   // out contains RMSNorm(in) * weight
+ */
+int sapphire_rmsnorm(float *out, const float *in, const float *weight,
+                     float epsilon, int dim);
+
 #endif // NORMALIZATION_H

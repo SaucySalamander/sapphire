@@ -304,6 +304,284 @@ static void test_rmsnorm_vs_layernorm(void) {
 }
 
 // ============================================================================
+// sapphire_rmsnorm Tests (Non-In-Place, Standardized API)
+// ============================================================================
+
+static void test_sapphire_rmsnorm_basic(void) {
+    printf("TEST: sapphire_rmsnorm basic functionality\n");
+    
+    float in[] = {1.0f, 2.0f, 3.0f};
+    float weight[] = {1.0f, 1.0f, 1.0f};
+    float out[3];
+    
+    int ret = sapphire_rmsnorm(out, in, weight, 1e-6f, 3);
+    assert(ret == 0);
+    
+    // Verify normalization: RMS = sqrt((1 + 4 + 9) / 3) = sqrt(14/3) ≈ 2.16...
+    float rms = sqrtf((1.0f + 4.0f + 9.0f) / 3.0f + 1e-6f);
+    
+    for (int i = 0; i < 3; i++) {
+        float expected = (in[i] / rms) * weight[i];
+        assert(fabsf(out[i] - expected) < 1e-5f);
+    }
+    
+    printf("  ✓ sapphire_rmsnorm basic test passed\n");
+}
+
+static void test_sapphire_rmsnorm_identity_weight(void) {
+    printf("TEST: sapphire_rmsnorm with identity weight\n");
+    
+    float in[] = {1.0f, 0.5f, -0.5f, 2.0f};
+    float weight[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float out[4];
+    
+    int ret = sapphire_rmsnorm(out, in, weight, 1e-6f, 4);
+    assert(ret == 0);
+    
+    // out[i] should equal in[i] / RMS
+    float rms = sqrtf((1.0f + 0.25f + 0.25f + 4.0f) / 4.0f + 1e-6f);
+    
+    for (int i = 0; i < 4; i++) {
+        float expected = in[i] / rms;
+        assert(fabsf(out[i] - expected) < 1e-5f);
+    }
+    
+    printf("  ✓ sapphire_rmsnorm identity weight test passed\n");
+}
+
+static void test_sapphire_rmsnorm_scaling(void) {
+    printf("TEST: sapphire_rmsnorm with scaling weights\n");
+    
+    float in[] = {2.0f, 4.0f};
+    float weight[] = {0.5f, 2.0f};
+    float out[2];
+    
+    int ret = sapphire_rmsnorm(out, in, weight, 1e-6f, 2);
+    assert(ret == 0);
+    
+    float rms = sqrtf((4.0f + 16.0f) / 2.0f + 1e-6f);
+    float expected_0 = (2.0f / rms) * 0.5f;
+    float expected_1 = (4.0f / rms) * 2.0f;
+    
+    assert(fabsf(out[0] - expected_0) < 1e-5f);
+    assert(fabsf(out[1] - expected_1) < 1e-5f);
+    
+    printf("  ✓ sapphire_rmsnorm scaling test passed\n");
+}
+
+static void test_sapphire_rmsnorm_invalid_inputs(void) {
+    printf("TEST: sapphire_rmsnorm invalid input handling\n");
+    
+    float dummy_in[3] = {1.0f, 2.0f, 3.0f};
+    float dummy_weight[3] = {1.0f, 1.0f, 1.0f};
+    float dummy_out[3];
+    
+    // NULL output
+    assert(sapphire_rmsnorm(NULL, dummy_in, dummy_weight, 1e-6f, 3) == -1);
+    
+    // NULL input
+    assert(sapphire_rmsnorm(dummy_out, NULL, dummy_weight, 1e-6f, 3) == -1);
+    
+    // NULL weight
+    assert(sapphire_rmsnorm(dummy_out, dummy_in, NULL, 1e-6f, 3) == -1);
+    
+    // Invalid dimension
+    assert(sapphire_rmsnorm(dummy_out, dummy_in, dummy_weight, 1e-6f, 0) == -1);
+    assert(sapphire_rmsnorm(dummy_out, dummy_in, dummy_weight, 1e-6f, -1) == -1);
+    
+    // Negative epsilon
+    assert(sapphire_rmsnorm(dummy_out, dummy_in, dummy_weight, -1e-6f, 3) == -1);
+    
+    printf("  ✓ sapphire_rmsnorm invalid input handling passed\n");
+}
+
+static void test_sapphire_rmsnorm_input_preserved(void) {
+    printf("TEST: sapphire_rmsnorm input preservation\n");
+    
+    float in_orig[] = {1.0f, 2.0f, 3.0f};
+    float in[] = {1.0f, 2.0f, 3.0f};
+    float weight[] = {1.0f, 1.0f, 1.0f};
+    float out[3];
+    
+    int ret = sapphire_rmsnorm(out, in, weight, 1e-6f, 3);
+    assert(ret == 0);
+    
+    // Verify input unchanged
+    for (int i = 0; i < 3; i++) {
+        assert(in[i] == in_orig[i]);
+    }
+    
+    // Output should be different
+    int different = 0;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(out[i] - in[i]) > 1e-6f) {
+            different++;
+        }
+    }
+    assert(different > 0);  // At least one element different
+    
+    printf("  ✓ sapphire_rmsnorm input preservation passed\n");
+}
+
+static void test_sapphire_rmsnorm_vs_existing(void) {
+    printf("TEST: sapphire_rmsnorm vs existing rmsnorm\n");
+    
+    float in[] = {1.5f, -0.5f, 2.0f, 0.5f};
+    float weight[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    
+    // Make copies for comparison
+    float in_copy1[4], in_copy2[4];
+    for (int i = 0; i < 4; i++) {
+        in_copy1[i] = in[i];
+        in_copy2[i] = in[i];
+    }
+    
+    // Existing in-place rmsnorm (modifies in_copy1)
+    rmsnorm(in_copy1, weight, 4, 1e-6f);
+    
+    // New non-in-place sapphire_rmsnorm
+    float out[4];
+    int ret = sapphire_rmsnorm(out, in_copy2, weight, 1e-6f, 4);
+    assert(ret == 0);
+    
+    // Results should be identical
+    for (int i = 0; i < 4; i++) {
+        assert(fabsf(in_copy1[i] - out[i]) < 1e-5f);
+    }
+    
+    printf("  ✓ sapphire_rmsnorm vs existing rmsnorm passed\n");
+}
+
+static void test_sapphire_rmsnorm_various_dimensions(void) {
+    printf("TEST: sapphire_rmsnorm with various dimensions\n");
+    
+    int dims[] = {1, 8, 16, 64, 128, 256, 512, 2048};
+    
+    for (int d = 0; d < 8; d++) {
+        int dim = dims[d];
+        
+        float *in = (float *)malloc(dim * sizeof(float));
+        float *weight = (float *)malloc(dim * sizeof(float));
+        float *out = (float *)malloc(dim * sizeof(float));
+        
+        // Fill with pattern
+        for (int i = 0; i < dim; i++) {
+            in[i] = sinf((float)i * 0.1f);
+            weight[i] = 1.0f;
+        }
+        
+        int ret = sapphire_rmsnorm(out, in, weight, 1e-6f, dim);
+        assert(ret == 0);
+        
+        // Spot-check normalization property
+        // Verify against manual calculation
+        float sum_in_sq = 0.0f;
+        for (int i = 0; i < dim; i++) {
+            sum_in_sq += in[i] * in[i];
+        }
+        float rms_in = sqrtf(sum_in_sq / (float)dim + 1e-6f);
+        
+        // Spot-check some values
+        for (int i = 0; i < 10; i++) {
+            float expected = in[i] / rms_in * weight[i];
+            assert(fabsf(out[i] - expected) < 1e-4f);
+        }
+        
+        free(in);
+        free(weight);
+        free(out);
+    }
+    
+    printf("  ✓ sapphire_rmsnorm various dimensions passed\n");
+}
+
+static void test_sapphire_rmsnorm_epsilon_values(void) {
+    printf("TEST: sapphire_rmsnorm epsilon handling\n");
+    
+    float in[] = {1.0f, 2.0f, 3.0f};
+    float weight[] = {1.0f, 1.0f, 1.0f};
+    float out1[3], out2[3], out3[3];
+    
+    // Very small epsilon
+    int ret1 = sapphire_rmsnorm(out1, in, weight, 1e-8f, 3);
+    assert(ret1 == 0);
+    
+    // Standard epsilon
+    int ret2 = sapphire_rmsnorm(out2, in, weight, 1e-6f, 3);
+    assert(ret2 == 0);
+    
+    // Larger epsilon
+    int ret3 = sapphire_rmsnorm(out3, in, weight, 1e-3f, 3);
+    assert(ret3 == 0);
+    
+    // All should be valid (not NaN/inf)
+    for (int i = 0; i < 3; i++) {
+        assert(!isnan(out1[i]) && !isinf(out1[i]));
+        assert(!isnan(out2[i]) && !isinf(out2[i]));
+        assert(!isnan(out3[i]) && !isinf(out3[i]));
+    }
+    
+    printf("  ✓ sapphire_rmsnorm epsilon handling passed\n");
+}
+
+static void test_sapphire_rmsnorm_inplace(void) {
+    printf("TEST: sapphire_rmsnorm in-place operation\n");
+    
+    float buffer[] = {1.0f, 2.0f, 3.0f};
+    float weight[] = {1.0f, 1.0f, 1.0f};
+    float buffer_orig[] = {1.0f, 2.0f, 3.0f};
+    
+    // In-place: output buffer is same as input
+    int ret = sapphire_rmsnorm(buffer, buffer, weight, 1e-6f, 3);
+    assert(ret == 0);
+    
+    // Verify result is correct
+    float rms = sqrtf((1.0f + 4.0f + 9.0f) / 3.0f + 1e-6f);
+    for (int i = 0; i < 3; i++) {
+        float expected = buffer_orig[i] / rms;
+        assert(fabsf(buffer[i] - expected) < 1e-5f);
+    }
+    
+    printf("  ✓ sapphire_rmsnorm in-place operation passed\n");
+}
+
+static void test_sapphire_rmsnorm_large_array(void) {
+    printf("TEST: sapphire_rmsnorm large array processing\n");
+    
+    int dim = 10000;
+    float *in = (float *)malloc(dim * sizeof(float));
+    float *weight = (float *)malloc(dim * sizeof(float));
+    float *out = (float *)malloc(dim * sizeof(float));
+    
+    // Fill with random values
+    for (int i = 0; i < dim; i++) {
+        in[i] = (float)rand() / RAND_MAX;
+        weight[i] = 1.0f;
+    }
+    
+    int ret = sapphire_rmsnorm(out, in, weight, 1e-6f, dim);
+    assert(ret == 0);
+    
+    // Spot-check correctness
+    float rms = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        rms += in[i] * in[i];
+    }
+    rms = sqrtf(rms / (float)dim + 1e-6f);
+    
+    for (int i = 0; i < 100; i += 10) {
+        float expected = in[i] / rms;
+        assert(fabsf(out[i] - expected) < 1e-4f);
+    }
+    
+    free(in);
+    free(weight);
+    free(out);
+    
+    printf("  ✓ sapphire_rmsnorm large array processing passed\n");
+}
+
+// ============================================================================
 // Main test runner
 // ============================================================================
 
@@ -335,6 +613,19 @@ int main(void) {
     
     // Comparison tests
     test_rmsnorm_vs_layernorm();
+    printf("\n");
+    
+    // sapphire_rmsnorm tests (non-in-place, standardized API)
+    test_sapphire_rmsnorm_basic();
+    test_sapphire_rmsnorm_identity_weight();
+    test_sapphire_rmsnorm_scaling();
+    test_sapphire_rmsnorm_invalid_inputs();
+    test_sapphire_rmsnorm_input_preserved();
+    test_sapphire_rmsnorm_vs_existing();
+    test_sapphire_rmsnorm_various_dimensions();
+    test_sapphire_rmsnorm_epsilon_values();
+    test_sapphire_rmsnorm_inplace();
+    test_sapphire_rmsnorm_large_array();
     printf("\n");
     
     printf("============================================================\n");

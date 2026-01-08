@@ -1,6 +1,8 @@
 #ifndef ACTIVATIONS_H
 #define ACTIVATIONS_H
 
+#include <stddef.h>
+
 /**
  * @file activations.h
  * @brief Activation functions for neural network layers.
@@ -79,5 +81,59 @@ void relu_inplace(float *x, int n);
  * @param n Number of elements.
  */
 void gelu_inplace(float *x, int n);
+
+/**
+ * @brief GeGLU (Gated GELU) activation for a single pair of values.
+ *
+ * Formula: output = x * GELU(y)
+ *
+ * GeGLU is a gated variant of GELU used in modern transformers.
+ * One input acts as the main signal (x), the other as a gate (y).
+ *
+ * @param x The main signal value.
+ * @param y The gating value.
+ * @return x * GELU(y)
+ */
+float geglu(float x, float y);
+
+/**
+ * @brief Vectorized GeGLU (Gated GELU) activation for an array.
+ *
+ * Formula: output[i] = input[i] * GELU(input[i + n/2])
+ *
+ * Input layout: [x_1, x_2, ..., x_n, y_1, y_2, ..., y_n]
+ * where size = 2n (total elements), n is the number of (x,y) pairs.
+ *
+ * Memory layout (row-major):
+ * - First half: x values (signal)
+ * - Second half: y values (gate)
+ *
+ * Algorithm:
+ *   for i in 0..n-1:
+ *     output[i] = input[i] * GELU(input[i + n])
+ *
+ * Optimization: Inner loop is unrolled (factor 4-8) for cache efficiency.
+ *
+ * @param output Output array where results are written (size >= size).
+ *               Must be pre-allocated.
+ * @param input Input array with layout [x_1..x_n, y_1..y_n].
+ *              Must contain size elements (size must be even).
+ * @param size Total number of elements in input (2n where n is pair count).
+ *             Must be even and > 0.
+ *
+ * @return 0 on success, -1 on error (NULL pointers, invalid size).
+ *
+ * @note Input and output may be the same array (in-place operation).
+ * @note size must be even; the function will assert this.
+ * @note Loop unrolling assumes sequential memory layout.
+ *
+ * Example:
+ *   float input[] = {1.0, 2.0, 0.0, 0.5};  // [x_1, x_2, y_1, y_2]
+ *   float output[2];
+ *   sapphire_geglu(output, input, 4);
+ *   // output[0] = 1.0 * GELU(0.0) ≈ 0.0
+ *   // output[1] = 2.0 * GELU(0.5) ≈ 2.0 * 0.38...
+ */
+int sapphire_geglu(float *output, const float *input, size_t size);
 
 #endif // ACTIVATIONS_H
