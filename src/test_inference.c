@@ -22,9 +22,28 @@
 #include "../include/inference.h"
 #include "../include/kv_cache.h"
 #include "../include/tensor.h"
+#include "../include/test_utils.h"
+
+// Global test counters
+int tests_passed = 0;
+int tests_failed = 0;
+
+void test_begin(const char *name) {
+    printf("TEST: %s\n", name);
+}
+
+void test_pass(const char *msg) {
+    printf("  ✓ %s\n", msg);
+    tests_passed++;
+}
+
+void test_fail(const char *msg) {
+    printf("  ✗ %s\n", msg);
+    tests_failed++;
+}
 
 // ============================================================================
-// Test Utilities
+// Helper Macros for Assertions
 // ============================================================================
 
 #define ASSERT_TRUE(condition) \
@@ -41,23 +60,6 @@
 #define ASSERT_LT(a, b) ASSERT_TRUE((a) < (b))
 #define ASSERT_GTE(a, b) ASSERT_TRUE((a) >= (b))
 #define ASSERT_LTE(a, b) ASSERT_TRUE((a) <= (b))
-
-static int tests_passed = 0;
-static int tests_failed = 0;
-
-void test_begin(const char *name) {
-    printf("TEST: %s\n", name);
-}
-
-void test_pass(const char *msg) {
-    printf("  ✓ %s\n", msg);
-    tests_passed++;
-}
-
-void test_fail(const char *msg) {
-    printf("  ✗ %s\n", msg);
-    tests_failed++;
-}
 
 // ============================================================================
 // Mock Model Creation Helpers
@@ -810,9 +812,5 @@ int main(void) {
     test_session_with_small_model();
     test_session_with_large_model();
     
-    printf("\n============================================================\n");
-    printf("TEST RESULTS: %d passed, %d failed\n", tests_passed, tests_failed);
-    printf("============================================================\n");
-    
-    return (tests_failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+    PRINT_TEST_RESULTS_AND_EXIT();
 }

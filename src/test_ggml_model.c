@@ -18,24 +18,11 @@
 #include <math.h>
 #include "../include/ggml_model.h"
 #include "../include/tensor.h"
+#include "../include/test_utils.h"
 
-// ============================================================================
-// Test Utilities
-// ============================================================================
-
-#define ASSERT_TRUE(condition) \
-    do { if (!(condition)) { \
-        printf("  ✗ ASSERTION FAILED: %s (line %d)\n", #condition, __LINE__); \
-        return 0; \
-    } } while(0)
-
-#define ASSERT_NULL(ptr) ASSERT_TRUE((ptr) == NULL)
-#define ASSERT_NOT_NULL(ptr) ASSERT_TRUE((ptr) != NULL)
-#define ASSERT_EQ(a, b) ASSERT_TRUE((a) == (b))
-#define ASSERT_NEQ(a, b) ASSERT_TRUE((a) != (b))
-
-static int tests_passed = 0;
-static int tests_failed = 0;
+// Global test counters
+int tests_passed = 0;
+int tests_failed = 0;
 
 void test_begin(const char *name) {
     printf("TEST: %s\n", name);
@@ -50,6 +37,21 @@ void test_fail(const char *msg) {
     printf("  ✗ %s\n", msg);
     tests_failed++;
 }
+
+// ============================================================================
+// Helper Macros for Assertions
+// ============================================================================
+
+#define ASSERT_TRUE(condition) \
+    do { if (!(condition)) { \
+        printf("  ✗ ASSERTION FAILED: %s (line %d)\n", #condition, __LINE__); \
+        return 0; \
+    } } while(0)
+
+#define ASSERT_NULL(ptr) ASSERT_TRUE((ptr) == NULL)
+#define ASSERT_NOT_NULL(ptr) ASSERT_TRUE((ptr) != NULL)
+#define ASSERT_EQ(a, b) ASSERT_TRUE((a) == (b))
+#define ASSERT_NEQ(a, b) ASSERT_TRUE((a) != (b))
 
 // ============================================================================
 // Model Configuration Tests
@@ -559,9 +561,5 @@ int main(void) {
     test_layer_array_allocation();
     test_tensor_metadata_array_allocation();
     
-    printf("\n============================================================\n");
-    printf("TEST RESULTS: %d passed, %d failed\n", tests_passed, tests_failed);
-    printf("============================================================\n");
-    
-    return (tests_failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+    PRINT_TEST_RESULTS_AND_EXIT();
 }

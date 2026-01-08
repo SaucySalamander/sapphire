@@ -74,11 +74,7 @@ $(OUTDIR)/sapphire_q8_0.o: $(SRCDIR)/sapphire/q8_0.c | $(OUTDIR)
 $(OUTDIR)/transformer_main.o: $(SRCDIR)/main.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Compile test_activations from transformer module
-$(OUTDIR)/test_activations.o: $(SRCDIR)/transformer/test_activations.c | $(OUTDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Compile test_normalization from transformer module
+# Compile test_normalization from transformer module (not consolidated)
 $(OUTDIR)/test_normalization.o: $(SRCDIR)/transformer/test_normalization.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 

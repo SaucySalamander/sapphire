@@ -3,6 +3,11 @@
 #include <math.h>
 #include <assert.h>
 #include "tensor.h"
+#include "test_utils.h"
+
+// Global test counters
+int tests_passed = 0;
+int tests_failed = 0;
 
 // ============================================================================
 // Test: Create and release
@@ -20,6 +25,8 @@ static void test_tensor_create_1d(void) {
     
     tensor_release(t);
     printf("  ✓ 1D tensor creation and release\n");
+    tests_passed++;
+    tests_passed++;
 }
 
 static void test_tensor_create_2d(void) {
@@ -34,6 +41,8 @@ static void test_tensor_create_2d(void) {
     
     tensor_release(t);
     printf("  ✓ 2D tensor creation and release\n");
+    tests_passed++;
+    tests_passed++;
 }
 
 static void test_tensor_create_3d(void) {
@@ -48,6 +57,7 @@ static void test_tensor_create_3d(void) {
     
     tensor_release(t);
     printf("  ✓ 3D tensor creation and release\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -62,6 +72,8 @@ static void test_dtype_element_size(void) {
     assert(dtype_element_size(DTYPE_Q4_0) == 1);  // Q4_0 uses 1 byte per 2 elements
     
     printf("  ✓ Element size calculations correct\n");
+    tests_passed++;
+    tests_passed++;
 }
 
 static void test_dtype_name(void) {
@@ -72,6 +84,7 @@ static void test_dtype_name(void) {
     assert(dtype_name(DTYPE_Q8_0) != NULL);
     
     printf("  ✓ dtype_name returns valid strings\n");
+    tests_passed++;
 }
 
 static void test_tensor_create_quantized(void) {
@@ -92,6 +105,7 @@ static void test_tensor_create_quantized(void) {
     tensor_release(t_q8);
     
     printf("  ✓ Quantized tensor creation correct\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -120,6 +134,7 @@ static void test_tensor_get_set_f32(void) {
     
     tensor_release(t);
     printf("  ✓ Get/set values work correctly\n");
+    tests_passed++;
 }
 
 static void test_tensor_set_invalid_dtype(void) {
@@ -135,6 +150,7 @@ static void test_tensor_set_invalid_dtype(void) {
     
     tensor_release(t);
     printf("  ✓ Correctly rejects set_f32 on quantized tensors\n");
+    tests_passed++;
 }
 
 static void test_tensor_data_mutable(void) {
@@ -186,6 +202,7 @@ static void test_tensor_data_mutable(void) {
     assert(tensor_data_mutable(NULL) == NULL);
     
     printf("  ✓ tensor_data_mutable works for F32 and quantized tensors\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -226,6 +243,7 @@ static void test_tensor_clone(void) {
     tensor_release(original);
     tensor_release(clone);
     printf("  ✓ Clone creates independent copy\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -259,6 +277,7 @@ static void test_reference_counting(void) {
     // After final release, ptr is invalid, don't dereference
     
     printf("  ✓ Reference counting works correctly\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -283,6 +302,7 @@ static void test_null_handling(void) {
     tensor_ref_inc(NULL);
     
     printf("  ✓ NULL handling is safe\n");
+    tests_passed++;
 }
 
 static void test_invalid_index_access(void) {
@@ -302,6 +322,7 @@ static void test_invalid_index_access(void) {
     
     tensor_release(t);
     printf("  ✓ Out-of-bounds access handled safely\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -320,6 +341,7 @@ static void test_print_info(void) {
     
     tensor_release(t);
     printf("  ✓ tensor_print_info works\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -343,6 +365,7 @@ static void test_large_tensor(void) {
     
     tensor_release(t);
     printf("  ✓ Large tensor allocation succeeds\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -395,10 +418,6 @@ int main(void) {
     test_large_tensor();
     printf("\n");
     
-    printf("============================================================\n");
-    printf("                    ALL TESTS PASSED ✓\n");
-    printf("============================================================\n");
-    printf("\n");
-    
-    return 0;
+    PRINT_TEST_RESULTS_AND_EXIT();
 }
+
