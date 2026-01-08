@@ -4,6 +4,11 @@
 #include <assert.h>
 #include "tensor_gemv.h"
 #include "tensor.h"
+#include "test_utils.h"
+
+// Global test counters
+int tests_passed = 0;
+int tests_failed = 0;
 
 // ============================================================================
 // Test: F32 GEMV
@@ -51,6 +56,7 @@ static void test_tensor_gemv_f32_basic(void) {
     tensor_gemv_ctx_destroy(ctx);
     
     printf("  ✓ F32 GEMV basic computation correct\n");
+    tests_passed++;
 }
 
 static void test_tensor_gemv_f32_random(void) {
@@ -95,6 +101,7 @@ static void test_tensor_gemv_f32_random(void) {
     tensor_gemv_ctx_destroy(ctx);
     
     printf("  ✓ F32 GEMV random matrix computation correct\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -142,6 +149,7 @@ static void test_tensor_gemv_tensor_wrapper(void) {
     tensor_gemv_ctx_destroy(ctx);
     
     printf("  ✓ Tensor wrapper works correctly\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -186,6 +194,7 @@ static void test_tensor_gemv_add(void) {
     tensor_gemv_ctx_destroy(ctx);
     
     printf("  ✓ GEMV accumulation works correctly\n");
+    tests_passed++;
 }
 
 static void test_tensor_gemv_add_with_scaling(void) {
@@ -220,6 +229,7 @@ static void test_tensor_gemv_add_with_scaling(void) {
     tensor_gemv_ctx_destroy(ctx);
     
     printf("  ✓ GEMV accumulation with scaling works correctly\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -264,6 +274,7 @@ static void test_tensor_gemv_batch(void) {
     tensor_gemv_ctx_destroy(ctx);
     
     printf("  ✓ Batched GEMV works correctly\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -299,6 +310,7 @@ static void test_tensor_gemv_error_handling(void) {
     tensor_release(A);
     
     printf("  ✓ Error handling works correctly\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -315,6 +327,7 @@ static void test_tensor_gemv_init_cleanup_idempotent(void) {
     tensor_gemv_ctx_destroy(NULL); // destroy NULL-safe
     
     printf("  ✓ Init/cleanup idempotency correct\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -357,6 +370,7 @@ static void test_tensor_gemv_large(void) {
     tensor_gemv_ctx_destroy(ctx);
     
     printf("  ✓ Large matrix GEMV works\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -400,10 +414,5 @@ int main(void) {
     test_tensor_gemv_large();
     printf("\n");
     
-    printf("============================================================\n");
-    printf("                    ALL TESTS PASSED ✓\n");
-    printf("============================================================\n");
-    printf("\n");
-    
-    return 0;
+    PRINT_TEST_RESULTS_AND_EXIT();
 }

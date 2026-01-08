@@ -4,6 +4,11 @@
 #include <assert.h>
 #include "kv_cache.h"
 #include "tensor.h"
+#include "test_utils.h"
+
+// Global test counters
+int tests_passed = 0;
+int tests_failed = 0;
 
 // ============================================================================
 // Test: KV cache creation and release
@@ -25,6 +30,7 @@ static void test_kv_cache_create(void) {
     
     kv_cache_release(cache);
     printf("  ✓ KV cache creation and release successful\n");
+    tests_passed++;
 }
 
 static void test_kv_cache_large(void) {
@@ -45,6 +51,7 @@ static void test_kv_cache_large(void) {
     
     kv_cache_release(cache);
     printf("  ✓ Large context window (32k) cache creation successful\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -85,6 +92,7 @@ static void test_kv_cache_append_single_token(void) {
     
     kv_cache_release(cache);
     printf("  ✓ Single token append successful\n");
+    tests_passed++;
 }
 
 static void test_kv_cache_append_multiple_tokens(void) {
@@ -112,6 +120,7 @@ static void test_kv_cache_append_multiple_tokens(void) {
     
     kv_cache_release(cache);
     printf("  ✓ Multiple token append successful\n");
+    tests_passed++;
 }
 
 static void test_kv_cache_fill_to_capacity(void) {
@@ -143,6 +152,7 @@ static void test_kv_cache_fill_to_capacity(void) {
     
     kv_cache_release(cache);
     printf("  ✓ Fill to capacity and overflow handling correct\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -179,6 +189,7 @@ static void test_kv_cache_reset(void) {
     
     kv_cache_release(cache);
     printf("  ✓ Cache reset successful\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -220,6 +231,7 @@ static void test_kv_cache_getters(void) {
 
     kv_cache_release(cache);
     printf("  ✓ Getter functions work correctly\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -246,6 +258,7 @@ static void test_kv_cache_null_handling(void) {
     kv_cache_print_info(NULL);
     
     printf("  ✓ Null pointer handling is safe\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -273,6 +286,7 @@ static void test_kv_cache_print_info(void) {
     
     kv_cache_release(cache);
     printf("  ✓ Info printing works\n");
+    tests_passed++;
 }
 
 // ============================================================================
@@ -313,10 +327,5 @@ int main(void) {
     test_kv_cache_print_info();
     printf("\n");
     
-    printf("============================================================\n");
-    printf("                    ALL TESTS PASSED ✓\n");
-    printf("============================================================\n");
-    printf("\n");
-    
-    return 0;
+    PRINT_TEST_RESULTS_AND_EXIT();
 }

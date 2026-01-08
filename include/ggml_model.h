@@ -118,7 +118,7 @@ void ggml_header_destroy(ggml_file_header_t *header);
  * Load entire GGML model from file.
  *
  * @param filename Path to .ggml model file.
- * @param config Model configuration (or infer from file).
+ * @param config Model configuration (required; must not be NULL).
  * @return Allocated llm_model_t with all weights loaded, or NULL on failure.
  */
 llm_model_t* llm_model_load(const char *filename, const model_config_t *config);
