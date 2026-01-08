@@ -38,6 +38,11 @@ llm_model_t* llm_model_load(const char *filename, const model_config_t *config) 
     model->config = *config;
     model->weight_file = fp;
     model->file_header = file_header;
+    
+    // Transfer ownership to model structure
+    fp = NULL;
+    file_header.tensors = NULL;
+
     model->layers = NULL;
     model->embedding_weight = NULL;
     model->norm_final_weight = NULL;

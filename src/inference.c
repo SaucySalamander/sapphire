@@ -21,10 +21,8 @@
  * Precompute RoPE frequencies (cos and sin for all positions and dimensions).
  */
 static int precompute_rope_freqs(float *freqs_cos, float *freqs_sin,
-                                  int d_model, int max_context_len, float rope_base) {
+                                  int d_k, int max_context_len, float rope_base) {
     if (!freqs_cos || !freqs_sin) return -1;
-    
-    int d_k = d_model;  // For simplicity, assuming no head dimension reduction
     
     for (int pos = 0; pos < max_context_len; pos++) {
         for (int dim = 0; dim < d_k; dim += 2) {
@@ -58,7 +56,14 @@ inference_session_t* inference_session_create(llm_model_t *model, int max_contex
     }
     
     session->model = model;
-    session->scratch_size = model->config.d_model * 4;  // 4x hidden dim scratch buffer
+    
+    /**
+     * Scratch buffer layout:
+     * [0       ... d_model-1]: layer_in (current hidden state)
+     * [d_model ... 2*d_model-1]: layer_out (next hidden state / residual)
+     * [2*d_model ... 4*d_model-1]: intermediate activations (e.g. attention, FFN)
+     */
+    session->scratch_size = model->config.d_model * 4;
     session->scratch_buffer = (float *)malloc(session->scratch_size * sizeof(float));
     
     if (!session->scratch_buffer) {
@@ -94,7 +99,8 @@ inference_session_t* inference_session_create(llm_model_t *model, int max_contex
     }
     
     // Precompute RoPE frequencies
-    int freq_size = max_context_len * model->config.d_model;
+    int d_k = model->config.d_k;
+    int freq_size = max_context_len * d_k;
     session->rope_freqs_cos = (float *)malloc(freq_size * sizeof(float));
     session->rope_freqs_sin = (float *)malloc(freq_size * sizeof(float));
     
@@ -112,7 +118,7 @@ inference_session_t* inference_session_create(llm_model_t *model, int max_contex
     }
     
     if (precompute_rope_freqs(session->rope_freqs_cos, session->rope_freqs_sin,
-                              model->config.d_model, max_context_len, model->config.rope_base) < 0) {
+                              d_k, max_context_len, model->config.rope_base) < 0) {
         fprintf(stderr, "ERROR: Failed to precompute RoPE frequencies\n");
         free(session->rope_freqs_cos);
         free(session->rope_freqs_sin);
@@ -252,6 +258,11 @@ int llm_generate_greedy(inference_session_t *session,
                         int *output_tokens) {
     if (!session || !prompt_tokens || !output_tokens) {
         fprintf(stderr, "ERROR: llm_generate_greedy requires session, prompt, and output\n");
+        return 0;
+    }
+
+    if (prompt_len <= 0) {
+        fprintf(stderr, "ERROR: llm_generate_greedy requires prompt_len > 0\n");
         return 0;
     }
     
