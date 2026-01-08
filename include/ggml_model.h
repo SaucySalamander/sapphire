@@ -32,7 +32,7 @@ typedef struct {
  */
 typedef struct {
     char name[256];              /**< Tensor name (e.g., "layers.0.attention.q_proj.weight"). */
-    int ndim;                    /**< Number of dimensions. */
+    uint32_t ndim;               /**< Number of dimensions. */
     uint32_t shape[8];           /**< Shape array. */
     tensor_dtype_t dtype;        /**< Data type (F32, Q4_0, Q8_0, etc.). */
     size_t file_offset;          /**< Byte offset in file where data starts. */

@@ -404,7 +404,7 @@ int test_forward_pass_near_context_limit(void) {
             // Forward pass near the context limit
             inference_forward(session, 1000, ctx_len - 10, logits);
             
-            test_pass("Forward pass at position");
+            test_pass("Forward pass at position near context limit");
             free(logits);
         }
         
@@ -641,7 +641,7 @@ int test_greedy_decoding_empty_prompt(void) {
         
         // Should handle empty prompt gracefully
         ASSERT_GTE(gen_count, 0);
-        test_pass("Empty prompt handled (returned");
+        test_pass("Empty prompt handled (returned non-negative count)");
         
         inference_session_destroy(session);
     } else {

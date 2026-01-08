@@ -118,6 +118,7 @@ FILE* ggml_file_open_and_parse_header(const char *filename, ggml_file_header_t *
         }
         
         meta->ndim = ndim;
+        memset(meta->shape, 0, sizeof(meta->shape));
         if (read_exact(fp, meta->shape, ndim * sizeof(uint32_t)) < 0) {
             fprintf(stderr, "ERROR: Failed to read tensor %u shape\n", i);
             free(header->tensors);
@@ -137,7 +138,7 @@ FILE* ggml_file_open_and_parse_header(const char *filename, ggml_file_header_t *
         
         // Calculate data size
         size_t nelems = 1;
-        for (int j = 0; j < ndim; j++) {
+        for (uint32_t j = 0; j < ndim; j++) {
             nelems *= meta->shape[j];
         }
         
@@ -147,12 +148,14 @@ FILE* ggml_file_open_and_parse_header(const char *filename, ggml_file_header_t *
                 meta->data_size = nelems * sizeof(float);
                 break;
             case DTYPE_Q4_0:
-                // Q4_0: 32 elements per block, 2 bytes overhead per block
-                meta->data_size = (nelems / 32 + (nelems % 32 ? 1 : 0)) * (2 + 16);
+                // Q4_0: 32 elements per block.
+                // Each block has a 4-byte float scale and 16 bytes of packed data (20 bytes total).
+                meta->data_size = ((nelems + 31) / 32) * (sizeof(float) + 16);
                 break;
             case DTYPE_Q8_0:
-                // Q8_0: 32 elements per block, 1 byte scale + 32 bytes quantized
-                meta->data_size = (nelems / 32 + (nelems % 32 ? 1 : 0)) * (1 + 32);
+                // Q8_0: 32 elements per block.
+                // Each block has a 4-byte float scale and 32 bytes of data (36 bytes total).
+                meta->data_size = ((nelems + 31) / 32) * (sizeof(float) + 32);
                 break;
             default:
                 fprintf(stderr, "ERROR: Unknown tensor dtype %d for tensor %u\n", meta->dtype, i);
