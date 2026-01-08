@@ -24,16 +24,28 @@ static int precompute_rope_freqs(float *freqs_cos, float *freqs_sin,
                                   int d_k, int max_context_len, float rope_base) {
     if (!freqs_cos || !freqs_sin) return -1;
     
+    /**
+     * RoPE (Rotary Position Encoding) formula:
+     * For each position pos and pair index m (where m = 0, 1, 2, ..., d_k/2-1):
+     *   freq = 1.0 / rope_base^(2m / d_k)
+     *   angle = pos * freq
+     * The same angle is applied to both elements in the pair (dim, dim+1).
+     */
     for (int pos = 0; pos < max_context_len; pos++) {
-        for (int dim = 0; dim < d_k; dim += 2) {
-            float freq = 1.0f / powf(rope_base, (float)dim / (float)d_k);
+        for (int m = 0; m < d_k / 2; m++) {
+            float freq = 1.0f / powf(rope_base, 2.0f * (float)m / (float)d_k);
             float angle = (float)pos * freq;
             
-            freqs_cos[pos * d_k + dim] = cosf(angle);
-            freqs_cos[pos * d_k + dim + 1] = cosf(angle);
+            float cos_val = cosf(angle);
+            float sin_val = sinf(angle);
             
-            freqs_sin[pos * d_k + dim] = sinf(angle);
-            freqs_sin[pos * d_k + dim + 1] = sinf(angle);
+            // Store same angle for both elements in the pair
+            int dim = 2 * m;
+            freqs_cos[pos * d_k + dim] = cos_val;
+            freqs_cos[pos * d_k + dim + 1] = cos_val;
+            
+            freqs_sin[pos * d_k + dim] = sin_val;
+            freqs_sin[pos * d_k + dim + 1] = sin_val;
         }
     }
     
@@ -61,9 +73,11 @@ inference_session_t* inference_session_create(llm_model_t *model, int max_contex
      * Scratch buffer layout:
      * [0       ... d_model-1]: layer_in (current hidden state)
      * [d_model ... 2*d_model-1]: layer_out (next hidden state / residual)
-     * [2*d_model ... 4*d_model-1]: intermediate activations (e.g. attention, FFN)
+     * 
+     * Note: Intermediate activations (e.g. attention, FFN) are not stored in this
+     * scratch buffer and are handled by other temporary buffers during layer computation.
      */
-    session->scratch_size = model->config.d_model * 4;
+    session->scratch_size = model->config.d_model * 2;
     session->scratch_buffer = (float *)malloc(session->scratch_size * sizeof(float));
     
     if (!session->scratch_buffer) {
@@ -283,6 +297,7 @@ int llm_generate_greedy(inference_session_t *session,
     }
     
     // Generate new tokens
+    // Safe to access prompt_tokens[prompt_len - 1] because prompt_len > 0 is guaranteed above
     int last_token = prompt_tokens[prompt_len - 1];
     for (int i = prompt_len; i < max_tokens; i++) {
         inference_forward(session, last_token, i, logits);

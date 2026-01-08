@@ -129,15 +129,23 @@ FILE* create_truncated_ggml_file(const char *filename) {
 int test_magic_number_recognition(void) {
     test_begin("Magic number recognition");
     
-    uint32_t magic = 0x67676d6c;  // "ggml"
+    uint32_t magic = 0x67676d6c;  // "ggml" encoded as 0x67 0x67 0x6d 0x6c
     ASSERT_EQ(magic, 0x67676d6c);
     
-    // Verify byte order (little-endian)
-    uint8_t *bytes = (uint8_t *)&magic;
-    ASSERT_EQ(bytes[0], 'g');
-    ASSERT_EQ(bytes[1], 'g');
-    ASSERT_EQ(bytes[2], 'm');
-    ASSERT_EQ(bytes[3], 'l');
+    /**
+     * Verify that the magic constant corresponds to ASCII "ggml"
+     * in a portable way, without relying on the host's endianness.
+     *
+     * We construct the expected magic number from individual bytes
+     * in big-endian/network order: 'g' is the most significant byte,
+     * 'l' is the least significant.
+     */
+    const uint32_t magic_from_chars = 
+        ((uint32_t)'g' << 24) |
+        ((uint32_t)'g' << 16) |
+        ((uint32_t)'m' <<  8) |
+        ((uint32_t)'l' <<  0);
+    ASSERT_EQ(magic, magic_from_chars);
     
     test_pass("Magic number is 0x67676d6c (ggml)");
     return 1;
@@ -280,12 +288,12 @@ int test_invalid_magic_number(void) {
     
     // Try to read it back
     fp = fopen(filename, "rb");
-    if (fp) {
-        uint32_t magic;
-        fread(&magic, sizeof(magic), 1, fp);
-        ASSERT_NEQ(magic, 0x67676d6c);
-        fclose(fp);
-    }
+    ASSERT_NOT_NULL(fp);  // File must exist and be readable
+    
+    uint32_t magic;
+    fread(&magic, sizeof(magic), 1, fp);
+    ASSERT_NEQ(magic, 0x67676d6c);
+    fclose(fp);
     
     unlink(filename);
     test_pass("Invalid magic number detected");
@@ -301,15 +309,15 @@ int test_truncated_file(void) {
     
     // Try to read it back
     fp = fopen(filename, "rb");
-    if (fp) {
-        uint32_t magic, version;
-        int magic_read = fread(&magic, sizeof(magic), 1, fp);
-        int version_read = fread(&version, sizeof(version), 1, fp);
-        
-        ASSERT_EQ(magic_read, 1);
-        ASSERT_EQ(version_read, 0);  // Should fail
-        fclose(fp);
-    }
+    ASSERT_NOT_NULL(fp);  // File must exist and be readable
+    
+    uint32_t magic, version;
+    int magic_read = fread(&magic, sizeof(magic), 1, fp);
+    int version_read = fread(&version, sizeof(version), 1, fp);
+    
+    ASSERT_EQ(magic_read, 1);
+    ASSERT_EQ(version_read, 0);  // Should fail
+    fclose(fp);
     
     unlink(filename);
     test_pass("Truncated file detected");

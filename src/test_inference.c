@@ -63,6 +63,9 @@ void test_fail(const char *msg) {
 // Mock Model Creation Helpers
 // ============================================================================
 
+// Forward declaration for use in create_mock_model failure path
+static void destroy_mock_model(llm_model_t *model);
+
 static llm_model_t* create_mock_model(int vocab_size, int d_model, int num_layers) {
     llm_model_t *model = (llm_model_t *)malloc(sizeof(llm_model_t));
     if (!model) return NULL;
@@ -75,43 +78,105 @@ static llm_model_t* create_mock_model(int vocab_size, int d_model, int num_layer
     model->config.max_context_len = 2048;
     model->config.rope_base = 10000.0f;
     
+    // Initialize all tensor pointers to NULL for safe cleanup on failure
+    model->embedding_weight = NULL;
+    model->norm_final_weight = NULL;
+    model->lm_head_weight = NULL;
+    model->layers = NULL;
+    model->weight_file = NULL;
+    
     // Allocate dummy tensors using new API: tensor_create(ndim, shape_array, dtype)
     int embedding_shape[] = {vocab_size, d_model};
     model->embedding_weight = tensor_create(2, embedding_shape, DTYPE_F32);
+    if (!model->embedding_weight) {
+        destroy_mock_model(model);
+        return NULL;
+    }
     
     int norm_shape[] = {d_model};
     model->norm_final_weight = tensor_create(1, norm_shape, DTYPE_F32);
+    if (!model->norm_final_weight) {
+        destroy_mock_model(model);
+        return NULL;
+    }
     
     int lm_head_shape[] = {vocab_size, d_model};
     model->lm_head_weight = tensor_create(2, lm_head_shape, DTYPE_F32);
+    if (!model->lm_head_weight) {
+        destroy_mock_model(model);
+        return NULL;
+    }
     
     // Allocate layer weights
     model->layers = (model_layer_weights_t *)malloc(num_layers * sizeof(model_layer_weights_t));
-    if (model->layers) {
-        memset(model->layers, 0, num_layers * sizeof(model_layer_weights_t));
-        for (int i = 0; i < num_layers; i++) {
-            int attn_norm_shape[] = {d_model};
-            model->layers[i].norm_attn_weight = tensor_create(1, attn_norm_shape, DTYPE_F32);
-            
-            int proj_shape[] = {d_model, d_model};
-            model->layers[i].q_proj_weight = tensor_create(2, proj_shape, DTYPE_F32);
-            model->layers[i].k_proj_weight = tensor_create(2, proj_shape, DTYPE_F32);
-            model->layers[i].v_proj_weight = tensor_create(2, proj_shape, DTYPE_F32);
-            model->layers[i].out_proj_weight = tensor_create(2, proj_shape, DTYPE_F32);
-            
-            int ffn_norm_shape[] = {d_model};
-            model->layers[i].norm_ffn_weight = tensor_create(1, ffn_norm_shape, DTYPE_F32);
-            
-            int up_shape[] = {d_model * 4, d_model};
-            model->layers[i].up_proj_weight = tensor_create(2, up_shape, DTYPE_F32);
-            model->layers[i].gate_proj_weight = tensor_create(2, up_shape, DTYPE_F32);
-            
-            int down_shape[] = {d_model, d_model * 4};
-            model->layers[i].down_proj_weight = tensor_create(2, down_shape, DTYPE_F32);
+    if (!model->layers) {
+        destroy_mock_model(model);
+        return NULL;
+    }
+    memset(model->layers, 0, num_layers * sizeof(model_layer_weights_t));
+    
+    // Allocate tensors for each layer
+    for (int i = 0; i < num_layers; i++) {
+        int attn_norm_shape[] = {d_model};
+        model->layers[i].norm_attn_weight = tensor_create(1, attn_norm_shape, DTYPE_F32);
+        if (!model->layers[i].norm_attn_weight) {
+            destroy_mock_model(model);
+            return NULL;
+        }
+        
+        int proj_shape[] = {d_model, d_model};
+        model->layers[i].q_proj_weight = tensor_create(2, proj_shape, DTYPE_F32);
+        if (!model->layers[i].q_proj_weight) {
+            destroy_mock_model(model);
+            return NULL;
+        }
+        
+        model->layers[i].k_proj_weight = tensor_create(2, proj_shape, DTYPE_F32);
+        if (!model->layers[i].k_proj_weight) {
+            destroy_mock_model(model);
+            return NULL;
+        }
+        
+        model->layers[i].v_proj_weight = tensor_create(2, proj_shape, DTYPE_F32);
+        if (!model->layers[i].v_proj_weight) {
+            destroy_mock_model(model);
+            return NULL;
+        }
+        
+        model->layers[i].out_proj_weight = tensor_create(2, proj_shape, DTYPE_F32);
+        if (!model->layers[i].out_proj_weight) {
+            destroy_mock_model(model);
+            return NULL;
+        }
+        
+        int ffn_norm_shape[] = {d_model};
+        model->layers[i].norm_ffn_weight = tensor_create(1, ffn_norm_shape, DTYPE_F32);
+        if (!model->layers[i].norm_ffn_weight) {
+            destroy_mock_model(model);
+            return NULL;
+        }
+        
+        int up_shape[] = {d_model * 4, d_model};
+        model->layers[i].up_proj_weight = tensor_create(2, up_shape, DTYPE_F32);
+        if (!model->layers[i].up_proj_weight) {
+            destroy_mock_model(model);
+            return NULL;
+        }
+        
+        model->layers[i].gate_proj_weight = tensor_create(2, up_shape, DTYPE_F32);
+        if (!model->layers[i].gate_proj_weight) {
+            destroy_mock_model(model);
+            return NULL;
+        }
+        
+        int down_shape[] = {d_model, d_model * 4};
+        model->layers[i].down_proj_weight = tensor_create(2, down_shape, DTYPE_F32);
+        if (!model->layers[i].down_proj_weight) {
+            destroy_mock_model(model);
+            return NULL;
         }
     }
     
-    model->weight_file = NULL;
     memset(&model->file_header, 0, sizeof(model->file_header));
     
     return model;
@@ -527,10 +592,10 @@ int test_logits_values_finite(void) {
         if (logits) {
             inference_forward(session, 100, 0, logits);
             
-            // Check that logits are finite or zero
+            // Check that logits are finite (note: 0.0f is already finite)
             int finite_count = 0;
             for (int i = 0; i < model->config.vocab_size; i++) {
-                if (isfinite(logits[i]) || logits[i] == 0.0f) {
+                if (isfinite(logits[i])) {
                     finite_count++;
                 }
             }
@@ -572,8 +637,9 @@ int test_greedy_decoding_single_token(void) {
         int gen_count = llm_generate_greedy(session, prompt, 3, 5, output);
         
         if (gen_count > 0) {
-            ASSERT_GTE(gen_count, 3);  // At least prompt tokens
-            test_pass("Tokens generated successfully");
+            // Verify that at least the prompt tokens are in the output
+            ASSERT_GTE(gen_count, 3);
+            test_pass("Tokens generated successfully (including prompt)");
         } else {
             test_pass("Generation skipped (not implemented)");
         }
@@ -608,7 +674,9 @@ int test_greedy_decoding_max_tokens(void) {
         
         if (gen_count > 0) {
             ASSERT_LTE(gen_count, max_tokens);
-            test_pass("Tokens generated:");
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Tokens generated: %d (max %d)", gen_count, max_tokens);
+            test_pass(msg);
         } else {
             test_pass("Skipped");
         }

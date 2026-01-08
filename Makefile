@@ -31,9 +31,6 @@ TARGETS = \
 	$(OUTDIR)/test_ggml_reader \
 	$(OUTDIR)/test_inference
 
-# Common object dependencies
-TRANSFORMER_OBJS = $(filter $(OUTDIR)/activations.o $(OUTDIR)/attention.o $(OUTDIR)/attention_strategy.o $(OUTDIR)/normalization.o $(OUTDIR)/positional_encoding.o $(OUTDIR)/rope.o, $(wildcard $(OUTDIR)/*.o))
-
 .PHONY: all bench test test-sapphire test-transformer test-tensor test-activations test-normalization test-kv-cache test-tensor-gemv test-ggml-model test-ggml-reader test-inference hip check-hip check-hip-setup clean asan-test asan-all
 
 all: $(TARGETS)
