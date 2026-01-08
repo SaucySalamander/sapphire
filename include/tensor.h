@@ -165,6 +165,17 @@ const void* tensor_data(const tensor_t *t);
 float* tensor_data_f32(tensor_t *t);
 
 /**
+ * @brief Accessor: get pointer to raw data buffer (writable) for any dtype.
+ * 
+ * Use this when you need mutable access to the underlying tensor data,
+ * particularly for loading quantized weights from disk or other initialization.
+ * 
+ * @param t Tensor.
+ * @return pointer to writable internal data buffer or NULL
+ */
+void* tensor_data_mutable(tensor_t *t);
+
+/**
  * @brief Accessor: get tensor dtype.
  * @return dtype enum
  */
