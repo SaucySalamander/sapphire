@@ -287,6 +287,11 @@ float* tensor_data_f32(tensor_t *t) {
     return (float *)t->data;
 }
 
+void* tensor_data_mutable(tensor_t *t) {
+    if (!t) return NULL;
+    return t->data;
+}
+
 tensor_dtype_t tensor_dtype(const tensor_t *t) {
     if (!t) return DTYPE_F32; // sensible default
     return t->dtype;

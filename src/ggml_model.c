@@ -38,11 +38,6 @@ llm_model_t* llm_model_load(const char *filename, const model_config_t *config) 
     model->config = *config;
     model->weight_file = fp;
     model->file_header = file_header;
-    
-    // Transfer ownership to model structure
-    fp = NULL;
-    file_header.tensors = NULL;
-
     model->layers = NULL;
     model->embedding_weight = NULL;
     model->norm_final_weight = NULL;
@@ -51,7 +46,7 @@ llm_model_t* llm_model_load(const char *filename, const model_config_t *config) 
     // Load embedding weight
     const ggml_tensor_meta_t *emb_meta = ggml_find_tensor_meta(&file_header, "embedding.weight");
     if (emb_meta) {
-        model->embedding_weight = ggml_load_tensor(fp, emb_meta);
+        model->embedding_weight = ggml_load_tensor(model->weight_file, emb_meta);
         if (!model->embedding_weight) {
             fprintf(stderr, "ERROR: Failed to load embedding weights\n");
             llm_model_destroy(model);
@@ -64,7 +59,7 @@ llm_model_t* llm_model_load(const char *filename, const model_config_t *config) 
     // Load final layer norm
     const ggml_tensor_meta_t *norm_meta = ggml_find_tensor_meta(&file_header, "norm_final.weight");
     if (norm_meta) {
-        model->norm_final_weight = ggml_load_tensor(fp, norm_meta);
+        model->norm_final_weight = ggml_load_tensor(model->weight_file, norm_meta);
         if (!model->norm_final_weight) {
             fprintf(stderr, "ERROR: Failed to load final norm weights\n");
             llm_model_destroy(model);
@@ -77,7 +72,7 @@ llm_model_t* llm_model_load(const char *filename, const model_config_t *config) 
     // Load LM head
     const ggml_tensor_meta_t *lm_head_meta = ggml_find_tensor_meta(&file_header, "lm_head.weight");
     if (lm_head_meta) {
-        model->lm_head_weight = ggml_load_tensor(fp, lm_head_meta);
+        model->lm_head_weight = ggml_load_tensor(model->weight_file, lm_head_meta);
         if (!model->lm_head_weight) {
             fprintf(stderr, "ERROR: Failed to load LM head weights\n");
             llm_model_destroy(model);
@@ -115,61 +110,64 @@ llm_model_t* llm_model_load(const char *filename, const model_config_t *config) 
         snprintf(tensor_name, sizeof(tensor_name), "layers.%d.attention_norm.weight", layer);
         const ggml_tensor_meta_t *meta = ggml_find_tensor_meta(&file_header, tensor_name);
         if (meta) {
-            model->layers[layer].norm_attn_weight = ggml_load_tensor(fp, meta);
+            model->layers[layer].norm_attn_weight = ggml_load_tensor(model->weight_file, meta);
         }
         
         // Q, K, V projections
         snprintf(tensor_name, sizeof(tensor_name), "layers.%d.attention.q_proj.weight", layer);
         meta = ggml_find_tensor_meta(&file_header, tensor_name);
         if (meta) {
-            model->layers[layer].q_proj_weight = ggml_load_tensor(fp, meta);
+            model->layers[layer].q_proj_weight = ggml_load_tensor(model->weight_file, meta);
         }
         
         snprintf(tensor_name, sizeof(tensor_name), "layers.%d.attention.k_proj.weight", layer);
         meta = ggml_find_tensor_meta(&file_header, tensor_name);
         if (meta) {
-            model->layers[layer].k_proj_weight = ggml_load_tensor(fp, meta);
+            model->layers[layer].k_proj_weight = ggml_load_tensor(model->weight_file, meta);
         }
         
         snprintf(tensor_name, sizeof(tensor_name), "layers.%d.attention.v_proj.weight", layer);
         meta = ggml_find_tensor_meta(&file_header, tensor_name);
         if (meta) {
-            model->layers[layer].v_proj_weight = ggml_load_tensor(fp, meta);
+            model->layers[layer].v_proj_weight = ggml_load_tensor(model->weight_file, meta);
         }
         
         // Output projection
         snprintf(tensor_name, sizeof(tensor_name), "layers.%d.attention.out_proj.weight", layer);
         meta = ggml_find_tensor_meta(&file_header, tensor_name);
         if (meta) {
-            model->layers[layer].out_proj_weight = ggml_load_tensor(fp, meta);
+            model->layers[layer].out_proj_weight = ggml_load_tensor(model->weight_file, meta);
         }
         
         // FFN norm
         snprintf(tensor_name, sizeof(tensor_name), "layers.%d.ffn_norm.weight", layer);
         meta = ggml_find_tensor_meta(&file_header, tensor_name);
         if (meta) {
-            model->layers[layer].norm_ffn_weight = ggml_load_tensor(fp, meta);
+            model->layers[layer].norm_ffn_weight = ggml_load_tensor(model->weight_file, meta);
         }
         
         // FFN projections
         snprintf(tensor_name, sizeof(tensor_name), "layers.%d.ffn.up_proj.weight", layer);
         meta = ggml_find_tensor_meta(&file_header, tensor_name);
         if (meta) {
-            model->layers[layer].up_proj_weight = ggml_load_tensor(fp, meta);
+            model->layers[layer].up_proj_weight = ggml_load_tensor(model->weight_file, meta);
         }
         
         snprintf(tensor_name, sizeof(tensor_name), "layers.%d.ffn.gate_proj.weight", layer);
         meta = ggml_find_tensor_meta(&file_header, tensor_name);
         if (meta) {
-            model->layers[layer].gate_proj_weight = ggml_load_tensor(fp, meta);
+            model->layers[layer].gate_proj_weight = ggml_load_tensor(model->weight_file, meta);
         }
         
         snprintf(tensor_name, sizeof(tensor_name), "layers.%d.ffn.down_proj.weight", layer);
         meta = ggml_find_tensor_meta(&file_header, tensor_name);
         if (meta) {
-            model->layers[layer].down_proj_weight = ggml_load_tensor(fp, meta);
+            model->layers[layer].down_proj_weight = ggml_load_tensor(model->weight_file, meta);
         }
     }
+    
+    // Transfer ownership: stack variables no longer own these resources
+    file_header.tensors = NULL;
     
     fprintf(stderr, "INFO: Model loaded successfully: %d layers, vocab_size=%d, d_model=%d\n",
             config->num_layers, config->vocab_size, config->d_model);

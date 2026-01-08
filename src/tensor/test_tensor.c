@@ -137,6 +137,57 @@ static void test_tensor_set_invalid_dtype(void) {
     printf("  ✓ Correctly rejects set_f32 on quantized tensors\n");
 }
 
+static void test_tensor_data_mutable(void) {
+    printf("TEST: tensor_data_mutable\n");
+    
+    // Test F32 tensor
+    int shape_f32[] = {5};
+    tensor_t *t_f32 = tensor_create(1, shape_f32, DTYPE_F32);
+    assert(t_f32 != NULL);
+    
+    float *data_f32 = (float *)tensor_data_mutable(t_f32);
+    assert(data_f32 != NULL);
+    
+    // Write some values via mutable pointer
+    for (int i = 0; i < 5; i++) {
+        data_f32[i] = (float)i * 1.5f;
+    }
+    
+    // Verify via read accessor
+    for (int i = 0; i < 5; i++) {
+        assert(fabs(tensor_get_f32(t_f32, i) - (float)i * 1.5f) < 1e-6f);
+    }
+    
+    tensor_release(t_f32);
+    
+    // Test quantized tensor (Q4_0)
+    int shape_q4[] = {32};
+    tensor_t *t_q4 = tensor_create(1, shape_q4, DTYPE_Q4_0);
+    assert(t_q4 != NULL);
+    
+    void *data_q4 = tensor_data_mutable(t_q4);
+    assert(data_q4 != NULL);
+    
+    // Verify we can write raw bytes (simulating file read)
+    uint8_t *q4_bytes = (uint8_t *)data_q4;
+    for (int i = 0; i < tensor_nbytes(t_q4); i++) {
+        q4_bytes[i] = (uint8_t)(i & 0xFF);
+    }
+    
+    // Verify the data was written
+    uint8_t *q4_verify = (uint8_t *)tensor_data(t_q4);
+    for (int i = 0; i < tensor_nbytes(t_q4); i++) {
+        assert(q4_verify[i] == (uint8_t)(i & 0xFF));
+    }
+    
+    tensor_release(t_q4);
+    
+    // Test NULL tensor
+    assert(tensor_data_mutable(NULL) == NULL);
+    
+    printf("  ✓ tensor_data_mutable works for F32 and quantized tensors\n");
+}
+
 // ============================================================================
 // Test: Clone
 // ============================================================================
@@ -320,6 +371,7 @@ int main(void) {
     // Get/Set operations
     test_tensor_get_set_f32();
     test_tensor_set_invalid_dtype();
+    test_tensor_data_mutable();
     printf("\n");
     
     // Clone

@@ -205,15 +205,12 @@ tensor_t* ggml_load_tensor(FILE *fp, const ggml_tensor_meta_t *meta) {
     }
     
     // Read data
-    const void *data_ptr = tensor_data(t);
-    if (!data_ptr) {
-        fprintf(stderr, "ERROR: Tensor %s has no data buffer\n", meta->name);
+    void *data = tensor_data_mutable(t);
+    if (!data) {
+        fprintf(stderr, "ERROR: Tensor %s has no mutable data buffer\n", meta->name);
         tensor_release(t);
         return NULL;
     }
-    
-    // Cast away const for writing
-    void *data = (void *)data_ptr;
     
     if (read_exact(fp, data, meta->data_size) < 0) {
         fprintf(stderr, "ERROR: Failed to read tensor %s data\n", meta->name);
