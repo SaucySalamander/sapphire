@@ -1,63 +1,101 @@
-// sapphire.h - Q4_0 quantized GEMM API for sapphire core
+// sapphire.h - Kernels Interface (formerly sapphire.h)
+// Model-agnostic GEMV API using unified tensor_dtype_t
 #ifndef SAPPHIRE_H
 #define SAPPHIRE_H
 
 #include <stdint.h>
 #include <stddef.h>
+#include "tensor.h"  // Unified tensor type system
 
-// Define the structure for a block of 32 4-bit quantized weights.
-// Each block stores a shared scale and 16 bytes packing 32 4-bit weights.
+// ============================================================================
+// KERNEL FUNCTION POINTERS (Generic dispatch interface)
+// ============================================================================
+
+/**
+ * Generic GEMV kernel function signature.
+ * All kernels conform to this interface for polymorphic dispatch.
+ * 
+ * @param w_row        Opaque pointer to weight row (Q4_0 blocks, Q8_0 blocks, BF16 array, or F32 array)
+ * @param x            Input vector (always F32)
+ * @param blocks       Number of blocks/elements to process
+ * @param block_size   Size of each block (typically 32 for quantized)
+ * @return Dot product result (float)
+ */
+typedef float (*gemv_kernel_t)(const void* w_row, const float* x, int blocks, int block_size);
+
+// ============================================================================
+// BLOCK STRUCTURE DEFINITIONS (Memory layout for weights)
+// ============================================================================
+
+// Q4_0: 4-bit quantized weights
 typedef struct {
-    float scale;         // Scaling factor for the entire block (f32)
-    uint8_t q_data[16];  // 16 bytes * 2 weights/byte = 32 packed 4-bit weights
+    float scale;         // Scaling factor (f32)
+    uint8_t q_data[16];  // 16 bytes * 2 nibbles/byte = 32 packed 4-bit weights
 } ggml_block_q4_0;
 
-// Performs a dot-product between one quantized row (W_row) and a float vector (x).
-// W_row: Array of ggml_block_q4_0 blocks representing one row of the weight matrix.
-// x: The input vector (float array).
-// block_count: The total number of blocks in the row.
-// block_size: The number of weights per block (fixed at 32 for Q4_0).
-// Returns the resulting dot product as a float.
-float quantized_gemv_row_dot_product(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size);
-// Fast path: caller promises x is 32-byte aligned. Uses _mm256_load_ps for speed.
-float quantized_gemv_row_dot_product_aligned(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size);
-// Scalar reference implementation (useful for tests and validation)
-float quantized_gemv_row_dot_product_scalar(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size);
-
-// Persistent thread-pool context for batched GEMV
-typedef struct sapphire_context sapphire_context;
-
-// Create/destroy thread-pool context. num_threads=0 => autodetect hardware_concurrency.
-sapphire_context *sapphire_context_create(int num_threads, int chunk_size);
-void sapphire_context_destroy(sapphire_context *ctx);
-
-// Q8 block format (one byte per weight)
+// Q8_0: 8-bit quantized weights
 typedef struct {
     float scale;
-    uint8_t q_data[32];
+    uint8_t q_data[32];  // 32 bytes = 32 int8 weights
 } ggml_block_q8_0;
 
-float quantized_gemv_q8_0_unaligned(const ggml_block_q8_0 *W_row, const float *x, int block_count, int block_size);
-float quantized_gemv_q8_0_aligned(const ggml_block_q8_0 *W_row, const float *x, int block_count, int block_size);
+// ============================================================================
+// KERNEL IMPLEMENTATIONS (Model-agnostic, use void* for opaque data)
+// ============================================================================
 
-// Minimal GGML reader API
-typedef enum { GGML_TYPE_F32 = 0, GGML_TYPE_Q8_0 = 1, GGML_TYPE_Q4_0 = 2 } ggml_type_t;
-typedef struct {
-    ggml_type_t type;
-    int rows;
-    int cols;
-    void *data; /* pointer to tensor payload (heap-owned) */
-    size_t data_size;
-} ggml_tensor_t;
+// Q4_0 kernels
+float quantized_gemv_q4_0_unaligned(const void *W_row, const float *x, int block_count, int block_size);
+float quantized_gemv_q4_0_aligned(const void *W_row, const float *x, int block_count, int block_size);
+float quantized_gemv_row_dot_product_scalar(const void *W_row, const float *x, int block_count, int block_size);
 
-// Run batched GEMV using the context's thread pool. tensors points to an array of ggml_tensor_t describing the
-// weight tensors to use (one or more). rows is the number of output rows to compute. Returns 0 on success.
-int sapphire_batched_gemv(sapphire_context *ctx, const ggml_tensor_t *tensors, size_t tensor_count, int rows, int blocks_per_row, const float *x, float *y);
+// Legacy compatibility wrappers (for backward compatibility with old tests)
+float quantized_gemv_row_dot_product(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size);
+float quantized_gemv_row_dot_product_aligned(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size);
 
-// Additional kernel wrappers
-float quantized_gemv_q4_0_unaligned(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size);
-float quantized_gemv_q4_0_aligned(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size);
-int ggml_model_load(const char *path, ggml_tensor_t **out_tensors, size_t *out_count);
-void ggml_model_free(ggml_tensor_t *tensors, size_t count);
+// Q8_0 kernels
+float quantized_gemv_q8_0_unaligned(const void *W_row, const float *x, int block_count, int block_size);
+float quantized_gemv_q8_0_aligned(const void *W_row, const float *x, int block_count, int block_size);
+
+// BF16 kernels
+float quantized_gemv_bf16_scalar(const void *W_row, const float *x, int block_count, int block_size);
+float quantized_gemv_bf16_avx2(const void *W_row, const float *x, int block_count, int block_size);
+
+// F32 kernels
+float quantized_gemv_f32_scalar(const void *W_row, const float *x, int block_count, int block_size);
+float quantized_gemv_f32_avx2(const void *W_row, const float *x, int block_count, int block_size);
+
+// ============================================================================
+// THREAD POOL CONTEXT (Persistent batched GEMV dispatcher)
+// ============================================================================
+
+typedef struct sapphire_context sapphire_context;
+
+/**
+ * Create a thread-pool context for batched GEMV operations.
+ * 
+ * @param num_threads   Number of worker threads (0 = autodetect CPU count)
+ * @param chunk_size    Rows per task per worker (default 16)
+ * @return Allocated context, or NULL on error
+ */
+sapphire_context *sapphire_context_create(int num_threads, int chunk_size);
+
+/**
+ * Destroy a thread-pool context and free resources.
+ */
+void sapphire_context_destroy(sapphire_context *ctx);
+
+/**
+ * Batched GEMV: Compute Y = A @ X using thread pool.
+ * 
+ * The dispatcher automatically selects the best kernel for A's dtype
+ * (Q4_0, Q8_0, BF16, F32) and uses aligned/unaligned fast-paths.
+ * 
+ * @param ctx    Thread pool context
+ * @param A      Weight matrix tensor (can be any supported dtype)
+ * @param x      Input vector (F32)
+ * @param y      Output vector (F32)
+ * @return 0 on success, non-zero on error
+ */
+int sapphire_batched_gemv(sapphire_context *ctx, const tensor_t *A, const float *x, float *y);
 
 #endif // SAPPHIRE_H

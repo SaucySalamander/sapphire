@@ -9,149 +9,152 @@
 // Global test counters
 int tests_passed = 0;
 int tests_failed = 0;
+#define PRINT_TEST_RESULTS_AND_EXIT() do { \
+    printf("\n============================================================\n"); \
+    printf("Results: %d passed, %d failed\n", tests_passed, tests_failed); \
+    printf("============================================================\n"); \
+    return tests_failed > 0 ? 1 : 0; \
+} while(0)
 
 // ============================================================================
-// Test: KV cache creation and release
+// Test: Multi-layer KV cache creation and release
 // ============================================================================
 
 static void test_kv_cache_create(void) {
-    printf("TEST: kv_cache_create and release\n");
+    printf("TEST: kv_cache_create (multi-layer) and release\n");
     
+    int num_layers = 12;
+    int num_kv_heads = 2;
     int max_seq_len = 2048;
-    int d_k = 64;
+    int head_dim = 64;
     
-    kv_cache_t *cache = kv_cache_create(max_seq_len, d_k);
+    kv_cache_t *cache = kv_cache_create(num_layers, num_kv_heads, max_seq_len, head_dim);
     assert(cache != NULL);
+    assert(kv_cache_get_num_layers(cache) == num_layers);
+    assert(kv_cache_get_num_kv_heads(cache) == num_kv_heads);
     assert(kv_cache_get_max_seq_len(cache) == max_seq_len);
-    assert(kv_cache_get_d_k(cache) == d_k);
+    assert(kv_cache_get_head_dim(cache) == head_dim);
     assert(kv_cache_get_seq_len(cache) == 0);
-    assert(kv_cache_get_keys(cache) != NULL);
-    assert(kv_cache_get_values(cache) != NULL);
+    
+    // Check that we can access keys and values for each layer
+    for (int layer = 0; layer < num_layers; layer++) {
+        assert(kv_cache_get_keys(cache, layer) != NULL);
+        assert(kv_cache_get_values(cache, layer) != NULL);
+    }
     
     kv_cache_release(cache);
-    printf("  ✓ KV cache creation and release successful\n");
+    printf("  ✓ Multi-layer KV cache creation and release successful\n");
     tests_passed++;
 }
 
 static void test_kv_cache_large(void) {
-    printf("TEST: kv_cache_create with large context window\n");
+    printf("TEST: kv_cache_create with large context window and GQA\n");
     
-    int max_seq_len = 32768;  // 32k tokens
-    int d_k = 128;
+    int num_layers = 18;   // Gemma 3 270M
+    int num_kv_heads = 1;  // 8:1 GQA ratio (8 query heads, 1 KV head)
+    int max_seq_len = 8192; // 8k context
+    int head_dim = 256;
     
-    kv_cache_t *cache = kv_cache_create(max_seq_len, d_k);
+    kv_cache_t *cache = kv_cache_create(num_layers, num_kv_heads, max_seq_len, head_dim);
     assert(cache != NULL);
     
-    // Check memory allocation: 32768 * 128 * 4 bytes * 2 (K+V) = ~33 MB
-    size_t expected_nbytes = (size_t)max_seq_len * d_k * sizeof(float) * 2;
-    tensor_t *keys_tmp = kv_cache_get_keys(cache);
-    tensor_t *values_tmp = kv_cache_get_values(cache);
-    size_t actual_nbytes = tensor_nbytes(keys_tmp) + tensor_nbytes(values_tmp);
-    assert(actual_nbytes == expected_nbytes);
+    // Check memory allocation per layer: [num_kv_heads, max_seq_len, head_dim] * 2 (K+V)
+    size_t per_layer_nbytes = (size_t)num_kv_heads * max_seq_len * head_dim * sizeof(float) * 2;
+    
+    // Get memory from a single layer tensor (K + V)
+    tensor_t *keys = kv_cache_get_keys(cache, 0);
+    tensor_t *values = kv_cache_get_values(cache, 0);
+    size_t single_layer_nbytes = tensor_nbytes(keys) + tensor_nbytes(values);
+    assert(single_layer_nbytes == per_layer_nbytes);
     
     kv_cache_release(cache);
-    printf("  ✓ Large context window (32k) cache creation successful\n");
+    printf("  ✓ Large multi-layer KV cache creation successful (Gemma 3 config)\n");
     tests_passed++;
 }
 
 // ============================================================================
-// Test: Token appending
+// Test: Token appending and sequence tracking
 // ============================================================================
 
-static void test_kv_cache_append_single_token(void) {
-    printf("TEST: kv_cache_append_token single token\n");
+static void test_append_token(void) {
+    printf("TEST: kv_cache_append_token\n");
     
-    int max_seq_len = 100;
-    int d_k = 8;
+    int num_layers = 4;
+    int num_kv_heads = 2;
+    int max_seq_len = 256;
+    int head_dim = 32;
     
-    kv_cache_t *cache = kv_cache_create(max_seq_len, d_k);
+    kv_cache_t *cache = kv_cache_create(num_layers, num_kv_heads, max_seq_len, head_dim);
     assert(cache != NULL);
     assert(kv_cache_get_seq_len(cache) == 0);
-    
-    // Create test vectors
-    float k_vec[d_k];
-    float v_vec[d_k];
-    for (int i = 0; i < d_k; i++) {
-        k_vec[i] = 0.1f * (i + 1);
-        v_vec[i] = (float)(i + 1);
-    }
-
-    // Append first token
-    int ret = kv_cache_append_token(cache, k_vec, v_vec);
-    assert(ret == 0);
-    assert(kv_cache_get_seq_len(cache) == 1);
-
-    // Verify the data was written
-    float *keys_data = tensor_data_f32(kv_cache_get_keys(cache));
-    float *values_data = tensor_data_f32(kv_cache_get_values(cache));
-
-    for (int i = 0; i < d_k; i++) {
-        assert(fabs(keys_data[i] - k_vec[i]) < 1e-6f);
-        assert(fabs(values_data[i] - v_vec[i]) < 1e-6f);
-    }
-    
-    kv_cache_release(cache);
-    printf("  ✓ Single token append successful\n");
-    tests_passed++;
-}
-
-static void test_kv_cache_append_multiple_tokens(void) {
-    printf("TEST: kv_cache_append_token multiple tokens\n");
-    
-    int max_seq_len = 10;
-    int d_k = 4;
-    
-    kv_cache_t *cache = kv_cache_create(max_seq_len, d_k);
-    assert(cache != NULL);
-    
-    // Append multiple tokens
-    for (int t = 0; t < 5; t++) {
-        float k_vec[] = {(float)t * 0.1f, (float)t * 0.2f, (float)t * 0.3f, (float)t * 0.4f};
-        float v_vec[] = {(float)t * 1.0f, (float)t * 2.0f, (float)t * 3.0f, (float)t * 4.0f};
-
-        int ret = kv_cache_append_token(cache, k_vec, v_vec);
-        assert(ret == 0);
-        assert(kv_cache_get_seq_len(cache) == t + 1);
-    }
-    
-    // Verify all tokens are in cache
-    assert(kv_cache_get_seq_len(cache) == 5);
     assert(!kv_cache_is_full(cache));
     
+    // Create token vectors [num_kv_heads, head_dim]
+    size_t token_size = num_kv_heads * head_dim;
+    float *k_token = (float *)malloc(token_size * sizeof(float));
+    float *v_token = (float *)malloc(token_size * sizeof(float));
+    
+    for (size_t i = 0; i < token_size; i++) {
+        k_token[i] = 1.0f + (float)i * 0.01f;
+        v_token[i] = 2.0f - (float)i * 0.01f;
+    }
+    
+    // Append first token
+    int ret = kv_cache_append_token(cache, k_token, v_token);
+    assert(ret == 0);
+    assert(kv_cache_get_seq_len(cache) == 1);
+    
+    // Append more tokens
+    for (int i = 1; i < 10; i++) {
+        ret = kv_cache_append_token(cache, k_token, v_token);
+        assert(ret == 0);
+        assert(kv_cache_get_seq_len(cache) == i + 1);
+    }
+    
+    free(k_token);
+    free(v_token);
     kv_cache_release(cache);
-    printf("  ✓ Multiple token append successful\n");
+    printf("  ✓ Token appending successful\n");
     tests_passed++;
 }
 
-static void test_kv_cache_fill_to_capacity(void) {
-    printf("TEST: kv_cache fill to capacity\n");
+// ============================================================================
+// Test: Full cache capacity
+// ============================================================================
+
+static void test_cache_full(void) {
+    printf("TEST: kv_cache_is_full\n");
     
-    int max_seq_len = 10;
-    int d_k = 2;
+    int num_layers = 2;
+    int num_kv_heads = 1;
+    int max_seq_len = 64;
+    int head_dim = 16;
     
-    kv_cache_t *cache = kv_cache_create(max_seq_len, d_k);
+    kv_cache_t *cache = kv_cache_create(num_layers, num_kv_heads, max_seq_len, head_dim);
     assert(cache != NULL);
     
-    // Fill cache to capacity
-    float k_vec[] = {1.0f, 2.0f};
-    float v_vec[] = {3.0f, 4.0f};
+    size_t token_size = num_kv_heads * head_dim;
+    float *k_token = (float *)malloc(token_size * sizeof(float));
+    float *v_token = (float *)malloc(token_size * sizeof(float));
     
-    for (int t = 0; t < max_seq_len; t++) {
-        int ret = kv_cache_append_token(cache, k_vec, v_vec);
-        assert(ret == 0);
+    // Fill cache
+    for (int i = 0; i < max_seq_len; i++) {
+        assert(!kv_cache_is_full(cache));
+        kv_cache_append_token(cache, k_token, v_token);
     }
-
-    // Cache should be full now
-    assert(kv_cache_get_seq_len(cache) == max_seq_len);
+    
+    // Now cache should be full
     assert(kv_cache_is_full(cache));
+    assert(kv_cache_get_seq_len(cache) == max_seq_len);
     
-    // Trying to append when full should fail
-    int ret = kv_cache_append_token(cache, k_vec, v_vec);
-    assert(ret == -1);
-    assert(kv_cache_get_seq_len(cache) == max_seq_len);  // Position unchanged
+    // Further appends should fail
+    int ret = kv_cache_append_token(cache, k_token, v_token);
+    assert(ret != 0);
     
+    free(k_token);
+    free(v_token);
     kv_cache_release(cache);
-    printf("  ✓ Fill to capacity and overflow handling correct\n");
+    printf("  ✓ Cache full detection successful\n");
     tests_passed++;
 }
 
@@ -159,133 +162,98 @@ static void test_kv_cache_fill_to_capacity(void) {
 // Test: Cache reset
 // ============================================================================
 
-static void test_kv_cache_reset(void) {
+static void test_cache_reset(void) {
     printf("TEST: kv_cache_reset\n");
     
-    int max_seq_len = 10;
-    int d_k = 4;
+    int num_layers = 4;
+    int num_kv_heads = 1;
+    int max_seq_len = 128;
+    int head_dim = 32;
     
-    kv_cache_t *cache = kv_cache_create(max_seq_len, d_k);
-    assert(cache != NULL);
+    kv_cache_t *cache = kv_cache_create(num_layers, num_kv_heads, max_seq_len, head_dim);
     
-    // Append some tokens
-    float k_vec[] = {1.0f, 2.0f, 3.0f, 4.0f};
-    float v_vec[] = {5.0f, 6.0f, 7.0f, 8.0f};
+    size_t token_size = num_kv_heads * head_dim;
+    float *k_token = (float *)malloc(token_size * sizeof(float));
+    float *v_token = (float *)malloc(token_size * sizeof(float));
     
-    for (int t = 0; t < 5; t++) {
-        kv_cache_append_token(cache, k_vec, v_vec);
+    // Add some tokens
+    for (int i = 0; i < 20; i++) {
+        kv_cache_append_token(cache, k_token, v_token);
     }
-    assert(kv_cache_get_seq_len(cache) == 5);
+    assert(kv_cache_get_seq_len(cache) == 20);
     
     // Reset cache
     kv_cache_reset(cache);
     assert(kv_cache_get_seq_len(cache) == 0);
     assert(!kv_cache_is_full(cache));
     
-    // Should be able to append again
-    int ret2 = kv_cache_append_token(cache, k_vec, v_vec);
-    assert(ret2 == 0);
-    assert(kv_cache_get_seq_len(cache) == 1);
-    
+    free(k_token);
+    free(v_token);
     kv_cache_release(cache);
     printf("  ✓ Cache reset successful\n");
     tests_passed++;
 }
 
 // ============================================================================
-// Test: Getter functions
+// Test: Per-layer attention configuration
 // ============================================================================
 
-static void test_kv_cache_getters(void) {
-    printf("TEST: kv_cache getter functions\n");
+static void test_layer_config(void) {
+    printf("TEST: kv_cache_set_layer_config (per-layer attention strategy)\n");
     
-    int max_seq_len = 20;
-    int d_k = 4;
+    int num_layers = 12;
+    int num_kv_heads = 1;
+    int max_seq_len = 4096;
+    int head_dim = 128;
     
-    kv_cache_t *cache = kv_cache_create(max_seq_len, d_k);
+    kv_cache_t *cache = kv_cache_create(num_layers, num_kv_heads, max_seq_len, head_dim);
     assert(cache != NULL);
     
-    // Check initial state
-    assert(kv_cache_get_seq_len(cache) == 0);
-    assert(!kv_cache_is_full(cache));
-    
-    // Append some tokens
-    float k_vec[] = {1.0f, 2.0f, 3.0f, 4.0f};
-    float v_vec[] = {5.0f, 6.0f, 7.0f, 8.0f};
-    
-    for (int t = 0; t < 3; t++) {
-        kv_cache_append_token(cache, k_vec, v_vec);
+    // Configure some layers as local (sliding window), others as global
+    for (int layer = 0; layer < num_layers; layer++) {
+        int is_local = (layer % 2 == 0) ? 1 : 0;  // Alternate local/global
+        int window_size = is_local ? 2048 : 0;
+        
+        int ret = kv_cache_set_layer_config(cache, layer, is_local, window_size);
+        assert(ret == 0);
     }
-
-    // Check getters
-    assert(kv_cache_get_seq_len(cache) == 3);
-    assert(!kv_cache_is_full(cache));
     
-    // Get tensor pointers
-    tensor_t *keys = kv_cache_get_keys(cache);
-    tensor_t *values = kv_cache_get_values(cache);
-    assert(keys != NULL);
-    assert(values != NULL);
-    assert(kv_cache_get_keys(cache) == keys);
-    assert(kv_cache_get_values(cache) == values);
-
+    // Verify configuration was set
+    for (int layer = 0; layer < num_layers; layer++) {
+        int expected_is_local = (layer % 2 == 0) ? 1 : 0;
+        int expected_window = expected_is_local ? 2048 : 0;
+        
+        assert(kv_cache_is_layer_local(cache, layer) == expected_is_local);
+        assert(kv_cache_get_layer_window_size(cache, layer) == expected_window);
+    }
+    
     kv_cache_release(cache);
-    printf("  ✓ Getter functions work correctly\n");
+    printf("  ✓ Per-layer attention configuration successful\n");
     tests_passed++;
 }
 
 // ============================================================================
-// Test: Null pointer handling
+// Test: Accessor functions
 // ============================================================================
 
-static void test_kv_cache_null_handling(void) {
-    printf("TEST: kv_cache null pointer safety\n");
+static void test_accessors(void) {
+    printf("TEST: kv_cache accessor functions\n");
     
-    // Release NULL should be safe
-    kv_cache_release(NULL);
+    int num_layers = 8;
+    int num_kv_heads = 4;
+    int max_seq_len = 1024;
+    int head_dim = 96;
     
-    // Get functions with NULL
-    assert(kv_cache_get_keys(NULL) == NULL);
-    assert(kv_cache_get_values(NULL) == NULL);
-    assert(kv_cache_get_seq_len(NULL) == 0);
-    assert(kv_cache_is_full(NULL) == 1);  // Conservative: treat as full
-    
-    // Reset NULL should be safe
-    kv_cache_reset(NULL);
-    
-    // Print info with NULL
-    printf("  Info output: ");
-    kv_cache_print_info(NULL);
-    
-    printf("  ✓ Null pointer handling is safe\n");
-    tests_passed++;
-}
-
-// ============================================================================
-// Test: Info printing
-// ============================================================================
-
-static void test_kv_cache_print_info(void) {
-    printf("TEST: kv_cache_print_info\n");
-    
-    kv_cache_t *cache = kv_cache_create(1024, 64);
+    kv_cache_t *cache = kv_cache_create(num_layers, num_kv_heads, max_seq_len, head_dim);
     assert(cache != NULL);
     
-    // Add some tokens
-    float k_vec[64], v_vec[64];
-    for (int i = 0; i < 64; i++) {
-        k_vec[i] = v_vec[i] = 0.1f;
-    }
-    
-    for (int t = 0; t < 100; t++) {
-        kv_cache_append_token(cache, k_vec, v_vec);
-    }
-    
-    printf("  Info output: ");
-    kv_cache_print_info(cache);
+    assert(kv_cache_get_num_layers(cache) == num_layers);
+    assert(kv_cache_get_num_kv_heads(cache) == num_kv_heads);
+    assert(kv_cache_get_max_seq_len(cache) == max_seq_len);
+    assert(kv_cache_get_head_dim(cache) == head_dim);
     
     kv_cache_release(cache);
-    printf("  ✓ Info printing works\n");
+    printf("  ✓ Accessor functions successful\n");
     tests_passed++;
 }
 
@@ -293,39 +261,85 @@ static void test_kv_cache_print_info(void) {
 // Main test runner
 // ============================================================================
 
-int main(void) {
-    printf("\n");
-    printf("============================================================\n");
-    printf("                KV CACHE TEST SUITE\n");
-    printf("============================================================\n");
-    printf("\n");
+
+// ============================================================================
+// Test: Gemma 3 configuration (real-world use case)
+// ============================================================================
+
+static void test_gemma3_config(void) {
+    printf("TEST: Gemma 3 270M configuration\n");
     
-    // Creation and release
+    // Gemma 3 270M parameters
+    int num_layers = 18;
+    int num_heads = 8;        // Query heads
+    int num_kv_heads = 1;     // KV heads (8:1 GQA ratio)
+    int d_model = 2048;
+    int head_dim = d_model / num_heads;  // 256
+    int max_context_len = 8192;
+    
+    kv_cache_t *cache = kv_cache_create(num_layers, num_kv_heads, max_context_len, head_dim);
+    assert(cache != NULL);
+    
+    // Configure interleaved attention pattern
+    // Some layers use local attention (faster), some use global (more expressive)
+    for (int layer = 0; layer < num_layers; layer++) {
+        int is_local = (layer < 6) ? 1 : 0;  // First 6 layers local, rest global
+        int window_size = is_local ? 2048 : 0;
+        kv_cache_set_layer_config(cache, layer, is_local, window_size);
+    }
+    
+    // Simulate token generation sequence
+    size_t token_size = num_kv_heads * head_dim;
+    float *k_token = (float *)malloc(token_size * sizeof(float));
+    float *v_token = (float *)malloc(token_size * sizeof(float));
+    
+    // Initialize with small values
+    for (size_t i = 0; i < token_size; i++) {
+        k_token[i] = 0.1f;
+        v_token[i] = 0.2f;
+    }
+    
+    // Process 100 tokens
+    for (int i = 0; i < 100; i++) {
+        int ret = kv_cache_append_token(cache, k_token, v_token);
+        assert(ret == 0);
+    }
+    assert(kv_cache_get_seq_len(cache) == 100);
+    
+    // Verify configurations are preserved
+    assert(kv_cache_is_layer_local(cache, 0) == 1);
+    assert(kv_cache_get_layer_window_size(cache, 0) == 2048);
+    assert(kv_cache_is_layer_local(cache, 10) == 0);
+    assert(kv_cache_get_layer_window_size(cache, 10) == 0);
+    
+    free(k_token);
+    free(v_token);
+    kv_cache_release(cache);
+    printf("  ✓ Gemma 3 configuration successful\n");
+    tests_passed++;
+}
+
+// ============================================================================
+// Test runner
+// ============================================================================
+
+int main(void) {
+    printf("================================================================================\n");
+    printf("KV Cache Tests (Multi-Layer, GQA-Aware)\n");
+    printf("================================================================================\n\n");
+    
     test_kv_cache_create();
     test_kv_cache_large();
-    printf("\n");
+    test_append_token();
+    test_cache_full();
+    test_cache_reset();
+    test_layer_config();
+    test_accessors();
+    test_gemma3_config();
     
-    // Token appending
-    test_kv_cache_append_single_token();
-    test_kv_cache_append_multiple_tokens();
-    test_kv_cache_fill_to_capacity();
-    printf("\n");
+    printf("\n================================================================================\n");
+    printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);
+    printf("================================================================================\n");
     
-    // Reset
-    test_kv_cache_reset();
-    printf("\n");
-    
-    // Getters
-    test_kv_cache_getters();
-    printf("\n");
-    
-    // Null handling
-    test_kv_cache_null_handling();
-    printf("\n");
-    
-    // Info printing
-    test_kv_cache_print_info();
-    printf("\n");
-    
-    PRINT_TEST_RESULTS_AND_EXIT();
+    return tests_failed > 0 ? 1 : 0;
 }

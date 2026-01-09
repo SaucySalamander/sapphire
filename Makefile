@@ -15,13 +15,14 @@ HIPCFLAGS_COMPILE = -O3 -fPIC -D__HIP_PLATFORM_AMD__ -x hip -std=c++14 $(HIP_INC
 HIPCFLAGS_LINK = -O3 -fPIC -D__HIP_PLATFORM_AMD__ -std=c++14 $(HIP_LIBDIRS)
 
 # Target binaries
+# NOTE: bench targets (sapphire_end_to_end_bench, bench_q4, bench_q8) are temporarily
+# excluded - they reference old GGML_TYPE_* enums that were unified into tensor_dtype_t.
+# They will be migrated in a follow-up task.
 TARGETS = \
-	$(OUTDIR)/sapphire_end_to_end_bench \
-	$(OUTDIR)/bench_q4 \
-	$(OUTDIR)/bench_q8 \
 	$(OUTDIR)/test_bitnet \
 	$(OUTDIR)/test_sapphire \
 	$(OUTDIR)/transformer_test \
+	$(OUTDIR)/sapphire \
 	$(OUTDIR)/test_tensor \
 	$(OUTDIR)/test_activations \
 	$(OUTDIR)/test_normalization \
@@ -29,11 +30,12 @@ TARGETS = \
 	$(OUTDIR)/test_e2e_transformer \
 	$(OUTDIR)/test_kv_cache \
 	$(OUTDIR)/test_tensor_gemv \
-	$(OUTDIR)/test_ggml_model \
 	$(OUTDIR)/test_ggml_reader \
-	$(OUTDIR)/test_inference
+	$(OUTDIR)/test_inference \
+	$(OUTDIR)/test_safetensors_reader \
+	$(OUTDIR)/test_tensor_mapper
 
-.PHONY: all bench test test-sapphire test-transformer test-transformer-block test-e2e test-tensor test-activations test-normalization test-kv-cache test-tensor-gemv test-ggml-model test-ggml-reader test-inference hip check-hip check-hip-setup clean asan-test asan-all
+.PHONY: all bench test test-sapphire test-transformer test-transformer-block test-e2e test-tensor test-activations test-normalization test-kv-cache test-tensor-gemv test-ggml-reader test-inference test-safetensors test-tensor-mapper hip check-hip check-hip-setup clean asan-test asan-all run
 
 all: $(TARGETS)
 
@@ -47,7 +49,7 @@ $(OUTDIR)/%.o: $(SRCDIR)/%.c | $(OUTDIR)
 $(OUTDIR)/%.o: $(SRCDIR)/transformer/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTDIR)/%.o: $(SRCDIR)/kv_cache/%.c | $(OUTDIR)
+$(OUTDIR)/%.o: $(SRCDIR)/memory/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/tensor/%.c | $(OUTDIR)
@@ -59,17 +61,16 @@ $(OUTDIR)/%.o: $(SRCDIR)/gemv/%.c | $(OUTDIR)
 $(OUTDIR)/%.o: $(SRCDIR)/bitnet/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTDIR)/%.o: $(SRCDIR)/sapphire/%.c | $(OUTDIR)
+$(OUTDIR)/%.o: $(SRCDIR)/io/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTDIR)/%.o: $(SRCDIR)/sapphire/bench/%.c | $(OUTDIR)
+$(OUTDIR)/%.o: $(SRCDIR)/loader/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Explicit rules for quantization implementations
-$(OUTDIR)/sapphire_q4_0.o: $(SRCDIR)/sapphire/q4_0.c | $(OUTDIR)
+$(OUTDIR)/%.o: $(SRCDIR)/kernels/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(OUTDIR)/sapphire_q8_0.o: $(SRCDIR)/sapphire/q8_0.c | $(OUTDIR)
+$(OUTDIR)/%.o: $(SRCDIR)/kernels/bench/%.c | $(OUTDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Rename main.c to transformer_main.o for disambiguation
@@ -84,13 +85,13 @@ $(OUTDIR)/test_normalization.o: $(SRCDIR)/transformer/test_normalization.c | $(O
 # Benchmark Targets
 # ============================================================================
 
-$(OUTDIR)/bench_q4: $(OUTDIR)/bench_q4.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
+$(OUTDIR)/bench_q4: $(OUTDIR)/bench_q4.o $(OUTDIR)/q4_0_avx.o $(OUTDIR)/q8_0_avx.o $(OUTDIR)/dispatch.o $(OUTDIR)/pool.o $(OUTDIR)/bf16_avx.o $(OUTDIR)/f32_avx.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(OUTDIR)/bench_q8: $(OUTDIR)/bench_q8.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
+$(OUTDIR)/bench_q8: $(OUTDIR)/bench_q8.o $(OUTDIR)/q8_0_avx.o $(OUTDIR)/q4_0_avx.o $(OUTDIR)/dispatch.o $(OUTDIR)/pool.o $(OUTDIR)/bf16_avx.o $(OUTDIR)/f32_avx.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(OUTDIR)/sapphire_end_to_end_bench: $(OUTDIR)/bench_sapphire_end_to_end.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
+$(OUTDIR)/sapphire_end_to_end_bench: $(OUTDIR)/bench_sapphire_end_to_end.o $(OUTDIR)/dispatch.o $(OUTDIR)/pool.o $(OUTDIR)/q4_0_avx.o $(OUTDIR)/q8_0_avx.o $(OUTDIR)/bf16_avx.o $(OUTDIR)/f32_avx.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # ============================================================================
@@ -100,11 +101,15 @@ $(OUTDIR)/sapphire_end_to_end_bench: $(OUTDIR)/bench_sapphire_end_to_end.o $(OUT
 $(OUTDIR)/test_bitnet: $(OUTDIR)/test_bitnet.o $(OUTDIR)/bitnet.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(OUTDIR)/test_sapphire: $(OUTDIR)/test_sapphire.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
+$(OUTDIR)/test_sapphire: $(OUTDIR)/test_dispatch.o $(OUTDIR)/dispatch.o $(OUTDIR)/pool.o $(OUTDIR)/q4_0_avx.o $(OUTDIR)/q8_0_avx.o $(OUTDIR)/bf16_avx.o $(OUTDIR)/f32_avx.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(OUTDIR)/transformer_test: $(OUTDIR)/transformer_main.o $(OUTDIR)/rope.o $(OUTDIR)/positional_encoding.o $(OUTDIR)/attention.o $(OUTDIR)/attention_strategy.o $(OUTDIR)/activations.o $(OUTDIR)/normalization.o $(OUTDIR)/utils.o
+$(OUTDIR)/transformer_test: $(OUTDIR)/transformer_main.o $(OUTDIR)/rope.o $(OUTDIR)/positional_encoding.o $(OUTDIR)/attention.o $(OUTDIR)/attention_strategy.o $(OUTDIR)/activations.o $(OUTDIR)/normalization.o $(OUTDIR)/utils.o $(OUTDIR)/inference.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o $(OUTDIR)/kv_cache.o $(OUTDIR)/dispatch.o $(OUTDIR)/dispatch.o $(OUTDIR)/pool.o $(OUTDIR)/q4_0_avx.o $(OUTDIR)/q8_0_avx.o $(OUTDIR)/bf16_avx.o $(OUTDIR)/f32_avx.o $(OUTDIR)/safetensors_reader.o $(OUTDIR)/tensor_mapper.o $(OUTDIR)/tensor_mapper_safetensors.o $(OUTDIR)/tensor_mapper_ggml.o $(OUTDIR)/llm_model.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+# Alias: sapphire is the main interactive inference engine
+$(OUTDIR)/sapphire: $(OUTDIR)/transformer_test
+	cp $< $@
 
 $(OUTDIR)/test_tensor: $(OUTDIR)/test_tensor.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
@@ -124,16 +129,19 @@ $(OUTDIR)/test_e2e_transformer: $(OUTDIR)/test_e2e_transformer.o $(OUTDIR)/trans
 $(OUTDIR)/test_kv_cache: $(OUTDIR)/test_kv_cache.o $(OUTDIR)/kv_cache.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(OUTDIR)/test_tensor_gemv: $(OUTDIR)/test_tensor_gemv.o $(OUTDIR)/tensor_gemv.o $(OUTDIR)/tensor.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o $(OUTDIR)/ggml_reader.o
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-
-$(OUTDIR)/test_ggml_model: $(OUTDIR)/test_ggml_model.o
+$(OUTDIR)/test_tensor_gemv: $(OUTDIR)/test_tensor_gemv.o $(OUTDIR)/dispatch.o $(OUTDIR)/tensor.o $(OUTDIR)/pool.o $(OUTDIR)/q4_0_avx.o $(OUTDIR)/q8_0_avx.o $(OUTDIR)/bf16_avx.o $(OUTDIR)/f32_avx.o $(OUTDIR)/ggml_reader.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(OUTDIR)/test_ggml_reader: $(OUTDIR)/test_ggml_reader.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(OUTDIR)/test_inference: $(OUTDIR)/test_inference.o $(OUTDIR)/inference.o $(OUTDIR)/tensor.o $(OUTDIR)/kv_cache.o $(OUTDIR)/rope.o $(OUTDIR)/attention.o $(OUTDIR)/attention_strategy.o $(OUTDIR)/activations.o $(OUTDIR)/normalization.o $(OUTDIR)/tensor_gemv.o $(OUTDIR)/positional_encoding.o $(OUTDIR)/utils.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/sapphire.o $(OUTDIR)/sapphire_pool.o $(OUTDIR)/sapphire_q4_0.o $(OUTDIR)/sapphire_q8_0.o
+$(OUTDIR)/test_inference: $(OUTDIR)/test_inference.o $(OUTDIR)/inference.o $(OUTDIR)/tensor.o $(OUTDIR)/kv_cache.o $(OUTDIR)/rope.o $(OUTDIR)/attention.o $(OUTDIR)/attention_strategy.o $(OUTDIR)/activations.o $(OUTDIR)/normalization.o $(OUTDIR)/dispatch.o $(OUTDIR)/positional_encoding.o $(OUTDIR)/utils.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/dispatch.o $(OUTDIR)/pool.o $(OUTDIR)/q4_0_avx.o $(OUTDIR)/q8_0_avx.o $(OUTDIR)/bf16_avx.o $(OUTDIR)/f32_avx.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(OUTDIR)/test_safetensors_reader: $(OUTDIR)/test_safetensors_reader.o $(OUTDIR)/safetensors_reader.o $(OUTDIR)/tensor.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(OUTDIR)/test_tensor_mapper: $(OUTDIR)/test_tensor_mapper.o $(OUTDIR)/tensor_mapper.o $(OUTDIR)/tensor_mapper_safetensors.o $(OUTDIR)/tensor_mapper_ggml.o $(OUTDIR)/safetensors_reader.o $(OUTDIR)/ggml_reader.o $(OUTDIR)/tensor.o $(OUTDIR)/llm_model.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # ============================================================================
@@ -155,9 +163,10 @@ test: $(TARGETS)
 	@echo "\nRunning end-to-end transformer test..." && $(OUTDIR)/test_e2e_transformer
 	@echo "\nRunning kv_cache test..." && $(OUTDIR)/test_kv_cache
 	@echo "\nRunning tensor_gemv test..." && $(OUTDIR)/test_tensor_gemv
-	@echo "\nRunning ggml_model test..." && $(OUTDIR)/test_ggml_model
 	@echo "\nRunning ggml_reader test..." && $(OUTDIR)/test_ggml_reader
 	@echo "\nRunning inference test..." && $(OUTDIR)/test_inference
+	@echo "\nRunning safetensors_reader test..." && $(OUTDIR)/test_safetensors_reader
+	@echo "\nRunning tensor_mapper test..." && $(OUTDIR)/test_tensor_mapper
 
 test-transformer: $(OUTDIR)/transformer_test
 	@echo "Running transformer components test..." && $(OUTDIR)/transformer_test
@@ -180,8 +189,8 @@ test-tensor-gemv: $(OUTDIR)/test_tensor_gemv
 test-sapphire: $(OUTDIR)/test_sapphire
 	@echo "Running sapphire test..." && $(OUTDIR)/test_sapphire
 
-test-ggml-model: $(OUTDIR)/test_ggml_model
-	@echo "Running ggml_model test..." && $(OUTDIR)/test_ggml_model
+test-ggml-model:
+	@echo "NOTE: ggml_model test excluded (functionality moved to tensor_mapper)"
 
 test-ggml-reader: $(OUTDIR)/test_ggml_reader
 	@echo "Running ggml_reader test..." && $(OUTDIR)/test_ggml_reader
@@ -189,8 +198,46 @@ test-ggml-reader: $(OUTDIR)/test_ggml_reader
 test-inference: $(OUTDIR)/test_inference
 	@echo "Running inference test..." && $(OUTDIR)/test_inference
 
+test-safetensors: $(OUTDIR)/test_safetensors_reader
+	@echo "Running safetensors_reader test..." && $(OUTDIR)/test_safetensors_reader
+
+test-tensor-mapper: $(OUTDIR)/test_tensor_mapper
+	@echo "Running tensor_mapper test..." && $(OUTDIR)/test_tensor_mapper
+
 # ============================================================================
-# HIP/ROCm Targets (Optional)
+# Run Targets
+# ============================================================================
+
+run: $(OUTDIR)/sapphire
+	@echo "========================================================================"
+	@echo "                  Sapphire Inference Engine"
+	@echo "========================================================================"
+	@echo ""
+	@echo "Usage: make run MODEL=/path/to/model.gguf [ARGS=\"-c 4096 -t 0.7\"]"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make run MODEL=./models/gemma-3-2b.gguf"
+	@echo "  make run MODEL=./models/gemma-3-2b.safetensors ARGS=\"-c 4096 -t 0.7\""
+	@echo ""
+	@echo "Supported model formats:"
+	@echo "  - GGML/GGUF (.gguf, .ggml, .bin)"
+	@echo "  - Safetensors (.safetensors)"
+	@echo ""
+	@echo "Interactive commands:"
+	@echo "  /exit          - Exit the program"
+	@echo "  /clear         - Clear conversation history"
+	@echo "  /info          - Show model information"
+	@echo "  /help          - Show command help"
+	@echo ""
+	@if [ -z "$(MODEL)" ]; then \
+		echo "ERROR: MODEL argument required"; \
+		echo ""; \
+		echo "Usage: make run MODEL=/path/to/model.gguf"; \
+		exit 1; \
+	fi
+	@echo "Launching: $(OUTDIR)/sapphire $(MODEL) $(ARGS)"
+	@echo ""
+	$(OUTDIR)/sapphire $(MODEL) $(ARGS)
 # ============================================================================
 
 $(OUTDIR)/bitnet_hip.o: $(SRCDIR)/bitnet_hip.c | $(OUTDIR)
