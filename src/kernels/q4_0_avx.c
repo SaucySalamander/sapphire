@@ -1,4 +1,5 @@
 // q4_0.c - Q4_0 kernel implementations (scalar + AVX2 aligned/unaligned)
+// Model-agnostic: takes void *W_row (opaque weight block data)
 
 #define _POSIX_C_SOURCE 200809L
 #include "../../include/sapphire.h"
@@ -6,6 +7,18 @@
 #include <immintrin.h>
 #include <stdint.h>
 #include <string.h>
+
+/**
+ * Q4_0 block structure (local definition for decoupling from ggml)
+ * Each block contains:
+ *   - scale: float (4 bytes)
+ *   - q_data: 16 bytes of quantized 4-bit values (32 x 4-bit = 16 bytes)
+ * Total: 20 bytes per block
+ */
+typedef struct {
+    float scale;
+    uint8_t q_data[16];
+} q4_0_block_t;
 
 // Note: keep a scalar unpack helper
 static void unpack_q4_0_block(const uint8_t *q_data, uint8_t *out32) {
@@ -16,26 +29,12 @@ static void unpack_q4_0_block(const uint8_t *q_data, uint8_t *out32) {
     }
 }
 
-// Scalar reference implementation
-float quantized_gemv_row_dot_product_scalar(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size) {
-    if (block_size != 32) return 0.0f;
-    const int offset = 8;
-    float acc = 0.0f;
-    for (int b = 0; b < block_count; ++b) {
-        const ggml_block_q4_0 *blk = &W_row[b];
-        uint8_t unpacked[32];
-        unpack_q4_0_block(blk->q_data, unpacked);
-        for (int i = 0; i < 32; ++i) {
-            float w = blk->scale * ((float)((int)unpacked[i] - offset));
-            acc += w * x[b*32 + i];
-        }
-    }
-    return acc;
-}
-
 // AVX2 + FMA unaligned implementation
-float quantized_gemv_q4_0_unaligned(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size) {
-    if (block_size != 32) return 0.0f;
+// W_row: opaque void pointer to Q4_0 block array
+float quantized_gemv_q4_0_unaligned(const void *W_row, const float *x, int block_count, int block_size) {
+    if (block_size != 32 || !W_row || !x) return 0.0f;
+    
+    const q4_0_block_t *blocks = (const q4_0_block_t *)W_row;
     const int offset = 8;
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
@@ -49,7 +48,7 @@ float quantized_gemv_q4_0_unaligned(const ggml_block_q4_0 *W_row, const float *x
     int b = 0;
     const __m128i mask0f = _mm_set1_epi8((char)0x0F);
     for (; b + 1 < block_count; b += 2) {
-        const ggml_block_q4_0 *blk0 = &W_row[b];
+        const q4_0_block_t *blk0 = &blocks[b];
         __m128i packed0 = _mm_loadu_si128((const __m128i*)blk0->q_data);
         __m128i low0 = _mm_and_si128(packed0, mask0f);
         __m128i high0 = _mm_and_si128(_mm_srli_epi16(packed0, 4), mask0f);
@@ -90,7 +89,7 @@ float quantized_gemv_q4_0_unaligned(const ggml_block_q4_0 *W_row, const float *x
         __m256 w3 = _mm256_mul_ps(_mm256_sub_ps(wf3, offset_v0), scale_v0);
         acc3 = _mm256_fmadd_ps(w3, xv3, acc3);
 
-        const ggml_block_q4_0 *blk1 = &W_row[b+1];
+        const q4_0_block_t *blk1 = &blocks[b+1];
         __m128i packed1 = _mm_loadu_si128((const __m128i*)blk1->q_data);
         __m128i low1 = _mm_and_si128(packed1, mask0f);
         __m128i high1 = _mm_and_si128(_mm_srli_epi16(packed1, 4), mask0f);
@@ -133,7 +132,7 @@ float quantized_gemv_q4_0_unaligned(const ggml_block_q4_0 *W_row, const float *x
     }
 
     for (; b < block_count; ++b) {
-        const ggml_block_q4_0 *blk = &W_row[b];
+        const q4_0_block_t *blk = &blocks[b];
         __m128i packed = _mm_loadu_si128((const __m128i*)blk->q_data);
         __m128i low = _mm_and_si128(packed, mask0f);
         __m128i high = _mm_and_si128(_mm_srli_epi16(packed, 4), mask0f);
@@ -190,8 +189,11 @@ float quantized_gemv_q4_0_unaligned(const ggml_block_q4_0 *W_row, const float *x
 }
 
 // Aligned fast-path
-float quantized_gemv_q4_0_aligned(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size) {
-    if (block_size != 32) return 0.0f;
+// W_row: opaque void pointer to Q4_0 block array
+float quantized_gemv_q4_0_aligned(const void *W_row, const float *x, int block_count, int block_size) {
+    if (block_size != 32 || !W_row || !x) return 0.0f;
+    
+    const q4_0_block_t *blocks = (const q4_0_block_t *)W_row;
     const int offset = 8;
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
@@ -205,7 +207,7 @@ float quantized_gemv_q4_0_aligned(const ggml_block_q4_0 *W_row, const float *x, 
     int b = 0;
     const __m128i mask0f = _mm_set1_epi8((char)0x0F);
     for (; b + 1 < block_count; b += 2) {
-        const ggml_block_q4_0 *blk0 = &W_row[b];
+        const q4_0_block_t *blk0 = &blocks[b];
         __m128i packed0 = _mm_loadu_si128((const __m128i*)blk0->q_data);
         __m128i low0 = _mm_and_si128(packed0, mask0f);
         __m128i high0 = _mm_and_si128(_mm_srli_epi16(packed0, 4), mask0f);
@@ -244,7 +246,7 @@ float quantized_gemv_q4_0_aligned(const ggml_block_q4_0 *W_row, const float *x, 
         __m256 w3 = _mm256_mul_ps(_mm256_sub_ps(wf3, offset_v0), scale_v0);
         acc3 = _mm256_fmadd_ps(w3, xv3, acc3);
 
-        const ggml_block_q4_0 *blk1 = &W_row[b+1];
+        const q4_0_block_t *blk1 = &blocks[b+1];
         __m128i packed1 = _mm_loadu_si128((const __m128i*)blk1->q_data);
         __m128i low1 = _mm_and_si128(packed1, mask0f);
         __m128i high1 = _mm_and_si128(_mm_srli_epi16(packed1, 4), mask0f);
@@ -285,7 +287,7 @@ float quantized_gemv_q4_0_aligned(const ggml_block_q4_0 *W_row, const float *x, 
     }
 
     for (; b < block_count; ++b) {
-        const ggml_block_q4_0 *blk = &W_row[b];
+        const q4_0_block_t *blk = &blocks[b];
         __m128i packed = _mm_loadu_si128((const __m128i*)blk->q_data);
         __m128i low = _mm_and_si128(packed, mask0f);
         __m128i high = _mm_and_si128(_mm_srli_epi16(packed, 4), mask0f);

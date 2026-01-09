@@ -19,14 +19,17 @@ struct tensor_t {
 // ============================================================================
 
 /**
- * Returns element size in bytes (times 2 for fractional bytes).
- * For Q4_0: returns 1 (meaning 0.5 bytes per element, or 2 elements per byte)
- * For Q8_0: returns 2 (meaning 1 byte per element)
- * For F32: returns 8 (meaning 4 bytes per element)
+ * Returns element size in bytes.
+ * For Q4_0: returns 1 (special handling: 0.5 bytes per element, or 2 elements per byte)
+ * For Q8_0: returns 1 (1 byte per element)
+ * For F16/BF16: returns 2 (2 bytes per element)
+ * For F32: returns 4 (4 bytes per element)
  */
 size_t dtype_element_size(tensor_dtype_t dtype) {
     switch (dtype) {
         case DTYPE_F32:   return 4;      // 32-bit float: 4 bytes per element
+        case DTYPE_BF16:  return 2;      // 16-bit brain float: 2 bytes per element
+        case DTYPE_F16:   return 2;      // 16-bit float: 2 bytes per element
         case DTYPE_Q4_0:  return 1;      // 4-bit quantized: 2 elements per 1 byte (special handling)
         case DTYPE_Q8_0:  return 1;      // 8-bit quantized: 1 byte per element
         default:          return 0;
@@ -36,6 +39,8 @@ size_t dtype_element_size(tensor_dtype_t dtype) {
 const char* dtype_name(tensor_dtype_t dtype) {
     switch (dtype) {
         case DTYPE_F32:   return "F32";
+        case DTYPE_BF16:  return "BF16";
+        case DTYPE_F16:   return "F16";
         case DTYPE_Q4_0:  return "Q4_0";
         case DTYPE_Q8_0:  return "Q8_0";
         default:          return "UNKNOWN";
@@ -117,6 +122,31 @@ tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype) {
 
     return t;
 }
+
+// ============================================================================
+// Public API: tensor_create_view
+// ============================================================================
+
+tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, void *data) {
+    tensor_t *t = (tensor_t *)malloc(sizeof(tensor_t));
+    if (!t) return NULL;
+    
+    t->data = data; // Point to existing memory (e.g. mmap offset)
+    t->ndim = ndim;
+    t->dtype = dtype;
+    t->layout = LAYOUT_ROW_MAJOR;
+    t->ref_count = 1;
+    
+    size_t elements = 1;
+    for (int i = 0; i < ndim; i++) {
+        t->shape[i] = shape[i];
+        elements *= shape[i];
+    }
+    t->nbytes = elements * dtype_element_size(dtype);
+    
+    return t;
+}
+
 
 // ============================================================================
 // Public API: tensor_clone

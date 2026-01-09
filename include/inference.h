@@ -8,6 +8,7 @@
 
 #include "ggml_model.h"
 #include "kv_cache.h"
+#include "tensor_gemv.h"  /* For sapphire_context in GEMV operations */
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,13 +19,26 @@ extern "C" {
  */
 typedef struct {
     llm_model_t *model;
-    kv_cache_t **layer_kv_caches;  /**< [num_layers] KV caches, one per layer. */
+    kv_cache_t *kv_cache;          /**< Global multi-layer KV cache for all layers. */
     
     float *scratch_buffer;          /**< Reusable buffer for temporary tensors. */
     size_t scratch_size;
+
+    /* Padded dimensions (multiples of 8 floats / 32 bytes) to ensure SIMD kernels can
+     * safely load 256-bit vectors without overrunning the allocation. Calculated from
+     * model->config.d_model, d_inner (query dimension), d_kv (key/value dimension),
+     * and the FFN hidden size. */
+    int padded_d_model;
+    int padded_d_inner;   /**< Padded query projection dimension */
+    int padded_d_kv;      /**< Padded key/value projection dimension (may differ in GQA) */
+    int padded_d_ff;
+
+    float *attn_scores;            /**< Pre-allocated attention scores buffer (size = max_context_len) */
     
     float *rope_freqs_cos;          /**< RoPE precomputed cos frequencies. */
     float *rope_freqs_sin;          /**< RoPE precomputed sin frequencies. */
+    
+    sapphire_context *gemv_ctx;     /**< GEMV context for matrix-vector operations. */
 } inference_session_t;
 
 /**

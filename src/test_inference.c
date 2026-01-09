@@ -227,7 +227,7 @@ int test_inference_session_creation(void) {
     if (session) {
         ASSERT_NOT_NULL(session);
         ASSERT_EQ(session->model, model);
-        ASSERT_NOT_NULL(session->layer_kv_caches);
+        ASSERT_NOT_NULL(session->kv_cache);
         
         inference_session_destroy(session);
         test_pass("Session created and destroyed successfully");
@@ -310,10 +310,10 @@ int test_kv_cache_array_per_layer(void) {
     
     inference_session_t *session = inference_session_create(model, 2048);
     
-    if (session && session->layer_kv_caches) {
-        // Verify we have caches for each layer
-        ASSERT_NOT_NULL(session->layer_kv_caches);
-        test_pass("KV cache array created for all layers");
+    if (session && session->kv_cache) {
+        // Verify we have a global KV cache
+        ASSERT_NOT_NULL(session->kv_cache);
+        test_pass("Global multi-layer KV cache created");
         
         inference_session_destroy(session);
     } else {

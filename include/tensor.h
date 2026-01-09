@@ -9,11 +9,15 @@
  * 
  * This enum allows tensors to store data in different formats:
  * - DTYPE_F32: Standard 32-bit floats (unquantized)
+ * - DTYPE_BF16: 16-bit brain float (bfloat16)
+ * - DTYPE_F16: 16-bit float (half precision)
  * - DTYPE_Q4_0: 4-bit quantized (from Phase 1 quantization)
  * - DTYPE_Q8_0: 8-bit quantized (from Phase 1 quantization)
  */
 typedef enum {
     DTYPE_F32,     // 32-bit float
+    DTYPE_BF16,    // 16-bit brain float (bfloat16)
+    DTYPE_F16,     // 16-bit float (half precision)
     DTYPE_Q4_0,    // 4-bit quantized (Phase 1)
     DTYPE_Q8_0,    // 8-bit quantized (Phase 1)
 } tensor_dtype_t;
@@ -192,5 +196,11 @@ size_t tensor_nbytes(const tensor_t *t);
  * @return reference count, or 0 for NULL
  */
 int tensor_ref_count(const tensor_t *t);
+
+/**
+ * @brief Create a tensor that points to existing data (no allocation).
+ * Used for memory-mapped weights.
+ */
+tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, void *data);
 
 #endif // TENSOR_H
