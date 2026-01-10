@@ -164,4 +164,17 @@ void layernorm_batch(float *matrix, const float *weight, const float *bias,
 int sapphire_rmsnorm(float *out, const float *in, const float *weight,
                      float epsilon, int dim);
 
+/* Delta semantics: weight is interpreted as zero-centered delta, apply (1.0 + weight) */
+void rmsnorm_delta(float *x, const float *weight, int n, float eps);
+int sapphire_rmsnorm_delta(float *out, const float *in, const float *weight,
+                           float epsilon, int dim);
+
+/**
+ * @brief Apply QK-Norm (RMSNorm on Q and K vectors) for Gemma 3.
+ * 
+ * Integrates directly into GQA forward pass.
+ * Normalizes Q and K vectors using per-head scale weights.
+ */
+void apply_qk_norm(float* q, float* k, float* q_scale, float* k_scale, int head_dim, int num_q_heads, int num_kv_heads);
+
 #endif // NORMALIZATION_H

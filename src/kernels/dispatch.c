@@ -26,108 +26,9 @@
 // SECTION 1: DISPATCHER (Routes to appropriate kernel based on tensor dtype)
 // ============================================================================
 
-/**
- * gemv_dispatch - Route GEMV to the correct kernel based on weight dtype
- * 
- * This is the main switchboard. Given a weight matrix with a specific dtype,
- * this routes to the appropriate optimized kernel implementation.
- * 
- * Supported paths:
- * - DTYPE_Q4_0: Quantized 4-bit weights -> quantized_gemv_q4_0_aligned/unaligned
- * - DTYPE_Q8_0: Quantized 8-bit weights -> quantized_gemv_q8_0_aligned/unaligned
- * - DTYPE_BF16: Brain float 16-bit -> quantized_gemv_bf16_avx2/scalar
- * - DTYPE_F32:  Standard 32-bit float -> quantized_gemv_f32_avx2/scalar
- * 
- * @param weight_tensor  Weight matrix (can be Q4_0, Q8_0, BF16, or F32)
- * @param input_vector   Activation vector (always F32)
- * @param block_size     Block size for quantized weights (typically 32 for Q4/Q8)
- * 
- * @return Dot product result (float), or 0.0 if dispatch fails
- */
-static float gemv_dispatch(const tensor_t *weight_tensor, const float *input_vector, 
-                           const int block_size) {
-    if (!weight_tensor || !input_vector) {
-        fprintf(stderr, "ERROR: gemv_dispatch null pointer\n");
-        return 0.0f;
-    }
-
-    tensor_dtype_t dtype = tensor_dtype(weight_tensor);
-    const void *W_data = (const void *)tensor_data(weight_tensor);
-
-    switch (dtype) {
-        case DTYPE_Q4_0: {
-            // 4-bit quantized: check alignment for fast-path
-            int ndim = tensor_ndim(weight_tensor);
-            const int *shape = tensor_shape(weight_tensor);
-            int w_cols = shape[ndim - 1];
-            int blocks_per_row = (w_cols + 31) / 32;
-            
-            int x_aligned = ((uintptr_t)input_vector % 32) == 0;
-            float result = x_aligned ? 
-                quantized_gemv_q4_0_aligned(W_data, input_vector, blocks_per_row, block_size) :
-                quantized_gemv_q4_0_unaligned(W_data, input_vector, blocks_per_row, block_size);
-            return result;
-        }
-
-        case DTYPE_Q8_0: {
-            // 8-bit quantized: check alignment for fast-path
-            int ndim = tensor_ndim(weight_tensor);
-            const int *shape = tensor_shape(weight_tensor);
-            int w_cols = shape[ndim - 1];
-            int blocks_per_row = (w_cols + 31) / 32;
-            
-            int x_aligned = ((uintptr_t)input_vector % 32) == 0;
-            float result = x_aligned ? 
-                quantized_gemv_q8_0_aligned(W_data, input_vector, blocks_per_row, block_size) :
-                quantized_gemv_q8_0_unaligned(W_data, input_vector, blocks_per_row, block_size);
-            return result;
-        }
-
-        case DTYPE_BF16: {
-            // BF16 (brain float): 16-bit per value, no blocking
-            int ndim = tensor_ndim(weight_tensor);
-            const int *shape = tensor_shape(weight_tensor);
-            int w_cols = shape[ndim - 1];
-            int blocks_per_row = (w_cols + 31) / 32;
-            
-            // Use AVX2 implementation when available
-            return quantized_gemv_bf16_avx2(W_data, input_vector, blocks_per_row, block_size);
-        }
-
-        case DTYPE_F32: {
-            // Standard F32: use AVX2 when available
-            int ndim = tensor_ndim(weight_tensor);
-            const int *shape = tensor_shape(weight_tensor);
-            int w_cols = shape[ndim - 1];
-            int blocks_per_row = (w_cols + 31) / 32;
-            
-            // Use AVX2 implementation
-            return quantized_gemv_f32_avx2(W_data, input_vector, blocks_per_row, block_size);
-        }
-
-        default: {
-            // Unsupported dtype: log and return zero (safe fallback, no crash)
-            fprintf(stderr, "WARNING: gemv_dispatch unsupported dtype %d, returning 0.0\n", (int)dtype);
-            return 0.0f;
-        }
-    }
-}
-
 // ============================================================================
-// LEGACY COMPATIBILITY WRAPPERS (for backward compatibility with old tests)
+// LEGACY COMPATIBILITY WRAPPERS (DEPRECATED - REMOVED)
 // ============================================================================
-
-float quantized_gemv_row_dot_product(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size) {
-    return quantized_gemv_q4_0_unaligned((const void *)W_row, x, block_count, block_size);
-}
-
-float quantized_gemv_row_dot_product_aligned(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size) {
-    return quantized_gemv_q4_0_aligned((const void *)W_row, x, block_count, block_size);
-}
-
-float quantized_gemv_row_dot_product_scalar(const void *W_row, const float *x, int block_count, int block_size) {
-    return quantized_gemv_q4_0_unaligned(W_row, x, block_count, block_size);
-}
 
 // ============================================================================
 // SECTION 2: TENSOR GEMV OPERATIONS (High-level tensor operations)
@@ -141,7 +42,9 @@ float quantized_gemv_row_dot_product_scalar(const void *W_row, const float *x, i
  */
 static float bf16_to_f32(uint16_t bf16_val) {
     uint32_t f32_bits = ((uint32_t)bf16_val) << 16;
-    return *(float *)&f32_bits;
+    float f;
+    memcpy(&f, &f32_bits, sizeof(float));
+    return f;
 }
 
 /**
@@ -212,24 +115,23 @@ int tensor_gemv_with_ctx(sapphire_context *ctx, float *y, const tensor_t *A, con
     }
 
     switch (tensor_dtype(A)) {
-        case DTYPE_F32: {
-            const float *A_data = (const float *)tensor_data(A);
-            gemv_f32(y, A_data, x, m, n);
-            return 0;
-        }
-
-        case DTYPE_BF16: {
-            const uint16_t *A_data = (const uint16_t *)tensor_data(A);
-            gemv_bf16(y, A_data, x, m, n);
-            return 0;
-        }
-
+        case DTYPE_F32:
+        case DTYPE_BF16:
         case DTYPE_Q4_0:
         case DTYPE_Q8_0: {
             if (!ctx) {
+                // Fallback for single-threaded or small models if no context provided
+                if (tensor_dtype(A) == DTYPE_F32) {
+                    gemv_f32(y, (const float *)tensor_data(A), x, m, n);
+                    return 0;
+                } else if (tensor_dtype(A) == DTYPE_BF16) {
+                    gemv_bf16(y, (const uint16_t *)tensor_data(A), x, m, n);
+                    return 0;
+                }
                 fprintf(stderr, "ERROR: tensor_gemv_with_ctx requires non-NULL context for quantized weights\n");
                 return -1;
             }
+            // Use the optimized and multithreaded pool implementations
             int ret = sapphire_batched_gemv(ctx, A, x, y);
             if (ret != 0) {
                 fprintf(stderr, "ERROR: sapphire_batched_gemv failed with code %d\n", ret);
@@ -349,3 +251,22 @@ int tensor_gemv_batch_with_ctx(sapphire_context *ctx, float *Y, const tensor_t *
 }
 
 // End of dispatch.c
+
+/*
+ * Return preferred SIMD float lane count for a given dtype.
+ * This is a lightweight query used by higher-level code to size scratch
+ * buffers (round-up padding). It mirrors assumptions used by the kernels.
+ */
+int tensor_gemv_simd_lane_count_for_dtype(tensor_dtype_t dtype) {
+    switch (dtype) {
+        case DTYPE_F32:
+        case DTYPE_BF16:
+        case DTYPE_F16:
+            return 8; // AVX2 256-bit -> 8 x 32-bit floats
+        case DTYPE_Q4_0:
+        case DTYPE_Q8_0:
+            return 8; // quantized kernels operate on blocks but 8 is a safe lane count
+        default:
+            return 1;
+    }
+}

@@ -19,6 +19,9 @@
 #include <ctype.h>
 #include "../include/safetensors_reader.h"
 #include "../include/tensor.h"
+#include "../include/utils.h"
+#include "../include/model_spec.h"
+#include "../include/tensor_mapper.h"
 
 /**
  * @brief Opaque structure managing an open Safetensors file.
@@ -433,80 +436,45 @@ tensor_t* safetensors_create_tensor_ref(safetensors_file_t *st,
     // Map Safetensors dtype to Sapphire dtype
     tensor_dtype_t dtype;
     switch (meta->dtype) {
-        case SAFETENSORS_F32:
-            dtype = DTYPE_F32;
-            break;
-        case SAFETENSORS_BF16:
-            dtype = DTYPE_BF16;
-            break;
-        case SAFETENSORS_F16:
-            dtype = DTYPE_F16;
-            break;
+        case SAFETENSORS_F32:  dtype = DTYPE_F32; break;
+        case SAFETENSORS_BF16: dtype = DTYPE_BF16; break;
+        case SAFETENSORS_F16:  dtype = DTYPE_F16; break;
         default:
-            fprintf(stderr, "ERROR: Unsupported dtype in safetensors\n");
+            fprintf(stderr, "ERROR: Unsupported dtype in safetensors: %d\n", meta->dtype);
             return NULL;
     }
     
-    // Create tensor with shape from metadata
-    // Special-case: for BF16 1D tensors (norms/bias), create an F32 tensor and
-    // convert BF16->F32 upfront so consumers can treat weights as float arrays.
-    tensor_dtype_t create_dtype = dtype;
-    int convert_bf16_to_f32 = 0;
-    if (meta->dtype == SAFETENSORS_BF16 && meta->ndim == 1) {
-        create_dtype = DTYPE_F32;
-        convert_bf16_to_f32 = 1;
-    }
-
-    tensor_t *t = tensor_create(meta->ndim, (int*)meta->shape, create_dtype);
-    if (!t) {
-        fprintf(stderr, "ERROR: Failed to create tensor '%s'\n", meta->name);
+    uint64_t data_section_start = 8 + st->header_size;
+    
+    // Validate we're not reading beyond the mmap
+    if (data_section_start + meta->offset + meta->size_bytes > st->mmap_size) {
+        fprintf(stderr, "ERROR: Tensor '%s' data extends beyond file\n", meta->name);
         return NULL;
     }
-    
-    // Get mutable pointer and copy data from mmapped region
-    void *data = tensor_data_mutable(t);
-    if (data) {
-        // Data section starts at: 8 bytes (header length) + header_size
-        // meta->offset is relative to the start of the data section
-        uint64_t data_section_start = 8 + st->header_size;
-        
-        // Validate we're not reading beyond the mmap
-        if (data_section_start + meta->offset + meta->size_bytes > st->mmap_size) {
-            fprintf(stderr, "ERROR: Tensor '%s' data extends beyond file (offset %lu + size %lu > file %zu)\n",
-                    meta->name, 
-                    (unsigned long)(data_section_start + meta->offset),
-                    (unsigned long)meta->size_bytes,
-                    st->mmap_size);
-            tensor_release(t);
-            return NULL;
-        }
-        
-        // Handle BF16->F32 conversion for 1D norm/bias tensors
-        if (convert_bf16_to_f32) {
-            size_t numel = 1;
-            for (int i = 0; i < meta->ndim; i++) numel *= meta->shape[i];
-            const uint16_t *src = (const uint16_t *)((char*)st->mmap_ptr + data_section_start + meta->offset);
-            float *dst = (float *)data;
-            for (size_t i = 0; i < numel; i++) {
-                uint16_t bf = src[i];
-                uint32_t fbits = ((uint32_t)bf) << 16;
-                dst[i] = *(float *)&fbits;
-            }
-        } else {
-            // Copy tensor data - sizes should match for properly configured dtypes
-            size_t copy_size = meta->size_bytes;
-            size_t tensor_alloc = tensor_nbytes(t);
-            if (copy_size != tensor_alloc) {
-                // Size mismatch - this can happen with dtype conversion requirements
-                // For now, copy the minimum to avoid buffer overflow
-                copy_size = (copy_size < tensor_alloc) ? copy_size : tensor_alloc;
-            }
 
-            memcpy(data, (char*)st->mmap_ptr + data_section_start + meta->offset, copy_size);
-        }
-    } else {
-        fprintf(stderr, "ERROR: tensor_data_mutable returned NULL for '%s'\n", meta->name);
+    // Special-case: for BF16 norm/bias tensors, elevate to F32 (requires copy + conversion)
+    if (meta->dtype == SAFETENSORS_BF16 && 
+        (meta->ndim == 1 || strstr(meta->name, "norm") || strstr(meta->name, "bias"))) {
+        
+        tensor_t *t = tensor_create(meta->ndim, (int*)meta->shape, DTYPE_F32);
+        if (!t) return NULL;
+        
+        size_t numel = 1;
+        for (int i = 0; i < meta->ndim; i++) numel *= meta->shape[i];
+        
+        const uint16_t *src = (const uint16_t *)((char*)st->mmap_ptr + data_section_start + meta->offset);
+        float *dst = (float *)tensor_data_mutable(t);
+        
+        // Use vectorized conversion assistant
+        bf16_to_f32_vec(dst, src, (int)numel);
+        return t;
     }
+
+    // ZERO-COPY PATH: Create a view directly into the mmapped file data.
+    // This keeps the massive projection weights in BF16/F32 in the mmapped file,
+    // satisfying the 8GB RAM constraint.
+    void *mmap_offset = (char*)st->mmap_ptr + data_section_start + meta->offset;
+    tensor_t *t = tensor_create_view(dtype, meta->ndim, (int*)meta->shape, mmap_offset);
     
     return t;
 }
@@ -589,4 +557,114 @@ void safetensors_print_info(const safetensors_file_t *st) {
     }
     
     printf("================================================================================\n");
+}
+
+/**
+ * Map all tensors in a Safetensors file using a static table and optional dynamic handler.
+ * See include/tensor_mapper.h for the public declaration and semantics.
+ */
+int safetensors_map_all_tensors_with_table(safetensors_file_t* st,
+                                           const tensor_map_entry_t* table,
+                                           int table_size,
+                                           safetensors_dynamic_handler_t dyn_cb,
+                                           llm_model_t* model,
+                                           char* error_msg, int max_error_len) {
+    if (!st || !table || !model) {
+        if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Invalid argument to safetensors_map_all_tensors_with_table");
+        return -1;
+    }
+
+    for (int i = 0; i < table_size; i++) {
+        const tensor_map_entry_t *e = &table[i];
+        if (!e->hf_name) continue;
+
+        const safetensors_tensor_meta_t *meta = safetensors_get_tensor_by_name(st, e->hf_name);
+        if (!meta) {
+            // Special-case: allow lm_head to be tied to embeddings when missing
+            if (e->field_name && strcmp(e->field_name, "lm_head_weight") == 0 && model->embedding_weight) {
+                model->lm_head_weight = model->embedding_weight;
+                tensor_ref_inc(model->lm_head_weight);
+                continue;
+            }
+            if (dyn_cb) {
+                int dr = dyn_cb((const safetensors_file_t*)st, NULL, model, error_msg, max_error_len);
+                if (dr == 0) {
+                    continue; // dynamic handler handled this missing tensor
+                } else if (dr == 1) {
+                    if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Required tensor not found: %s", e->hf_name);
+                    return -1;
+                } else {
+                    if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Dynamic handler error for tensor: %s", e->hf_name);
+                    return -1;
+                }
+            }
+
+            if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Required tensor not found: %s", e->hf_name);
+            return -1;
+        }
+
+        tensor_t *t = safetensors_create_tensor_ref(st, meta);
+        if (!t) {
+            if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Failed to create tensor for %s (unsupported dtype or corrupt data)", e->hf_name);
+            return -1;
+        }
+
+        // Top-level mappings
+        if (strcmp(e->internal_key, "embedding") == 0) {
+            model->embedding_weight = t;
+            continue;
+        }
+
+        if (strcmp(e->internal_key, "final") == 0) {
+            if (strcmp(e->field_name, "norm_final_weight") == 0) {
+                model->norm_final_weight = t;
+                continue;
+            }
+            if (strcmp(e->field_name, "lm_head_weight") == 0) {
+                model->lm_head_weight = t;
+                continue;
+            }
+            // Unknown field under final
+            if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Unknown final field: %s", e->field_name);
+            return -1;
+        }
+
+        // Per-layer mappings: expect keys like "blk.N"
+        if (strncmp(e->internal_key, "blk.", 4) == 0) {
+            int layer_idx = -1;
+            if (sscanf(e->internal_key, "blk.%d", &layer_idx) != 1 || layer_idx < 0 || layer_idx >= SAPPHIRE_MAX_LAYERS) {
+                if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Invalid layer key: %s", e->internal_key);
+                return -1;
+            }
+
+            model_layer_weights_t *lw = &model->layers[layer_idx];
+
+            // Map field names to struct members
+            if (strcmp(e->field_name, "norm_attn_weight") == 0) lw->norm_attn_weight = t;
+            else if (strcmp(e->field_name, "norm_attn_post_weight") == 0) lw->norm_attn_post_weight = t;
+            else if (strcmp(e->field_name, "q_proj_weight") == 0) lw->q_proj_weight = t;
+            else if (strcmp(e->field_name, "k_proj_weight") == 0) lw->k_proj_weight = t;
+            else if (strcmp(e->field_name, "v_proj_weight") == 0) lw->v_proj_weight = t;
+            else if (strcmp(e->field_name, "q_norm_weight") == 0) lw->q_norm_weight = t;
+            else if (strcmp(e->field_name, "k_norm_weight") == 0) lw->k_norm_weight = t;
+            else if (strcmp(e->field_name, "out_proj_weight") == 0) lw->out_proj_weight = t;
+            else if (strcmp(e->field_name, "norm_ffn_weight") == 0) lw->norm_ffn_weight = t;
+            else if (strcmp(e->field_name, "norm_ffn_post_weight") == 0) lw->norm_ffn_post_weight = t;
+            else if (strcmp(e->field_name, "up_proj_weight") == 0) lw->up_proj_weight = t;
+            else if (strcmp(e->field_name, "gate_proj_weight") == 0) lw->gate_proj_weight = t;
+            else if (strcmp(e->field_name, "down_proj_weight") == 0) lw->down_proj_weight = t;
+            else {
+                if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Unknown layer field: %s for key %s", e->field_name, e->internal_key);
+                return -1;
+            }
+
+            continue;
+        }
+
+        // Unknown internal_key
+        if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Unknown internal key: %s", e->internal_key);
+        return -1;
+    }
+
+    return 0;
 }

@@ -85,7 +85,7 @@ static int test_config_extraction(void) {
 
     printf("  Q proj shape: [%u, %u]\n", q_proj->shape[0], q_proj->shape[1]);
     // Gemma 3 uses Grouped Query Attention with structured weights
-    // q_proj: [1024, 640] (16 heads * 64 dims per head, projected to d_model)
+    // q_proj: [1024, 640] (4 query heads * 256 dims per head, projected to d_model)
     assert(q_proj->shape[0] == 1024);
     assert(q_proj->shape[1] == 640);
 
@@ -138,7 +138,7 @@ static int test_load_full_model(void) {
     // Gemma 3 has vocab_size of 262144
     assert(model.config.vocab_size == 262144);
     assert(model.config.d_model == 640);
-    assert(model.config.num_heads == 16);  // 1024 / 64 = 16 query heads with GQA
+    assert(model.config.num_heads == 4);   // 1024 / 256 = 4 query heads with GQA
     assert(model.config.num_layers == 18);
 
     // Verify key tensors are loaded
@@ -199,12 +199,12 @@ static int test_tensor_shapes(void) {
 
     // Check Q projection of first layer
     // Gemma 3 uses Grouped Query Attention: q_proj is [num_q_heads * head_dim, d_model]
-    // With 16 query heads and head_dim=64: [1024, 640]
+    // With 4 query heads and head_dim=256: [1024, 640]
     const int *q_shape = tensor_shape(model.layers[0].q_proj_weight);
     int q_ndim = tensor_ndim(model.layers[0].q_proj_weight);
     printf("  Layer 0 Q proj shape: [%d, %d] (ndim=%d)\n", q_shape[0], q_shape[1], q_ndim);
     assert(q_ndim == 2);
-    assert(q_shape[0] == 1024);  // 16 heads * 64 dim
+    assert(q_shape[0] == 1024);  // 4 heads * 256 dim
     assert(q_shape[1] == 640);
 
     // Check FFN up projection

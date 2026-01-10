@@ -53,7 +53,7 @@ typedef struct tensor_mapper_plugin {
      * @param config Output: populated model_config_t
      * @return 0 on success, -1 if config cannot be extracted
      */
-    int (*extract_config)(void *handle, model_config_t *config);
+    int (*extract_config)(void *handle, void *variant_config);
 
     /**
      * Map a single tensor from file to model field.
@@ -137,6 +137,30 @@ int sapphire_load_model(const char *path, llm_model_t *out_model,
  */
 int sapphire_load_safetensors(const char *safetensors_path, llm_model_t *out_model,
                               char *error_message, int max_error_len);
+
+/*
+ * Generic Safetensors mapping helpers
+ */
+#include "safetensors_reader.h"
+
+/** Dynamic handler called when a tensor name is not found in the static table.
+ * Return values:
+ *   0  -> handled successfully
+ *   1  -> not handled (allow caller to treat as unknown)
+ *  -1  -> error
+ */
+typedef int (*safetensors_dynamic_handler_t)(const safetensors_file_t* st,
+                                             const safetensors_tensor_meta_t* meta,
+                                             llm_model_t* model,
+                                             char* error_msg, int max_error_len);
+
+/** Map all tensors in a Safetensors file using a static table and optional dynamic handler */
+int safetensors_map_all_tensors_with_table(safetensors_file_t* st,
+                                           const tensor_map_entry_t* table,
+                                           int table_size,
+                                           safetensors_dynamic_handler_t dyn_cb,
+                                           llm_model_t* model,
+                                           char* error_msg, int max_error_len);
 
 /**
  * Load model from GGML format file.

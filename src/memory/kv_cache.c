@@ -217,6 +217,45 @@ int kv_cache_get_seq_len(const kv_cache_t *cache) {
     return cache->current_pos;
 }
 
+int kv_cache_set_seq_len(kv_cache_t *cache, int seq_len) {
+    if (!cache || seq_len < 0 || seq_len > cache->max_seq_len) {
+        return -1;
+    }
+    cache->current_pos = seq_len;
+    return 0;
+}
+
+int kv_cache_write_token(kv_cache_t *cache, int layer, int pos, const float *k_token, const float *v_token) {
+    if (!cache || !k_token || !v_token) {
+        return -1;
+    }
+
+    if (layer < 0 || layer >= cache->num_layers) {
+        return -1;
+    }
+
+    if (pos < 0 || pos >= cache->max_seq_len) {
+        return -1;
+    }
+
+    tensor_t *keys = cache->keys_per_layer[layer];
+    tensor_t *values = cache->values_per_layer[layer];
+
+    float *keys_data = (float *)tensor_data(keys);
+    float *values_data = (float *)tensor_data(values);
+
+    for (int head = 0; head < cache->num_kv_heads; head++) {
+        int base_offset = head * (cache->max_seq_len * cache->head_dim) + pos * cache->head_dim;
+
+        for (int dim = 0; dim < cache->head_dim; dim++) {
+            keys_data[base_offset + dim] = k_token[head * cache->head_dim + dim];
+            values_data[base_offset + dim] = v_token[head * cache->head_dim + dim];
+        }
+    }
+
+    return 0;
+}
+
 /**
  * Check if cache is full.
  */

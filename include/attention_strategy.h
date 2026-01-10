@@ -24,17 +24,25 @@ typedef void (*AttentionScalingStrategy)(
 );
 
 /**
+ * @brief Parameters for Gemma 3 style attention (includes softcapping).
+ */
+typedef struct {
+    float softcap;      /**< Logit softcap value (e.g., 50.0). 0.0 to disable. */
+    float manual_scale; /**< Override scale factor. If > 0, replaces 1/sqrt(d_k). */
+} gemma3_attention_params_t;
+
+/**
  * @brief Standard scaled dot-product attention strategy.
  * 
  * Scales scores by 1/sqrt(d_k), then applies softmax.
  * Formula: Softmax(Q·K^T / sqrt(d_k))
  * 
- * user_data should be NULL.
+ * For Gemma 3, user_data can point to a gemma3_attention_params_t struct.
  * 
  * @param scores Raw dot-product scores. Modified in-place to contain softmax output.
  * @param context_length Number of tokens in the cache.
  * @param d_k Dimension of the attention head.
- * @param user_data Unused (pass NULL).
+ * @param user_data Optional pointer to gemma3_attention_params_t.
  */
 void scaled_dot_product_strategy(
     float *scores,

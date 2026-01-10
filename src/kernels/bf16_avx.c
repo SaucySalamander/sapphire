@@ -23,13 +23,14 @@ float quantized_gemv_bf16_scalar(const void *W_row, const float *x, int block_co
     if (!W_row || !x) return 0.0f;
     
     const uint16_t *bf16_data = (const uint16_t *)W_row;
-    int cols = block_count * block_size;
+    int cols = (block_size == 1) ? block_count : block_count * block_size;
     float acc = 0.0f;
     
     for (int j = 0; j < cols; ++j) {
         // Convert BF16 to F32: shift left 16 bits (padding in lower 16 bits)
         uint32_t f32_bits = ((uint32_t)bf16_data[j]) << 16;
-        float w = *(const float *)&f32_bits;
+        float w;
+        memcpy(&w, &f32_bits, sizeof(float));
         acc += w * x[j];
     }
     return acc;
@@ -55,7 +56,7 @@ float quantized_gemv_bf16_avx2(const void *W_row, const float *x, int block_coun
     if (!W_row || !x) return 0.0f;
     
     const uint16_t *bf16_data = (const uint16_t *)W_row;
-    int cols = block_count * block_size;
+    int cols = (block_size == 1) ? block_count : block_count * block_size;
     
     // Check alignment of x for fast-path selection
     int x_aligned = (((uintptr_t)(const void*)x) & 31) == 0;

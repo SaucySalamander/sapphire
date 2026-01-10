@@ -80,6 +80,8 @@ tensor_t* kv_cache_get_values(kv_cache_t *cache, int layer);
  * @brief Get current sequence length (shared across all layers).
  */
 int kv_cache_get_seq_len(const kv_cache_t *cache);
+int kv_cache_set_seq_len(kv_cache_t *cache, int seq_len);
+int kv_cache_write_token(kv_cache_t *cache, int layer, int pos, const float *k_token, const float *v_token);
 
 /**
  * @brief Check if cache is full.

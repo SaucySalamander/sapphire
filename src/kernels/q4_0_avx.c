@@ -20,16 +20,7 @@ typedef struct {
     uint8_t q_data[16];
 } q4_0_block_t;
 
-// Note: keep a scalar unpack helper
-static void unpack_q4_0_block(const uint8_t *q_data, uint8_t *out32) {
-    for (int i = 0; i < 16; ++i) {
-        uint8_t b = q_data[i];
-        out32[i*2 + 0] = b & 0x0F;
-        out32[i*2 + 1] = (b >> 4) & 0x0F;
-    }
-}
-
-// AVX2 + FMA unaligned implementation
+// Note: AVX2 + FMA unaligned implementation
 // W_row: opaque void pointer to Q4_0 block array
 float quantized_gemv_q4_0_unaligned(const void *W_row, const float *x, int block_count, int block_size) {
     if (block_size != 32 || !W_row || !x) return 0.0f;

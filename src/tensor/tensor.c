@@ -5,13 +5,14 @@
 
 // Concrete definition of the tensor structure (private to this .c file)
 struct tensor_t {
-    void *data;                  // Pointer to tensor data (malloc'd)
+    void *data;                  // Pointer to tensor data
     int ndim;                    // Number of dimensions (1-8)
     int shape[8];                // Shape array [ndim]
     tensor_dtype_t dtype;        // Data type (F32, Q4_0, Q8_0)
     memory_layout_t layout;      // Memory layout (row-major default)
     size_t nbytes;               // Total bytes allocated
-    int ref_count;               // Reference count (for safe deallocation)
+    int ref_count;               // Reference count
+    int is_external;             // Flag if data is managed elsewhere (e.g. mmap)
 };
 
 // ============================================================================
@@ -119,6 +120,7 @@ tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype) {
 
     // Initialize reference count
     t->ref_count = 1;
+    t->is_external = 0;
 
     return t;
 }
@@ -136,7 +138,8 @@ tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, v
     t->dtype = dtype;
     t->layout = LAYOUT_ROW_MAJOR;
     t->ref_count = 1;
-    
+    t->is_external = 1;
+
     size_t elements = 1;
     for (int i = 0; i < ndim; i++) {
         t->shape[i] = shape[i];
@@ -170,6 +173,33 @@ tensor_t* tensor_clone(const tensor_t *src) {
     memcpy(clone->data, src->data, src->nbytes);
 
     return clone;
+}
+
+int tensor_transpose(const tensor_t *src, tensor_t **dst) {
+    if (!src || !dst) return -1;
+    if (tensor_ndim(src) != 2) return -1;
+    if (tensor_dtype(src) != DTYPE_F32) return -1;
+
+    const int *shape = tensor_shape(src);
+    int m = shape[0];
+    int n = shape[1];
+
+    int dims[2] = { n, m };
+    tensor_t *tnew = tensor_create(2, dims, DTYPE_F32);
+    if (!tnew) return -1;
+
+    const float *sdata = (const float *)tensor_data(src);
+    float *ddata = (float *)tensor_data(tnew);
+
+    // Transpose: d[i,j] = s[j,i]
+    for (int i = 0; i < m; ++i) {
+        for (int j = 0; j < n; ++j) {
+            ddata[j * m + i] = sdata[i * n + j];
+        }
+    }
+
+    *dst = tnew;
+    return 0;
 }
 
 // ============================================================================
@@ -254,7 +284,7 @@ void tensor_release(tensor_t *t) {
 
     t->ref_count--;
     if (t->ref_count <= 0) {
-        if (t->data) {
+        if (t->data && !t->is_external) {
             free(t->data);
         }
         free(t);

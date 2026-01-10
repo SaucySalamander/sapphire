@@ -23,12 +23,32 @@ void rmsnorm(float *x, const float *weight, int n, float eps) {
         sum_sq += x[i] * x[i];
     }
     
-    // Step 2: Compute RMS
-    float rms = sqrtf(sum_sq / (float)n + eps);
-    
-    // Step 3: Normalize and scale by weight
+    // Step 2: Compute inverse RMS using the Gemma 3 convention (no unit offset)
+    float mean_sq = sum_sq / (float)n;
+    float inv_rms = 1.0f / sqrtf(mean_sq + eps);
+
+    // Step 3: Normalize and scale by learned weight (Gemma 3 standard)
     for (int i = 0; i < n; i++) {
-        x[i] = (x[i] / rms) * weight[i];
+        x[i] = x[i] * inv_rms * weight[i];
+    }
+}
+
+void rmsnorm_delta(float *x, const float *weight, int n, float eps) {
+    if (!x || !weight || n <= 0) return;
+
+    // Compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = 0; i < n; i++) {
+        sum_sq += x[i] * x[i];
+    }
+
+    // Compute inverse RMS
+    float mean_sq = sum_sq / (float)n;
+    float inv_rms = 1.0f / sqrtf(mean_sq + eps);
+
+    // Apply delta semantics: scale by (1.0 + weight[i])
+    for (int i = 0; i < n; i++) {
+        x[i] = x[i] * inv_rms * (1.0f + weight[i]);
     }
 }
 
@@ -64,7 +84,7 @@ void rmsnorm_batch(float *matrix, const float *weight, int num_rows, int row_siz
         
         float rms = sqrtf(sum_sq / (float)row_size + eps);
         
-        // Normalize and scale
+        // Normalize and scale with learned weights
         for (int i = 0; i < row_size; i++) {
             row_ptr[i] = (row_ptr[i] / rms) * weight[i];
         }
@@ -179,6 +199,7 @@ void layernorm_batch(float *matrix, const float *weight, const float *bias,
  * - Separate input/output buffers
  * - Return error code instead of void
  * - Better for pipelined operations
+ * - Uses direct gamma scaling (weight)
  * 
  * Algorithm:
  *   1. Compute sum of squares: sum = Σ(in[i]²)
@@ -242,11 +263,49 @@ int sapphire_rmsnorm(float *out, const float *in, const float *weight,
     return 0;
 }
 
+int sapphire_rmsnorm_delta(float *out, const float *in, const float *weight,
+                           float epsilon, int dim) {
+    // Validate inputs
+    if (!out || !in || !weight || dim <= 0 || epsilon < 0.0f) {
+        return -1;
+    }
+
+    // Compute sum of squares
+    float sum_sq = 0.0f;
+    int unroll_limit = (dim / 4) * 4;
+    int i = 0;
+    for (i = 0; i < unroll_limit; i += 4) {
+        sum_sq += in[i + 0] * in[i + 0];
+        sum_sq += in[i + 1] * in[i + 1];
+        sum_sq += in[i + 2] * in[i + 2];
+        sum_sq += in[i + 3] * in[i + 3];
+    }
+    for (; i < dim; i++) sum_sq += in[i] * in[i];
+
+    float rms = sqrtf(sum_sq / (float)dim + epsilon);
+
+    // Normalize and apply (1.0 + weight)
+    i = 0;
+    for (i = 0; i < unroll_limit; i += 4) {
+        out[i + 0] = (in[i + 0] / rms) * (1.0f + weight[i + 0]);
+        out[i + 1] = (in[i + 1] / rms) * (1.0f + weight[i + 1]);
+        out[i + 2] = (in[i + 2] / rms) * (1.0f + weight[i + 2]);
+        out[i + 3] = (in[i + 3] / rms) * (1.0f + weight[i + 3]);
+    }
+    for (; i < dim; i++) {
+        out[i] = (in[i] / rms) * (1.0f + weight[i]);
+    }
+
+    return 0;
+}
+
 /**
  * Batch RMSNorm: Process multiple vectors efficiently.
  * 
  * Processes batch_size vectors of dimension dim each.
  * Memory layout: row-major, C-contiguous (as in typical neural networks).
+ * 
+ * GEMMA 3 UPDATE: Uses direct gamma scaling (weight only)
  * 
  * Matrix layout:
  *   in: [batch_size x dim] matrix, stored row-major
@@ -290,3 +349,74 @@ int sapphire_rmsnorm_batch(float *out, const float *in, const float *weight,
     
     return 0;
 }
+
+// ============================================================================
+// Gemma 3 QK-Normalization Attention Mechanism
+// ============================================================================
+
+/**
+ * @brief Apply QK-Norm (RMSNorm on Q and K vectors) for Gemma 3.
+ * 
+ * Requirement:
+ * - RMSNorm Logic: x_i = (x_i / sqrt(mean(x^2) + eps)) * g_i
+ * - Single pass optimization for sum-of-squares.
+ * - 1e-6 epsilon.
+ * 
+ * @param q Pointer to Query vectors [num_q_heads * head_dim]
+ * @param k Pointer to Key vectors [num_kv_heads * head_dim]
+ * @param q_scale Pointer to Query scale weights [num_q_heads * head_dim]
+ * @param k_scale Pointer to Key scale weights [num_kv_heads * head_dim]
+ * @param head_dim Dimension of each head
+ * @param num_q_heads Number of Query heads
+ * @param num_kv_heads Number of Key/Value heads
+ */
+void apply_qk_norm(float* q, float* k, float* q_scale, float* k_scale, int head_dim, int num_q_heads, int num_kv_heads) {
+    const float eps = 1e-6f;
+
+    // Normalize Q vectors
+    if (q && q_scale) {
+        for (int h = 0; h < num_q_heads; h++) {
+            float* head_q = q + h * head_dim;
+            float* head_scale = q_scale + h * head_dim;
+
+            // Single pass sum-of-squares
+            float sum_sq = 0.0f;
+            for (int i = 0; i < head_dim; i++) {
+                sum_sq += head_q[i] * head_q[i];
+            }
+
+            // Compute RMS and inverse
+            float mean_sq = sum_sq / (float)head_dim;
+            float inv_rms = 1.0f / sqrtf(mean_sq + eps);
+
+            // Apply normalization and scaling
+            for (int i = 0; i < head_dim; i++) {
+                head_q[i] = (head_q[i] * inv_rms) * head_scale[i];
+            }
+        }
+    }
+
+    // Normalize K vectors
+    if (k && k_scale) {
+        for (int h = 0; h < num_kv_heads; h++) {
+            float* head_k = k + h * head_dim;
+            float* head_scale = k_scale + h * head_dim;
+
+            // Single pass sum-of-squares
+            float sum_sq = 0.0f;
+            for (int i = 0; i < head_dim; i++) {
+                sum_sq += head_k[i] * head_k[i];
+            }
+
+            // Compute RMS and inverse
+            float mean_sq = sum_sq / (float)head_dim;
+            float inv_rms = 1.0f / sqrtf(mean_sq + eps);
+
+            // Apply normalization and scaling
+            for (int i = 0; i < head_dim; i++) {
+                head_k[i] = (head_k[i] * inv_rms) * head_scale[i];
+            }
+        }
+    }
+}
+
