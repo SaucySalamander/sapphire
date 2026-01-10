@@ -46,11 +46,6 @@ typedef struct {
 // Q4_0 kernels
 float quantized_gemv_q4_0_unaligned(const void *W_row, const float *x, int block_count, int block_size);
 float quantized_gemv_q4_0_aligned(const void *W_row, const float *x, int block_count, int block_size);
-float quantized_gemv_row_dot_product_scalar(const void *W_row, const float *x, int block_count, int block_size);
-
-// Legacy compatibility wrappers (for backward compatibility with old tests)
-float quantized_gemv_row_dot_product(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size);
-float quantized_gemv_row_dot_product_aligned(const ggml_block_q4_0 *W_row, const float *x, int block_count, int block_size);
 
 // Q8_0 kernels
 float quantized_gemv_q8_0_unaligned(const void *W_row, const float *x, int block_count, int block_size);

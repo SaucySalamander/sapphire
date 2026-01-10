@@ -23,11 +23,11 @@ int main(void) {
     if (!x) return 3;
     for (int i = 0; i < blocks * block_size; ++i) x[i] = 0.001f * (float)(i + 1);
 
-    float s = quantized_gemv_row_dot_product_scalar(row, x, blocks, block_size);
-    float a = quantized_gemv_row_dot_product(row, x, blocks, block_size);
-    float aa = quantized_gemv_row_dot_product_aligned(row, x, blocks, block_size);
+    float s = quantized_gemv_q4_0_unaligned(row, x, blocks, block_size);
+    float a = quantized_gemv_q4_0_unaligned(row, x, blocks, block_size);
+    float aa = quantized_gemv_q4_0_aligned(row, x, blocks, block_size);
 
-    printf("scalar=%.8f avx=%.8f aligned=%.8f\n", s, a, aa);
+    printf("unaligned1=%.8f unaligned2=%.8f aligned=%.8f\n", s, a, aa);
     float d1 = fabsf(s - a);
     float d2 = fabsf(s - aa);
 

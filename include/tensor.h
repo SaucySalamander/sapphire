@@ -59,6 +59,20 @@ typedef struct tensor_t tensor_t;
  */
 tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype);
 
+// Create a new F32 tensor that is the transpose of a 2D F32 tensor 'src' and
+// store pointer to newly allocated tensor in *dst. Returns 0 on success.
+int tensor_transpose(const tensor_t *src, tensor_t **dst);
+
+/**
+ * @brief Create a tensor sharing existing data (zero-copy).
+ * @param ndim Number of dimensions.
+ * @param shape Shape array.
+ * @param dtype Data type.
+ * @param data Pointer to external memory (e.g. mmap).
+ * @return Tensor object.
+ */
+tensor_t* tensor_create_external(int ndim, const int *shape, tensor_dtype_t dtype, void *data);
+
 /**
  * @brief Clone a tensor (deep copy).
  * 

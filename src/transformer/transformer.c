@@ -1,486 +1,373 @@
+#include "transformer.h"
+
+#include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
-#include <math.h>
-#include <time.h>
-#include <sys/time.h>
-#include "transformer.h"
+
+#include "../include/gemma3_270m_config.h"
 #include "activations.h"
+#include "attention.h"
+#include "inference.h"
 #include "normalization.h"
+#include "rope.h"
+#include "tensor.h"
+#include "utils.h"
+#include "log.h"
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-/**
- * Get current timestamp in nanoseconds (Unix epoch)
- */
-static uint64_t get_timestamp_ns(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000000000ULL + (uint64_t)tv.tv_usec * 1000ULL;
+// Helper to handle BF16 norm weights on the fly
+static const float* get_norm_weights(const tensor_t* weight, float* scratch, int n) {
+    if (!weight) return NULL;
+    if (tensor_dtype(weight) == DTYPE_BF16) {
+        bf16_to_f32_vec(scratch, (const uint16_t*)tensor_data(weight), n);
+        return scratch;
+    }
+    return (const float*)tensor_data(weight);
 }
 
 /**
- * Simple GEMV (matrix-vector multiplication) for testing
- * In production, this would be optimized BLAS call
+ * @brief Forward pass for a single transformer layer.
  */
-static int gemv_naive(float *output, const float *matrix, const float *vector,
-                      int rows, int cols) {
-    if (!output || !matrix || !vector) return -1;
-    
-    for (int i = 0; i < rows; i++) {
-        float sum = 0.0f;
-        for (int j = 0; j < cols; j++) {
-            sum += matrix[i * cols + j] * vector[j];
+int sapphire_transformer_layer(struct inference_session_t* session, int layer_idx, int token_pos, float* hidden,
+                               const float* rope_cos, const float* rope_sin) {
+    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
+    model_layer_weights_t* layer = &model->layers[layer_idx];
+    gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
+    int norm_weights_are_deltas = 0;
+
+    int d_model = config->hidden_size;
+    int head_dim = config->head_dim > 0 ? config->head_dim : (d_model / config->num_attention_heads);
+
+    // Buffers from scratch space based on inference.c layout:
+    // 0: hidden (passed in)
+    // 1: residual
+    // 2: norm_buf
+    // 3: q_proj
+    // 4: k_proj
+    // 5: v_proj
+    // 6: attn_out
+    // 7: ffn_gate
+    // 8: ffn_value
+    // 9: geglu_input
+
+    int pm = session->padded_d_model;
+    int pi = session->padded_d_inner;
+    int pk = session->padded_d_kv;
+    int pf = session->padded_d_ff;
+
+    float* residual = session->scratch_buffer + pm;
+    float* norm_buf = session->scratch_buffer + 2 * pm;
+    float* q_proj = session->scratch_buffer + 3 * pm;
+    float* k_proj = q_proj + pi;
+    float* v_proj = k_proj + pk;
+    float* attn_out = v_proj + pk;
+    float* ffn_gate_buf = attn_out + pi;
+    float* ffn_value_buf = ffn_gate_buf + pf;
+    float* geglu_buf = ffn_value_buf + pf;
+
+    // 1. Residual Connection (Save hidden to residual)
+    vec_copy(residual, hidden, d_model);
+
+    // 2. Pre-attention RMSNorm
+    const float* norm_attn_data = get_norm_weights(layer->norm_attn_weight, q_proj, d_model);
+    if (norm_weights_are_deltas) {
+        sapphire_rmsnorm_delta(norm_buf, hidden, norm_attn_data, 1e-6f, d_model);
+    } else {
+        sapphire_rmsnorm(norm_buf, hidden, norm_attn_data, 1e-6f, d_model);
+    }
+
+    // 3. Projections (Q, K, V)
+    tensor_gemv_with_ctx(session->gemv_ctx, q_proj, layer->q_proj_weight, norm_buf);
+    tensor_gemv_with_ctx(session->gemv_ctx, k_proj, layer->k_proj_weight, norm_buf);
+    tensor_gemv_with_ctx(session->gemv_ctx, v_proj, layer->v_proj_weight, norm_buf);
+
+    if (log_get_level() == LOG_LEVEL_DEBUG) {
+        float r_q = 0, r_k = 0, r_v = 0;
+        int n_q = config->num_attention_heads * head_dim;
+        int n_kv = config->num_key_value_heads * head_dim;
+        vec_stats(q_proj, n_q, NULL, NULL, &r_q);
+        vec_stats(k_proj, n_kv, NULL, NULL, &r_k);
+        vec_stats(v_proj, n_kv, NULL, NULL, &r_v);
+        LOG_DEBUG("Layer %d Proj RMS: Q=%.3f K=%.3f V=%.3f", layer_idx, r_q, r_k, r_v);
+    }
+
+    // 5. RoPE application
+    // Use the explicitly provided RoPE frequencies (toggled in inference.c based on layer type)
+    for (int h = 0; h < config->num_attention_heads; h++) rope_apply_fast(q_proj + h * head_dim, token_pos, head_dim, rope_cos, rope_sin);
+    for (int h = 0; h < config->num_key_value_heads; h++) rope_apply_fast(k_proj + h * head_dim, token_pos, head_dim, rope_cos, rope_sin);
+
+    // 6. QK-Normalization (Gemma 3: After RoPE, integrated via apply_qk_norm)
+    float* q_scale_ptr = NULL;
+    float* k_scale_ptr = NULL;
+
+    if (layer->q_norm_weight) {
+        int q_norm_len = tensor_shape(layer->q_norm_weight)[0];
+        const float* raw = get_norm_weights(layer->q_norm_weight, ffn_gate_buf, q_norm_len);
+        int expected_q = config->num_attention_heads * head_dim;
+        if (q_norm_len == expected_q) {
+            q_scale_ptr = (float*)raw;  // per-head gamma
+        } else if (q_norm_len == head_dim) {
+            // Broadcast single-head gamma to all Q heads (common for small Gemma configs)
+            float head_gamma[head_dim];
+            memcpy(head_gamma, raw, head_dim * sizeof(float));
+            // reuse ffn_gate_buf as expanded gamma scratch (size pf >= expected_q)
+            q_scale_ptr = ffn_gate_buf;
+            for (int h = 0; h < config->num_attention_heads; h++) {
+                memcpy(q_scale_ptr + h * head_dim, head_gamma, head_dim * sizeof(float));
+            }
+            LOG_DEBUG("Layer %d q_norm len=%d; broadcasting gamma to %d heads", layer_idx, q_norm_len, config->num_attention_heads);
+        } else {
+            LOG_WARN("Layer %d q_norm len=%d expected=%d; disabling QK-Norm for Q", layer_idx, q_norm_len, expected_q);
+            q_scale_ptr = NULL;
         }
-        output[i] = sum;
     }
-    return 0;
-}
 
-// ============================================================================
-// Transformer Block Context Management
-// ============================================================================
-
-/**
- * Create a transformer block context with pre-allocated buffers.
- * 
- * This function allocates all intermediate buffers needed for efficient
- * forward passes. Buffers are reused across multiple forward passes.
- * 
- * Memory layout: All buffers are contiguous, row-major (C-style).
- * 
- * Total buffer memory:
- *   - buf_attn_norm: sizeof(float) * dim
- *   - buf_attn_out:  sizeof(float) * dim
- *   - buf_ffn_norm:  sizeof(float) * dim
- *   - buf_ffn_hidden: sizeof(float) * hidden_dim
- *   - buf_ffn_value: sizeof(float) * hidden_dim
- *   - buf_ffn_out:   sizeof(float) * dim
- *   
- *   Total: ~(4*dim + 2*hidden_dim) * sizeof(float) bytes
- */
-TransformerBlockContext *transformer_block_context_create(
-    int dim, int hidden_dim, int num_heads, int num_kv_heads, float epsilon) {
-    
-    // Validate inputs
-    if (dim <= 0 || hidden_dim <= 0 || num_heads <= 0 || num_kv_heads <= 0 || epsilon < 0.0f) {
-        return NULL;
-    }
-    
-    if (dim % num_heads != 0 || num_heads % num_kv_heads != 0) {
-        return NULL;  // dim must be divisible by num_heads, and num_heads by num_kv_heads (GQA)
-    }
-    
-    // Allocate context structure
-    TransformerBlockContext *ctx = (TransformerBlockContext *)malloc(
-        sizeof(TransformerBlockContext)
-    );
-    if (!ctx) {
-        return NULL;
-    }
-    
-    // Initialize configuration
-    ctx->dim = dim;
-    ctx->hidden_dim = hidden_dim;
-    ctx->num_heads = num_heads;
-    ctx->num_kv_heads = num_kv_heads;  // GQA: typically num_heads/4 or num_heads/8
-    ctx->head_dim = dim / num_heads;
-    ctx->epsilon = epsilon;
-    
-    // Allocate intermediate buffers
-    ctx->buf_attn_norm = (float *)malloc(dim * sizeof(float));
-    ctx->buf_attn_out = (float *)malloc(dim * sizeof(float));
-    ctx->buf_ffn_norm = (float *)malloc(dim * sizeof(float));
-    ctx->buf_ffn_hidden = (float *)malloc(hidden_dim * sizeof(float));
-    ctx->buf_ffn_value = (float *)malloc(hidden_dim * sizeof(float));
-    ctx->buf_ffn_out = (float *)malloc(dim * sizeof(float));
-    
-    // Check allocation success
-    if (!ctx->buf_attn_norm || !ctx->buf_attn_out || !ctx->buf_ffn_norm ||
-        !ctx->buf_ffn_hidden || !ctx->buf_ffn_value || !ctx->buf_ffn_out) {
-        
-        // Cleanup on partial failure
-        free(ctx->buf_attn_norm);
-        free(ctx->buf_attn_out);
-        free(ctx->buf_ffn_norm);
-        free(ctx->buf_ffn_hidden);
-        free(ctx->buf_ffn_value);
-        free(ctx->buf_ffn_out);
-        free(ctx);
-        return NULL;
-    }
-    
-    // Initialize weight pointers to NULL (must be set before forward pass)
-    ctx->w_norm_attn = NULL;
-    ctx->w_norm_ffn = NULL;
-    ctx->w_attn_q = NULL;
-    ctx->w_attn_k = NULL;
-    ctx->w_attn_v = NULL;
-    ctx->w_attn_out = NULL;
-    ctx->w_ffn_gate = NULL;
-    ctx->w_ffn_value = NULL;
-    ctx->w_ffn_out = NULL;
-    
-    // KV-Cache pointers (optional, for future phases)
-    ctx->kv_cache_k = NULL;
-    ctx->kv_cache_v = NULL;
-    ctx->kv_cache_pos = 0;
-    
-    // ========== HYBRID DAEMON EXTENSIONS ==========
-    ctx->last_active_timestamp = 0;
-    ctx->total_tokens_processed = 0;
-    ctx->idle_rumination_passes = 0;
-    ctx->attention_strategy = ATTN_TYPE_STANDARD;
-    ctx->local_window_size = 256;
-    ctx->session_id = 0;
-    ctx->is_idle_state = 0;
-    
-    return ctx;
-}
-
-/**
- * Create transformer block context with hybrid daemon configuration.
- */
-TransformerBlockContext *transformer_block_context_create_hybrid(
-    int dim, int hidden_dim, int num_heads, int num_kv_heads, float epsilon,
-    int session_id, sapphire_attn_type_t initial_attn_type, int local_window_size) {
-    
-    // Create base context
-    TransformerBlockContext *ctx = transformer_block_context_create(
-        dim, hidden_dim, num_heads, num_kv_heads, epsilon
-    );
-    
-    if (!ctx) {
-        return NULL;
-    }
-    
-    // Set hybrid-specific fields
-    ctx->session_id = session_id;
-    ctx->attention_strategy = initial_attn_type;
-    ctx->local_window_size = local_window_size;
-    
-    return ctx;
-}
-
-/**
- * Destroy a transformer block context and free all buffers.
- * 
- * Safe to call with NULL pointer (no-op).
- */
-void transformer_block_context_destroy(TransformerBlockContext *ctx) {
-    if (!ctx) {
-        return;
-    }
-    
-    // Free intermediate buffers
-    free(ctx->buf_attn_norm);
-    free(ctx->buf_attn_out);
-    free(ctx->buf_ffn_norm);
-    free(ctx->buf_ffn_hidden);
-    free(ctx->buf_ffn_value);
-    free(ctx->buf_ffn_out);
-    
-    // Note: Weight pointers are NOT freed (they're borrowed from model)
-    
-    // Free context structure
-    free(ctx);
-}
-
-// ============================================================================
-// Hybrid Attention Strategy Dispatch
-// ============================================================================
-
-/**
- * Set the attention strategy for a transformer block (runtime dispatch).
- */
-int transformer_set_attention_strategy(
-    TransformerBlockContext *ctx,
-    sapphire_attn_type_t strategy) {
-    
-    if (!ctx) {
-        return -1;
-    }
-    
-    ctx->attention_strategy = strategy;
-    return 0;
-}
-
-/**
- * Check if the context is in idle/rumination state.
- */
-int transformer_is_idle(TransformerBlockContext *ctx) {
-    if (!ctx) {
-        return 0;
-    }
-    
-    return ctx->is_idle_state;
-}
-
-/**
- * Reset session statistics (for new conversation/session).
- */
-int transformer_reset_session(TransformerBlockContext *ctx, int new_session_id) {
-    if (!ctx) {
-        return -1;
-    }
-    
-    ctx->session_id = new_session_id;
-    ctx->total_tokens_processed = 0;
-    ctx->idle_rumination_passes = 0;
-    ctx->last_active_timestamp = 0;
-    
-    return 0;
-}
-
-// ============================================================================
-// Transformer Block Forward Pass
-// ============================================================================
-
-/**
- * Simplified Multi-Head Attention with Hybrid Strategy Dispatch
- * 
- * For full batched attention, this would be replaced with an optimized
- * kernel that handles multiple tokens and efficient KV-cache management.
- * 
- * This implementation supports:
- * - STANDARD: Full-sequence attention (O(n²) complexity)
- * - LOCAL_SLIDING: Windowed attention (O(n·w) complexity, w = window size)
- * - GLOBAL: Full sequence (used for critical layers in 5:1 pattern)
- * 
- * This is a proof-of-concept implementation for single-token forward pass.
- */
-static int multi_head_attention_hybrid(
-    float *output,
-    const float *query_proj,  // [dim]
-    const float *key_proj,    // [dim]
-    const float *value_proj,  // [dim]
-    const float *w_out,       // [dim x dim] output projection
-    int dim, int num_heads,
-    sapphire_attn_type_t strategy,
-    int local_window_size) {
-    
-    if (!output || !query_proj || !key_proj || !value_proj || !w_out) {
-        return -1;
-    }
-    
-    // Dispatch based on attention strategy
-    switch (strategy) {
-        case ATTN_TYPE_STANDARD:
-            // Standard full-sequence attention
-            // In practice: output = (Softmax(Q·K^T) @ V) @ W_out
-            // Simplified: output = V @ W_out (single-token placeholder)
-            for (int i = 0; i < dim; i++) {
-                output[i] = value_proj[i];
+    if (layer->k_norm_weight) {
+        int k_norm_len = tensor_shape(layer->k_norm_weight)[0];
+        const float* raw = get_norm_weights(layer->k_norm_weight, ffn_value_buf, k_norm_len);
+        int expected_k = config->num_key_value_heads * head_dim;
+        if (k_norm_len == expected_k) {
+            k_scale_ptr = (float*)raw;  // per-KV-head gamma
+        } else if (k_norm_len == head_dim) {
+            // Broadcast single-head gamma to all KV heads (GQA)
+            float head_gamma[head_dim];
+            memcpy(head_gamma, raw, head_dim * sizeof(float));
+            // reuse ffn_value_buf as expanded gamma scratch (size pf >= expected_k)
+            k_scale_ptr = ffn_value_buf;
+            for (int h = 0; h < config->num_key_value_heads; h++) {
+                memcpy(k_scale_ptr + h * head_dim, head_gamma, head_dim * sizeof(float));
             }
-            break;
-            
-        case ATTN_TYPE_LOCAL_SLIDING:
-            // Local sliding window attention (windowed context)
-            // Only attend to tokens within local_window_size
-            // Reduces complexity from O(n²) to O(n·w)
-            // Placeholder: return value projection
-            for (int i = 0; i < dim; i++) {
-                output[i] = value_proj[i];
-            }
-            break;
-            
-        case ATTN_TYPE_GLOBAL:
-            // Global attention (same as STANDARD for single-token)
-            // Used for critical layers (every 6th in 5:1 pattern)
-            for (int i = 0; i < dim; i++) {
-                output[i] = value_proj[i];
-            }
-            break;
-            
-        default:
-            return -1;
+            LOG_DEBUG("Layer %d k_norm len=%d; broadcasting gamma to %d KV heads", layer_idx, k_norm_len, config->num_key_value_heads);
+        } else {
+            LOG_WARN("Layer %d k_norm len=%d expected=%d; disabling QK-Norm for K", layer_idx, k_norm_len, expected_k);
+            k_scale_ptr = NULL;
+        }
     }
-    
-    // TODO: Implement full multi-head attention with KV-cache in future phases
-    
+
+    // Apply normalization if we have scales
+    if (q_scale_ptr || k_scale_ptr) {
+        apply_qk_norm(q_proj, k_proj, q_scale_ptr, k_scale_ptr, head_dim, config->num_attention_heads, config->num_key_value_heads);
+    }
+
+    // 5a. Query Scaling
+    // UPDATE: Removed "16.0x Scaling Rule" based on new Gemma 3 technical report.
+    // QK-Norm + Standard 1/sqrt(d) attention scaling is sufficient.
+    // We rely on attention.c to handle the scaling.
+
+    // 6. KV-Cache Commit
+    kv_cache_write_token(session->kv_cache, layer_idx, token_pos, k_proj, v_proj);
+
+    // 7. Attention Forward Pass
+    sapphire_attention_forward(session, layer_idx, token_pos, q_proj, attn_out);
+
+    if (log_get_level() == LOG_LEVEL_DEBUG) {
+        float r_a = 0;
+        vec_stats(attn_out, config->num_attention_heads * head_dim, NULL, NULL, &r_a);
+        LOG_DEBUG("Layer %d AttnOut RMS: %.3f", layer_idx, r_a);
+    }
+
+    // 8. Output projection
+    tensor_gemv_with_ctx(session->gemv_ctx, hidden, layer->out_proj_weight, attn_out);
+
+    // FIX (Run 32): Removed Residual Dampening (Run 28 Logic: No Brakes)
+    // vec_scale(hidden, residual_scale, d_model);
+
+    if (getenv("SAPPHIRE_LOG_TENSORS") && token_pos == 0) {
+        float r_o = 0;
+        vec_stats(hidden, d_model, NULL, NULL, &r_o);
+        fprintf(stderr, "DEBUG: Layer %d OutProj RMS: %.3f\n", layer_idx, r_o);
+    }
+
+    // TEMP SUSH MECHANISM (Attention)
+    // 8a. Post-Attention RMSNorm (Gemma 3) & Residual Sum
+    // hidden currently contains OutProj output (Attn Result)
+    if (layer->norm_attn_post_weight) {
+        const float* norm_post_w = get_norm_weights(layer->norm_attn_post_weight, q_proj, d_model);
+        if (norm_weights_are_deltas)
+            sapphire_rmsnorm_delta(norm_buf, hidden, norm_post_w, 1e-6f, d_model);
+        else
+            sapphire_rmsnorm(norm_buf, hidden, norm_post_w, 1e-6f, d_model);
+
+        vec_add(residual, norm_buf, d_model);
+    } else {
+        vec_add(residual, hidden, d_model);
+    }
+
+    // 9. FFN stage (Sequential)
+    // Use RESIDUAL (Current State) for FFN Norm
+    const float* norm_ffn_data = NULL;
+    if (layer->norm_ffn_weight) {
+        int n_norm = tensor_shape(layer->norm_ffn_weight)[0];
+        if (n_norm == d_model) {
+            norm_ffn_data = get_norm_weights(layer->norm_ffn_weight, q_proj, d_model);
+        } else {
+            fprintf(stderr, "WARN: layer %d norm_ffn_weight len=%d expected=%d; using weightless RMSNorm\n", layer_idx, n_norm, d_model);
+        }
+    }
+
+    if (norm_ffn_data) {
+        if (norm_weights_are_deltas)
+            sapphire_rmsnorm_delta(norm_buf, residual, norm_ffn_data, 1e-6f, d_model);
+        else
+            sapphire_rmsnorm(norm_buf, residual, norm_ffn_data, 1e-6f, d_model);
+    } else {
+        // Fallback: weightless RMSNorm (normalize without learned gamma)
+        // Reuse q_proj scratch to hold ones if needed for sapphire_rmsnorm path
+        // but sapphire_rmsnorm_no_weight expects in-place operation; use the out-variant instead
+        // Create an implicit ones vector in q_proj and call sapphire_rmsnorm
+        for (int i = 0; i < d_model; i++) q_proj[i] = 1.0f;
+        sapphire_rmsnorm(norm_buf, residual, q_proj, 1e-6f, d_model);
+    }
+
+    tensor_gemv_with_ctx(session->gemv_ctx, ffn_gate_buf, layer->gate_proj_weight, norm_buf);
+    tensor_gemv_with_ctx(session->gemv_ctx, ffn_value_buf, layer->up_proj_weight, norm_buf);
+
+    if (getenv("SAPPHIRE_LOG_TENSORS") && token_pos == 0) {
+        float r_g = 0, r_u = 0;
+        vec_stats(ffn_gate_buf, config->intermediate_size, NULL, NULL, &r_g);
+        vec_stats(ffn_value_buf, config->intermediate_size, NULL, NULL, &r_u);
+        fprintf(stderr, "DEBUG: Layer %d FFN Proj RMS: G=%.3f U=%.3f\n", layer_idx, r_g, r_u);
+    }
+
+    // Activations
+    memcpy(geglu_buf, ffn_value_buf, config->intermediate_size * sizeof(float));
+    memcpy(geglu_buf + config->intermediate_size, ffn_gate_buf, config->intermediate_size * sizeof(float));
+    sapphire_geglu(ffn_gate_buf, geglu_buf, 2 * config->intermediate_size);
+
+    if (getenv("SAPPHIRE_LOG_TENSORS") && token_pos == 0) {
+        float r_a = 0;
+        vec_stats(ffn_gate_buf, config->intermediate_size, NULL, NULL, &r_a);
+        fprintf(stderr, "DEBUG: Layer %d Activation RMS: %.3f\n", layer_idx, r_a);
+    }
+
+    tensor_gemv_with_ctx(session->gemv_ctx, hidden, layer->down_proj_weight, ffn_gate_buf);
+
+    // 9a. Post-FFN RMSNorm (Gemma 3)
+    // hidden currently contains DownProj output (FFN Result)
+    if (layer->norm_ffn_post_weight) {
+        int n_post = tensor_shape(layer->norm_ffn_post_weight)[0];
+        const float* norm_post_w = NULL;
+        if (n_post == d_model) {
+            norm_post_w = get_norm_weights(layer->norm_ffn_post_weight, q_proj, d_model);
+            if (token_pos == 0 && layer_idx == 0) {
+                fprintf(stderr, "DEBUG: Layer 0 has norm_ffn_post_weight (ptr=%p). Applying Post-FFN Norm.\n", norm_post_w);
+            }
+            if (norm_weights_are_deltas)
+                sapphire_rmsnorm_delta(norm_buf, hidden, norm_post_w, 1e-6f, d_model);
+            else
+                sapphire_rmsnorm(norm_buf, hidden, norm_post_w, 1e-6f, d_model);
+
+            vec_add(residual, norm_buf, d_model);
+        } else {
+            fprintf(stderr, "WARN: layer %d norm_ffn_post_weight len=%d expected=%d; using weightless RMSNorm\n", layer_idx, n_post, d_model);
+            // Fallback: compute weightless normalized output
+            for (int i = 0; i < d_model; i++) q_proj[i] = 1.0f;
+            sapphire_rmsnorm(norm_buf, hidden, q_proj, 1e-6f, d_model);
+            vec_add(residual, norm_buf, d_model);
+        }
+    } else {
+        if (token_pos == 0 && layer_idx == 0) {
+            fprintf(stderr, "DEBUG: Layer 0 MISSING norm_ffn_post_weight. Adding raw FFN output.\n");
+        }
+        vec_add(residual, hidden, d_model);
+    }
+
+    // Copy computed residual back to hidden (Layer Output)
+    vec_copy(hidden, residual, d_model);
+
     return 0;
 }
 
-/**
- * Complete transformer block forward pass (hybrid-aware).
- * 
- * Implements the pre-norm architecture (LLaMA style) with hybrid dispatch:
- *   1. Pre-Attention RMSNorm
- *   2. Multi-Head Self-Attention (dispatched by layer index)
- *   3. Residual Connection
- *   4. Pre-FFN RMSNorm
- *   5. Feed-Forward (with GeGLU)
- *   6. Residual Connection
- *   7. Update temporal state (last_active_timestamp)
- *
- * Hybrid Dispatch (Gemma 3 5:1 Pattern):
- *   - Layer index % 6 == 0: GLOBAL attention (full sequence)
- *   - Otherwise: LOCAL_SLIDING attention (windowed context)
- * 
- * Temporal Tracking:
- *   - Updates last_active_timestamp if is_idle_pass == 0 (user input)
- *   - Increments total_tokens_processed and idle_rumination_passes
- */
-int transformer_forward_pass(
-    TransformerBlockContext *ctx,
-    const float *w_norm_attn, const float *w_norm_ffn,
-    const float *w_attn_q, const float *w_attn_k, const float *w_attn_v,
-    const float *w_attn_out,
-    const float *w_ffn_gate, const float *w_ffn_value, const float *w_ffn_out,
-    const float *input, float *output, int seq_len, int layer_idx, int is_idle_pass) {
-    
-    // Validate inputs
-    if (!ctx || !input || !output || !w_norm_attn || !w_norm_ffn ||
-        !w_attn_q || !w_attn_k || !w_attn_v || !w_attn_out ||
-        !w_ffn_gate || !w_ffn_value || !w_ffn_out) {
-        return -1;
+void sapphire_embed_lookup(struct inference_session_t* session, int token_id, float* hidden) {
+    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
+    gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
+
+    const uint16_t* embed_table_bf16 = (const uint16_t*)tensor_data(model->embedding_weight);
+    bf16_to_f32_vec(hidden, embed_table_bf16 + (token_id * config->hidden_size), config->hidden_size);
+
+    if (getenv("SAPPHIRE_LOG_TENSORS")) {
+        float mn, mx, rms;
+        vec_stats(hidden, config->hidden_size, &mn, &mx, &rms);
+        fprintf(stderr, "DEBUG[EMBED]: token=%d before_scale rms=%.4f\n", token_id, rms);
     }
-    
-    if (seq_len <= 0 || layer_idx < 0) {
-        return -1;
+
+    // Gemma 3 requires input embeddings to be scaled by sqrt(d_model)
+    // ENABLED: RMS=0.04 (raw) * 25.3 = ~1.0 (correct for transformer inputs)
+    if (!getenv("SAPPHIRE_NO_EMBED_SCALE")) {
+        float embed_scale = sqrtf((float)config->hidden_size);
+        vec_scale(hidden, embed_scale, config->hidden_size);
+
+        if (getenv("SAPPHIRE_LOG_TENSORS")) {
+            float mn, mx, rms;
+            vec_stats(hidden, config->hidden_size, &mn, &mx, &rms);
+            fprintf(stderr, "DEBUG[EMBED]: token=%d after_scale rms=%.4f scale=%.4f\n", token_id, rms, embed_scale);
+        }
     }
-    
-    int dim = ctx->dim;
-    int hidden_dim = ctx->hidden_dim;
-    float epsilon = ctx->epsilon;
-    
-    // ========================================
-    // Step 1: Pre-Attention RMSNorm
-    // ========================================
-    int ret = sapphire_rmsnorm(
-        ctx->buf_attn_norm,  // output
-        input,               // input
-        w_norm_attn,         // weight
-        epsilon,
-        dim
-    );
-    if (ret != 0) return ret;
-    
-    // ========================================
-    // Step 2: Hybrid Attention Dispatch
-    // ========================================
-    
-    // Determine attention strategy based on layer index (5:1 pattern)
-    sapphire_attn_type_t layer_strategy = ATTN_TYPE_LOCAL_SLIDING;  // Default
-    if (layer_idx % 6 == 0) {
-        layer_strategy = ATTN_TYPE_GLOBAL;  // Every 6th layer: global
+}
+
+void sapphire_lm_head(struct inference_session_t* session, float* hidden, float* logits) {
+    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
+    gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
+    int norm_weights_are_deltas = 0;
+
+    float* scratch_norm = session->scratch_buffer + 2 * session->padded_d_model;  // reuse norm_buf
+
+    // 1. Final RMSNorm
+    // Reuse q_proj area.
+    float* tmp_w = session->scratch_buffer + 3 * session->padded_d_model;
+    const float* final_w = get_norm_weights(model->norm_final_weight, tmp_w, config->hidden_size);
+
+    if (norm_weights_are_deltas)
+        sapphire_rmsnorm_delta(scratch_norm, hidden, final_w, 1e-6f, config->hidden_size);
+    else
+        sapphire_rmsnorm(scratch_norm, hidden, final_w, 1e-6f, config->hidden_size);
+
+    if (getenv("SAPPHIRE_LOG_TENSORS")) {
+        float mn, mx, rms;
+        vec_stats(scratch_norm, config->hidden_size, &mn, &mx, &rms);
+        fprintf(stderr, "DEBUG: Final Norm Out: min=%.3f max=%.3f rms=%.3f\n", mn, mx, rms);
     }
-    
-    // Allow runtime override via context
-    sapphire_attn_type_t active_strategy = (ctx->attention_strategy != 0) ? 
-        ctx->attention_strategy : layer_strategy;
-    
-    // Project to Q, K, V
-    float *q_proj = (float *)malloc(dim * sizeof(float));
-    float *k_proj = (float *)malloc(dim * sizeof(float));
-    float *v_proj = (float *)malloc(dim * sizeof(float));
-    
-    if (!q_proj || !k_proj || !v_proj) {
-        free(q_proj);
-        free(k_proj);
-        free(v_proj);
-        return -1;
+
+    // 2. Output Projection (Weight Tying)
+    // Perform projection first to maintain numerical stability in the hidden state
+    tensor_gemv_with_ctx(session->gemv_ctx, logits, model->embedding_weight, scratch_norm);
+
+    // Final logit scaling: optionally applied via env var.
+    // Use SAPPHIRE_FINAL_LOGIT_SCALE to match external runtimes if required
+    // (for example, set to 1.0 / sqrt(d_model) or 1.0 / 25.3 depending on model).
+    {
+        const char* env = getenv("SAPPHIRE_FINAL_LOGIT_SCALE");
+        if (env && env[0] != '\0') {
+            float final_scale = strtof(env, NULL);
+            if (final_scale != 1.0f) {
+                vec_scale(logits, final_scale, config->vocab_size);
+                fprintf(stderr, "DEBUG: Applied SAPPHIRE_FINAL_LOGIT_SCALE=%.6f to logits\n", final_scale);
+            } else {
+                fprintf(stderr, "DEBUG: SAPPHIRE_FINAL_LOGIT_SCALE set to 1.0 (no-op)\n");
+            }
+        }
     }
-    
-    gemv_naive(q_proj, w_attn_q, ctx->buf_attn_norm, dim, dim);
-    gemv_naive(k_proj, w_attn_k, ctx->buf_attn_norm, dim, dim);
-    gemv_naive(v_proj, w_attn_v, ctx->buf_attn_norm, dim, dim);
-    
-    // Dispatch to hybrid attention based on strategy
-    ret = multi_head_attention_hybrid(
-        ctx->buf_attn_out,
-        q_proj, k_proj, v_proj,
-        w_attn_out,
-        dim, ctx->num_heads,
-        active_strategy,
-        ctx->local_window_size
-    );
-    
-    free(q_proj);
-    free(k_proj);
-    free(v_proj);
-    
-    if (ret != 0) return ret;
-    
-    // ========================================
-    // Step 3: Attention Residual (in-place add)
-    // ========================================
-    // x = x + Attention(RMSNorm(x))
-    // Standard element-wise add preserves input_x buffer
-    for (int i = 0; i < dim; i++) {
-        ((float *)input)[i] += ctx->buf_attn_out[i];
+
+    // 3a. Final Logit Soft-Capping (Gemma family behavior)
+    // Apply if model config specifies a positive final_logit_softcap or when
+    // SAPPHIRE_FINAL_LOGIT_SOFTCAP is set (env overrides model config). The
+    // transform applied is: logits := cap * tanh(logits / cap)
+    {
+        float cap = config->final_logit_softcapping;
+        const char* env_cap = getenv("SAPPHIRE_FINAL_LOGIT_SOFTCAP");
+        if (env_cap && env_cap[0] != '\0') {
+            cap = strtof(env_cap, NULL);
+        }
+        if (cap > 0.0f) {
+            int V = config->vocab_size;
+            for (int i = 0; i < V; i++) {
+                logits[i] = cap * tanhf(logits[i] / cap);
+            }
+            fprintf(stderr, "DEBUG: Applied final logit softcap (cap=%.6f) to logits\n", cap);
+        }
     }
-    
-    // ========================================
-    // Step 4: Pre-FFN RMSNorm
-    // ========================================
-    ret = sapphire_rmsnorm(
-        ctx->buf_ffn_norm,
-        input,  // Now contains x + attention output
-        w_norm_ffn,
-        epsilon,
-        dim
-    );
-    if (ret != 0) return ret;
-    
-    // ========================================
-    // Step 5: Feed-Forward with GeGLU
-    // ========================================
-    
-    // Linear projection for gate and value paths
-    ret = gemv_naive(ctx->buf_ffn_hidden, w_ffn_gate, ctx->buf_ffn_norm, hidden_dim, dim);
-    if (ret != 0) return ret;
-    
-    ret = gemv_naive(ctx->buf_ffn_value, w_ffn_value, ctx->buf_ffn_norm, hidden_dim, dim);
-    if (ret != 0) return ret;
-    
-    // GeGLU activation: combine gate and value
-    // Input: [value_1..value_n, gate_1..gate_n] (for geglu function)
-    float *geglu_input = (float *)malloc(2 * hidden_dim * sizeof(float));
-    if (!geglu_input) return -1;
-    
-    memcpy(geglu_input, ctx->buf_ffn_value, hidden_dim * sizeof(float));
-    memcpy(geglu_input + hidden_dim, ctx->buf_ffn_hidden, hidden_dim * sizeof(float));
-    
-    // Apply GeGLU: geglu_output[i] = value[i] * GELU(gate[i])
-    ret = sapphire_geglu(ctx->buf_ffn_hidden, geglu_input, 2 * hidden_dim);
-    free(geglu_input);
-    
-    if (ret != 0) return ret;
-    
-    // Output projection
-    ret = gemv_naive(ctx->buf_ffn_out, w_ffn_out, ctx->buf_ffn_hidden, dim, hidden_dim);
-    if (ret != 0) return ret;
-    
-    // ========================================
-    // Step 6: Feed-Forward Residual (in-place add)
-    // ========================================
-    // x = x + FFN(RMSNorm(x))
-    // Standard element-wise add directly into input buffer
-    for (int i = 0; i < dim; i++) {
-        ((float *)input)[i] += ctx->buf_ffn_out[i];
-    }
-    
-    // ========================================
-    // Step 7: Copy Result to Output
-    // ========================================
-    memcpy(output, input, dim * sizeof(float));
-    
-    // ========================================
-    // Step 8: Update Temporal State (Hybrid)
-    // ========================================
-    if (!is_idle_pass) {
-        // User input: update activity timestamp for circadian tracking
-        ctx->last_active_timestamp = get_timestamp_ns();
-    }
-    
-    // Always update counters
-    ctx->total_tokens_processed++;
-    if (is_idle_pass) {
-        ctx->idle_rumination_passes++;
-    }
-    
-    return 0;
+
+    // 4. Final Logit Soft-Capping
+    // UPDATE: Removed per new Gemma 3 technical report ("replace... with QK-norm").
+    // We rely on stable internal activations.
 }

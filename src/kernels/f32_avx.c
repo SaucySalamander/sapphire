@@ -22,7 +22,7 @@ float quantized_gemv_f32_scalar(const void *W_row, const float *x, int block_cou
     if (!W_row || !x) return 0.0f;
     
     const float *f32_data = (const float *)W_row;
-    int cols = block_count * block_size;
+    int cols = (block_size == 1) ? block_count : block_count * block_size;
     float acc = 0.0f;
     
     for (int j = 0; j < cols; ++j) {
@@ -45,7 +45,7 @@ float quantized_gemv_f32_avx2(const void *W_row, const float *x, int block_count
     if (!W_row || !x) return 0.0f;
     
     const float *f32_data = (const float *)W_row;
-    int cols = block_count * block_size;
+    int cols = (block_size == 1) ? block_count : block_count * block_size;
     int x_aligned = (((uintptr_t)(const void*)x) & 31) == 0;
     
     __m256 acc0 = _mm256_setzero_ps();

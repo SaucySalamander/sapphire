@@ -581,6 +581,46 @@ static void test_sapphire_rmsnorm_large_array(void) {
     printf("  ✓ sapphire_rmsnorm large array processing passed\n");
 }
 
+static void test_rmsnorm_delta_inplace(void) {
+    printf("TEST: rmsnorm_delta in-place\n");
+    int n = 4;
+    float x[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float weight[] = {0.1f, -0.2f, 0.05f, 0.0f}; // deltas (zero-centered)
+    float eps = 1e-6f;
+    
+    // Copy for manual expected calculation
+    float expected[4];
+    float sum_sq = 0.0f;
+    for (int i = 0; i < n; i++) sum_sq += x[i] * x[i];
+    float inv_rms = 1.0f / sqrtf(sum_sq / (float)n + eps);
+    for (int i = 0; i < n; i++) expected[i] = x[i] * inv_rms * (1.0f + weight[i]);
+
+    rmsnorm_delta(x, weight, n, eps);
+    for (int i = 0; i < n; i++) {
+        assert(fabsf(x[i] - expected[i]) < 1e-6f);
+    }
+    printf("  ✓ rmsnorm_delta in-place passed\n");
+}
+
+static void test_sapphire_rmsnorm_delta(void) {
+    printf("TEST: sapphire_rmsnorm_delta non-inplace\n");
+    float in[] = {1.0f, 2.0f, 3.0f};
+    float weight[] = {0.1f, -0.2f, 0.05f};
+    float out[3];
+
+    int ret = sapphire_rmsnorm_delta(out, in, weight, 1e-6f, 3);
+    assert(ret == 0);
+
+    float sum_sq = 1.0f + 4.0f + 9.0f;
+    float rms = sqrtf(sum_sq / 3.0f + 1e-6f);
+    for (int i = 0; i < 3; i++) {
+        float expected = (in[i] / rms) * (1.0f + weight[i]);
+        assert(fabsf(out[i] - expected) < 1e-5f);
+    }
+
+    printf("  ✓ sapphire_rmsnorm_delta test passed\n");
+}
+
 // ============================================================================
 // Main test runner
 // ============================================================================
@@ -626,8 +666,12 @@ int main(void) {
     test_sapphire_rmsnorm_epsilon_values();
     test_sapphire_rmsnorm_inplace();
     test_sapphire_rmsnorm_large_array();
+
+    // Delta semantics tests (1.0 + weight)
+    test_rmsnorm_delta_inplace();
+    test_sapphire_rmsnorm_delta();
+
     printf("\n");
-    
     printf("============================================================\n");
     printf("                    ALL TESTS PASSED ✓\n");
     printf("============================================================\n");

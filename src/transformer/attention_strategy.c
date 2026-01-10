@@ -1,16 +1,35 @@
 #include "attention_strategy.h"
 #include "utils.h"
+#include <stdio.h>
 #include <math.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define GEMMA3_QK_HEAD_DIM 256
+/* NOTE: Use model->config.query_pre_attn_scalar at runtime (e.g., 256).
+ * The legacy GEMMA3_QK_SCALE used 1/sqrt(256) which is misleading; prefer
+ * applying 1.0 / query_pre_attn_scalar to scale unit-normalized Q·K.
+ */
+#define GEMMA3_QK_SCALE 0.00390625f  // 1 / 256 (legacy informational constant)
+
+static bool attention_debug_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("SAPPHIRE_DEBUG_ATTENTION");
+        cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
 
 /**
  * @brief Standard scaled dot-product attention strategy.
  * 
- * Scales scores by 1/sqrt(d_k), then applies softmax.
- * This is the core mechanism used in the Transformer architecture.
+ * For Gemma 3: NO scaling applied (scale_factor = 1.0).
+ * QK-norm already normalizes Q and K to unit vectors, preventing score explosion.
  * 
- * The scaling factor 1/sqrt(d_k) prevents the dot products from growing too large,
- * which would cause softmax to concentrate probability on a single token.
+ * For other models: Scales scores by 1/sqrt(d_k), then applies softmax.
+ * The scaling factor prevents dot products from growing too large.
  */
 void scaled_dot_product_strategy(
     float *scores,
@@ -18,16 +37,49 @@ void scaled_dot_product_strategy(
     int d_k,
     void *user_data
 ) {
-    (void)user_data;  // Unused for this strategy
-
     if (scores == NULL || context_length <= 0 || d_k <= 0) {
         return;
     }
 
-    // Scale by 1/sqrt(d_k)
-    float scale_factor = 1.0f / sqrtf((float)d_k);
+    const bool debug_enabled = attention_debug_enabled();
+    gemma3_attention_params_t* params = (gemma3_attention_params_t*)user_data;
+
+    // Gemma 3: QK-norm replaces 1/sqrt(d_k) scaling
+    // After QK-norm, Q and K are unit vectors, so no additional scaling needed
+    float scale_factor = (d_k == GEMMA3_QK_HEAD_DIM) ? 1.0f : (1.0f / sqrtf((float)d_k));
+    
+    if (params && params->manual_scale > 0.0f) {
+        scale_factor = params->manual_scale;
+    }
+
     for (int i = 0; i < context_length; i++) {
         scores[i] *= scale_factor;
+    }
+
+    // Apply softcap if specified (Gemma 3)
+    // REMOVED: Soft-capping is replaced by QK-Norm in Gemma 3
+    /* 
+    if (params && params->softcap > 0.0f) {
+        float inv_cap = 1.0f / params->softcap;
+        for (int i = 0; i < context_length; i++) {
+            scores[i] = params->softcap * tanhf(scores[i] * inv_cap);
+        }
+    }
+    */
+
+    if (debug_enabled) {
+        if (context_length <= 20) {
+            fprintf(stderr, "DEBUG: Attention scores (after scaling by %.4f, before softmax):\n", scale_factor);
+            for (int i = 0; i < context_length; i++) {
+                fprintf(stderr, "  scores[%d] = %.6f\n", i, scores[i]);
+            }
+        } else {
+            fprintf(stderr, "DEBUG: Scaled scores (first 10 of %d): ", context_length);
+            for (int i = 0; i < 10; i++) {
+                fprintf(stderr, "%.4f ", scores[i]);
+            }
+            fprintf(stderr, "\n");
+        }
     }
 
     // Apply softmax normalization
