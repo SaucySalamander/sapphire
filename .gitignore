@@ -9,6 +9,8 @@ bin/
 dist/
 ai_docs/
 /ai_docs/
+modles/
+./models/
 
 # Object and library files
 *.o
