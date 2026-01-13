@@ -36,7 +36,8 @@ static int build_gemma3_prompt(sapphire_tokenizer_t* tokenizer, const char* user
  * @brief Initialize inference context
  */
 inference_context_t* create_inference_context(float temperature, int max_tokens, int context_len, const char* model_name) {
-    if (!model_name || temperature <= 0.0f || max_tokens <= 0 || context_len <= 0) return NULL;
+    // Allow max_tokens == 0 for diagnostic-only initialization runs
+    if (!model_name || temperature <= 0.0f || max_tokens < 0 || context_len <= 0) return NULL;
 
     // Get the model specification for the requested model
     model_spec_t* spec = get_model_spec(model_name);
@@ -203,22 +204,36 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
         return -1;
     }
 
-    printf("DEBUG: Prompt Tokens: [");
-    for (int i = 0; i < prompt_len; i++) printf("%d%s", tokens[i], (i < prompt_len - 1) ? ", " : "");
-    printf("]\n");
+    LOG_DEBUG("Built prompt with %d tokens", prompt_len);
 
-    printf("DEBUG: Built prompt with %d tokens (hardcoded Gemma 3 IT markers)\n", prompt_len);
-    printf("DEBUG: First 10 Token IDs: %d %d %d %d %d %d %d %d %d %d\n",
-           prompt_len > 0 ? tokens[0] : -1,
-           prompt_len > 1 ? tokens[1] : -1,
-           prompt_len > 2 ? tokens[2] : -1,
-           prompt_len > 3 ? tokens[3] : -1,
-           prompt_len > 4 ? tokens[4] : -1,
-           prompt_len > 5 ? tokens[5] : -1,
-           prompt_len > 6 ? tokens[6] : -1,
-           prompt_len > 7 ? tokens[7] : -1,
-           prompt_len > 8 ? tokens[8] : -1,
-           prompt_len > 9 ? tokens[9] : -1);
+    /* Log the entire token list. To avoid enormous logs, cap the printed
+     * tokens to `MAX_SHOW_LIMIT`. This prints a single DEBUG line with the
+     * token ids in order. */
+    {
+        int max_show = prompt_len;
+        const int MAX_SHOW_LIMIT = 10000; /* safety cap */
+        if (max_show > MAX_SHOW_LIMIT) max_show = MAX_SHOW_LIMIT;
+        size_t buf_sz = (size_t)max_show * 12 + 64;
+        char *tbuf = (char*)malloc(buf_sz);
+        if (tbuf) {
+            char *p = tbuf;
+            size_t rem = buf_sz;
+            int w = snprintf(p, rem, "Tokens (%d):", prompt_len);
+            if (w < 0) w = 0;
+            p += w; rem -= w;
+            for (int i = 0; i < max_show; ++i) {
+                int n = snprintf(p, rem, " %d", tokens[i]);
+                if (n < 0 || (size_t)n >= rem) break;
+                p += n; rem -= n;
+            }
+            if (max_show < prompt_len) snprintf(p, rem, " ...(truncated)");
+            LOG_DEBUG("%s", tbuf);
+            free(tbuf);
+        } else {
+            /* Fallback: log only the first token if allocation fails */
+            LOG_DEBUG("First token (alloc fail): %d", prompt_len > 0 ? tokens[0] : -1);
+        }
+    }
 
     if (prompt_len <= 20) {
         printf("DEBUG: Token sequence: [");
@@ -298,8 +313,70 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
             }
         }
 
+        // Optional detailed logits/softmax debugging
+        int debug_logits = getenv("SAPPHIRE_DEBUG_LOGITS") != NULL;
+        if (debug_logits && ctx->temperature <= 0.0f) {
+            // For greedy sampling, compute softmax on a temporary copy to inspect probabilities
+            float *tmp = (float*)malloc(sizeof(float) * config->vocab_size);
+            if (tmp) {
+                memcpy(tmp, ctx->logits, sizeof(float) * config->vocab_size);
+                softmax(tmp, config->vocab_size);
+                float sum_exp = 0.0f; // already normalized
+                for (int i = 0; i < config->vocab_size; ++i) sum_exp += tmp[i];
+                float ent = sampling_entropy_from_unnormalized(tmp, config->vocab_size, sum_exp);
+                float topk_mass = sampling_topk_mass_from_unnormalized(tmp, config->vocab_size, 10, sum_exp);
+                float mn, mx, rms;
+                vec_stats(ctx->logits, config->vocab_size, &mn, &mx, &rms);
+                fprintf(stderr, "DEBUG_LOGITS pre-softmax: min=%.3f max=%.3f rms=%.3f\n", mn, mx, rms);
+                fprintf(stderr, "DEBUG_LOGITS greedy softmax: entropy=%.4f topk_mass=%.4f\n", ent, topk_mass);
+                free(tmp);
+            }
+        }
+
         // Use T=1.0 for sample_temperature because we already scaled the logits
         int next_token = sample_temperature(ctx->logits, config->vocab_size, 1.0f);
+
+        // After temperature sampling (when temperature>0) the `ctx->logits` buffer
+        // contains unnormalized exp(logit) values. If debugging is enabled, compute
+        // summary stats (entropy, top-k mass) and print top-k probabilities.
+        if (debug_logits && ctx->temperature > 0.0f) {
+            // sum of exp-values
+            double sum_exp = 0.0;
+            for (int i = 0; i < config->vocab_size; ++i) sum_exp += (double)ctx->logits[i];
+            float sumf = (float)sum_exp;
+            float ent = sampling_entropy_from_unnormalized(ctx->logits, config->vocab_size, sumf);
+            int topk = 10;
+            float topk_mass = sampling_topk_mass_from_unnormalized(ctx->logits, config->vocab_size, topk, sumf);
+
+            float mn, mx, rms;
+            vec_stats(ctx->logits, config->vocab_size, &mn, &mx, &rms);
+            fprintf(stderr, "DEBUG_LOGITS post-exp: min=%.3f max=%.3f rms=%.3f sum_exp=%.3e entropy=%.4f top%d_mass=%.4f\n",
+                    mn, mx, rms, sum_exp, ent, topk, topk_mass);
+
+            // Print top-k ids and probabilities
+            int K = topk;
+            float top_vals[16];
+            int top_ids[16];
+            if (K > 16) K = 16;
+            for (int i = 0; i < K; ++i) { top_vals[i] = 0.0f; top_ids[i] = -1; }
+            for (int i = 0; i < config->vocab_size; ++i) {
+                float v = ctx->logits[i];
+                for (int j = 0; j < K; ++j) {
+                    if (v > top_vals[j]) {
+                        for (int t = K - 1; t > j; --t) { top_vals[t] = top_vals[t-1]; top_ids[t] = top_ids[t-1]; }
+                        top_vals[j] = v;
+                        top_ids[j] = i;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "DEBUG_LOGITS Top-%d probs: ", K);
+            for (int i = 0; i < K; ++i) {
+                float prob = (sumf > 0.0f && top_ids[i] >= 0) ? top_vals[i] / sumf : 0.0f;
+                fprintf(stderr, "%d(%.6f) ", top_ids[i], prob);
+            }
+            fprintf(stderr, "\n");
+        }
 
         // DEBUG: Show what token was selected and top-3 logits
         if (generated_count < 10 || generated_count % 20 == 0) {
@@ -512,6 +589,9 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
 
     // Pre-allocate attention scores buffer (max_context_len)
     session->attn_scores = (float*)malloc(max_context_len * sizeof(float));
+    if (session->attn_scores) {
+        memset(session->attn_scores, 0, max_context_len * sizeof(float));
+    }
     if (!session->attn_scores) {
         fprintf(stderr, "ERROR: Failed to allocate attention score buffer\n");
         destroy_inference_session(session);
@@ -613,6 +693,23 @@ void inference_forward(inference_session_t* session, int token_id, int token_pos
 
     // 1. Embedding lookup
     sapphire_embed_lookup(session, token_id, session->scratch_buffer);
+
+    // Targeted dump: embeddings for token 0
+    if (token_pos == 0 && getenv("SAPPHIRE_DEBUG_DUMPS")) {
+        float mn, mx, rms;
+        int d_model = config->hidden_size;
+        vec_stats(session->scratch_buffer, d_model, &mn, &mx, &rms);
+        LOG_DEBUG("DUMP EMBED: token=%d stats min=%.6f max=%.6f rms=%.6f", token_id, mn, mx, rms);
+        int nonfinite = 0;
+        int N = d_model < 16 ? d_model : 16;
+        for (int i = 0; i < d_model; ++i) {
+            if (!isfinite(session->scratch_buffer[i])) nonfinite++;
+        }
+        LOG_DEBUG("DUMP EMBED: non-finite count=%d (first %d values):", nonfinite, N);
+        for (int i = 0; i < N; ++i) {
+            LOG_DEBUG("DUMP EMBED: idx=%d val=%.9g", i, session->scratch_buffer[i]);
+        }
+    }
 
     // 2. Transformer layers
     for (int l = 0; l < config->num_hidden_layers; l++) {

@@ -57,11 +57,52 @@ static int gemma3_populate_from_files(const char* model_dir, model_spec_t* spec,
     model->layers = loaded_model->layers;
     model->safetensors_handle = loaded_model->safetensors_handle;
 
-    /* Free the shell structure (loaded_model) but keep its contents */
-    free(loaded_model);
+    LOG_DEBUG("LOADER: After copy, layer 0 norm_attn_post_weight = %p", model->layers[0].norm_attn_post_weight);
+    LOG_DEBUG("LOADER: After copy, layer 1 norm_attn_post_weight = %p", model->layers[1].norm_attn_post_weight);
 
     /* Compute derived fields on the Gemma runtime config */
     gemma3_270m_config_t* cfg = (gemma3_270m_config_t*)spec->variant_config;
+
+    /* Optional per-layer norm presence diagnostic for debugging mapping issues.
+     * Enable by setting SAPPHIRE_DEBUG_LAYER_NORMS=1 or running with LOG_LEVEL=DEBUG.
+     */
+    if (getenv("SAPPHIRE_DEBUG_LAYER_NORMS") || log_get_level() == LOG_LEVEL_DEBUG) {
+        int dbg_layers = cfg ? (cfg->num_hidden_layers > 0 ? cfg->num_hidden_layers : 0) : 0;
+        if (dbg_layers <= 0) dbg_layers = 18;
+        LOG_DEBUG("Per-layer norm presence (showing norms if present, MISSING otherwise):");
+        for (int li = 0; li < dbg_layers && li < SAPPHIRE_MAX_LAYERS; ++li) {
+            model_layer_weights_t *lw = &model->layers[li];
+            LOG_DEBUG("Layer %d:", li);
+            if (lw->norm_attn_weight) { LOG_DEBUG("  norm_attn_weight:"); tensor_print_info(lw->norm_attn_weight); } else LOG_DEBUG("  norm_attn_weight: MISSING");
+            if (lw->norm_attn_post_weight) { LOG_DEBUG("  norm_attn_post_weight:"); tensor_print_info(lw->norm_attn_post_weight); } else LOG_DEBUG("  norm_attn_post_weight: MISSING");
+            if (lw->q_norm_weight) { LOG_DEBUG("  q_norm_weight:"); tensor_print_info(lw->q_norm_weight); } else LOG_DEBUG("  q_norm_weight: MISSING");
+            if (lw->k_norm_weight) { LOG_DEBUG("  k_norm_weight:"); tensor_print_info(lw->k_norm_weight); } else LOG_DEBUG("  k_norm_weight: MISSING");
+            if (lw->norm_ffn_weight) { LOG_DEBUG("  norm_ffn_weight:"); tensor_print_info(lw->norm_ffn_weight); } else LOG_DEBUG("  norm_ffn_weight: MISSING");
+            if (lw->norm_ffn_post_weight) { LOG_DEBUG("  norm_ffn_post_weight:"); tensor_print_info(lw->norm_ffn_post_weight); } else LOG_DEBUG("  norm_ffn_post_weight: MISSING");
+        }
+    }
+    /* Free the shell structure (loaded_model) but keep its contents */
+    free(loaded_model);
+
+    /* Debug: print shapes/info for each loaded layer to aid diagnosis */
+    LOG_DEBUG("Model loaded; printing per-layer tensor info (first layers may be long)...");
+    if (cfg) {
+        int num_layers_dbg = cfg->num_hidden_layers > 0 ? cfg->num_hidden_layers : 0;
+        for (int li = 0; li < num_layers_dbg && li < SAPPHIRE_MAX_LAYERS; ++li) {
+            model_layer_weights_t *lw = &model->layers[li];
+            LOG_DEBUG("Layer %d:", li);
+            if (lw->q_proj_weight) { LOG_DEBUG(" q_proj_weight:"); tensor_print_info(lw->q_proj_weight); }
+            if (lw->k_proj_weight) { LOG_DEBUG(" k_proj_weight:"); tensor_print_info(lw->k_proj_weight); }
+            if (lw->v_proj_weight) { LOG_DEBUG(" v_proj_weight:"); tensor_print_info(lw->v_proj_weight); }
+            if (lw->out_proj_weight) { LOG_DEBUG(" out_proj_weight:"); tensor_print_info(lw->out_proj_weight); }
+            if (lw->up_proj_weight) { LOG_DEBUG(" up_proj_weight:"); tensor_print_info(lw->up_proj_weight); }
+            if (lw->gate_proj_weight) { LOG_DEBUG(" gate_proj_weight:"); tensor_print_info(lw->gate_proj_weight); }
+            if (lw->down_proj_weight) { LOG_DEBUG(" down_proj_weight:"); tensor_print_info(lw->down_proj_weight); }
+        }
+    } else {
+        LOG_DEBUG("No variant config present; skipping per-layer debug prints");
+    }
+
     if (!cfg) return 0;
 
     sapphire_tokenizer_t *tokenizer = tokenizer_load(model_dir);

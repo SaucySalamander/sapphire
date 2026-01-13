@@ -55,6 +55,9 @@ typedef struct sapphire_tokenizer_t {
     // Configuration
     bool add_bos_token;
     bool add_eos_token;
+    // Fast lookup: open-addressing hash table mapping token string -> id
+    int *hash_table;      // length == hash_capacity, stores token id or -1
+    int hash_capacity;    // power-of-two capacity of hash_table
 } sapphire_tokenizer_t;
 
 /**
