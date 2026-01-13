@@ -6,6 +6,59 @@
 #include "../include/simple_json.h"
 #include "log.h"
 
+/* Simple DJB2 hash for strings */
+static unsigned long hash_str(const char *s) {
+    unsigned long h = 5381;
+    unsigned char c;
+    while ((c = (unsigned char)*s++) != '\0') {
+        h = ((h << 5) + h) + c;
+    }
+    return h;
+}
+
+static int next_pow2(int v) {
+    int n = 1;
+    while (n < v) n <<= 1;
+    return n;
+}
+
+/* Insert token id keyed by string into tokenizer hash table */
+static int tok_hash_insert(sapphire_tokenizer_t *tok, const char *s, int id) {
+    if (!tok || !tok->hash_table || !s) return -1;
+    unsigned long h = hash_str(s);
+    int mask = tok->hash_capacity - 1;
+    int idx = (int)(h & mask);
+    for (int probe = 0; probe < tok->hash_capacity; probe++) {
+        int cur = tok->hash_table[idx];
+        if (cur == -1) {
+            tok->hash_table[idx] = id;
+            return 0;
+        }
+        /* if same string, replace */
+        if (tok->vocab[cur].str && strcmp(tok->vocab[cur].str, s) == 0) {
+            tok->hash_table[idx] = id;
+            return 0;
+        }
+        idx = (idx + 1) & mask;
+    }
+    return -1; /* table full */
+}
+
+/* Lookup token id by string; returns -1 if not found */
+static int tok_hash_lookup(sapphire_tokenizer_t *tok, const char *s) {
+    if (!tok || !tok->hash_table || !s) return -1;
+    unsigned long h = hash_str(s);
+    int mask = tok->hash_capacity - 1;
+    int idx = (int)(h & mask);
+    for (int probe = 0; probe < tok->hash_capacity; probe++) {
+        int cur = tok->hash_table[idx];
+        if (cur == -1) return -1;
+        if (tok->vocab[cur].str && strcmp(tok->vocab[cur].str, s) == 0) return tok->vocab[cur].id;
+        idx = (idx + 1) & mask;
+    }
+    return -1;
+}
+
 /**
  * Load tokenizer from JSON files with streaming parser
  * Handles both root-level and nested model.vocab structures (Gemma 3 support)
@@ -110,7 +163,17 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
 
     // Compute required capacity (two-pass): first compute max token id
     // and child count, then allocate tok->vocab accordingly.
-    int child_count = tokens[vocab_idx_token].size;
+    int raw_child_count = tokens[vocab_idx_token].size;
+    /* sjson records each child token (keys and values) in tokens[].size, so for
+     * an object of N pairs this value will be ~2*N. Compute actual pair count by
+     * scanning direct children and counting string keys. */
+    int child_count = 0;
+    int probe_idx = vocab_idx_token + 1;
+    while (probe_idx < ntokens && tokens[probe_idx].parent == vocab_idx_token) {
+        if (tokens[probe_idx].type == SJSON_STR) child_count++;
+        probe_idx++;
+    }
+    LOG_DEBUG("tokenizer.json: ntokens=%d raw_child_tokens=%d vocab_pairs=%d", ntokens, raw_child_count, child_count);
     int scan_idx = vocab_idx_token + 1;
     int max_token_id = -1;
     for (int i = 0; i < child_count && scan_idx + 1 < ntokens; i++) {
@@ -127,6 +190,8 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
         if (token_id > max_token_id) max_token_id = token_id;
     }
 
+    LOG_DEBUG("tokenizer.json: max_token_id=%d", max_token_id);
+
     int capacity = 0;
     if (max_token_id >= 0) capacity = max_token_id + 1;
     if (capacity < child_count) capacity = child_count;
@@ -142,10 +207,13 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
     }
     // Set vocab_size to capacity so decode() bounds checks are valid.
     tok->vocab_size = capacity;
+    LOG_DEBUG("Allocated tok->vocab capacity=%d (vocab_size=%d)", capacity, tok->vocab_size);
 
     // Second pass: populate vocabulary entries
     int idx = vocab_idx_token + 1;
     int parsed = 0;
+    int skipped_out_of_range = 0;
+    int skipped_malformed = 0;
     printf("DEBUG: Parsing vocabulary entries from nested model.vocab...\n");
     for (int i = 0; i < child_count && idx + 1 < ntokens; i++) {
         sjson_token_t *k = &tokens[idx++];
@@ -170,6 +238,7 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
             tmp[vlen] = '\0';
             token_id = (int)strtol(tmp, NULL, 10);
         } else {
+            skipped_malformed++;
             free(token_text);
             continue;
         }
@@ -180,6 +249,8 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
             tok->vocab[token_id].len = key_len;
             parsed++;
         } else {
+            skipped_out_of_range++;
+            LOG_DEBUG("Skipping token id %d out-of-range (capacity=%d): %.*s", token_id, tok->vocab_size, key_len, token_text);
             free(token_text);
         }
 
@@ -192,6 +263,25 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
     }
 
     printf("✓ Successfully parsed %d vocabulary entries (capacity=%d)\n", parsed, tok->vocab_size);
+    LOG_DEBUG("Tokenizer parse summary: parsed=%d skipped_out_of_range=%d skipped_malformed=%d", parsed, skipped_out_of_range, skipped_malformed);
+
+    /* Build fast lookup hash table sized to power-of-two >= 2 * parsed */
+    int ht_size = next_pow2(parsed * 2 + 1);
+    tok->hash_capacity = ht_size;
+    tok->hash_table = malloc(sizeof(int) * ht_size);
+    if (tok->hash_table) {
+        for (int i = 0; i < ht_size; i++) tok->hash_table[i] = -1;
+        for (int i = 0; i < tok->vocab_size; i++) {
+            if (tok->vocab[i].str) {
+                if (tok_hash_insert(tok, tok->vocab[i].str, i) != 0) {
+                    LOG_DEBUG("Hash insert failed for token id %d (%s)", i, tok->vocab[i].str);
+                }
+            }
+        }
+        LOG_DEBUG("Built tokenizer hash table: capacity=%d entries_indexed=%d", ht_size, parsed);
+    } else {
+        LOG_DEBUG("Failed to allocate tokenizer hash table (size=%d)", ht_size);
+    }
 
     free(tokens);
     free(json_data);
@@ -276,6 +366,11 @@ void tokenizer_free(sapphire_tokenizer_t *tok) {
         }
         free(tok->vocab);
     }
+    if (tok->hash_table) {
+        free(tok->hash_table);
+        tok->hash_table = NULL;
+        tok->hash_capacity = 0;
+    }
     
     if (tok->merges) {
         for (int i = 0; i < tok->num_merges; i++) {
@@ -316,21 +411,19 @@ int tokenize(sapphire_tokenizer_t *tok, const char *text,
         
         // 1. Check for SPECIAL TOKENS (critical for prompt structure)
         if (strncmp(&text[i], "<start_of_turn>", 15) == 0) {
-            for (int j = 0; j < tok->vocab_size; j++) {
-                if (tok->vocab[j].str && strcmp(tok->vocab[j].str, "<start_of_turn>") == 0) {
-                    tokens[token_count++] = tok->vocab[j].id;
-                    i += 15;
-                    goto next_token;
-                }
+            int sid = tok_hash_lookup(tok, "<start_of_turn>");
+            if (sid >= 0) {
+                tokens[token_count++] = sid;
+                i += 15;
+                goto next_token;
             }
         }
         if (strncmp(&text[i], "<end_of_turn>", 13) == 0) {
-            for (int j = 0; j < tok->vocab_size; j++) {
-                if (tok->vocab[j].str && strcmp(tok->vocab[j].str, "<end_of_turn>") == 0) {
-                    tokens[token_count++] = tok->vocab[j].id;
-                    i += 13;
-                    goto next_token;
-                }
+            int eid = tok_hash_lookup(tok, "<end_of_turn>");
+            if (eid >= 0) {
+                tokens[token_count++] = eid;
+                i += 13;
+                goto next_token;
             }
         }
         
@@ -355,22 +448,16 @@ int tokenize(sapphire_tokenizer_t *tok, const char *text,
                  strcat(spiece_substr, raw_substr);
             }
 
-            // Reverse Lookup (Linear Scan)
-            for (int j = 0; j < tok->vocab_size; j++) {
-                if (!tok->vocab[j].str) continue;
-                
-                // Try Exact Match
-                if (strcmp(tok->vocab[j].str, raw_substr) == 0) {
+            // Reverse Lookup via hash table
+            int hid = tok_hash_lookup(tok, raw_substr);
+            if (hid >= 0) {
+                best_match_len = substr_len;
+                best_token_id = hid;
+            } else if (spiece_substr[0] != '\0') {
+                int sid = tok_hash_lookup(tok, spiece_substr);
+                if (sid >= 0) {
                     best_match_len = substr_len;
-                    best_token_id = tok->vocab[j].id;
-                    break; 
-                }
-                
-                // Try SPIECE Match
-                if (spiece_substr[0] != '\0' && strcmp(tok->vocab[j].str, spiece_substr) == 0) {
-                    best_match_len = substr_len;
-                    best_token_id = tok->vocab[j].id;
-                    break; 
+                    best_token_id = sid;
                 }
             }
         }
@@ -384,17 +471,11 @@ int tokenize(sapphire_tokenizer_t *tok, const char *text,
                 i++;
                 continue;
             }
-            // Try single char match
+            // Try single char match via hash
             char single[2] = {text[i], '\0'};
-            int found = 0;
-            for (int j = 0; j < tok->vocab_size; j++) {
-                if (tok->vocab[j].str && strcmp(tok->vocab[j].str, single) == 0) {
-                    tokens[token_count++] = tok->vocab[j].id;
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found) tokens[token_count++] = tok->unk_token_id;
+            int sid = tok_hash_lookup(tok, single);
+            if (sid >= 0) tokens[token_count++] = sid;
+            else tokens[token_count++] = tok->unk_token_id;
             i++;
         }
         

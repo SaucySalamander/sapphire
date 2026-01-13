@@ -12,8 +12,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "../include/kv_cache.h"
 #include "../include/tensor.h"
+#include "../include/log.h"
+#include "../include/utils.h"
 
 /**
  * Multi-layer, multi-head KV cache structure.
@@ -35,6 +38,10 @@ struct kv_cache_t {
     
     int *layer_window_size;         /**< [num_layers] Sliding window size per layer (0 = global) */
     int *layer_is_local;            /**< [num_layers] 1 = local/windowed, 0 = global attention */
+    /* Debug snapshots: store last written K/V token per layer for readback verification */
+    float **last_k_snapshot;        /**< [num_layers] pointer to last-written K token (num_kv_heads*head_dim) */
+    float **last_v_snapshot;        /**< [num_layers] pointer to last-written V token (num_kv_heads*head_dim) */
+    int *last_snapshot_pos;         /**< [num_layers] position associated with the snapshots, -1 if none */
 };
 
 /**
@@ -71,6 +78,9 @@ kv_cache_t* kv_cache_create(int num_layers, int num_kv_heads, int max_seq_len, i
     cache->values_per_layer = (tensor_t **)malloc(num_layers * sizeof(tensor_t *));
     cache->layer_window_size = (int *)malloc(num_layers * sizeof(int));
     cache->layer_is_local = (int *)malloc(num_layers * sizeof(int));
+    cache->last_k_snapshot = (float **)malloc(num_layers * sizeof(float *));
+    cache->last_v_snapshot = (float **)malloc(num_layers * sizeof(float *));
+    cache->last_snapshot_pos = (int *)malloc(num_layers * sizeof(int));
     
     if (!cache->keys_per_layer || !cache->values_per_layer || 
         !cache->layer_window_size || !cache->layer_is_local) {
@@ -79,6 +89,9 @@ kv_cache_t* kv_cache_create(int num_layers, int num_kv_heads, int max_seq_len, i
         if (cache->values_per_layer) free(cache->values_per_layer);
         if (cache->layer_window_size) free(cache->layer_window_size);
         if (cache->layer_is_local) free(cache->layer_is_local);
+        if (cache->last_k_snapshot) free(cache->last_k_snapshot);
+        if (cache->last_v_snapshot) free(cache->last_v_snapshot);
+        if (cache->last_snapshot_pos) free(cache->last_snapshot_pos);
         free(cache);
         return NULL;
     }
@@ -97,6 +110,13 @@ kv_cache_t* kv_cache_create(int num_layers, int num_kv_heads, int max_seq_len, i
                 tensor_release(cache->keys_per_layer[j]);
                 tensor_release(cache->values_per_layer[j]);
             }
+            for (int j = 0; j < i; j++) {
+                if (cache->last_k_snapshot[j]) free(cache->last_k_snapshot[j]);
+                if (cache->last_v_snapshot[j]) free(cache->last_v_snapshot[j]);
+            }
+            free(cache->last_k_snapshot);
+            free(cache->last_v_snapshot);
+            free(cache->last_snapshot_pos);
             free(cache->keys_per_layer);
             free(cache->values_per_layer);
             free(cache->layer_window_size);
@@ -108,6 +128,11 @@ kv_cache_t* kv_cache_create(int num_layers, int num_kv_heads, int max_seq_len, i
         // Default: all layers global attention with no window
         cache->layer_is_local[i] = 0;
         cache->layer_window_size[i] = 0;
+            // allocate debug snapshots
+            int snapshot_size = cache->num_kv_heads * cache->head_dim;
+            cache->last_k_snapshot[i] = (float *)calloc(snapshot_size, sizeof(float));
+            cache->last_v_snapshot[i] = (float *)calloc(snapshot_size, sizeof(float));
+            cache->last_snapshot_pos[i] = -1;
     }
     
     return cache;
@@ -253,6 +278,29 @@ int kv_cache_write_token(kv_cache_t *cache, int layer, int pos, const float *k_t
         }
     }
 
+    /* Debug: snapshot of written K/V for quick integrity checks */
+    if (log_get_level() == LOG_LEVEL_DEBUG && pos == 0) {
+        float kmin = 0.0f, kmax = 0.0f, krms = 0.0f;
+        float vmin = 0.0f, vmax = 0.0f, vrms = 0.0f;
+        int total = cache->num_kv_heads * cache->head_dim;
+        vec_stats(k_token, total, &kmin, &kmax, &krms);
+        vec_stats(v_token, total, &vmin, &vmax, &vrms);
+        LOG_DEBUG("KV Write L%d P%d: K min=%.6f max=%.6f rms=%.6f | V min=%.6f max=%.6f rms=%.6f",
+                  layer, pos, kmin, kmax, krms, vmin, vmax, vrms);
+    }
+
+    /* Store a snapshot of the last written token for readback verification */
+    if (cache->last_k_snapshot && cache->last_v_snapshot && cache->last_snapshot_pos) {
+        int total = cache->num_kv_heads * cache->head_dim;
+        float *k_snap = cache->last_k_snapshot[layer];
+        float *v_snap = cache->last_v_snapshot[layer];
+        if (k_snap && v_snap) {
+            memcpy(k_snap, k_token, total * sizeof(float));
+            memcpy(v_snap, v_token, total * sizeof(float));
+            cache->last_snapshot_pos[layer] = pos;
+        }
+    }
+
     return 0;
 }
 
@@ -294,6 +342,24 @@ void kv_cache_release(kv_cache_t *cache) {
             }
         }
         free(cache->values_per_layer);
+    }
+    
+    if (cache->last_k_snapshot) {
+        for (int i = 0; i < cache->num_layers; i++) {
+            if (cache->last_k_snapshot[i]) free(cache->last_k_snapshot[i]);
+        }
+        free(cache->last_k_snapshot);
+    }
+
+    if (cache->last_v_snapshot) {
+        for (int i = 0; i < cache->num_layers; i++) {
+            if (cache->last_v_snapshot[i]) free(cache->last_v_snapshot[i]);
+        }
+        free(cache->last_v_snapshot);
+    }
+
+    if (cache->last_snapshot_pos) {
+        free(cache->last_snapshot_pos);
     }
     
     if (cache->layer_window_size) {
@@ -364,4 +430,41 @@ int kv_cache_is_layer_local(const kv_cache_t *cache, int layer) {
         return 0;
     }
     return cache->layer_is_local[layer];
+}
+
+int kv_cache_verify_entry(kv_cache_t *cache, int layer, int pos, const float *k_token, const float *v_token) {
+    if (!cache || !k_token || !v_token) return -1;
+    if (layer < 0 || layer >= cache->num_layers) return -1;
+
+    if (!cache->last_k_snapshot || !cache->last_v_snapshot || !cache->last_snapshot_pos) return -1;
+
+    if (cache->last_snapshot_pos[layer] != pos) {
+        LOG_DEBUG("KV Verify L%d P%d: no matching snapshot (snapshot_pos=%d)", layer, pos, cache->last_snapshot_pos[layer]);
+        return -1;
+    }
+
+    int total = cache->num_kv_heads * cache->head_dim;
+    float *k_snap = cache->last_k_snapshot[layer];
+    float *v_snap = cache->last_v_snapshot[layer];
+    if (!k_snap || !v_snap) return -1;
+
+    double k_sq = 0.0, v_sq = 0.0;
+    double k_max_abs = 0.0, v_max_abs = 0.0;
+    for (int i = 0; i < total; i++) {
+        double kd = (double)k_snap[i] - (double)k_token[i];
+        double vd = (double)v_snap[i] - (double)v_token[i];
+        double k_abs = fabs(kd);
+        double v_abs = fabs(vd);
+        if (i == 0 || k_abs > k_max_abs) k_max_abs = k_abs;
+        if (i == 0 || v_abs > v_max_abs) v_max_abs = v_abs;
+        k_sq += kd * kd;
+        v_sq += vd * vd;
+    }
+    double k_rms = sqrt(k_sq / (double)total);
+    double v_rms = sqrt(v_sq / (double)total);
+
+    LOG_DEBUG("KV Verify L%d P%d: K max_abs=%.6e rms=%.6e | V max_abs=%.6e rms=%.6e",
+              layer, pos, k_max_abs, k_rms, v_max_abs, v_rms);
+
+    return 0;
 }

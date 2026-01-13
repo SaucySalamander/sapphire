@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <ctype.h>
+#include "../include/log.h"
 #include "../include/safetensors_reader.h"
 #include "../include/tensor.h"
 #include "../include/utils.h"
@@ -641,7 +642,10 @@ int safetensors_map_all_tensors_with_table(safetensors_file_t* st,
 
             // Map field names to struct members
             if (strcmp(e->field_name, "norm_attn_weight") == 0) lw->norm_attn_weight = t;
-            else if (strcmp(e->field_name, "norm_attn_post_weight") == 0) lw->norm_attn_post_weight = t;
+            else if (strcmp(e->field_name, "norm_attn_post_weight") == 0) {
+                lw->norm_attn_post_weight = t;
+                LOG_DEBUG("MAPPER: Assigned norm_attn_post_weight to layer %d", layer_idx);
+            }
             else if (strcmp(e->field_name, "q_proj_weight") == 0) lw->q_proj_weight = t;
             else if (strcmp(e->field_name, "k_proj_weight") == 0) lw->k_proj_weight = t;
             else if (strcmp(e->field_name, "v_proj_weight") == 0) lw->v_proj_weight = t;

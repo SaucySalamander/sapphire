@@ -114,4 +114,14 @@ int kv_cache_get_head_dim(const kv_cache_t *cache);
 int kv_cache_get_layer_window_size(const kv_cache_t *cache, int layer);
 int kv_cache_is_layer_local(const kv_cache_t *cache, int layer);
 
+/**
+ * @brief Verify a readback entry against the last written snapshot for the layer.
+ *
+ * This helper compares the provided K/V vectors against the last snapshot stored
+ * for the given layer/position (if available). It returns 0 on success (snapshot
+ * exists and comparison performed), or -1 if no snapshot exists or on error.
+ * When run under `LOG_LEVEL_DEBUG` it emits max/rms absolute differences.
+ */
+int kv_cache_verify_entry(kv_cache_t *cache, int layer, int pos, const float *k_token, const float *v_token);
+
 #endif // KV_CACHE_H

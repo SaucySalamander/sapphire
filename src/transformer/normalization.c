@@ -23,14 +23,19 @@ void rmsnorm(float *x, const float *weight, int n, float eps) {
         sum_sq += x[i] * x[i];
     }
     
-    // Step 2: Compute inverse RMS using the Gemma 3 convention (no unit offset)
+        // Step 2: Compute inverse RMS
     float mean_sq = sum_sq / (float)n;
     float inv_rms = 1.0f / sqrtf(mean_sq + eps);
 
-    // Step 3: Normalize and scale by learned weight (Gemma 3 standard)
-    for (int i = 0; i < n; i++) {
-        x[i] = x[i] * inv_rms * weight[i];
-    }
+        /*
+         * GEMMA3 Unit-Offset semantics:
+         * The learned per-dimension param is an additive delta on top of 1.0,
+         * i.e. effective scale = 1.0 + weight[i]. This preserves channels
+         * intended to be near-identity while allowing learned offsets.
+         */
+        for (int i = 0; i < n; i++) {
+            x[i] = x[i] * inv_rms * (1.0f + weight[i]);
+        }
 }
 
 void rmsnorm_delta(float *x, const float *weight, int n, float eps) {
@@ -46,7 +51,7 @@ void rmsnorm_delta(float *x, const float *weight, int n, float eps) {
     float mean_sq = sum_sq / (float)n;
     float inv_rms = 1.0f / sqrtf(mean_sq + eps);
 
-    // Apply delta semantics: scale by (1.0 + weight[i])
+        // Apply delta semantics: scale by (1.0 + weight[i])
     for (int i = 0; i < n; i++) {
         x[i] = x[i] * inv_rms * (1.0f + weight[i]);
     }
@@ -84,10 +89,10 @@ void rmsnorm_batch(float *matrix, const float *weight, int num_rows, int row_siz
         
         float rms = sqrtf(sum_sq / (float)row_size + eps);
         
-        // Normalize and scale with learned weights
-        for (int i = 0; i < row_size; i++) {
-            row_ptr[i] = (row_ptr[i] / rms) * weight[i];
-        }
+            /* GEMMA3 Unit-Offset: use (1.0 + weight) for effective scaling */
+            for (int i = 0; i < row_size; i++) {
+                row_ptr[i] = (row_ptr[i] / rms) * (1.0f + weight[i]);
+            }
     }
 }
 
@@ -249,15 +254,15 @@ int sapphire_rmsnorm(float *out, const float *in, const float *weight,
     // Step 3: Normalize and scale with loop unrolling
     i = 0;
     for (i = 0; i < unroll_limit; i += 4) {
-        out[i + 0] = (in[i + 0] / rms) * weight[i + 0];
-        out[i + 1] = (in[i + 1] / rms) * weight[i + 1];
-        out[i + 2] = (in[i + 2] / rms) * weight[i + 2];
-        out[i + 3] = (in[i + 3] / rms) * weight[i + 3];
+        out[i + 0] = (in[i + 0] / rms) * (1.0f + weight[i + 0]);
+        out[i + 1] = (in[i + 1] / rms) * (1.0f + weight[i + 1]);
+        out[i + 2] = (in[i + 2] / rms) * (1.0f + weight[i + 2]);
+        out[i + 3] = (in[i + 3] / rms) * (1.0f + weight[i + 3]);
     }
     
     // Handle remaining elements
     for (; i < dim; i++) {
-        out[i] = (in[i] / rms) * weight[i];
+        out[i] = (in[i] / rms) * (1.0f + weight[i]);
     }
     
     return 0;
@@ -284,7 +289,7 @@ int sapphire_rmsnorm_delta(float *out, const float *in, const float *weight,
 
     float rms = sqrtf(sum_sq / (float)dim + epsilon);
 
-    // Normalize and apply (1.0 + weight)
+    // Normalize and apply unit-offset scaling: (1.0 + weight)
     i = 0;
     for (i = 0; i < unroll_limit; i += 4) {
         out[i + 0] = (in[i + 0] / rms) * (1.0f + weight[i + 0]);
@@ -341,9 +346,9 @@ int sapphire_rmsnorm_batch(float *out, const float *in, const float *weight,
         
         float rms = sqrtf(sum_sq / (float)dim + epsilon);
         
-        // Normalize and scale
+        // Normalize and scale (unit-offset semantics)
         for (int i = 0; i < dim; i++) {
-            row_out[i] = (row_in[i] / rms) * weight[i];
+            row_out[i] = (row_in[i] / rms) * (1.0f + weight[i]);
         }
     }
     
@@ -389,10 +394,10 @@ void apply_qk_norm(float* q, float* k, float* q_scale, float* k_scale, int head_
             float mean_sq = sum_sq / (float)head_dim;
             float inv_rms = 1.0f / sqrtf(mean_sq + eps);
 
-            // Apply normalization and scaling
-            for (int i = 0; i < head_dim; i++) {
-                head_q[i] = (head_q[i] * inv_rms) * head_scale[i];
-            }
+                // Apply normalization and GEMMA3 unit-offset scaling
+                for (int i = 0; i < head_dim; i++) {
+                    head_q[i] = (head_q[i] * inv_rms) * (1.0f + head_scale[i]);
+                }
         }
     }
 
@@ -412,10 +417,10 @@ void apply_qk_norm(float* q, float* k, float* q_scale, float* k_scale, int head_
             float mean_sq = sum_sq / (float)head_dim;
             float inv_rms = 1.0f / sqrtf(mean_sq + eps);
 
-            // Apply normalization and scaling
-            for (int i = 0; i < head_dim; i++) {
-                head_k[i] = (head_k[i] * inv_rms) * head_scale[i];
-            }
+                // Apply normalization and GEMMA3 unit-offset scaling
+                for (int i = 0; i < head_dim; i++) {
+                    head_k[i] = (head_k[i] * inv_rms) * (1.0f + head_scale[i]);
+                }
         }
     }
 }
