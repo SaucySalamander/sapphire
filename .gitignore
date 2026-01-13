@@ -9,7 +9,7 @@ bin/
 dist/
 ai_docs/
 /ai_docs/
-modles/
+models/
 ./models/
 
 # Object and library files
