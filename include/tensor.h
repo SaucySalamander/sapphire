@@ -9,11 +9,15 @@
  * 
  * This enum allows tensors to store data in different formats:
  * - DTYPE_F32: Standard 32-bit floats (unquantized)
+ * - DTYPE_BF16: 16-bit brain float (bfloat16)
+ * - DTYPE_F16: 16-bit float (half precision)
  * - DTYPE_Q4_0: 4-bit quantized (from Phase 1 quantization)
  * - DTYPE_Q8_0: 8-bit quantized (from Phase 1 quantization)
  */
 typedef enum {
     DTYPE_F32,     // 32-bit float
+    DTYPE_BF16,    // 16-bit brain float (bfloat16)
+    DTYPE_F16,     // 16-bit float (half precision)
     DTYPE_Q4_0,    // 4-bit quantized (Phase 1)
     DTYPE_Q8_0,    // 8-bit quantized (Phase 1)
 } tensor_dtype_t;
@@ -54,6 +58,20 @@ typedef struct tensor_t tensor_t;
  *   tensor_t *t = tensor_create(2, shape, DTYPE_F32);  // 3x4 float matrix
  */
 tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype);
+
+// Create a new F32 tensor that is the transpose of a 2D F32 tensor 'src' and
+// store pointer to newly allocated tensor in *dst. Returns 0 on success.
+int tensor_transpose(const tensor_t *src, tensor_t **dst);
+
+/**
+ * @brief Create a tensor sharing existing data (zero-copy).
+ * @param ndim Number of dimensions.
+ * @param shape Shape array.
+ * @param dtype Data type.
+ * @param data Pointer to external memory (e.g. mmap).
+ * @return Tensor object.
+ */
+tensor_t* tensor_create_external(int ndim, const int *shape, tensor_dtype_t dtype, void *data);
 
 /**
  * @brief Clone a tensor (deep copy).
@@ -192,5 +210,11 @@ size_t tensor_nbytes(const tensor_t *t);
  * @return reference count, or 0 for NULL
  */
 int tensor_ref_count(const tensor_t *t);
+
+/**
+ * @brief Create a tensor that points to existing data (no allocation).
+ * Used for memory-mapped weights.
+ */
+tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, void *data);
 
 #endif // TENSOR_H

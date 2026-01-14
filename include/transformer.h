@@ -6,52 +6,45 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// Hyperparameters
-typedef struct {
-    int dimensions;
-    int hidden_dimensions;
-    int num_layers;
-    int num_heads;
-    int num_keyvalue_heads;
-    int vocab_size;
-    int sequence_length;
-    float learning_rate;
-} TransformerConfig;
+struct inference_session_t;
 
-// Trained model
-typedef struct {
-    float* token_embedding_table;
+/**
+ * @brief Forward pass for a single transformer layer.
+ * 
+ * Orchestrates:
+ * 1. Pre-attention RMSNorm
+ * 2. Q, K, V Projections
+ * 3. Q-Norm and K-Norm (Gemma 3)
+ * 4. Query Scaling
+ * 5. RoPE application
+ * 6. KV-Cache write
+ * 7. Multi-head Attention (GQA)
+ * 8. Output projection
+ * 9. Residual connection
+ * 10. Post-attention RMSNorm
+ * 11. Feed-forward (GeGLU)
+ * 12. Output projection
+ * 13. Residual connection
+ * 
+ * @param session Inference session.
+ * @param layer_idx Layer index.
+ * @param token_pos Current token position.
+ * @param hidden Input/Output hidden state [d_model].
+ * @param rope_cos Cosine frequencies for RoPE.
+ * @param rope_sin Sine frequencies for RoPE.
+ * @return 0 on success.
+ */
+int sapphire_transformer_layer(struct inference_session_t* session, int layer_idx, int token_pos, float* hidden,
+                               const float* rope_cos, const float* rope_sin);
 
-    float* wq;
-    float* wk;
-    float* wv;
-    float* wo;
+/**
+ * @brief Performs embedding lookup.
+ */
+void sapphire_embed_lookup(struct inference_session_t* session, int token_id, float* hidden);
 
-    float* rms_att_weight;
-    float* rms_ffn_weight;
-} TransformerWeights;
-
-// Gradients: Error signals
-typedef struct {
-    float* dwq;
-    float* dwk;
-    float* dwv;
-    float* dwo;
-
-    float* d_rms_att;
-    float* d_rms_ffn;
-} TransformerGradients;
-
-// Short Term memory
-typedef struct {
-    float* x;
-    float* xb;
-    float* q;
-    float* k;
-    float* v;
-    float* logits;
-
-    float* post_norm_x;
-} RunState;
+/**
+ * @brief Performs LM Head calculation and softcapping.
+ */
+void sapphire_lm_head(struct inference_session_t* session, float* hidden, float* logits);
 
 #endif // TRANSFORMER_H

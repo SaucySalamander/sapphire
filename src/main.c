@@ -1,245 +1,245 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
-#include "rope.h"
-#include "positional_encoding.h"
-#include "attention.h"
-#include "attention_strategy.h"
+#include <time.h>
+#include <unistd.h>
+
+#include "ggml_model.h"
+#include "inference.h"
+#include "tokenizer.h"
 #include "utils.h"
+#include "log.h"
+
+#define MAX_PROMPT_LENGTH 1024
+#define MAX_TOKENS_GENERATE 100
+#define BUFFER_SIZE 4096
+#define CONTEXT_LEN 2048
+#define TEMPERATURE 1.0f;
 
 /**
- * @brief Utility function to print a float array.
+ * @brief Print help message
  */
-void print_array(const char *name, const float *arr, int n, int max_print) {
-    printf("%s: [", name);
-    int limit = (n < max_print) ? n : max_print;
-    for (int i = 0; i < limit; i++) {
-        printf("%.4f", arr[i]);
-        if (i < limit - 1) printf(", ");
-    }
-    if (n > max_print) printf(", ...");
-    printf("]\n");
+static void print_help(const char* program_name) {
+    printf("\n");
+    printf("================================================================================\n");
+    printf("                        Sapphire Inference Engine\n");
+    printf("                   Hybrid Daemon LLM Architecture (Phase 7)\n");
+    printf("                    S-Tok: Sapphire Tokenizer Integration\n");
+    printf("================================================================================\n");
+    printf("Usage: %s [options]\n\n", program_name);
+    printf("Required Arguments:\n");
+    printf("  -m, --model <name>        Model name (e.g., gemma-3-270m-it)\n\n");
+    printf("Optional Arguments:\n");
+    printf("  -c, --context <length>    Context length (default: 2048)\n");
+    printf("  -t, --temp <value>        Temperature for sampling (default: 1.0)\n");
+    printf("  -n, --max-tokens <num>    Maximum tokens to generate (default: 100)\n");
+    printf("  -p, --prompt <string>     Run a single prompt non-interactively and exit (echoes prompt)\n");
+    printf("  -h, --help                Show this help message\n");
+    printf("\nModel Directory Structure (required files):\n");
+    printf("  model.safetensors (or model.gguf / model.bin)\n");
+    printf("  tokenizer.json\n");
+    printf("  tokenizer_config.json\n");
+    printf("  (optional) special_tokens_map.json\n");
+    printf("\nInteractive Commands:\n");
+    printf("  /exit                     Exit the program\n");
+    printf("  /clear                    Clear conversation history\n");
+    printf("  /info                     Show model information\n");
+    printf("  /help                     Show command help\n");
+    printf("\nExample:\n");
+    printf("  %s -m gemma-3-270m-it -c 4096 -t 0.7 -n 200\n", program_name);
+    printf("\n");
 }
 
 /**
- * @brief Test the softmax function directly.
+ * @brief Interactive prompt loop
  */
-void test_softmax(void) {
-    printf("\n========== TEST: Softmax (Numerically Stable) ==========\n");
+static int interactive_loop(inference_context_t* ctx) {
+    if (!ctx) return -1;
 
-    int n = 5;
-    float scores[5] = {2.0f, 1.0f, 0.1f, 3.0f, 0.5f};
+    char prompt[MAX_PROMPT_LENGTH];
+    char output[BUFFER_SIZE];
 
-    print_array("Original scores", scores, n, 5);
-    printf("\nApplying softmax...\n");
+    printf("\n");
+    printf("================================================================================\n");
+    printf("                         SAPPHIRE INFERENCE ENGINE                             \n");
+    printf("================================================================================\n");
+    printf("\nModel loaded and ready for inference.\n");
+    printf("Type '/help' for commands, '/exit' to quit.\n");
+    printf("Type 'quit' or 'exit' to end the program.\n");
+    printf("\n");
 
-    softmax(scores, n);
+    while (1) {
+        // Print prompt
+        printf("\n[Sapphire] > ");
+        fflush(stdout);
 
-    print_array("Softmax output", scores, n, 5);
-
-    // Verify sum is 1.0
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        sum += scores[i];
-    }
-    printf("Sum of softmax output: %.6f (should be 1.0)\n", sum);
-
-    // Test with large values (to demonstrate numerical stability)
-    printf("\n--- Testing with large values (numerical stability) ---\n");
-    float large_scores[3] = {1000.0f, 1001.0f, 999.0f};
-    print_array("Large scores", large_scores, 3, 3);
-
-    softmax(large_scores, 3);
-
-    print_array("Softmax output (large values)", large_scores, 3, 3);
-    sum = 0.0f;
-    for (int i = 0; i < 3; i++) {
-        sum += large_scores[i];
-    }
-    printf("Sum: %.6f (should be 1.0)\n", sum);
-}
-
-/**
- * @brief Test the RoPE function with modular strategy system.
- */
-void test_rope(void) {
-    printf("\n========== TEST: Rotary Positional Embedding (RoPE) - Modular Strategy ==========\n");
-
-    int head_dim = 8;
-    float base = 10000.0f;
-
-    // Create a dummy query vector
-    float query[8];
-    
-    // Initialize query with test values
-    for (int i = 0; i < head_dim; i++) {
-        query[i] = (float)(i + 1) * 0.1f; // 0.1, 0.2, 0.3, ...
-    }
-
-    print_array("Original query", query, head_dim, 8);
-
-    // Test 1: Apply RoPE at position 0 using the wrapper
-    printf("\nApplying RoPE (rope_encoding_strategy) at position 0...\n");
-    float query_pos0[8];
-    memcpy(query_pos0, query, sizeof(query));
-    apply_rope(query_pos0, 0, head_dim, base);
-    print_array("Query after RoPE (pos=0)", query_pos0, head_dim, 8);
-
-    // Test 2: Apply RoPE at position 5
-    printf("\nApplying RoPE (rope_encoding_strategy) at position 5...\n");
-    float query_pos5[8];
-    memcpy(query_pos5, query, sizeof(query));
-    apply_rope(query_pos5, 5, head_dim, base);
-    print_array("Query after RoPE (pos=5)", query_pos5, head_dim, 8);
-
-    // Test 3: Apply RoPE with default base
-    printf("\nApplying RoPE with default base at position 10...\n");
-    float query_pos10[8];
-    memcpy(query_pos10, query, sizeof(query));
-    apply_rope_default(query_pos10, 10, head_dim);
-    print_array("Query after RoPE (pos=10, default base)", query_pos10, head_dim, 8);
-
-    // Test 4: Demonstrate ALiBi strategy (identity rotation for demonstration)
-    printf("\nDemonstrating ALiBi strategy (identity rotation - no vector modification)...\n");
-    float query_alibi[8];
-    memcpy(query_alibi, query, sizeof(query));
-    apply_positional_encoding(query_alibi, 5, head_dim, alibi_encoding_strategy, NULL);
-    print_array("Query after ALiBi (should be unchanged)", query_alibi, head_dim, 8);
-    
-    // Verify ALiBi doesn't change the vector
-    int unchanged = 1;
-    for (int i = 0; i < head_dim; i++) {
-        if (query_alibi[i] != query[i]) {
-            unchanged = 0;
+        // Read user input
+        if (!fgets(prompt, sizeof(prompt), stdin)) {
             break;
         }
-    }
-    printf("ALiBi strategy correctly applies identity rotation: %s\n", unchanged ? "YES" : "NO");
-}
 
-/**
- * @brief Test the attention scoring function.
- */
-void test_attention_strategies(void) {
-    printf("\n========== TEST: Attention Strategies (Modular System) ==========\n");
+        // Remove trailing newline
+        size_t len = strlen(prompt);
+        if (len > 0 && prompt[len - 1] == '\n') {
+            prompt[len - 1] = '\0';
+        }
 
-    int d_k = 8;
-    int context_length = 5;
+        // Skip empty lines
+        if (strlen(prompt) == 0) {
+            continue;
+        }
 
-    // Create dummy query vector
-    float query[8];
-    for (int i = 0; i < d_k; i++) {
-        query[i] = (float)(i + 1) * 0.1f;
-    }
-    print_array("\nQuery vector", query, d_k, 8);
+        // Handle commands
+        if (prompt[0] == '/') {
+            if (strcmp(prompt, "/exit") == 0 || strcmp(prompt, "/quit") == 0) {
+                printf("Exiting Sapphire inference engine. Goodbye!\n");
+                break;
+            } else if (strcmp(prompt, "/clear") == 0) {
+                LOG_INFO("Conversation history cleared");
+                // Reset session
+                if (ctx->session) {
+                    destroy_inference_session(ctx->session);
+                    ctx->session = inference_session_create(ctx->spec, ctx->context_len);
+                }
+            } else if (strcmp(prompt, "/info") == 0) {
+                printf("\nModel Information:\n");
+                printf("\nInference Settings:\n");
+                printf("  Temperature: %.2f\n", ctx->temperature);
+                printf("  Max tokens: %d\n", ctx->max_tokens);
+                printf("  Context length: %d\n", ctx->context_len);
+            } else if (strcmp(prompt, "/help") == 0) {
+                printf("\nAvailable Commands:\n");
+                printf("  /exit          - Exit the program\n");
+                printf("  /clear         - Clear conversation history\n");
+                printf("  /info          - Show model configuration\n");
+                printf("  /help          - Show this help message\n");
+                printf("\nJust type your prompt to generate responses.\n");
+            } else {
+                printf("Unknown command: %s\n", prompt);
+                printf("Type '/help' for available commands.\n");
+            }
+        } else {
+            // Perform inference
+            printf("\n[Generating response...]\n");
 
-    // Create dummy KV cache with 5 key vectors
-    float kv_cache_k[d_k*context_length];  // 5 * 8
-    for (int i = 0; i < context_length * d_k; i++) {
-        kv_cache_k[i] = (float)(i % 7) * 0.05f;
-    }
-    printf("KV Cache: %d key vectors of dimension %d\n", context_length, d_k);
+            clock_t start = clock();
+            int result = perform_inference(ctx, prompt, output, sizeof(output));
+            clock_t end = clock();
 
-    // Allocate output scores
-    float *attention_scores = (float *)malloc(context_length * sizeof(float));
-    if (!attention_scores) {
-        fprintf(stderr, "Memory allocation failed for attention scores.\n");
-        return;
-    }
-
-    // Test 1: Standard Scaled Dot-Product Attention
-    printf("\n--- Strategy 1: Scaled Dot-Product (1/sqrt(d_k)) ---\n");
-    compute_attention_scores(query, kv_cache_k, context_length, d_k, attention_scores);
-    print_array("Attention weights", attention_scores, context_length, context_length);
-    
-    float sum = 0.0f;
-    for (int i = 0; i < context_length; i++) {
-        sum += attention_scores[i];
-    }
-    printf("Sum: %.6f (should be 1.0)\n", sum);
-
-    // Test 2: Temperature-Scaled Attention (T=0.5, sharper)
-    printf("\n--- Strategy 2: Temperature-Scaled (T=0.5, sharper/focused) ---\n");
-    float temp_sharp = 0.5f;
-    compute_attention_scores_with_temperature(query, kv_cache_k, context_length, d_k, temp_sharp, attention_scores);
-    print_array("Attention weights", attention_scores, context_length, 5);
-    
-    sum = 0.0f;
-    for (int i = 0; i < context_length; i++) {
-        sum += attention_scores[i];
-    }
-    printf("Sum: %.6f (should be 1.0)\n", sum);
-    printf("Note: Lower temperature concentrates attention on top token(s).\n");
-
-    // Test 3: Temperature-Scaled Attention (T=2.0, softer)
-    printf("\n--- Strategy 3: Temperature-Scaled (T=2.0, softer/distributed) ---\n");
-    float temp_soft = 2.0f;
-    compute_attention_scores_with_temperature(query, kv_cache_k, context_length, d_k, temp_soft, attention_scores);
-    print_array("Attention weights", attention_scores, context_length, 5);
-    
-    sum = 0.0f;
-    for (int i = 0; i < context_length; i++) {
-        sum += attention_scores[i];
-    }
-    printf("Sum: %.6f (should be 1.0)\n", sum);
-    printf("Note: Higher temperature spreads attention more evenly.\n");
-
-    // Test 4: ALiBi Attention Strategy
-    printf("\n--- Strategy 4: ALiBi (Attention with Linear Biases) ---\n");
-    compute_attention_scores_with_alibi(query, kv_cache_k, context_length, d_k, attention_scores);
-    print_array("Attention weights", attention_scores, context_length, 5);
-    
-    sum = 0.0f;
-    for (int i = 0; i < context_length; i++) {
-        sum += attention_scores[i];
-    }
-    printf("Sum: %.6f (should be 1.0)\n", sum);
-    printf("Note: ALiBi uses position-dependent biases instead of scaling.\n");
-
-    // Test 5: Direct strategy usage
-    printf("\n--- Strategy 5: Custom Strategy Call (Direct API) ---\n");
-    printf("Computing with scaled_dot_product_strategy directly...\n");
-    
-    // Reset scores to raw dot products
-    for (int i = 0; i < context_length; i++) {
-        attention_scores[i] = 0.0f;
-        for (int j = 0; j < d_k; j++) {
-            attention_scores[i] += query[j] * kv_cache_k[i * d_k + j];
+            if (result == 0) {
+                double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
+                printf("\n[Response]\n%s\n", output);
+                printf("\n[Generation time: %.3f seconds]\n", elapsed);
+            } else {
+                LOG_ERROR("Inference failed");
+            }
         }
     }
-    print_array("Raw dot products", attention_scores, context_length, 5);
-    
-    // Apply strategy
-    scaled_dot_product_strategy(attention_scores, context_length, d_k, NULL);
-    print_array("After scaled_dot_product_strategy", attention_scores, context_length, 5);
-    
-    sum = 0.0f;
-    for (int i = 0; i < context_length; i++) {
-        sum += attention_scores[i];
-    }
-    printf("Sum: %.6f\n", sum);
 
-    free(attention_scores);
+    return 0;
 }
 
 /**
- * @brief Main test program.
+ * @brief Run a single non-interactive inference and return the result.
+ *
+ * Convenience wrapper that runs `perform_inference()` for `prompt`, prints the
+ * response to stdout, and returns the inference result code.
+ *
+ * Ownership semantics: this function DOES NOT free or destroy `ctx`; the
+ * caller retains ownership and is responsible for cleaning up the context
+ * (e.g., by calling `destroy_inference_context(ctx)`).
+ *
+ * @param ctx         Inference context to use (must be non-NULL). Caller retains ownership.
+ * @param prompt      Null-terminated prompt string to generate from.
+ * @param output_size Size of the output buffer passed to `perform_inference()`.
+ * @return 0 on success, non-zero on failure.
  */
-int main(void) {
-    printf("========================================\n");
-    printf("   Transformer Components Test Suite\n");
-    printf("   (Modular Positional Encoding &\n");
-    printf("    Pluggable Attention Strategies)\n");
-    printf("========================================\n");
+int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_size) {
+    if (!ctx || !prompt) return -1;
 
-    test_softmax();
-    test_rope();
-    test_attention_strategies();
+    printf("\nRunning prompt (non-interactive): '%s'\n", prompt);
+    char output[BUFFER_SIZE];
 
-    printf("\n========================================\n");
-    printf("   All tests completed successfully!\n");
-    printf("========================================\n");
+    printf("\n[Running one-shot inference for prompt: '%s']\n", prompt);
+    int rc = perform_inference(ctx, prompt, output, output_size);
+    if (rc == 0) {
+        printf("\n[Response]\n%s\n", output);
+    } else {
+        LOG_ERROR("One-shot inference failed");
+    }
 
-    return 0;
+    return rc;
+}
+
+/**
+ * @brief Main function - Interactive Sapphire Inference Engine
+ */
+int main(int argc, char* argv[]) {
+    // Check for help first
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_help(argc > 0 ? argv[0] : "sapphire");
+            return 0;
+        }
+    }
+
+    // Parse arguments
+    const char* model_name = NULL;
+    int context_len = CONTEXT_LEN;
+    float temperature = TEMPERATURE;
+    int max_tokens = MAX_TOKENS_GENERATE;
+    const char* prompt_arg = NULL;  // Non-interactive prompt (via -p)
+
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
+            model_name = argv[++i];
+        } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--context") == 0) && i + 1 < argc) {
+            context_len = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0) && i + 1 < argc) {
+            temperature = atof(argv[++i]);
+        } else if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) && i + 1 < argc) {
+            max_tokens = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
+            prompt_arg = argv[++i];
+        }
+    }
+
+    // Validate that model name was provided
+    if (!model_name) {
+        fprintf(stderr, "ERROR: Model name required. Use -m or --model flag.\n");
+        print_help(argv[0]);
+        return 1;
+    }
+
+    log_set_level_from_env("SAPPHIRE_LOG_LEVEL");
+
+    printf("================================================================================\n");
+    printf("                      SAPPHIRE INFERENCE ENGINE (v1.0)\n");
+    printf("================================================================================\n");
+
+    // Create inference context with tokenizer
+    inference_context_t* ctx = create_inference_context(temperature, max_tokens, context_len, model_name);
+    if (!ctx) {
+        LOG_ERROR("Failed to create inference context. Exiting.");
+        return 1;
+    }
+
+    int result = 0;
+    // If prompt_arg provided, run a single non-interactive inference and exit
+    if (prompt_arg) {
+        result = one_shot_inference(ctx, prompt_arg, BUFFER_SIZE);
+    } else {
+        // Enter interactive loop
+        result = interactive_loop(ctx);
+    }
+
+    // Cleanup
+    destroy_inference_context(ctx);
+
+    printf("\n================================================================================\n");
+    printf("                    Sapphire Inference Engine Closed\n");
+    printf("================================================================================\n");
+
+    return result;
 }

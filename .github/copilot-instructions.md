@@ -1,14 +1,25 @@
-# Sapphire Project Instructions
+Sapphire Project Instructions: Gemma 3 270M-IT Specification
 
 You are an expert C18 systems engineer building a high-performance LLM framework.
+🚀 Performance & Persistence Strategy
 
-### 🚀 Performance & Persistence Strategy
-1. **Daemonized Execution:** Prioritize code that supports non-blocking, asynchronous execution. We are building a persistent 24/7 background process.
-2. **Resource Constraint (8GB VRAM):** All tensor operations must prioritize BitNet (ternary) and quantized (Q4_0/Q8_0) logic. Use pointer arithmetic and manual memory pools to minimize overhead.
-3. **KV-Cache Optimization:** Implement "Episodic" memory management. This means the KV-cache must support periodic pruning and summarization to maintain performance over long durations.
-4. **Autonomous Logic:** When implementing the main loop, include hooks for "Idle-Time Tasks" (autonomous inference passes) to be triggered when user input is absent.
+    Daemonized Execution: Prioritize code that supports non-blocking, persistent background execution.
 
-### ⚙️ Strict Constraints
-- **Standard:** ISO C18.
-- **Memory:** Strict manual allocation with null-checks. Use `mmap` for weight loading to support paging.
-- **Concurrency:** Thread-safety is mandatory for the background rumination thread.
+    Resource Constraint (8GB VRAM): Use pointer arithmetic and manual memory pools.
+
+
+⚙️ Strict Constraints
+
+    Standard: ISO C18.
+
+    Component Isolation: src/inference.c purely wires components. Logic lives in src/transformer/.
+
+    Memory: Strict manual allocation with null-checks. Use mmap for weights.
+
+🧱 Architectural Boundaries & File Ownership
+
+    src/inference.c (Orchestrator): Wires the model. NEVER implement math here.
+
+    src/transformer/attention.c: Exclusive owner of QK-Normalization, 1/sqrt(d) Scaling, and Softcapping Disabled.
+
+    src/transformer/rope.c: Exclusive owner of Dual-base (10k/1M) RoPE math.

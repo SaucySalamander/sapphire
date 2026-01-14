@@ -3,6 +3,7 @@
 
 /* Forward declaration to avoid exposing tensor internals in this public header */
 typedef struct tensor_t tensor_t;
+#include "tensor.h"
 
 /* Forward declaration for the Sapphire thread-pool context type */
 typedef struct sapphire_context sapphire_context;
@@ -41,6 +42,13 @@ int tensor_gemv_with_ctx(sapphire_context *ctx, float *y, const tensor_t *A, con
 int tensor_gemv_tensor_with_ctx(sapphire_context *ctx, tensor_t *y, const tensor_t *A, const tensor_t *x);
 int tensor_gemv_add_with_ctx(sapphire_context *ctx, float *y, const tensor_t *A, const float *x, float alpha);
 int tensor_gemv_batch_with_ctx(sapphire_context *ctx, float *Y, const tensor_t *A, const float *X, int batch_size);
+
+/*
+ * Query helpers
+ * Return the preferred SIMD float lane count for a given tensor dtype as
+ * used by GEMV kernels (e.g. 8 for AVX2/F32). Returns >=1.
+ */
+int tensor_gemv_simd_lane_count_for_dtype(tensor_dtype_t dtype);
 
 /**
  * @example

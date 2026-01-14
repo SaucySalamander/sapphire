@@ -25,4 +25,29 @@ void apply_rope(float *x, int pos, int head_dim, float base);
  */
 void apply_rope_default(float *x, int pos, int head_dim);
 
+/**
+ * @brief Precompute RoPE frequencies (cos and sin for all positions and dimensions).
+ * 
+ * @param freqs_cos Pointer to pre-allocated buffer for cosine frequencies.
+ * @param freqs_sin Pointer to pre-allocated buffer for sine frequencies.
+ * @param d_k The hidden dimension of a single head.
+ * @param max_context_len Maximum context length to precompute for.
+ * @param rope_base The base for frequency calculation.
+ * @return 0 on success, non-zero on error.
+ */
+int rope_precompute_freqs(float* freqs_cos, float* freqs_sin,
+                         int d_k, int max_context_len, float rope_base);
+
+/**
+ * @brief Fast RoPE application using precomputed frequencies.
+ * 
+ * @param x The input vector to modify.
+ * @param pos The position index.
+ * @param head_dim The head dimension.
+ * @param freqs_cos Pointer to the precomputed cosine frequencies buffer.
+ * @param freqs_sin Pointer to the precomputed sine frequencies buffer.
+ */
+void rope_apply_fast(float* x, int pos, int head_dim, 
+                    const float* freqs_cos, const float* freqs_sin);
+
 #endif // ROPE_H
