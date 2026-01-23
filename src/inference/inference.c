@@ -439,8 +439,10 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
                    next_token, decode(ctx->tokenizer, next_token));
         }
 
-        // Gemma 3 EOS token is 107 (or 1 depending on the config)
-        if (next_token == 107 || next_token == 1) break;
+        // Gemma 3 stop tokens:
+        // - Token 1: <eos> (explicit end-of-sequence)
+        // - Token 106: <end_of_turn> (marks end of model's turn in chat format)
+        if (next_token == 1 || next_token == 106) break;
 
         // --- STREAMING DECODE WITH SPIECE HANDLING ---
         const char* token_str = decode(ctx->tokenizer, next_token);
