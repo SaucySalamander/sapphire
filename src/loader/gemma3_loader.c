@@ -18,6 +18,7 @@
 #include "simple_json.h"
 #include "tensor_mapper.h"
 #include "tokenizer.h"
+#include "utils.h"
 
 /* Forward declarations for helpers used below */
 static int load_gemma3_config_json_from_dir(const char* dir, model_spec_t* spec, char* error_msg, int max_err_len);
@@ -122,9 +123,75 @@ static int gemma3_populate_from_files(const char* model_dir, model_spec_t* spec,
     return 0;
 }
 
+static float gemma3_bf16_to_f32(uint16_t bf16_val) {
+    uint32_t f32_bits = ((uint32_t)bf16_val) << 16;
+    float f;
+    memcpy(&f, &f32_bits, sizeof(float));
+    return f;
+}
+
+static tensor_t* gemma3_scale_norm_tensor(const tensor_t* src, float scale, const char* label) {
+    if (!src) return NULL;
+
+    int ndim = tensor_ndim(src);
+    const int* shape = tensor_shape(src);
+    size_t numel = tensor_numel(src);
+    if (ndim <= 0 || !shape || numel == 0) return NULL;
+
+    tensor_dtype_t dtype = tensor_dtype(src);
+    if (dtype != DTYPE_F32 && dtype != DTYPE_BF16) {
+        LOG_WARN("Gemma3 loader: skipping norm scale for %s (dtype=%s unsupported)",
+                 label ? label : "(unnamed)", dtype_name(dtype));
+        return NULL;
+    }
+
+    tensor_t* dst = tensor_create(ndim, shape, DTYPE_F32);
+    if (!dst) return NULL;
+
+    float* out = tensor_data_f32(dst);
+    if (!out) {
+        tensor_release(dst);
+        return NULL;
+    }
+
+    if (dtype == DTYPE_F32) {
+        const float* in = (const float*)tensor_data(src);
+        if (!in) {
+            tensor_release(dst);
+            return NULL;
+        }
+        for (size_t i = 0; i < numel; ++i) {
+            out[i] = in[i] * scale;
+        }
+    } else {
+        const uint16_t* in = (const uint16_t*)tensor_data(src);
+        if (!in) {
+            tensor_release(dst);
+            return NULL;
+        }
+        for (size_t i = 0; i < numel; ++i) {
+            out[i] = gemma3_bf16_to_f32(in[i]) * scale;
+        }
+    }
+
+    LOG_DEBUG("Gemma3 loader: scaled %s by %.6f into F32", label ? label : "(unnamed)", scale);
+    return dst;
+}
+
+static void gemma3_scale_norm_inplace(tensor_t** slot, float scale, const char* label) {
+    if (!slot || !*slot) return;
+    tensor_t* scaled = gemma3_scale_norm_tensor(*slot, scale, label);
+    if (!scaled) return;
+    tensor_release(*slot);
+    *slot = scaled;
+}
+
 static void gemma3_postprocess_model(const model_spec_t* model_spec) {
-    /* currently none; placeholder for future per-model transformations */
+    if (!model_spec || !model_spec->llm_model || !model_spec->variant_config) return;
+
+    /* No postprocessing for now - investigate core bug */
     (void)model_spec;
+    return;
 }
 
 const model_loader_hooks_t GEMMA3_LOADER_HOOKS = {

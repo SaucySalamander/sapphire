@@ -567,3 +567,52 @@ int tokenizer_vocab_size(const sapphire_tokenizer_t *tok) {
     if (!tok) return 0;
     return tok->vocab_size;
 }
+
+/**
+ * @brief Construct Gemma 3 IT instruction-tuned prompt with hardcoded token sequence
+ *
+ * This mirrors the previous helper in inference.c but belongs to the tokenizer
+ * module because it uses tokenizer primitives (tokenize, tokenize_fallback,
+ * decode) and the tokenizer's special-token configuration.
+ */
+int build_gemma3_prompt(sapphire_tokenizer_t* tokenizer, const char* user_prompt,
+                        int* tokens, int max_tokens) {
+    if (!tokenizer || !user_prompt || !tokens || max_tokens < 20) {
+        return -1;
+    }
+
+    int idx = 0;
+
+    /* CRITICAL: Hardcoded Gemma 3 IT turn markers (matches HuggingFace template) */
+    tokens[idx++] = 2;     // <bos>
+    tokens[idx++] = 2;     // <bos> (duplicate, as per HF template)
+    tokens[idx++] = 105;   // <start_of_turn>
+    tokens[idx++] = 2364;  // "user"
+    tokens[idx++] = 107;   // "\n"
+
+    /* Tokenize user's actual prompt message */
+    int prompt_tokens[512];
+    int prompt_len = tokenize(tokenizer, user_prompt, prompt_tokens, 512);
+
+    if (prompt_len <= 0) {
+        fprintf(stderr, "WARN: Failed to tokenize user prompt, using fallback\n");
+        prompt_len = tokenize_fallback(user_prompt, prompt_tokens, 512);
+    }
+
+    /* Append user prompt tokens (skip BOS and PAD tokens from tokenizer) */
+    int skip_bos = (prompt_len > 0 && prompt_tokens[0] == 2) ? 1 : 0;
+    for (int i = skip_bos; i < prompt_len && idx < max_tokens - 7; i++) {
+        if (prompt_tokens[i] != 0) {  /* Skip pad tokens (token ID 0) */
+            tokens[idx++] = prompt_tokens[i];
+        }
+    }
+
+    /* End user turn and start model turn (hardcoded token sequence) */
+    tokens[idx++] = 106;   // <end_of_turn>
+    tokens[idx++] = 107;   // "\n" (added to match HF template)
+    tokens[idx++] = 105;   // <start_of_turn>
+    tokens[idx++] = 4368;  // "model"
+    tokens[idx++] = 107;   // "\n"
+
+    return idx;  /* Return actual prompt length */
+}

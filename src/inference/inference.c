@@ -29,15 +29,15 @@
 
 static int g_attn_debug_raw_warned = 0;
 
-/* Forward declare model-specific prompt builder used later in this file */
-static int build_gemma3_prompt(sapphire_tokenizer_t* tokenizer, const char* user_prompt, int* tokens, int max_tokens);
+/* Note: build_gemma3_prompt moved to tokenizer module (see include/tokenizer.h)
+    to centralize tokenization / prompt construction logic. */
 
 /**
  * @brief Initialize inference context
  */
 inference_context_t* create_inference_context(float temperature, int max_tokens, int context_len, const char* model_name) {
     // Allow max_tokens == 0 for diagnostic-only initialization runs
-    if (!model_name || temperature <= 0.0f || max_tokens < 0 || context_len <= 0) return NULL;
+    if (!model_name || temperature < 0.0f || max_tokens < 0 || context_len <= 0) return NULL;
 
     // Get the model specification for the requested model
     model_spec_t* spec = get_model_spec(model_name);
@@ -269,12 +269,21 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
     int last_token = tokens[prompt_len - 1];
     int generated_count = 0;
 
+    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+        fprintf(stderr, "[DEBUG_INIT] prompt_len=%d, total_tokens=%d, last_token=%d\n", prompt_len, total_tokens, last_token);
+    }
+
     printf("\n[Response]\n");
 
     // 3. Generation loop (Auto-regressive)
     while (total_tokens < ctx->context_len && generated_count < ctx->max_tokens) {
         // Forward pass for the current token
-        inference_forward(session, last_token, total_tokens - 1, ctx->logits);
+        int cur_pos = total_tokens - 1;
+        inference_forward(session, last_token, cur_pos, ctx->logits);
+
+        if (generated_count == 0 && getenv("SAPPHIRE_DEBUG_LOGITS")) {
+            fprintf(stderr, "[DEBUG_GEN_LOOP] generated_count=%d, cur_pos=%d, total_tokens=%d\n", generated_count, cur_pos, total_tokens);
+        }
 
         // Sample next token (Greedy or Temperature)
         // Adjust logits by temperature BEFORE passing to sampler (Phase 8 Stability)
@@ -334,6 +343,23 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
         }
 
         // Use T=1.0 for sample_temperature because we already scaled the logits
+        int debug_logits_pre_select = getenv("SAPPHIRE_DEBUG_LOGITS") != NULL;
+        if (debug_logits_pre_select && generated_count == 0) {
+            // Print actual logits for key tokens BEFORE sampling
+            fprintf(stderr, "[DEBUG_LOGITS_PRE_SELECT] token_106=%.6f token_818=%.6f token_236776=%.6f\n",
+                    ctx->logits[106], ctx->logits[818], ctx->logits[236776]);
+            // Find argmax
+            int max_idx = 0;
+            float max_logit = ctx->logits[0];
+            for (int i = 1; i < config->vocab_size; ++i) {
+                if (ctx->logits[i] > max_logit) {
+                    max_logit = ctx->logits[i];
+                    max_idx = i;
+                }
+            }
+            fprintf(stderr, "[DEBUG_LOGITS_PRE_SELECT] argmax=token_%d with logit=%.6f\n", max_idx, max_logit);
+        }
+        
         int next_token = sample_temperature(ctx->logits, config->vocab_size, 1.0f);
 
         // After temperature sampling (when temperature>0) the `ctx->logits` buffer
@@ -694,6 +720,16 @@ void inference_forward(inference_session_t* session, int token_id, int token_pos
     // 1. Embedding lookup
     sapphire_embed_lookup(session, token_id, session->scratch_buffer);
 
+    // Debug: log embeddings
+    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+        float mn, mx, rms;
+        vec_stats(session->scratch_buffer, config->hidden_size, &mn, &mx, &rms);
+        fprintf(stderr, "[DEBUG_EMBEDDING] pos=%d min=%.6f max=%.6f rms=%.6f first5: %.6f %.6f %.6f %.6f %.6f\n", 
+                token_pos, mn, mx, rms,
+                session->scratch_buffer[0], session->scratch_buffer[1], session->scratch_buffer[2], 
+                session->scratch_buffer[3], session->scratch_buffer[4]);
+    }
+
     // Targeted dump: embeddings for token 0
     if (token_pos == 0 && getenv("SAPPHIRE_DEBUG_DUMPS")) {
         float mn, mx, rms;
@@ -728,7 +764,22 @@ void inference_forward(inference_session_t* session, int token_id, int token_pos
         const float* f_cos = is_global_layer ? session->rope_freqs_cos_global : session->rope_freqs_cos_local;
         const float* f_sin = is_global_layer ? session->rope_freqs_sin_global : session->rope_freqs_sin_local;
 
+        // Debug: log layer input/output for critical positions
+        if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+            float mn, mx, rms;
+            vec_stats(session->scratch_buffer, config->hidden_size, &mn, &mx, &rms);
+            fprintf(stderr, "[DEBUG_LAYER_INPUT] layer=%d pos=%d min=%.6f max=%.6f rms=%.6f\n", l, token_pos, mn, mx, rms);
+        }
+
         sapphire_transformer_layer(session, l, token_pos, session->scratch_buffer, f_cos, f_sin);
+        
+        // Debug: log layer output
+        if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+            float mn, mx, rms;
+            vec_stats(session->scratch_buffer, config->hidden_size, &mn, &mx, &rms);
+            fprintf(stderr, "[DEBUG_LAYER_OUTPUT] layer=%d pos=%d min=%.6f max=%.6f rms=%.6f first5: %.6f %.6f %.6f %.6f %.6f\n", l, token_pos, mn, mx, rms,
+                    session->scratch_buffer[0], session->scratch_buffer[1], session->scratch_buffer[2], session->scratch_buffer[3], session->scratch_buffer[4]);
+        }
     }
 
     // 3. Final norm & LM Head
@@ -780,56 +831,5 @@ void destroy_inference_session(inference_session_t* session) {
     free(session);
 }
 
-/**
- * @brief Construct Gemma 3 IT instruction-tuned prompt with hardcoded token sequence
- *
- * Run 28 Verified Token Mapping:
- *   2 (<bos>)
- *   105 (<start_of_turn>)
- *   2364 (user)
- *   107 (\n)
- *   [user_prompt_tokens]
- *   106 (<end_of_turn>)
- *   105 (<start_of_turn>)
- *   4368 (model)
- *   107 (\n)
- *
- * This forces the model into "Assistant Mode" for proper English responses.
- */
-static int build_gemma3_prompt(sapphire_tokenizer_t* tokenizer, const char* user_prompt,
-                               int* tokens, int max_tokens) {
-    if (!tokenizer || !user_prompt || !tokens || max_tokens < 20) {
-        return -1;
-    }
-
-    int idx = 0;
-
-    // CRITICAL: Hardcoded Gemma 3 IT turn markers (Run 28 verified)
-    tokens[idx++] = 2;     // <bos>
-    tokens[idx++] = 105;   // <start_of_turn>
-    tokens[idx++] = 2364;  // "user"
-    tokens[idx++] = 107;   // "\n"
-
-    // Tokenize user's actual prompt message
-    int prompt_tokens[512];
-    int prompt_len = tokenize(tokenizer, user_prompt, prompt_tokens, 512);
-
-    if (prompt_len <= 0) {
-        fprintf(stderr, "WARN: Failed to tokenize user prompt, using fallback\n");
-        prompt_len = tokenize_fallback(user_prompt, prompt_tokens, 512);
-    }
-
-    // Append user prompt tokens (skip BOS from tokenizer)
-    int skip_bos = (prompt_tokens[0] == 2) ? 1 : 0;
-    for (int i = skip_bos; i < prompt_len && idx < max_tokens - 6; i++) {
-        tokens[idx++] = prompt_tokens[i];
-    }
-
-    // End user turn and start model turn (hardcoded token sequence)
-    tokens[idx++] = 106;   // <end_of_turn>
-    tokens[idx++] = 105;   // <start_of_turn>
-    tokens[idx++] = 4368;  // "model"
-    tokens[idx++] = 107;   // "\n"
-
-    return idx;  // Return actual prompt length
-}
+/* build_gemma3_prompt moved to tokenizer module (include/tokenizer.h).
+   The tokenizer now owns prompt construction and tokenization helpers. */
