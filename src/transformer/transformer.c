@@ -88,6 +88,15 @@ int sapphire_transformer_layer(struct inference_session_t* session, int layer_id
     // 1. Residual Connection (Save hidden to residual)
     vec_copy(residual, hidden, d_model);
 
+    /* Capture embedding RMS (original hidden) for comparator-friendly logs.
+     * Compute only when debug log level is enabled to avoid extra cost. */
+    float __embed_rms = 0.0f;
+    if (layer_idx == 0 && token_pos == 0 && log_get_level() == LOG_LEVEL_DEBUG) {
+        float __mn_e = 0.0f, __mx_e = 0.0f;
+        vec_stats(residual, d_model, &__mn_e, &__mx_e, &__embed_rms);
+        LOG_DEBUG("Embedding RMS: %.6f", __embed_rms);
+    }
+
     // DEBUG: log residual RMS at layer entry on first token
     if (layer_idx == 0 && getenv("SAPPHIRE_DEBUG_RMS")) {
         float mn, mx, rms;
@@ -105,7 +114,16 @@ int sapphire_transformer_layer(struct inference_session_t* session, int layer_id
         }
     }
     const float* norm_attn_data = get_norm_weights(layer->norm_attn_weight, weight_scratch, d_model);
-    sapphire_rmsnorm(norm_buf, hidden, norm_attn_data, 1e-6f, d_model);
+    
+    if (getenv("SAPPHIRE_DEBUG_LOGITS") && layer_idx == 0 && token_pos == 0) {
+        fprintf(stderr, "[DEBUG_L0_NORM_ATTN_WEIGHTS] First 10 values:");
+        for (int i = 0; i < 10 && i < d_model; i++) {
+            fprintf(stderr, " %.6f", norm_attn_data[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+    
+    sapphire_rmsnorm_delta(norm_buf, hidden, norm_attn_data, 1e-6f, d_model);
     
     // 3. Projections (Q, K, V)
     tensor_gemv_with_ctx(session->gemv_ctx, q_proj, layer->q_proj_weight, norm_buf);
@@ -283,6 +301,15 @@ int sapphire_transformer_layer(struct inference_session_t* session, int layer_id
             LOG_DEBUG("DUMP L0 NORM_ATT_POST first %d vals:", n_print);
             for (int i = 0; i < n_print; ++i) LOG_DEBUG("DUMP L0 NORM_ATT_POST[%d]=%.9g", i, norm_post_w[i]);
         }
+        
+        if (getenv("SAPPHIRE_DEBUG_LOGITS") && layer_idx == 0 && token_pos == 0) {
+            fprintf(stderr, "[DEBUG_L0_NORM_ATTN_POST_WEIGHTS] First 10 values:");
+            for (int i = 0; i < 10 && i < d_model; i++) {
+                fprintf(stderr, " %.6f", norm_post_w[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+        
         sapphire_rmsnorm_delta(norm_buf, hidden, norm_post_w, 1e-6f, d_model);
 
         if (getenv("SAPPHIRE_DEBUG_RMS")) {
@@ -317,7 +344,7 @@ int sapphire_transformer_layer(struct inference_session_t* session, int layer_id
         }
     }
 
-    sapphire_rmsnorm(norm_buf, residual, norm_ffn_data, 1e-6f, d_model);
+    sapphire_rmsnorm_delta(norm_buf, residual, norm_ffn_data, 1e-6f, d_model);
 
     /* 11. GEMMA3: GeGLU FFN. Compute gate and value projections, apply GeGLU,
      * then project down. */
@@ -399,7 +426,27 @@ int sapphire_transformer_layer(struct inference_session_t* session, int layer_id
             if (token_pos == 0 && layer_idx == 0) {
                 LOG_DEBUG("Layer 0 has norm_ffn_post_weight (ptr=%p). Applying Post-FFN Norm.", norm_post_w);
             }
+            
+            if (getenv("SAPPHIRE_DEBUG_LOGITS") && layer_idx == 17 && token_pos == 0) {
+                fprintf(stderr, "[DEBUG_L17_FFN_PRE_NORM] hidden RMS before ffn post-norm:");
+                float mn, mx, rms;
+                vec_stats(hidden, d_model, &mn, &mx, &rms);
+                fprintf(stderr, " min=%.6f max=%.6f rms=%.6f\n", mn, mx, rms);
+                fprintf(stderr, "[DEBUG_L17_NORM_FFN_POST_WEIGHTS] First 10 values:");
+                for (int i = 0; i < 10 && i < d_model; i++) {
+                    fprintf(stderr, " %.6f", norm_post_w[i]);
+                }
+                fprintf(stderr, "\n");
+            }
+            
             sapphire_rmsnorm_delta(norm_buf, hidden, norm_post_w, 1e-6f, d_model);
+            
+            if (getenv("SAPPHIRE_DEBUG_LOGITS") && layer_idx == 17 && token_pos == 0) {
+                fprintf(stderr, "[DEBUG_L17_FFN_POST_NORM] norm_buf RMS after ffn post-norm:");
+                float mn, mx, rms;
+                vec_stats(norm_buf, d_model, &mn, &mx, &rms);
+                fprintf(stderr, " min=%.6f max=%.6f rms=%.6f\n", mn, mx, rms);
+            }
 
             if (getenv("SAPPHIRE_DEBUG_RMS")) {
                 float rms_norm = 0;
@@ -424,6 +471,14 @@ int sapphire_transformer_layer(struct inference_session_t* session, int layer_id
 
     // Copy computed residual back to hidden (Layer Output)
     vec_copy(hidden, residual, d_model);
+
+    /* Comparator-friendly per-layer output RMS (env-var controlled).
+     * Print after layer output is finalized. */
+    if (getenv("SAPPHIRE_DEBUG_RMS")) {
+        float __mn_o = 0.0f, __mx_o = 0.0f, __rms_o = 0.0f;
+        vec_stats(hidden, d_model, &__mn_o, &__mx_o, &__rms_o);
+        LOG_DEBUG("Layer %d Output RMS: min=%.6f max=%.6f rms=%.6f", layer_idx, __mn_o, __mx_o, __rms_o);
+    }
 
     return 0;
 }
@@ -467,6 +522,21 @@ void sapphire_lm_head(struct inference_session_t* session, float* hidden, float*
     float* tmp_w = session->scratch_buffer + 3 * session->padded_d_model;
     const float* final_w = get_norm_weights(model->norm_final_weight, tmp_w, config->hidden_size);
 
+    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+        float weight_rms, weight_min, weight_max;
+        vec_stats(final_w, config->hidden_size, &weight_min, &weight_max, &weight_rms);
+        fprintf(stderr, "[DEBUG_FINAL_NORM_WEIGHTS_STATS] min=%.6f max=%.6f rms=%.6f\n", weight_min, weight_max, weight_rms);
+        
+        // Compute (1+weight) stats
+        float one_plus_w_vals[640];
+        for (int i = 0; i < config->hidden_size; i++) {
+            one_plus_w_vals[i] = 1.0f + final_w[i];
+        }
+        float opw_rms, opw_min, opw_max;
+        vec_stats(one_plus_w_vals, config->hidden_size, &opw_min, &opw_max, &opw_rms);
+        fprintf(stderr, "[DEBUG_1PLUS_WEIGHTS_STATS] min=%.6f max=%.6f rms=%.6f\n", opw_min, opw_max, opw_rms);
+    }
+
     if (getenv("SAPPHIRE_DEBUG_RMS")) {
         float mn_b, mx_b, rms_b;
         vec_stats(hidden, config->hidden_size, &mn_b, &mx_b, &rms_b);
@@ -474,8 +544,48 @@ void sapphire_lm_head(struct inference_session_t* session, float* hidden, float*
         if (rms_b < 0.01f || rms_b > 100.0f) LOG_WARN("DEBUG_RMS WARNING FinalNorm BEFORE RMS out-of-range=%.6f", rms_b);
     }
 
-    if (norm_weights_are_deltas)
+    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+        float mn_b, mx_b, rms_b;
+        vec_stats(hidden, config->hidden_size, &mn_b, &mx_b, &rms_b);
+        fprintf(stderr, "[DEBUG_HIDDEN_BEFORE_FINAL_NORM] min=%.6f max=%.6f rms=%.6f\n", mn_b, mx_b, rms_b);
+        fprintf(stderr, "[DEBUG_HIDDEN_BEFORE_FINAL_NORM] first 5: %.6f %.6f %.6f %.6f %.6f\n",
+                hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
+        
+        // Compute what RMSNorm should output
+        float sum_sq = 0.0f;
+        for (int i = 0; i < config->hidden_size; i++) {
+            sum_sq += hidden[i] * hidden[i];
+        }
+        float rms_actual = sqrtf(sum_sq / (float)config->hidden_size + 1e-6f);
+        fprintf(stderr, "[DEBUG_RMS_CALC] sum_sq=%.2e, computed_rms=%.6f (should match rms_b=%.6f)\n", sum_sq, rms_actual, rms_b);
+    }
+
+    if (norm_weights_are_deltas) {
+        if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+            fprintf(stderr, "[DEBUG_FINAL_NORM_CALL] Calling sapphire_rmsnorm_delta\n");
+            fprintf(stderr, "[DEBUG_FINAL_NORM_CALL] hidden input first 5: %.6f %.6f %.6f %.6f %.6f\n",
+                    hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
+            fprintf(stderr, "[DEBUG_FINAL_NORM_WEIGHTS] weight first 5: %.6f %.6f %.6f %.6f %.6f\n",
+                    final_w[0], final_w[1], final_w[2], final_w[3], final_w[4]);
+            
+            // Manually compute what first element should be after norm
+            float sum_sq = 0.0f;
+            for (int i = 0; i < config->hidden_size; i++) {
+                sum_sq += hidden[i] * hidden[i];
+            }
+            float rms = sqrtf(sum_sq / (float)config->hidden_size + 1e-6f);
+            float expected_0 = (hidden[0] / rms) * (1.0f + final_w[0]);
+            fprintf(stderr, "[DEBUG_EXPECTED_OUTPUT] hidden[0]=%.6f, rms=%.6f, weight[0]=%.6f, expected_output[0]=%.6f (%.6f / %.6f) * (1 + %.6f)\n",
+                    hidden[0], rms, final_w[0], expected_0, hidden[0], rms, final_w[0]);
+        }
+        
         sapphire_rmsnorm_delta(scratch_norm, hidden, final_w, 1e-6f, config->hidden_size);
+        
+        if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+            fprintf(stderr, "[DEBUG_FINAL_NORM_CALL] scratch_norm output first 5: %.6f %.6f %.6f %.6f %.6f\n",
+                    scratch_norm[0], scratch_norm[1], scratch_norm[2], scratch_norm[3], scratch_norm[4]);
+        }
+    }
     else
         sapphire_rmsnorm(scratch_norm, hidden, final_w, 1e-6f, config->hidden_size);
 
@@ -486,15 +596,131 @@ void sapphire_lm_head(struct inference_session_t* session, float* hidden, float*
         if (rms_a < 0.01f || rms_a > 100.0f) LOG_WARN("DEBUG_RMS WARNING FinalNorm AFTER RMS out-of-range=%.6f", rms_a);
     }
 
+    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+        float mn_a, mx_a, rms_a;
+        vec_stats(scratch_norm, config->hidden_size, &mn_a, &mx_a, &rms_a);
+        fprintf(stderr, "[DEBUG_HIDDEN_AFTER_FINAL_NORM] min=%.6f max=%.6f rms=%.6f\n", mn_a, mx_a, rms_a);
+    }
+
     if (log_get_level() == LOG_LEVEL_DEBUG) {
         float mn, mx, rms;
         vec_stats(scratch_norm, config->hidden_size, &mn, &mx, &rms);
         LOG_DEBUG("Final Norm Out: min=%.3f max=%.3f rms=%.3f", mn, mx, rms);
     }
 
+    // Debug: dump first few values of scratch_norm before GEMV
+    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+        fprintf(stderr, "[DEBUG_SCRATCH_NORM] First 10 values before GEMV: ");
+        for (int i = 0; i < 10 && i < config->hidden_size; i++) {
+            fprintf(stderr, "%.6f ", scratch_norm[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
     // 2. Output Projection (Weight Tying)
     // Perform projection first to maintain numerical stability in the hidden state
+    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+        const int *emb_shape = tensor_shape(model->embedding_weight);
+        if (emb_shape) {
+            fprintf(stderr, "[DEBUG_EMBEDDING_WEIGHT] shape=[%d, %d] dtype=%d\n", 
+                    emb_shape[0], emb_shape[1], (int)tensor_dtype(model->embedding_weight));
+        }
+        fprintf(stderr, "[DEBUG_PRE_GEMV] x (scratch_norm) first 5 values: %.6f %.6f %.6f %.6f %.6f\n",
+                scratch_norm[0], scratch_norm[1], scratch_norm[2], scratch_norm[3], scratch_norm[4]);
+    }
+    
     tensor_gemv_with_ctx(session->gemv_ctx, logits, model->embedding_weight, scratch_norm);
+    
+    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+        fprintf(stderr, "[DEBUG_POST_GEMV] logits first 5 values: %.6f %.6f %.6f %.6f %.6f\n",
+                logits[0], logits[1], logits[2], logits[3], logits[4]);
+    }
+
+    // DEBUG: Show logits statistics
+    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
+        // Inline BF16 converter
+        #define LOCAL_BF16_TO_F32(bf16_val) ({ \
+            uint32_t f32_bits = ((uint32_t)(bf16_val)) << 16; \
+            float f; \
+            memcpy(&f, &f32_bits, sizeof(float)); \
+            f; \
+        })
+        
+        float min_l, max_l, rms_l;
+        vec_stats(logits, config->vocab_size, &min_l, &max_l, &rms_l);
+        
+        // Find top 5 logits
+        float top_vals[5] = {-1e9, -1e9, -1e9, -1e9, -1e9};
+        int top_ids[5] = {0, 0, 0, 0, 0};
+        for (int i = 0; i < config->vocab_size; i++) {
+            for (int j = 0; j < 5; j++) {
+                if (logits[i] > top_vals[j]) {
+                    for (int k = 4; k > j; k--) {
+                        top_vals[k] = top_vals[k-1];
+                        top_ids[k] = top_ids[k-1];
+                    }
+                    top_vals[j] = logits[i];
+                    top_ids[j] = i;
+                    break;
+                }
+            }
+        }
+        
+        fprintf(stderr, "[FINAL_LOGITS] min=%.6f max=%.6f rms=%.6f\n", min_l, max_l, rms_l);
+        fprintf(stderr, "[FINAL_LOGITS_TOP5]");
+        for (int i = 0; i < 5; i++) {
+            fprintf(stderr, " %d:%.6f", top_ids[i], top_vals[i]);
+        }
+        fprintf(stderr, "\n");
+        
+        // Debug: Manually compute logit for token 106 and token 818
+        if (config->vocab_size > 818) {
+            const uint16_t *embed_bf16 = (const uint16_t *)tensor_data(model->embedding_weight);
+            const int *embed_shape = tensor_shape(model->embedding_weight);
+            int vocab_size = embed_shape[0];
+            int hidden_size = embed_shape[1];
+            
+            float manual_logit_106 = 0.0f;
+            float manual_logit_818 = 0.0f;
+            
+            // Token 106
+            if (106 < vocab_size) {
+                for (int j = 0; j < hidden_size && j < config->hidden_size; j++) {
+                    uint16_t w_bf16 = embed_bf16[106 * hidden_size + j];
+                    float w_f32 = LOCAL_BF16_TO_F32(w_bf16);
+                    manual_logit_106 += w_f32 * scratch_norm[j];
+                }
+            }
+            
+            // Token 818
+            if (818 < vocab_size) {
+                for (int j = 0; j < hidden_size && j < config->hidden_size; j++) {
+                    uint16_t w_bf16 = embed_bf16[818 * hidden_size + j];
+                    float w_f32 = LOCAL_BF16_TO_F32(w_bf16);
+                    manual_logit_818 += w_f32 * scratch_norm[j];
+                }
+            }
+            
+            fprintf(stderr, "[DEBUG_MANUAL_LOGITS] token_106=%.6f(computed) vs %.6f(actual), token_818=%.6f(computed) vs %.6f(actual)\n",
+                    manual_logit_106, logits[106], manual_logit_818, logits[818]);
+                    
+            // Also check embedding weight values for these tokens
+            if (106 < vocab_size && 818 < vocab_size) {
+                fprintf(stderr, "[DEBUG_EMBED_WEIGHTS] token_106[0:5]:");
+                for (int j = 0; j < 5 && j < hidden_size; j++) {
+                    fprintf(stderr, " %.6f", LOCAL_BF16_TO_F32(embed_bf16[106 * hidden_size + j]));
+                }
+                fprintf(stderr, "\n");
+                fprintf(stderr, "[DEBUG_EMBED_WEIGHTS] token_818[0:5]:");
+                for (int j = 0; j < 5 && j < hidden_size; j++) {
+                    fprintf(stderr, " %.6f", LOCAL_BF16_TO_F32(embed_bf16[818 * hidden_size + j]));
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+        
+        #undef LOCAL_BF16_TO_F32
+    }
 
     /* Optional BF16->F32 GEMV verification (set SAPPHIRE_BF16_VERIFY="N" where N=checks) */
     const char *bfenv = getenv("SAPPHIRE_BF16_VERIFY");

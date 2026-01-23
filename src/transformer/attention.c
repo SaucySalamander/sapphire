@@ -102,7 +102,8 @@ void attention_debug_dump(
     int kv_head_idx,
     int token_pos,
     int window_start,
-    bool is_global_layer) {
+    bool is_global_layer,
+    const char* caller) {
     if (!cfg || !cfg->enabled || !softmax_scores || attn_len <= 0) {
         return;
     }
@@ -125,26 +126,25 @@ void attention_debug_dump(
     float com_pos = (sum_w > 0.0) ? (float)(com / sum_w) : -1.0f;
 
     const float scale_factor = (1.0f / sqrtf((float)head_dim));
-    fprintf(stderr,
-            "ATTN DEBUG: token=%d layer=%d head=%d (kv=%d) len=%d window=[%d,%d) strategy=%s\n",
-            token_pos,
-            layer_idx,
-            head_idx,
-            kv_head_idx,
-            attn_len,
-            window_start,
-            window_start + attn_len,
-            is_global_layer ? "global" : "local");
-    fprintf(stderr,
-            "             weights: min=%.6f max=%.6f entropy=%.4f sum=%.6f COM=%.3f\n",
-            w_min,
-            w_max,
-            (float)entropy,
-            (float)sum_w,
-            com_pos);
+    LOG_DEBUG("ATTN DEBUG (%s): token=%d layer=%d head=%d (kv=%d) len=%d window=[%d,%d) strategy=%s",
+              caller ? caller : "unknown",
+              token_pos,
+              layer_idx,
+              head_idx,
+              kv_head_idx,
+              attn_len,
+              window_start,
+              window_start + attn_len,
+              is_global_layer ? "global" : "local");
+    LOG_DEBUG("             weights: min=%.6f max=%.6f entropy=%.4f sum=%.6f COM=%.3f",
+              w_min,
+              w_max,
+              (float)entropy,
+              (float)sum_w,
+              com_pos);
 
     if (fabs(sum_w - 1.0) > 1e-3) {
-        fprintf(stderr, "             WARNING: softmax sum deviates from 1.0 by %.6f\n", (float)(sum_w - 1.0));
+        LOG_DEBUG("             WARNING: softmax sum deviates from 1.0 by %.6f", (float)(sum_w - 1.0));
     }
 
     if (raw_scores_buf != NULL) {
@@ -158,21 +158,21 @@ void attention_debug_dump(
             sum_sq += (double)v * (double)v;
         }
         float raw_rms = sqrtf((float)(sum_sq / (double)attn_len));
-        fprintf(stderr,
-                "             raw QK: min=%.3f max=%.3f rms=%.3f scale=%.5f\n",
-                raw_min,
-                raw_max,
-                raw_rms,
-                scale_factor);
+        LOG_DEBUG("             raw QK: min=%.3f max=%.3f rms=%.3f scale=%.5f",
+                  raw_min,
+                  raw_max,
+                  raw_rms,
+                  scale_factor);
     }
 
     const int print_len = (attn_len < cfg->max_print) ? attn_len : cfg->max_print;
     if (print_len > 0) {
-        fprintf(stderr, "             first %d weights:", print_len);
-        for (int i = 0; i < print_len; i++) {
-            fprintf(stderr, " %.5f", softmax_scores[i]);
+        char buf[256];
+        int off = snprintf(buf, sizeof(buf), "             first %d weights:", print_len);
+        for (int i = 0; i < print_len && off < (int)sizeof(buf) - 16; i++) {
+            off += snprintf(buf + off, sizeof(buf) - off, " %.5f", softmax_scores[i]);
         }
-        fprintf(stderr, "\n");
+        LOG_DEBUG("%s", buf);
     }
 
     int top_k = cfg->top_k;
@@ -213,7 +213,7 @@ void attention_debug_dump(
                 }
             }
         }
-        fprintf(stderr, "             top-%d spans:\n", top_k);
+        LOG_DEBUG("             top-%d spans:", top_k);
         for (int i = 0; i < top_k; i++) {
             if (top_idx[i] < 0) {
                 continue;
@@ -221,14 +221,13 @@ void attention_debug_dump(
             const int rel = top_idx[i];
             const int abs_pos = window_start + rel;
             const float raw_val = (raw_scores_buf != NULL) ? raw_scores_buf[rel] : 0.0f;
-            fprintf(stderr,
-                    "               #%d rel=%4d abs=%4d weight=%.5f raw=%.3f scaled=%.3f\n",
-                    i + 1,
-                    rel,
-                    abs_pos,
-                    top_vals[i],
-                    raw_val,
-                    raw_val * scale_factor);
+            LOG_DEBUG("               #%d rel=%4d abs=%4d weight=%.5f raw=%.3f scaled=%.3f",
+                      i + 1,
+                      rel,
+                      abs_pos,
+                      top_vals[i],
+                      raw_val,
+                      raw_val * scale_factor);
         }
     }
 }
@@ -273,22 +272,19 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
     const attention_debug_config_t* debug_cfg = get_attention_debug_config();
 
     // Scaling: Gemma 3 uses query_pre_attn_scalar**-0.5 (HF: self.scaling = config.query_pre_attn_scalar**-0.5).
-    // If not present, preserve prior behavior: 1.0 when QK-norm present, otherwise 1/sqrt(d_k).
     bool has_qk_norm = (model->layers[layer_idx].q_norm_weight != NULL) &&
                        (model->layers[layer_idx].k_norm_weight != NULL);
+
+    /*
+     * Gemma 3 Attention Scaling: 
+     * Dot product is scaled by query_pre_attn_scalar ** -0.5.
+     * If not provided, fallback to 1/sqrt(head_dim).
+     */
     float head_scalar = 1.0f;
     if (config->query_pre_attn_scalar > 0.0f) {
-        /*
-         * HuggingFace Gemma3Attention uses:
-         *   self.scaling = config.query_pre_attn_scalar ** -0.5
-         * and applies it to the Q·K dot product.
-         */
         head_scalar = 1.0f / sqrtf(config->query_pre_attn_scalar);
-        if (getenv("SAPPHIRE_LOG_TENSORS") && layer_idx == 0 && token_pos == 0) {
-            fprintf(stderr, "DEBUG: Using query_pre_attn_scalar=%.6f -> head_scalar=%.6f\n", config->query_pre_attn_scalar, head_scalar);
-        }
     } else {
-        head_scalar = has_qk_norm ? 1.0f : (1.0f / sqrtf((float)head_dim));
+        head_scalar = 1.0f / sqrtf((float)head_dim);
     }
 
     int group_size = config->num_attention_heads / config->num_key_value_heads;
@@ -392,7 +388,7 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
         if (attention_debug_should_log(debug_cfg, layer_idx, h, token_pos)) {
             attention_debug_dump(debug_cfg, session->attn_scores_raw, head_q, k_base, scores,
                                  head_dim, attn_len, layer_idx, h, h_kv, token_pos,
-                                 window_start, is_global_layer);
+                                 window_start, is_global_layer, "sapphire_attention_forward");
         }
 
         // Step 4: Accumulate Attention Output
@@ -405,25 +401,34 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
             }
         }
         /* Targeted elementwise dumps for external comparison tools */
-        if (token_pos == 0) {
-            int dump_layers[] = {4, 13, 14, 15, 17};
+        const char* attn_vec_env = getenv("SAPPHIRE_DEBUG_ATTN_VEC");
+        int attn_vec_enabled = (attn_vec_env && attn_vec_env[0] != '\0' && strcmp(attn_vec_env, "0") != 0) ? 1 : 0;
+        if (attn_vec_enabled && token_pos == 0) {
+            /* Include Layer 0 in dumps so external comparators can see
+             * initial Q/K vectors. Keep the other preselected layers
+             * that were previously hardcoded. */
+            int dump_layers[] = {0, 4, 13, 14, 15, 17};
             const int dump_count = sizeof(dump_layers) / sizeof(dump_layers[0]);
             for (int di = 0; di < dump_count; ++di) {
                 if (layer_idx == dump_layers[di]) {
-                    fprintf(stderr, "ATTN_VEC: L%d H%d token=%d Q_vec:", layer_idx, h, token_pos);
-                    for (int d = 0; d < head_dim; ++d) {
-                        fprintf(stderr, " %.6f", head_q[d]);
+                    // Build Q vector output
+                    char q_buf[8192];
+                    int q_off = snprintf(q_buf, sizeof(q_buf), "ATTN_VEC: L%d H%d token=%d Q_vec:", layer_idx, h, token_pos);
+                    for (int d = 0; d < head_dim && q_off < (int)sizeof(q_buf) - 32; ++d) {
+                        q_off += snprintf(q_buf + q_off, sizeof(q_buf) - q_off, " %.6f", head_q[d]);
                     }
-                    fprintf(stderr, "\n");
+                    LOG_DEBUG("%s", q_buf);
 
                     int rel = token_pos - window_start;
                     if (rel >= 0 && rel < attn_len) {
                         const float* k_tok = k_base + rel * head_dim;
-                        fprintf(stderr, "ATTN_VEC: L%d H%d token=%d K_vec:", layer_idx, h, token_pos);
-                        for (int d = 0; d < head_dim; ++d) {
-                            fprintf(stderr, " %.6f", k_tok[d]);
+                        // Build K vector output
+                        char k_buf[8192];
+                        int k_off = snprintf(k_buf, sizeof(k_buf), "ATTN_VEC: L%d H%d token=%d K_vec:", layer_idx, h, token_pos);
+                        for (int d = 0; d < head_dim && k_off < (int)sizeof(k_buf) - 32; ++d) {
+                            k_off += snprintf(k_buf + k_off, sizeof(k_buf) - k_off, " %.6f", k_tok[d]);
                         }
-                        fprintf(stderr, "\n");
+                        LOG_DEBUG("%s", k_buf);
                     }
                     break;
                 }

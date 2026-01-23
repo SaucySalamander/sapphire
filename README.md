@@ -109,7 +109,3 @@ Interactive REPL commands:
 - `/help`            : Show command help
 
 If you want help for the runtime itself, run `./out/sapphire -h`.
-
-If you'd like, I can:
-- run the benchmark suite and report results
-- add a short quickstart that shows how to load the example model from `models/`
