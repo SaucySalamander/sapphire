@@ -11,6 +11,8 @@ ai_docs/
 /ai_docs/
 models/
 ./models/
+logs/
+./logs/
 
 # Object and library files
 *.o

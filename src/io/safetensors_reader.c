@@ -468,6 +468,7 @@ tensor_t* safetensors_create_tensor_ref(safetensors_file_t *st,
         
         // Use vectorized conversion assistant
         bf16_to_f32_vec(dst, src, (int)numel);
+        
         return t;
     }
 

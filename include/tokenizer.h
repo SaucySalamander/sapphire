@@ -133,6 +133,21 @@ int detokenize(sapphire_tokenizer_t *tok, const int *tokens,
  */
 int tokenizer_vocab_size(const sapphire_tokenizer_t *tok);
 
+/**
+ * @brief Build a Gemma3 instruction-tuned prompt using tokenizer utilities
+ *
+ * This helper constructs the token sequence for the Gemma3 instruction-tuned
+ * chat format (start/end turn markers, role tokens, etc.) and writes token IDs
+ * into the provided `tokens` buffer.
+ *
+ * @param tok Tokenizer to use for encoding
+ * @param user_prompt Raw user prompt string
+ * @param tokens Output buffer for token ids
+ * @param max_tokens Capacity of `tokens` buffer
+ * @return Number of tokens written, or -1 on error
+ */
+int build_gemma3_prompt(sapphire_tokenizer_t* tok, const char* user_prompt, int* tokens, int max_tokens);
+
 #ifdef __cplusplus
 }
 #endif

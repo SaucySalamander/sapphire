@@ -42,7 +42,8 @@ void attention_debug_dump(
     int kv_head_idx,
     int token_pos,
     int window_start,
-    bool is_global_layer);
+    bool is_global_layer,
+    const char* caller);
 
 struct inference_session_t;
 
