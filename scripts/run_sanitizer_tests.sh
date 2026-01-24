@@ -3,8 +3,12 @@
 
 set -e
 
-BINARY="${1:-./out/asan/sapphire}"
-REPORT_FILE="asan-report.txt"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BINARY="${1:-$REPO_ROOT/out/asan/sapphire}"
+REPORTS_DIR="$REPO_ROOT/reports"
+REPORT_FILE="$REPORTS_DIR/asan-report.txt"
+
+mkdir -p "$REPORTS_DIR"
 
 if [ ! -f "$BINARY" ]; then
   echo "Error: Binary not found at $BINARY"

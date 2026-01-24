@@ -13,7 +13,7 @@ models/
 ./models/
 logs/
 ./logs/
-cppcheck-report/
+reports/
 
 
 # Object and library files

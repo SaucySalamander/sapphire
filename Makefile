@@ -174,6 +174,19 @@ sanitize: bin-asan
 	@bash scripts/run_sanitizer_tests.sh $(ASAN_OUTDIR)/sapphire
 
 bin: $(OUTDIR)/sapphire
+
+# ============================================================================
+# Reports Directory
+# ============================================================================
+
+REPORTS_DIR = reports
+
+$(REPORTS_DIR):
+	mkdir -p $(REPORTS_DIR)
+
+# ============================================================================
+# Generate compile_commands.json for static analysis tools
+# ============================================================================
 # This allows tools like cppcheck and clang-tidy to use the exact compile commands.
 .PHONY: compile_commands.json compile_commands
 compile_commands.json:
@@ -188,23 +201,52 @@ CPPCHECK_FLAGS ?= --enable=all --inconclusive --std=c11 -I $(INCDIR) --xml-versi
 
 .PHONY: cppcheck cppcheck-report
 
-# Run cppcheck and write XML to cppcheck.xml. This target will first ensure
+# Run cppcheck and write XML to reports/. This target will first ensure
 # a compile_commands.json exists so cppcheck sees the real compile flags.
-cppcheck: compile_commands
+cppcheck: compile_commands $(REPORTS_DIR)
 	@echo "Running cppcheck (this may take a while)..."
 	@# Prefer using compile_commands.json for accurate flags; fall back to scanning src/
 	@if [ -f compile_commands.json ]; then \
-	  $(CPPCHECK) $(CPPCHECK_FLAGS) --project=compile_commands.json 2> cppcheck.xml || true; \
+	  $(CPPCHECK) $(CPPCHECK_FLAGS) --project=compile_commands.json 2> $(REPORTS_DIR)/cppcheck.xml || true; \
 	else \
-	  $(CPPCHECK) $(CPPCHECK_FLAGS) src 2> cppcheck.xml || true; \
+	  $(CPPCHECK) $(CPPCHECK_FLAGS) src 2> $(REPORTS_DIR)/cppcheck.xml || true; \
 	fi
-	@echo "cppcheck: xml written to cppcheck.xml"
+	@echo "cppcheck: xml written to $(REPORTS_DIR)/cppcheck.xml"
 
 # Generate an HTML report from the XML output; non-fatal if report script is absent.
 cppcheck-report: cppcheck
 	@echo "Generating HTML report..."
-	@{ $(CPPCHECK_HTMLREPORT) --file=cppcheck.xml --report-dir=cppcheck-report --source-dir=. || python3 /usr/share/cppcheck/cppcheck-htmlreport.py --file=cppcheck.xml --report-dir=cppcheck-report --source-dir=. ; } >/dev/null 2>&1 || true
-	@echo "HTML report available at cppcheck-report/index.html (if generated)"
+	@{ $(CPPCHECK_HTMLREPORT) --file=$(REPORTS_DIR)/cppcheck.xml --report-dir=$(REPORTS_DIR)/cppcheck-report --source-dir=. || python3 /usr/share/cppcheck/cppcheck-htmlreport.py --file=$(REPORTS_DIR)/cppcheck.xml --report-dir=$(REPORTS_DIR)/cppcheck-report --source-dir=. ; } >/dev/null 2>&1 || true
+	@echo "HTML report available at $(REPORTS_DIR)/cppcheck-report/index.html (if generated)"
 
 clean:
-	rm -rf $(OUTDIR) $(ASAN_OUTDIR) cppcheck.xml cppcheck-report compile_commands.json asan-report.txt
+	rm -rf $(OUTDIR) $(ASAN_OUTDIR) $(REPORTS_DIR) compile_commands.json
+
+# ============================================================================
+# Complexity Analysis with Lizard (Phase 2 Quality Metrics)
+# ============================================================================
+
+LIZARD ?= .venv/bin/lizard
+LIZARD_THRESHOLD_CC ?= 15
+LIZARD_THRESHOLD_LENGTH ?= 1000
+
+.PHONY: complexity lizard-report
+
+# Run lizard on src/ directory and generate CSV/HTML reports
+# -C: Cyclomatic Complexity threshold (default 15)
+# -L: Maximum function length threshold (default 1000)
+# -m: Modified CCN (switch/case counts as 1)
+complexity: $(REPORTS_DIR)
+	@echo "Running Lizard complexity analysis..."
+	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_LENGTH) --csv > $(REPORTS_DIR)/lizard-report.csv || true
+	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_LENGTH) -H > $(REPORTS_DIR)/lizard-report.html || true
+	@echo "Complexity report generated: $(REPORTS_DIR)/lizard-report.csv, $(REPORTS_DIR)/lizard-report.html"
+
+# Generate and open HTML report
+lizard-report: complexity
+	@echo "Opening Lizard HTML report..."
+	@if [ -f $(REPORTS_DIR)/lizard-report.html ]; then \
+	  xdg-open $(REPORTS_DIR)/lizard-report.html 2>/dev/null || open $(REPORTS_DIR)/lizard-report.html 2>/dev/null || firefox $(REPORTS_DIR)/lizard-report.html 2>/dev/null || echo "Open $(REPORTS_DIR)/lizard-report.html manually"; \
+	else \
+	  echo "Report not generated"; \
+	fi
