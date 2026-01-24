@@ -18,18 +18,21 @@
 #define TEMPERATURE 1.0f;
 
 /**
- * @brief Print help message
+ * @brief Print usage/help message to stdout.
+ *
+ * Prints a detailed usage string describing required and optional CLI
+ * arguments and example usage.
+ *
+ * @param program_name Typically argv[0]; may be NULL in some callers.
  */
 static void print_help(const char* program_name) {
     printf("\n");
     printf("================================================================================\n");
     printf("                        Sapphire Inference Engine\n");
-    printf("                   Hybrid Daemon LLM Architecture (Phase 7)\n");
-    printf("                    S-Tok: Sapphire Tokenizer Integration\n");
     printf("================================================================================\n");
     printf("Usage: %s [options]\n\n", program_name);
     printf("Required Arguments:\n");
-    printf("  -m, --model <name>        Model name (e.g., gemma-3-270m-it)\n\n");
+    printf("  -m, --model <name>        Model name (e.g., gemma3-270m-it)\n\n");
     printf("Optional Arguments:\n");
     printf("  -c, --context <length>    Context length (default: 2048)\n");
     printf("  -t, --temp <value>        Temperature for sampling (default: 1.0)\n");
@@ -47,12 +50,19 @@ static void print_help(const char* program_name) {
     printf("  /info                     Show model information\n");
     printf("  /help                     Show command help\n");
     printf("\nExample:\n");
-    printf("  %s -m gemma-3-270m-it -c 4096 -t 0.7 -n 200\n", program_name);
+    printf("  %s -m gemma3-270m-it -c 4096 -t 0.7 -n 200\n", program_name);
     printf("\n");
 }
 
 /**
- * @brief Interactive prompt loop
+ * @brief Run the interactive REPL loop for prompts and commands.
+ *
+ * Reads lines from stdin, handles slash-commands ("/exit", "/clear", "/info",
+ * and "/help"), calls `perform_inference()` for non-command prompts, and may
+ * recreate `ctx->session` on `/clear`.
+ *
+ * @param ctx Non-NULL inference context used for session state and inference.
+ * @return 0 on normal exit; -1 if `ctx` is NULL or an immediate error occurs.
  */
 static int interactive_loop(inference_context_t* ctx) {
     if (!ctx) return -1;
@@ -96,7 +106,7 @@ static int interactive_loop(inference_context_t* ctx) {
                 printf("Exiting Sapphire inference engine. Goodbye!\n");
                 break;
             } else if (strcmp(prompt, "/clear") == 0) {
-                LOG_INFO("Conversation history cleared");
+                printf("Conversation history cleared\n");
                 // Reset session
                 if (ctx->session) {
                     destroy_inference_session(ctx->session);
@@ -132,7 +142,7 @@ static int interactive_loop(inference_context_t* ctx) {
                 printf("\n[Response]\n%s\n", output);
                 printf("\n[Generation time: %.3f seconds]\n", elapsed);
             } else {
-                LOG_ERROR("Inference failed");
+                printf("Inference failed\n");
             }
         }
     }
@@ -141,39 +151,70 @@ static int interactive_loop(inference_context_t* ctx) {
 }
 
 /**
- * @brief Run a single non-interactive inference and return the result.
+ * @brief Run a single non-interactive inference and print the result.
  *
  * Convenience wrapper that runs `perform_inference()` for `prompt`, prints the
- * response to stdout, and returns the inference result code.
+ * response to the log (via `LOG_INFO`) and returns the inference result code.
  *
  * Ownership semantics: this function DOES NOT free or destroy `ctx`; the
  * caller retains ownership and is responsible for cleaning up the context
  * (e.g., by calling `destroy_inference_context(ctx)`).
  *
- * @param ctx         Inference context to use (must be non-NULL). Caller retains ownership.
+ * @param ctx         Non-NULL inference context to use. Caller retains ownership.
  * @param prompt      Null-terminated prompt string to generate from.
- * @param output_size Size of the output buffer passed to `perform_inference()`.
- * @return 0 on success, non-zero on failure.
+ * @param output_size Size in bytes of the output buffer to be used by
+ *                    `perform_inference()`; must be >= 1. If greater than
+ *                    `BUFFER_SIZE`, a heap buffer will be allocated.
+ * @return 0 on success, non-zero on failure (invalid args, allocation failure,
+ *         or inference error).
  */
 int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_size) {
-    if (!ctx || !prompt) return -1;
+    if (!ctx || !prompt || output_size <= 0) return -1;
 
-    printf("\nRunning prompt (non-interactive): '%s'\n", prompt);
-    char output[BUFFER_SIZE];
+    char stack_buf[BUFFER_SIZE];
+    char *heap_buf = NULL;
+    char *output = NULL;
+    int use_heap = 0;
 
-    printf("\n[Running one-shot inference for prompt: '%s']\n", prompt);
+    if (output_size <= BUFFER_SIZE) {
+        output = stack_buf;
+    } else {
+        heap_buf = (char *)malloc((size_t)output_size);
+        if (!heap_buf) {
+            LOG_ERROR("One-shot inference: failed to allocate output buffer of size %d", output_size);
+            return -1;
+        }
+        use_heap = 1;
+        output = heap_buf;
+    }
+
+    /* Defensive: ensure last byte is NUL so logging is safe even if
+     * perform_inference() does not NUL-terminate on errors. */
+    output[output_size - 1] = '\0';
+
+    LOG_INFO("\nRunning prompt (non-interactive): '%s'\n", prompt);
+    LOG_INFO("\n[Running one-shot inference for prompt: '%s']\n", prompt);
+
     int rc = perform_inference(ctx, prompt, output, output_size);
     if (rc == 0) {
-        printf("\n[Response]\n%s\n", output);
+        LOG_INFO("\n[Response]\n%s\n", output);
     } else {
         LOG_ERROR("One-shot inference failed");
     }
 
+    if (use_heap) free(heap_buf);
     return rc;
 }
 
 /**
- * @brief Main function - Interactive Sapphire Inference Engine
+ * @brief Entry point for the Sapphire inference engine.
+ *
+ * Parses command-line arguments, creates an inference context, then runs
+ * either a single non-interactive prompt (via -p) or the interactive REPL.
+ * Cleans up resources and returns an exit status.
+ *
+ * @return 0 on success; non-zero on failure (missing arguments, context creation
+ *         failure, or runtime errors).
  */
 int main(int argc, char* argv[]) {
     // Check for help first
@@ -207,7 +248,7 @@ int main(int argc, char* argv[]) {
 
     // Validate that model name was provided
     if (!model_name) {
-        fprintf(stderr, "ERROR: Model name required. Use -m or --model flag.\n");
+        LOG_ERROR("ERROR: Model name required. Use -m or --model flag.\n");
         print_help(argv[0]);
         return 1;
     }

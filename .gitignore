@@ -13,6 +13,8 @@ models/
 ./models/
 logs/
 ./logs/
+cppcheck-report/
+
 
 # Object and library files
 *.o
@@ -33,8 +35,9 @@ coverage/
 *.profraw
 *.profdata
 *.prof
-asan.*
+asan-report.txt.*
 *sanitizer*.log
+cppcheck.xml
 
 # Build system / generated files
 CMakeFiles/

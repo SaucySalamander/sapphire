@@ -2,10 +2,18 @@ CC = gcc
 SRCDIR = src
 INCDIR = include
 OUTDIR = out
+ASAN_OUTDIR = out/asan
 
 # Compilation flags
 CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma
 LDFLAGS = -lm -pthread
+
+# AddressSanitizer + UndefinedBehaviorSanitizer flags
+# Use -g for debug info (better error messages), -O1 for reasonable speed
+# Include paths (-I. -I$(INCDIR)) must be present for sanitizer builds
+# IMPORTANT: must include -mavx2 -mfma for AVX/FMA intrinsics in kernel code
+SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer
+SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined
 
 # HIP configuration (optional ROCm support)
 HIPCC = hipcc
@@ -101,5 +109,102 @@ check-hip-setup:
 
 bin: $(OUTDIR)/sapphire
 
+# ============================================================================
+# AddressSanitizer + UndefinedBehaviorSanitizer (Phase 1 Hardening)
+# ============================================================================
+
+# Build with sanitizer instrumentation (separate output directory)
+$(ASAN_OUTDIR):
+	mkdir -p $(ASAN_OUTDIR)
+
+# Generic rules for sanitizer builds (mirrors normal rules but uses SANITIZER_FLAGS)
+$(ASAN_OUTDIR)/%.o: $(SRCDIR)/%.c | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+
+$(ASAN_OUTDIR)/%.o: $(SRCDIR)/inference/%.c | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+
+$(ASAN_OUTDIR)/%.o: $(SRCDIR)/io/%.c | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+
+$(ASAN_OUTDIR)/%.o: $(SRCDIR)/kernels/%.c | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+
+$(ASAN_OUTDIR)/%.o: $(SRCDIR)/loader/%.c | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+
+$(ASAN_OUTDIR)/%.o: $(SRCDIR)/memory/%.c | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+
+$(ASAN_OUTDIR)/%.o: $(SRCDIR)/tensor/%.c | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+
+$(ASAN_OUTDIR)/%.o: $(SRCDIR)/tokenizer/%.c | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+
+$(ASAN_OUTDIR)/%.o: $(SRCDIR)/transformer/%.c | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+
+$(ASAN_OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+
+# Reuse NON_TEST_SRCS and NON_TEST_OBJS but map to asan directory
+ASAN_TEST_OBJS := $(patsubst $(SRCDIR)/%.c,$(ASAN_OUTDIR)/%.o,$(NON_TEST_SRCS))
+
+$(ASAN_OUTDIR)/sapphire: $(ASAN_TEST_OBJS)
+	$(CC) $(SANITIZER_FLAGS) $^ -o $@ $(SANITIZER_LDFLAGS)
+
+# Build and run sanitizer tests
+.PHONY: bin-asan sanitize
+bin-asan: $(ASAN_OUTDIR)/sapphire
+	@echo "Built ASan/UBSan binary at $(ASAN_OUTDIR)/sapphire"
+
+sanitize: bin-asan
+	@echo "Running sanitizer checks (ASan + UBSan)..."
+	@bash scripts/run_sanitizer_tests.sh $(ASAN_OUTDIR)/sapphire
+
+bin: $(OUTDIR)/sapphire
+# This allows tools like cppcheck and clang-tidy to use the exact compile commands.
+.PHONY: compile_commands.json compile_commands
+compile_commands.json:
+	@bash scripts/gen_compile_commands.sh
+
+compile_commands: compile_commands.json
+
+# Static analysis with cppcheck
+CPPCHECK ?= cppcheck
+CPPCHECK_HTMLREPORT ?= cppcheck-htmlreport
+CPPCHECK_FLAGS ?= --enable=all --inconclusive --std=c11 -I $(INCDIR) --xml-version=2 -j4 --suppressions-list=.cppcheck_suppressions --check-level=exhaustive
+
+.PHONY: cppcheck cppcheck-report
+
+# Run cppcheck and write XML to cppcheck.xml. This target will first ensure
+# a compile_commands.json exists so cppcheck sees the real compile flags.
+cppcheck: compile_commands
+	@echo "Running cppcheck (this may take a while)..."
+	@# Prefer using compile_commands.json for accurate flags; fall back to scanning src/
+	@if [ -f compile_commands.json ]; then \
+	  $(CPPCHECK) $(CPPCHECK_FLAGS) --project=compile_commands.json 2> cppcheck.xml || true; \
+	else \
+	  $(CPPCHECK) $(CPPCHECK_FLAGS) src 2> cppcheck.xml || true; \
+	fi
+	@echo "cppcheck: xml written to cppcheck.xml"
+
+# Generate an HTML report from the XML output; non-fatal if report script is absent.
+cppcheck-report: cppcheck
+	@echo "Generating HTML report..."
+	@{ $(CPPCHECK_HTMLREPORT) --file=cppcheck.xml --report-dir=cppcheck-report --source-dir=. || python3 /usr/share/cppcheck/cppcheck-htmlreport.py --file=cppcheck.xml --report-dir=cppcheck-report --source-dir=. ; } >/dev/null 2>&1 || true
+	@echo "HTML report available at cppcheck-report/index.html (if generated)"
+
 clean:
-	rm -rf $(OUTDIR)
+	rm -rf $(OUTDIR) $(ASAN_OUTDIR) cppcheck.xml cppcheck-report compile_commands.json asan-report.txt

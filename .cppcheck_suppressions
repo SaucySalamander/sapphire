@@ -1,0 +1,4 @@
+// .cppcheck_suppressions
+*:*/usr/include/*
+*:*/usr/lib/gcc/*
+*:*/3rdparty/*
