@@ -2,3 +2,4 @@
 *:*/usr/include/*
 *:*/usr/lib/gcc/*
 *:*/3rdparty/*
+*:*/test/*

@@ -23,9 +23,12 @@
 model_spec_t* get_model_spec(const char *model_name) {
     if (!model_name) return NULL;
     
-    if (strcmp(model_name, "gemma3-270m-it") == 0) {
+    if (strcmp(model_name, "gemma-3-270m-it") == 0) {
+        return &GEMMA3_270M_IT_SPEC;
+    } else if (strcmp(model_name, "gemma-3-270m") == 0) {
         return &GEMMA3_270M_SPEC;
     }
+    
     
     fprintf(stderr, "ERROR: Unknown model: %s\n", model_name);
     return NULL;

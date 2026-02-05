@@ -49,7 +49,7 @@ float quantized_gemv_q4_0_unaligned(const void *W_row, const float *x, int block
         __m256 offset_v0 = _mm256_set1_ps((float)offset);
         __m256 scale_v0 = _mm256_set1_ps(blk0->scale);
 
-        _mm_prefetch((const char*)(xptr0 + 16), _MM_HINT_T0);
+        _mm_prefetch((const char*)(const void*)(xptr0 + 16), _MM_HINT_T0);
         int aligned0 = (((uintptr_t)(const void*)xptr0) & 31) == 0;
         __m256 xv0 = aligned0 ? _mm256_load_ps(xptr0 + 0)  : _mm256_loadu_ps(xptr0 + 0);
         __m256 xv1 = aligned0 ? _mm256_load_ps(xptr0 + 8)  : _mm256_loadu_ps(xptr0 + 8);
@@ -90,7 +90,7 @@ float quantized_gemv_q4_0_unaligned(const void *W_row, const float *x, int block
         __m256 offset_v1 = _mm256_set1_ps((float)offset);
         __m256 scale_v1 = _mm256_set1_ps(blk1->scale);
 
-        _mm_prefetch((const char*)(xptr1 + 16), _MM_HINT_T0);
+        _mm_prefetch((const char*)(const void*)(xptr1 + 16), _MM_HINT_T0);
         int aligned1 = (((uintptr_t)(const void*)xptr1) & 31) == 0;
         __m256 xv4 = aligned1 ? _mm256_load_ps(xptr1 + 0)  : _mm256_loadu_ps(xptr1 + 0);
         __m256 xv5 = aligned1 ? _mm256_load_ps(xptr1 + 8)  : _mm256_loadu_ps(xptr1 + 8);
@@ -133,7 +133,7 @@ float quantized_gemv_q4_0_unaligned(const void *W_row, const float *x, int block
         __m256 offset_v = _mm256_set1_ps((float)offset);
         __m256 scale_v = _mm256_set1_ps(blk->scale);
 
-        _mm_prefetch((const char*)(xptr + 16), _MM_HINT_T0);
+        _mm_prefetch((const char*)(const void*)(xptr + 16), _MM_HINT_T0);
         int aligned = (((uintptr_t)(const void*)xptr) & 31) == 0;
         __m256 xv0 = aligned ? _mm256_load_ps(xptr + 0)  : _mm256_loadu_ps(xptr + 0);
         __m256 xv1 = aligned ? _mm256_load_ps(xptr + 8)  : _mm256_loadu_ps(xptr + 8);

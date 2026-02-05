@@ -54,6 +54,8 @@ cscope.*
 ctags
 
 # Editor & IDE
+feature_list.md
+COMPLEXITY_REDUCTION_PLAN.md
 .vscode/
 .idea/
 *.code-workspace

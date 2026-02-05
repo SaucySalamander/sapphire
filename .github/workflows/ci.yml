@@ -1,0 +1,96 @@
+name: Quality Checks (Cppcheck, Lizard, ASan/UBSan)
+
+on:
+  push:
+    branches: [ main, standard-transformer-layers ]
+  pull_request:
+    branches: [ main, standard-transformer-layers ]
+
+jobs:
+  quality-checks:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python (for Lizard)
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+
+      - name: Install Lizard
+        run: |
+          pip install lizard
+
+      - name: Verify tools
+        run: |
+          cppcheck --version
+          lizard --version
+          gcc --version
+
+      - name: Generate compile_commands.json
+        run: |
+          bash scripts/gen_compile_commands.sh
+          # Verify the file was created
+          ls -lh compile_commands.json
+
+      - name: Run Cppcheck (Strict Mode)
+        run: |
+          echo "Running cppcheck with strict error checking..."
+          make check-cppcheck
+        continue-on-error: false
+
+      - name: Run Lizard Complexity Check (Strict Mode)
+        run: |
+          echo "Running Lizard with strict complexity thresholds..."
+          make check-complexity
+        continue-on-error: false
+
+      - name: Build ASan/UBSan Binary
+        run: |
+          echo "Building with AddressSanitizer and UndefinedBehaviorSanitizer..."
+          make bin-asan
+        continue-on-error: false
+
+      - name: Run Sanitizer Tests
+        run: |
+          echo "Running sanitizer checks (ASan/UBSan)..."
+          make check-sanitize
+        continue-on-error: false
+
+      - name: Generate Reports (on failure)
+        if: failure()
+        run: |
+          # Generate HTML reports for debugging
+          make cppcheck-report 2>/dev/null || true
+          make lizard-report 2>/dev/null || true
+
+      - name: Upload Reports as Artifacts
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: quality-reports
+          path: reports/
+          retention-days: 30
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "✓ All quality checks passed!"
+          echo ""
+          echo "Summary:"
+          echo "  ✓ Cppcheck: No errors/warnings"
+          echo "  ✓ Lizard: No high-complexity functions"
+          echo "  ✓ ASan/UBSan: No memory errors"
+
+      - name: Failure Summary
+        if: failure()
+        run: |
+          echo "❌ Quality check failed. See logs above for details."
+          exit 1

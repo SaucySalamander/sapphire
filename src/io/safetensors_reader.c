@@ -166,7 +166,7 @@ static int parse_safetensors_json(const char *json, size_t json_len,
         p++; // skip '{'
         
         // Parse shape, dtype, offset, size (or data_offsets)
-        int shape_idx = 0;
+        int shape_idx;
         current->ndim = 0;
         current->offset = 0;
         current->size_bytes = 0;

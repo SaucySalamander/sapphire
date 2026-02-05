@@ -75,7 +75,7 @@ parser.add_argument('--two-runs', action='store_true', help='Run second generati
 parser.add_argument('--max-new-tokens', type=int, default=359, help='Maximum new tokens to generate (default: 359)')
 args = parser.parse_args()
 
-model_id = "google/gemma-3-270m-it"
+model_id = "google/gemma-3-270m"
 print(f"Loading model {model_id}...")
 model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map="cpu")
 tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -92,10 +92,10 @@ head_scalar = 1.0 / math.sqrt(q_pre)
 print(model)
 print(f"CONFIG: heads={num_heads} kv_heads={num_kv_heads} head_dim={head_dim} query_pre_attn_scalar={q_pre} head_scalar={head_scalar}")
 
-# Build input ids via the tokenizer instead of hard-coded token ids.
-messages = [{"role": "user", "content": "Write a short poem about the sea."}]
-prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-inputs = tokenizer(prompt, return_tensors="pt")
+# Build input ids via simple BOS + text + EOS format (base model, no chat template)
+# This matches what Sapphire's build_gemma3_prompt_base() produces
+text = "Write a poem about the moon."
+inputs = tokenizer(text, return_tensors="pt")
 
 with torch.no_grad():
     outputs = model(**inputs, output_hidden_states=True, use_cache=False)
@@ -245,7 +245,7 @@ attention_mask = attention_mask.to(input_ids.device)
 pad_token = getattr(tokenizer, "eos_token_id", None)
 
 
-def run_autoregressive(input_ids, attention_mask, max_new_tokens=80, do_sample=False, temperature=1.0, tag="greedy"):
+def run_autoregressive(input_ids, attention_mask, max_new_tokens=20, do_sample=False, temperature=1.0, tag="greedy"):
     device = input_ids.device
     cur_ids = input_ids.clone()
     cur_attn = attention_mask.clone()
@@ -311,13 +311,16 @@ def run_autoregressive(input_ids, attention_mask, max_new_tokens=80, do_sample=F
 
 
 # Run greedy (deterministic) autoregressive generation with per-token per-layer RMS
-# Use the same (larger) token budget as Sapphire and keep generation deterministic (non-creative)
-greedy_ids, greedy_text = run_autoregressive(input_ids, attention_mask, max_new_tokens=args.max_new_tokens, do_sample=False, temperature=0.0, tag="greedy")
+# Use SMALLER token budget for base model (only ~50 tokens) to prevent runaway loops
+# Keep generation deterministic (non-creative)
+max_tokens_base = min(args.max_new_tokens, 50)  # Cap at 50 for base model to be safe
+greedy_ids, greedy_text = run_autoregressive(input_ids, attention_mask, max_new_tokens=max_tokens_base, do_sample=False, temperature=0.0, tag="greedy")
 print("\n--- Generated response (greedy) ---")
 print(greedy_text)
 
 # Optionally run a second pass; disabled by default to avoid duplicate logs
 if args.two_runs:
-    sample_ids, sample_text = run_autoregressive(input_ids, attention_mask, max_new_tokens=args.max_new_tokens, do_sample=False, temperature=0.0, tag="sample")
+    max_tokens_base = min(args.max_new_tokens, 50)
+    sample_ids, sample_text = run_autoregressive(input_ids, attention_mask, max_new_tokens=max_tokens_base, do_sample=False, temperature=0.0, tag="sample")
     print("\n--- Generated response (sampled-as-deterministic, temp=0.0) ---")
     print(sample_text)

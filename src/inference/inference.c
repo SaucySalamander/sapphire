@@ -30,7 +30,8 @@
 static int g_attn_debug_raw_warned = 0;
 
 /* Note: build_gemma3_prompt moved to tokenizer module (see include/tokenizer.h)
-    to centralize tokenization / prompt construction logic. */
+    to centralize tokenization / prompt construction logic. The function intelligently
+    detects whether the model is IT or base and calls the appropriate builder. */
 
 /**
  * @brief Initialize inference context
@@ -194,12 +195,12 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
 
     LOG_DEBUG("User prompt: '%s'", prompt);
 
-    // 1. Build Gemma 3 IT instruction-tuned prompt with hardcoded turn markers
+    // 1. Build prompt (intelligently selects IT or base format based on model)
     int* tokens = malloc((ctx->context_len) * sizeof(int));
-    int prompt_len = build_gemma3_prompt(ctx->tokenizer, prompt, tokens, ctx->context_len);
+    int prompt_len = build_gemma3_prompt(ctx->spec, prompt, tokens, ctx->context_len);
 
     if (prompt_len <= 0) {
-        LOG_ERROR("Failed to build instruction-tuned prompt");
+        LOG_ERROR("Failed to build prompt");
         free(tokens);
         return -1;
     }
@@ -342,7 +343,8 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
             }
         }
 
-        // Use T=1.0 for sample_temperature because we already scaled the logits
+        // Use actual temperature for sample_temperature (already scaled logits by 1/T above)
+        // When temperature <= 0, sample_temperature will use greedy selection
         int debug_logits_pre_select = getenv("SAPPHIRE_DEBUG_LOGITS") != NULL;
         if (debug_logits_pre_select && generated_count == 0) {
             // Print actual logits for key tokens BEFORE sampling
@@ -360,7 +362,7 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
             fprintf(stderr, "[DEBUG_LOGITS_PRE_SELECT] argmax=token_%d with logit=%.6f\n", max_idx, max_logit);
         }
         
-        int next_token = sample_temperature(ctx->logits, config->vocab_size, 1.0f);
+        int next_token = sample_temperature(ctx->logits, config->vocab_size, ctx->temperature);
 
         // After temperature sampling (when temperature>0) the `ctx->logits` buffer
         // contains unnormalized exp(logit) values. If debugging is enabled, compute
@@ -834,4 +836,5 @@ void destroy_inference_session(inference_session_t* session) {
 }
 
 /* build_gemma3_prompt moved to tokenizer module (include/tokenizer.h).
-   The tokenizer now owns prompt construction and tokenization helpers. */
+   The tokenizer now owns prompt construction and tokenization helpers.
+   The smart selector function detects IT vs base model and calls the right builder. */

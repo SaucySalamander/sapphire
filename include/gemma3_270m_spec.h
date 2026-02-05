@@ -48,8 +48,19 @@ static gemma3_270m_config_t GEMMA3_270M_RUNTIME_CONFIG = {0};
 #define GEMMA3_SPEC_RUNTIME_CONFIG(spec) ((gemma3_270m_config_t *)((spec)->variant_config))
 
 /* The public model specification object */
+static model_spec_t GEMMA3_270M_IT_SPEC = {
+    .model_id = "gemma-3-270m-it",
+    .tensor_map = GEMMA3_270M_TENSOR_MAP,
+    .tensor_map_size = GEMMA3_270M_TENSOR_MAP_SIZE,
+    .tokenizer_spec = &GEMMA3_270M_TOKENIZER_SPEC,
+    .files = &GEMMA3_270M_FILES,
+    .variant_config = &GEMMA3_270M_RUNTIME_CONFIG,
+    .loader_hooks = &GEMMA3_LOADER_HOOKS
+};
+
+/* The public model specification object */
 static model_spec_t GEMMA3_270M_SPEC = {
-    .model_id = "gemma3-270m-it",
+    .model_id = "gemma-3-270m",
     .tensor_map = GEMMA3_270M_TENSOR_MAP,
     .tensor_map_size = GEMMA3_270M_TENSOR_MAP_SIZE,
     .tokenizer_spec = &GEMMA3_270M_TOKENIZER_SPEC,

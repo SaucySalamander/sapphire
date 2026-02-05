@@ -8,6 +8,9 @@
 extern "C" {
 #endif
 
+/* Forward declaration to avoid circular include */
+typedef struct model_spec model_spec_t;
+
 /**
  * @brief Token-to-string mapping
  */
@@ -134,7 +137,7 @@ int detokenize(sapphire_tokenizer_t *tok, const int *tokens,
 int tokenizer_vocab_size(const sapphire_tokenizer_t *tok);
 
 /**
- * @brief Build a Gemma3 instruction-tuned prompt using tokenizer utilities
+ * @brief Build a Gemma3 instruction-tuned (IT) prompt using tokenizer utilities
  *
  * This helper constructs the token sequence for the Gemma3 instruction-tuned
  * chat format (start/end turn markers, role tokens, etc.) and writes token IDs
@@ -146,7 +149,35 @@ int tokenizer_vocab_size(const sapphire_tokenizer_t *tok);
  * @param max_tokens Capacity of `tokens` buffer
  * @return Number of tokens written, or -1 on error
  */
-int build_gemma3_prompt(sapphire_tokenizer_t* tok, const char* user_prompt, int* tokens, int max_tokens);
+int build_gemma3_prompt_it(sapphire_tokenizer_t* tok, const char* user_prompt, int* tokens, int max_tokens);
+
+/**
+ * @brief Build a Gemma3 base (non-IT) prompt using tokenizer utilities
+ *
+ * This helper constructs a simple token sequence for base Gemma3 models
+ * (no chat-specific markers). Just: BOS + tokenized_prompt + EOS
+ *
+ * @param tok Tokenizer to use for encoding
+ * @param user_prompt Raw user prompt string
+ * @param tokens Output buffer for token ids
+ * @param max_tokens Capacity of `tokens` buffer
+ * @return Number of tokens written, or -1 on error
+ */
+int build_gemma3_prompt_base(sapphire_tokenizer_t* tok, const char* user_prompt, int* tokens, int max_tokens);
+
+/**
+ * @brief Intelligently select and build a prompt based on model variant
+ *
+ * Detects whether the model is IT (instruction-tuned) or base by checking
+ * the model_id field in the spec, then calls the appropriate builder.
+ *
+ * @param spec Pointer to model_spec_t with model_id set
+ * @param user_prompt Raw user prompt string
+ * @param tokens Output buffer for token ids
+ * @param max_tokens Capacity of `tokens` buffer
+ * @return Number of tokens written, or -1 on error
+ */
+int build_gemma3_prompt(const model_spec_t* spec, const char* user_prompt, int* tokens, int max_tokens);
 
 #ifdef __cplusplus
 }

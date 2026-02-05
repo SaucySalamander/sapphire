@@ -4,6 +4,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "../include/simple_json.h"
+#include "../include/model_spec.h"
 #include "log.h"
 
 /* Simple DJB2 hash for strings */
@@ -179,7 +180,7 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
     for (int i = 0; i < child_count && scan_idx + 1 < ntokens; i++) {
         /* scan only the value token here to compute max id */
         scan_idx++; // skip key
-        sjson_token_t *v = &tokens[scan_idx++];
+        const sjson_token_t *v = &tokens[scan_idx++];
         if (v->type != SJSON_PRIM) continue;
         int vlen = v->end - v->start;
         if (vlen <= 0 || vlen >= 64) continue;
@@ -216,8 +217,8 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
     int skipped_malformed = 0;
     printf("DEBUG: Parsing vocabulary entries from nested model.vocab...\n");
     for (int i = 0; i < child_count && idx + 1 < ntokens; i++) {
-        sjson_token_t *k = &tokens[idx++];
-        sjson_token_t *v = &tokens[idx++];
+        const sjson_token_t *k = &tokens[idx++];
+        const sjson_token_t *v = &tokens[idx++];
 
         if (k->type != SJSON_STR) continue;
 
@@ -398,7 +399,7 @@ int tokenize(sapphire_tokenizer_t *tok, const char *text,
     int token_count = 0;
     
     // Add BOS if configured
-    if (tok->add_bos_token && token_count < max_tokens) {
+    if (tok->add_bos_token) {
         tokens[token_count++] = tok->bos_token_id;
     }
     
@@ -472,7 +473,7 @@ int tokenize(sapphire_tokenizer_t *tok, const char *text,
                 continue;
             }
             // Try single char match via hash
-            char single[2] = {text[i], '\0'};
+            const char single[2] = {text[i], '\0'};
             int sid = tok_hash_lookup(tok, single);
             if (sid >= 0) tokens[token_count++] = sid;
             else tokens[token_count++] = tok->unk_token_id;
@@ -544,9 +545,7 @@ int detokenize(sapphire_tokenizer_t *tok, const int *tokens,
         int src_idx = 0;
         if ((unsigned char)token_str[0] == 0xE2 && (unsigned char)token_str[1] == 0x96 && (unsigned char)token_str[2] == 0x81) {
             // Add space for SPIECE prefix
-            if (out_pos < output_size - 1) {
-                output[out_pos++] = ' ';
-            }
+            output[out_pos++] = ' ';
             src_idx = 3;  // Skip the 3-byte SPIECE prefix
         }
         
@@ -575,9 +574,9 @@ int tokenizer_vocab_size(const sapphire_tokenizer_t *tok) {
  * module because it uses tokenizer primitives (tokenize, tokenize_fallback,
  * decode) and the tokenizer's special-token configuration.
  */
-int build_gemma3_prompt(sapphire_tokenizer_t* tokenizer, const char* user_prompt,
-                        int* tokens, int max_tokens) {
-    if (!tokenizer || !user_prompt || !tokens || max_tokens < 20) {
+int build_gemma3_prompt_it(sapphire_tokenizer_t* tok, const char* user_prompt,
+                           int* tokens, int max_tokens) {
+    if (!tok || !user_prompt || !tokens || max_tokens < 20) {
         return -1;
     }
 
@@ -592,7 +591,7 @@ int build_gemma3_prompt(sapphire_tokenizer_t* tokenizer, const char* user_prompt
 
     /* Tokenize user's actual prompt message */
     int prompt_tokens[512];
-    int prompt_len = tokenize(tokenizer, user_prompt, prompt_tokens, 512);
+    int prompt_len = tokenize(tok, user_prompt, prompt_tokens, 512);
 
     if (prompt_len <= 0) {
         fprintf(stderr, "WARN: Failed to tokenize user prompt, using fallback\n");
@@ -616,3 +615,86 @@ int build_gemma3_prompt(sapphire_tokenizer_t* tokenizer, const char* user_prompt
 
     return idx;  /* Return actual prompt length */
 }
+
+/**
+ * @brief Construct Gemma 3 base (non-IT) prompt
+ *
+ * For base Gemma 3 models (non-instruction-tuned), we use a minimal format:
+ * BOS + tokenized_prompt + EOS
+ *
+ * This does NOT include chat-specific markers like <start_of_turn>, <end_of_turn>,
+ * or role tokens ("user", "model").
+ */
+int build_gemma3_prompt_base(sapphire_tokenizer_t* tok, const char* user_prompt,
+                             int* tokens, int max_tokens) {
+    if (!tok || !user_prompt || !tokens || max_tokens < 5) {
+        return -1;
+    }
+
+    int idx = 0;
+
+    /* Add BOS token */
+    tokens[idx++] = 2;  // <bos>
+
+    /* Tokenize user's prompt message */
+    int prompt_tokens[512];
+    int prompt_len = tokenize(tok, user_prompt, prompt_tokens, 512);
+
+    if (prompt_len <= 0) {
+        fprintf(stderr, "WARN: Failed to tokenize user prompt, using fallback\n");
+        prompt_len = tokenize_fallback(user_prompt, prompt_tokens, 512);
+    }
+
+    /* Append user prompt tokens (skip BOS added by tokenizer if present) */
+    int skip_bos = (prompt_len > 0 && prompt_tokens[0] == 2) ? 1 : 0;
+    for (int i = skip_bos; i < prompt_len && idx < max_tokens - 2; i++) {
+        if (prompt_tokens[i] != 0) {  /* Skip pad tokens (token ID 0) */
+            tokens[idx++] = prompt_tokens[i];
+        }
+    }
+
+    /* Add EOS token */
+    if (idx < max_tokens) {
+        tokens[idx++] = 1;  // <eos>
+    }
+
+    return idx;  /* Return actual prompt length */
+}
+
+/**
+ * @brief Smart prompt builder: detects model variant and calls appropriate builder
+ *
+ * Examines the model_spec_t's model_id field to determine if the model is IT
+ * (instruction-tuned) or base, then calls the appropriate builder function.
+ *
+ * @param spec Pointer to model_spec_t (must have model_id and tokenizer_handle set)
+ * @param user_prompt Raw user prompt string
+ * @param tokens Output buffer for token ids
+ * @param max_tokens Capacity of `tokens` buffer
+ * @return Number of tokens written, or -1 on error
+ */
+int build_gemma3_prompt(const model_spec_t* spec, const char* user_prompt,
+                        int* tokens, int max_tokens) {
+    if (!spec || !spec->model_id || !user_prompt || !tokens) {
+        fprintf(stderr, "ERROR: build_gemma3_prompt() received NULL arguments\n");
+        return -1;
+    }
+
+    sapphire_tokenizer_t* tok = (sapphire_tokenizer_t*)spec->tokenizer_handle;
+    if (!tok) {
+        fprintf(stderr, "ERROR: model_spec has no tokenizer loaded\n");
+        return -1;
+    }
+
+    /* Detect IT variant by checking model_id */
+    int is_it = (strstr(spec->model_id, "-it") != NULL);
+
+    LOG_DEBUG("build_gemma3_prompt: model_id='%s' is_it=%d", spec->model_id, is_it);
+
+    if (is_it) {
+        return build_gemma3_prompt_it(tok, user_prompt, tokens, max_tokens);
+    } else {
+        return build_gemma3_prompt_base(tok, user_prompt, tokens, max_tokens);
+    }
+}
+

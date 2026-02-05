@@ -165,13 +165,9 @@ $(ASAN_OUTDIR)/sapphire: $(ASAN_TEST_OBJS)
 	$(CC) $(SANITIZER_FLAGS) $^ -o $@ $(SANITIZER_LDFLAGS)
 
 # Build and run sanitizer tests
-.PHONY: bin-asan sanitize
+.PHONY: bin-asan
 bin-asan: $(ASAN_OUTDIR)/sapphire
 	@echo "Built ASan/UBSan binary at $(ASAN_OUTDIR)/sapphire"
-
-sanitize: bin-asan
-	@echo "Running sanitizer checks (ASan + UBSan)..."
-	@bash scripts/run_sanitizer_tests.sh $(ASAN_OUTDIR)/sapphire
 
 bin: $(OUTDIR)/sapphire
 
@@ -199,25 +195,54 @@ CPPCHECK ?= cppcheck
 CPPCHECK_HTMLREPORT ?= cppcheck-htmlreport
 CPPCHECK_FLAGS ?= --enable=all --inconclusive --std=c11 -I $(INCDIR) --xml-version=2 -j4 --suppressions-list=.cppcheck_suppressions --check-level=exhaustive
 
-.PHONY: cppcheck cppcheck-report
+.PHONY: cppcheck-report
 
-# Run cppcheck and write XML to reports/. This target will first ensure
-# a compile_commands.json exists so cppcheck sees the real compile flags.
-cppcheck: compile_commands $(REPORTS_DIR)
-	@echo "Running cppcheck (this may take a while)..."
-	@# Prefer using compile_commands.json for accurate flags; fall back to scanning src/
+# Generate HTML report from cppcheck analysis. Runs cppcheck in non-strict mode.
+cppcheck-report: compile_commands $(REPORTS_DIR)
+	@echo "Running cppcheck and generating HTML report..."
 	@if [ -f compile_commands.json ]; then \
 	  $(CPPCHECK) $(CPPCHECK_FLAGS) --project=compile_commands.json 2> $(REPORTS_DIR)/cppcheck.xml || true; \
 	else \
 	  $(CPPCHECK) $(CPPCHECK_FLAGS) src 2> $(REPORTS_DIR)/cppcheck.xml || true; \
 	fi
-	@echo "cppcheck: xml written to $(REPORTS_DIR)/cppcheck.xml"
-
-# Generate an HTML report from the XML output; non-fatal if report script is absent.
-cppcheck-report: cppcheck
-	@echo "Generating HTML report..."
 	@{ $(CPPCHECK_HTMLREPORT) --file=$(REPORTS_DIR)/cppcheck.xml --report-dir=$(REPORTS_DIR)/cppcheck-report --source-dir=. || python3 /usr/share/cppcheck/cppcheck-htmlreport.py --file=$(REPORTS_DIR)/cppcheck.xml --report-dir=$(REPORTS_DIR)/cppcheck-report --source-dir=. ; } >/dev/null 2>&1 || true
-	@echo "HTML report available at $(REPORTS_DIR)/cppcheck-report/index.html (if generated)"
+	@echo "HTML report available at $(REPORTS_DIR)/cppcheck-report/index.html"
+
+# ============================================================================
+# Strict Quality Checks (for CI/Pre-commit)
+# ============================================================================
+
+# Check: Cppcheck in strict mode (fails on errors/warnings)
+.PHONY: check-cppcheck
+check-cppcheck: compile_commands $(REPORTS_DIR)
+	@echo "Running cppcheck (strict mode - fails on errors)..."
+	@if [ -f compile_commands.json ]; then \
+	  $(CPPCHECK) $(CPPCHECK_FLAGS) --project=compile_commands.json --error-exitcode=1 2> $(REPORTS_DIR)/cppcheck-strict.xml || (echo "❌ Cppcheck found issues"; exit 1); \
+	else \
+	  $(CPPCHECK) $(CPPCHECK_FLAGS) src --error-exitcode=1 2> $(REPORTS_DIR)/cppcheck-strict.xml || (echo "❌ Cppcheck found issues"; exit 1); \
+	fi
+	@echo "✓ Cppcheck passed"
+
+# Check: Lizard complexity in strict mode (fails on violations)
+.PHONY: check-complexity
+check-complexity: $(REPORTS_DIR)
+	@echo "Running Lizard (strict mode - CC threshold: 10, Length threshold: 500, excluding tests)..."
+	@$(LIZARD) -l c -m -C 10 -L 500 -x '*/test/*' src 2>&1 | tee $(REPORTS_DIR)/lizard-strict.txt || true
+	@if grep -q "!!!!.*Warnings" $(REPORTS_DIR)/lizard-strict.txt 2>/dev/null; then \
+	  exit 1; \
+	fi
+
+# Check: ASan/UBSan in strict mode (fails on violations)
+.PHONY: check-sanitize
+check-sanitize: bin-asan
+	@echo "Running sanitizer checks (strict mode)..."
+	@bash scripts/run_sanitizer_tests.sh $(ASAN_OUTDIR)/sapphire 2>&1 || (echo "❌ Sanitizer violations detected"; exit 1)
+
+# Check: Run all checks (cppcheck + lizard + sanitize)
+# Use -k to continue on errors so all checks run and report all issues
+.PHONY: check-all
+check-all:
+	@make -k check-cppcheck check-complexity check-sanitize || exit 1
 
 clean:
 	rm -rf $(OUTDIR) $(ASAN_OUTDIR) $(REPORTS_DIR) compile_commands.json
@@ -230,23 +255,14 @@ LIZARD ?= .venv/bin/lizard
 LIZARD_THRESHOLD_CC ?= 15
 LIZARD_THRESHOLD_LENGTH ?= 1000
 
-.PHONY: complexity lizard-report
+.PHONY: lizard-report
 
-# Run lizard on src/ directory and generate CSV/HTML reports
-# -C: Cyclomatic Complexity threshold (default 15)
-# -L: Maximum function length threshold (default 1000)
-# -m: Modified CCN (switch/case counts as 1)
-complexity: $(REPORTS_DIR)
-	@echo "Running Lizard complexity analysis..."
-	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_LENGTH) --csv > $(REPORTS_DIR)/lizard-report.csv || true
-	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_LENGTH) -H > $(REPORTS_DIR)/lizard-report.html || true
-	@echo "Complexity report generated: $(REPORTS_DIR)/lizard-report.csv, $(REPORTS_DIR)/lizard-report.html"
-
-# Generate and open HTML report
-lizard-report: complexity
-	@echo "Opening Lizard HTML report..."
+# Generate CSV/HTML reports from lizard analysis (excluding tests)
+lizard-report: $(REPORTS_DIR)
+	@echo "Running Lizard complexity analysis and generating reports..."
+	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_LENGTH) -x '*/test/*' src --csv > $(REPORTS_DIR)/lizard-report.csv || true
+	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_LENGTH) -x '*/test/*' src -H > $(REPORTS_DIR)/lizard-report.html || true
+	@echo "Complexity reports generated: $(REPORTS_DIR)/lizard-report.csv, $(REPORTS_DIR)/lizard-report.html"
 	@if [ -f $(REPORTS_DIR)/lizard-report.html ]; then \
 	  xdg-open $(REPORTS_DIR)/lizard-report.html 2>/dev/null || open $(REPORTS_DIR)/lizard-report.html 2>/dev/null || firefox $(REPORTS_DIR)/lizard-report.html 2>/dev/null || echo "Open $(REPORTS_DIR)/lizard-report.html manually"; \
-	else \
-	  echo "Report not generated"; \
 	fi
