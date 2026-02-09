@@ -38,8 +38,6 @@ static llm_model_t* load_model_safetensors(const model_spec_t *model_spec,
         return NULL;
     }
     
-    char error_msg[512] = {0};
-    
     // Open the safetensors file
     safetensors_file_t *st = safetensors_open(safetensors_path);
     if (!st) {
@@ -73,12 +71,10 @@ static llm_model_t* load_model_safetensors(const model_spec_t *model_spec,
                                                      model_spec->tensor_map,
                                                      model_spec->tensor_map_size,
                                                      NULL,  // No dynamic handler
-                                                     model,
-                                                     error_msg, 
-                                                     sizeof(error_msg));
+                                                     model);
     
     if (rc != 0) {
-        LOG_ERROR("Failed to map tensors: %s", error_msg);
+        LOG_ERROR("Failed to map tensors");
         free(model->layers);
         free(model);
         safetensors_close(st);

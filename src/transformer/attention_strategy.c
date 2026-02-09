@@ -176,14 +176,14 @@ void alibi_attention_strategy(
 void compute_attention_scores_with_strategy(
     const float* q,
     const float* kv_cache_k,
-    int context_length,
-    int d_k,
-    AttentionScalingStrategy strategy,
-    void* user_data,
-    float* output_scores) {
-    if (q == NULL || kv_cache_k == NULL || output_scores == NULL || strategy == NULL) {
+    float* output_scores,
+    const attention_scoring_config_t* config) {
+    if (q == NULL || kv_cache_k == NULL || output_scores == NULL || config == NULL || config->strategy == NULL) {
         return;
     }
+
+    int context_length = config->context_length;
+    int d_k = config->d_k;
 
     if (context_length <= 0 || d_k <= 0) {
         return;
@@ -204,5 +204,5 @@ void compute_attention_scores_with_strategy(
 
     // Step 2: Apply the scaling/normalization strategy.
     // This handles all strategy-specific logic: scaling, bias application, softmax, etc.
-    strategy(output_scores, context_length, d_k, user_data);
+    config->strategy(output_scores, context_length, d_k, config->user_data);
 }

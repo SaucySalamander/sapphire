@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "tensor.h"
 #include <math.h>
 #include <stddef.h>
 #include <string.h>
@@ -194,4 +195,14 @@ float sampling_topk_mass_from_unnormalized(const float *exp_logits, int n, int k
     double mass = 0.0;
     for (int i = 0; i < k; i++) mass += top_vals[i];
     return (float)(mass / (double)sum);
+}
+
+// Helper to handle BF16 norm weights on the fly
+const float* get_norm_weights(const tensor_t* weight, float* scratch, int n) {
+    if (!weight) return NULL;
+    if (tensor_dtype(weight) == DTYPE_BF16) {
+        bf16_to_f32_vec(scratch, (const uint16_t*)tensor_data(weight), n);
+        return scratch;
+    }
+    return (const float*)tensor_data(weight);
 }

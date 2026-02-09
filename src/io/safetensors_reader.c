@@ -17,12 +17,14 @@
 #include <unistd.h>
 #include <errno.h>
 #include <ctype.h>
+#include <stddef.h>
 #include "../include/log.h"
 #include "../include/safetensors_reader.h"
 #include "../include/tensor.h"
 #include "../include/utils.h"
 #include "../include/model_spec.h"
 #include "../include/tensor_mapper.h"
+#include "../include/simple_json.h"
 
 /**
  * @brief Opaque structure managing an open Safetensors file.
@@ -72,16 +74,97 @@ static safetensors_dtype_t safetensors_dtype_from_string(const char *s) {
 // }
 
 /**
- * @brief Simple JSON parser for Safetensors header.
+ * @brief Parse the shape array [d1, d2, ...] for a tensor.
+ */
+static int parse_tensor_shape(sjson_cursor_t *c, safetensors_tensor_meta_t *meta) {
+    if (!sjson_cursor_consume(c, '[')) return -1;
+    
+    int shape_idx = 0;
+    while (shape_idx < 8) {
+        char ch = sjson_cursor_peek(c);
+        
+        if (ch == ']') {
+            sjson_cursor_consume(c, ']');
+            break;
+        }
+        
+        if (ch == ',') {
+            sjson_cursor_consume(c, ',');
+            continue;
+        }
+        
+        uint64_t dim = 0;
+        if (sjson_cursor_parse_u64(c, &dim) != 0) return -1;
+        meta->shape[shape_idx++] = (uint32_t)dim;
+    }
+    
+    meta->ndim = shape_idx;
+    return 0;
+}
+
+/**
+ * @brief Parse the metadata object fields for a single tensor.
+ */
+static int parse_tensor_fields(sjson_cursor_t *c, safetensors_tensor_meta_t *meta) {
+    if (!sjson_cursor_consume(c, '{')) return -1;
+    
+    // Initialize tensor metadata defaults
+    meta->ndim = 0;
+    meta->offset = 0;
+    meta->size_bytes = 0;
+    meta->dtype = SAFETENSORS_UNKNOWN;
+    
+    while (1) {
+        char ch = sjson_cursor_peek(c);
+        
+        if (ch == '}') {
+            sjson_cursor_consume(c, '}');
+            return 0;
+        }
+        
+        if (ch == ',') {
+            sjson_cursor_consume(c, ',');
+            continue;
+        }
+        
+        if (ch != '"') return -1;
+        
+        char field[64] = {0};
+        if (sjson_cursor_parse_string(c, field, sizeof(field)) != 0) return -1;
+        
+        if (!sjson_cursor_consume(c, ':')) return -1;
+        
+        // Parse field value based on key
+        if (strcmp(field, "shape") == 0) {
+            if (parse_tensor_shape(c, meta) != 0) return -1;
+        } else if (strcmp(field, "dtype") == 0) {
+            char dtype_str[64] = {0};
+            if (sjson_cursor_parse_string(c, dtype_str, sizeof(dtype_str)) != 0) return -1;
+            meta->dtype = safetensors_dtype_from_string(dtype_str);
+        } else if (strcmp(field, "data_offsets") == 0) {
+            if (!sjson_cursor_consume(c, '[')) return -1;
+            uint64_t start = 0, end = 0;
+            if (sjson_cursor_parse_u64(c, &start) != 0) return -1;
+            if (!sjson_cursor_consume(c, ',')) return -1;
+            if (sjson_cursor_parse_u64(c, &end) != 0) return -1;
+            if (!sjson_cursor_consume(c, ']')) return -1;
+            meta->offset = start;
+            meta->size_bytes = end - start;
+        } else if (strcmp(field, "offset") == 0) {
+            if (sjson_cursor_parse_u64(c, &meta->offset) != 0) return -1;
+        } else if (strcmp(field, "size") == 0) {
+            if (sjson_cursor_parse_u64(c, &meta->size_bytes) != 0) return -1;
+        } else {
+            if (sjson_cursor_skip_value(c) != 0) return -1;
+        }
+    }
+}
+
+/**
+ * @brief Simple JSON parser for Safetensors header using Cursor API.
  *
- * Parses the JSON header to extract tensor names, shapes, dtypes, and offsets.
- * This is a minimal parser that assumes well-formed JSON (as per Safetensors spec).
- *
- * Expected format (simplified):
- * {
- *   "tensor_name": {"shape": [d1, d2, ...], "dtype": "F32", "offset": 0, "size": N},
- *   ...
- * }
+ * Uses the low-level Cursor API for streaming, zero-allocation parsing.
+ * Extracts tensor names, shapes, dtypes, and offsets from the JSON header.
  *
  * @param json JSON string to parse.
  * @param json_len Length of JSON string.
@@ -97,184 +180,129 @@ static int parse_safetensors_json(const char *json, size_t json_len,
     if (!json || !out_tensors || !out_count) return -1;
     
     *out_count = 0;
+    sjson_cursor_t c = sjson_cursor_init(json, json_len);
     
-    // Skip initial '{'
-    const char *p = json;
-    const char *end = json + json_len;
+    // Expect opening '{'
+    if (!sjson_cursor_consume(&c, '{')) return -1;
     
-    while (p < end && *p != '{') p++;
-    if (p >= end) return -1;
-    p++;
-    
-    safetensors_tensor_meta_t *current = out_tensors;
-    
-    while (p < end && *out_count < max_tensors) {
-        // Skip whitespace
-        while (p < end && isspace(*p)) p++;
+    while (*out_count < max_tensors) {
+        char ch = sjson_cursor_peek(&c);
         
-        // Check for end of object
-        if (*p == '}') break;
-        
-        // Skip comma
-        if (*p == ',') {
-            p++;
-            while (p < end && isspace(*p)) p++;
+        // End of root object
+        if (ch == '}') {
+            sjson_cursor_consume(&c, '}');
+            return 0;
         }
         
-        // Expect "tensor_name": ...
-        if (*p != '"') break;
-        p++;
-        
-        // Read tensor name
-        char name[256] = {0};
-        int name_len = 0;
-        while (p < end && *p != '"' && name_len < 255) {
-            name[name_len++] = *p++;
-        }
-        if (p >= end || *p != '"') break;
-        p++; // skip closing "
-        
-        // Skip metadata entries (start with __)
-        if (name[0] == '_' && name[1] == '_') {
-            // Skip to next comma or close brace at this level
-            int brace_depth = 0;
-            while (p < end) {
-                if (*p == '{') brace_depth++;
-                else if (*p == '}') {
-                    if (brace_depth == 0) break;
-                    brace_depth--;
-                }
-                else if (*p == ',' && brace_depth == 0) {
-                    p++;
-                    break;
-                }
-                p++;
-            }
+        // Skip comma between entries
+        if (ch == ',') {
+            sjson_cursor_consume(&c, ',');
             continue;
         }
         
-        memcpy(current->name, name, name_len);
-        current->name[name_len] = '\0';
+        // Expect string key (tensor name)
+        if (ch != '"') break;
         
-        // Skip to ':' and then '{'
-        while (p < end && *p != ':') p++;
-        if (p >= end) break;
-        p++;
+        // Parse tensor name
+        char name[256] = {0};
+        if (sjson_cursor_parse_string(&c, name, sizeof(name)) != 0) break;
+
+        // Expect ':'
+        if (!sjson_cursor_consume(&c, ':')) break;
         
-        while (p < end && *p != '{') p++;
-        if (p >= end) break;
-        p++; // skip '{'
-        
-        // Parse shape, dtype, offset, size (or data_offsets)
-        int shape_idx;
-        current->ndim = 0;
-        current->offset = 0;
-        current->size_bytes = 0;
-        current->dtype = SAFETENSORS_UNKNOWN;
-        
-        while (p < end && *p != '}') {
-            while (p < end && (isspace(*p) || *p == ',')) p++;
-            if (*p != '"') break;
-            p++;
-            
-            // Read key
-            char key[64] = {0};
-            int key_len = 0;
-            while (p < end && *p != '"' && key_len < 63) {
-                key[key_len++] = *p++;
-            }
-            if (p >= end) break;
-            p++; // skip closing "
-            
-            while (p < end && *p != ':') p++;
-            if (p >= end) break;
-            p++;
-            
-            while (p < end && isspace(*p)) p++;
-            
-            // Parse value based on key
-            if (strcmp(key, "shape") == 0) {
-                // Expect '[' followed by numbers
-                while (p < end && *p != '[') p++;
-                if (p >= end) break;
-                p++;
-                
-                shape_idx = 0;
-                while (p < end && *p != ']' && shape_idx < 8) {
-                    while (p < end && (isspace(*p) || *p == ',')) p++;
-                    if (isdigit(*p)) {
-                        current->shape[shape_idx++] = (uint32_t)strtoul(p, (char**)&p, 10);
-                    } else {
-                        break;
-                    }
-                }
-                current->ndim = shape_idx;
-                while (p < end && *p != ']') p++;
-                if (p < end) p++;
-                
-            } else if (strcmp(key, "dtype") == 0) {
-                // Expect string value
-                while (p < end && *p != '"') p++;
-                if (p >= end) break;
-                p++;
-                
-                char dtype_str[64] = {0};
-                int dtype_len = 0;
-                while (p < end && *p != '"' && dtype_len < 63) {
-                    dtype_str[dtype_len++] = *p++;
-                }
-                current->dtype = safetensors_dtype_from_string(dtype_str);
-                
-                if (p < end) p++; // skip closing "
-                
-            } else if (strcmp(key, "data_offsets") == 0) {
-                // Modern format: [start_offset, end_offset]
-                while (p < end && *p != '[') p++;
-                if (p >= end) break;
-                p++;
-                
-                // Skip whitespace
-                while (p < end && isspace(*p)) p++;
-                
-                // Read start offset
-                uint64_t start_offset = (uint64_t)strtoll(p, (char**)&p, 10);
-                
-                // Skip to comma
-                while (p < end && isspace(*p)) p++;
-                if (*p == ',') p++;
-                while (p < end && isspace(*p)) p++;
-                
-                // Read end offset
-                uint64_t end_offset = (uint64_t)strtoll(p, (char**)&p, 10);
-                
-                // Skip to closing bracket
-                while (p < end && *p != ']') p++;
-                if (p < end) p++;
-                
-                current->offset = start_offset;
-                current->size_bytes = end_offset - start_offset;
-                
-            } else if (strcmp(key, "offset") == 0) {
-                // Old format: offset field
-                current->offset = (uint64_t)strtoll(p, (char**)&p, 10);
-                
-            } else if (strcmp(key, "size") == 0) {
-                // Old format: size field
-                current->size_bytes = (uint64_t)strtoll(p, (char**)&p, 10);
-                
-            } else {
-                // Skip unknown key-value (including __metadata__)
-                while (p < end && *p != ',' && *p != '}') p++;
-            }
+        // Skip metadata entries (start with __)
+        if (name[0] == '_' && name[1] == '_') {
+            if (sjson_cursor_skip_value(&c) != 0) break;
+            continue;
         }
         
-        if (p < end && *p == '}') {
-            p++; // skip '}'
-            (*out_count)++;
-            current++;
-        }
+        // Copy tensor name safely
+        strncpy(out_tensors[*out_count].name, name, sizeof(out_tensors[*out_count].name) - 1);
+        out_tensors[*out_count].name[sizeof(out_tensors[*out_count].name) - 1] = '\0';
+        
+        // Delegate parsing of tensor fields
+        if (parse_tensor_fields(&c, &out_tensors[*out_count]) != 0) return -1;
+        (*out_count)++;
     }
     
+    return 0;
+}
+
+/* Helper: Open and mmap the safetensors file */
+static int map_safetensors_file(const char* path, int* fd_out, void** mmap_ptr_out, size_t* mmap_size_out) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        LOG_ERROR("safetensors_open: cannot open %s: %s", path, strerror(errno));
+        return -1;
+    }
+
+    struct stat sb;
+    if (fstat(fd, &sb) < 0) {
+        LOG_ERROR("safetensors_open: fstat failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    size_t file_size = (size_t)sb.st_size;
+    if (file_size < 8) {
+        LOG_ERROR("safetensors_open: file too small (< 8 bytes)");
+        close(fd);
+        return -1;
+    }
+
+    void *mmap_ptr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (mmap_ptr == MAP_FAILED) {
+        LOG_ERROR("safetensors_open: mmap failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    *fd_out = fd;
+    *mmap_ptr_out = mmap_ptr;
+    *mmap_size_out = file_size;
+    return 0;
+}
+
+/* Helper: Extract JSON header and parse metadata */
+static int parse_header_metadata(void* mmap_ptr, size_t mmap_size,
+                                 uint64_t* header_len_out, char** json_header_out,
+                                 safetensors_tensor_meta_t** tensors_out, int* tensor_count_out) {
+    uint64_t header_len = *(uint64_t*)mmap_ptr;
+    if (header_len + 8 > mmap_size) {
+        LOG_ERROR("safetensors_open: header length exceeds file size");
+        LOG_ERROR("       File size: %zu bytes", mmap_size);
+        LOG_ERROR("       Declared header length: %lu bytes", (unsigned long)header_len);
+        return -1;
+    }
+
+    char *json_header = (char*)malloc(header_len + 1);
+    if (!json_header) {
+        LOG_ERROR("safetensors_open: malloc failed for header");
+        return -1;
+    }
+    memcpy(json_header, (char*)mmap_ptr + 8, header_len);
+    json_header[header_len] = '\0';
+
+    safetensors_tensor_meta_t *tensors = (safetensors_tensor_meta_t*)malloc(
+        1000 * sizeof(safetensors_tensor_meta_t));
+    if (!tensors) {
+        LOG_ERROR("safetensors_open: malloc failed for tensors");
+        free(json_header);
+        return -1;
+    }
+
+    int tensor_count = 0;
+    if (parse_safetensors_json(json_header, header_len, tensors, 1000, &tensor_count) < 0) {
+        LOG_ERROR("safetensors_open: failed to parse JSON header");
+        free(tensors);
+        free(json_header);
+        return -1;
+    }
+
+    *header_len_out = header_len;
+    *json_header_out = json_header;
+    *tensors_out = tensors;
+    *tensor_count_out = tensor_count;
     return 0;
 }
 
@@ -283,115 +311,54 @@ static int parse_safetensors_json(const char *json, size_t json_len,
  */
 safetensors_file_t* safetensors_open(const char *path) {
     if (!path) {
-        fprintf(stderr, "ERROR: safetensors_open: path is NULL\n");
+        LOG_ERROR("safetensors_open: path is NULL");
         return NULL;
     }
-    
-    // Open file
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "ERROR: safetensors_open: cannot open %s: %s\n", path, strerror(errno));
+
+    int fd = -1;
+    void *mmap_ptr = NULL;
+    size_t mmap_size = 0;
+    if (map_safetensors_file(path, &fd, &mmap_ptr, &mmap_size) != 0) {
         return NULL;
     }
-    
-    // Get file size
-    struct stat sb;
-    if (fstat(fd, &sb) < 0) {
-        fprintf(stderr, "ERROR: safetensors_open: fstat failed: %s\n", strerror(errno));
-        close(fd);
-        return NULL;
-    }
-    
-    size_t file_size = (size_t)sb.st_size;
-    
-    if (file_size < 8) {
-        fprintf(stderr, "ERROR: safetensors_open: file too small (< 8 bytes)\n");
-        close(fd);
-        return NULL;
-    }
-    
-    // mmap the entire file
-    void *mmap_ptr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (mmap_ptr == MAP_FAILED) {
-        fprintf(stderr, "ERROR: safetensors_open: mmap failed: %s\n", strerror(errno));
-        close(fd);
-        return NULL;
-    }
-    
-    // Read header length (first 8 bytes, little-endian)
-    uint64_t header_len = *(uint64_t*)mmap_ptr;
-    
-    if (header_len + 8 > file_size) {
-        fprintf(stderr, "ERROR: safetensors_open: header length exceeds file size\n");
-        fprintf(stderr, "       File size: %zu bytes\n", file_size);
-        fprintf(stderr, "       Declared header length: %lu bytes\n", (unsigned long)header_len);
-        fprintf(stderr, "       This may be a Git LFS pointer file (usually 100-200 bytes)\n");
-        fprintf(stderr, "       Download the actual model file and try again\n");
-        munmap(mmap_ptr, file_size);
-        close(fd);
-        return NULL;
-    }
-    
-    // Extract JSON header
-    const char *json_start = (const char*)mmap_ptr + 8;
-    char *json_header = (char*)malloc(header_len + 1);
-    if (!json_header) {
-        fprintf(stderr, "ERROR: safetensors_open: malloc failed\n");
-        munmap(mmap_ptr, file_size);
-        close(fd);
-        return NULL;
-    }
-    
-    memcpy(json_header, json_start, header_len);
-    json_header[header_len] = '\0';
-    
-    // Parse JSON to extract tensor metadata
-    // Allocate space for tensor metadata (up to 1000 tensors)
-    safetensors_tensor_meta_t *tensors = (safetensors_tensor_meta_t*)malloc(
-        1000 * sizeof(safetensors_tensor_meta_t));
-    if (!tensors) {
-        fprintf(stderr, "ERROR: safetensors_open: malloc failed for tensors\n");
-        free(json_header);
-        munmap(mmap_ptr, file_size);
-        close(fd);
-        return NULL;
-    }
-    
+
+    uint64_t header_len = 0;
+    char *json_header = NULL;
+    safetensors_tensor_meta_t *tensors = NULL;
     int tensor_count = 0;
-    if (parse_safetensors_json(json_header, header_len, tensors, 1000, &tensor_count) < 0) {
-        fprintf(stderr, "ERROR: safetensors_open: failed to parse JSON header\n");
-        free(tensors);
-        free(json_header);
-        munmap(mmap_ptr, file_size);
-        close(fd);
-        return NULL;
+    safetensors_file_t *st = NULL;
+
+    if (parse_header_metadata(mmap_ptr, mmap_size, &header_len, &json_header, &tensors, &tensor_count) != 0) {
+        goto cleanup;
     }
-    
-    // Allocate safetensors_file_t structure
-    safetensors_file_t *st = (safetensors_file_t*)malloc(sizeof(safetensors_file_t));
+
+    st = (safetensors_file_t*)malloc(sizeof(safetensors_file_t));
     if (!st) {
-        fprintf(stderr, "ERROR: safetensors_open: malloc failed\n");
-        free(tensors);
-        free(json_header);
-        munmap(mmap_ptr, file_size);
-        close(fd);
-        return NULL;
+        LOG_ERROR("safetensors_open: malloc failed");
+        goto cleanup;
     }
-    
+
     st->fd = fd;
     st->mmap_ptr = mmap_ptr;
-    st->mmap_size = file_size;
+    st->mmap_size = mmap_size;
     st->tensors = tensors;
     st->tensor_count = tensor_count;
     st->header_size = header_len;
     st->json_header = json_header;
-    
-    printf("✓ Safetensors file opened: %s\n", path);
-    printf("  - Header size: %lu bytes\n", (unsigned long)header_len);
-    printf("  - File size: %zu bytes\n", file_size);
-    printf("  - Tensor count: %d\n", tensor_count);
-    
+
+    LOG_INFO("✓ Safetensors file opened: %s", path);
+    LOG_INFO("  - Header size: %lu bytes", (unsigned long)header_len);
+    LOG_INFO("  - File size: %zu bytes", mmap_size);
+    LOG_INFO("  - Tensor count: %d", tensor_count);
+
     return st;
+
+cleanup:
+    if (tensors) free(tensors);
+    if (json_header) free(json_header);
+    if (mmap_ptr && mmap_ptr != MAP_FAILED) munmap(mmap_ptr, mmap_size);
+    if (fd >= 0) close(fd);
+    return NULL;
 }
 
 /**
@@ -561,6 +528,99 @@ void safetensors_print_info(const safetensors_file_t *st) {
     printf("================================================================================\n");
 }
 
+/* Helper for mapping individual layer fields */
+typedef struct {
+    const char *name;
+    size_t offset;
+} layer_field_map_t;
+
+static const layer_field_map_t LAYER_FIELD_MAP[] = {
+    {"norm_attn_weight", offsetof(model_layer_weights_t, norm_attn_weight)},
+    {"norm_attn_post_weight", offsetof(model_layer_weights_t, norm_attn_post_weight)},
+    {"q_proj_weight", offsetof(model_layer_weights_t, q_proj_weight)},
+    {"k_proj_weight", offsetof(model_layer_weights_t, k_proj_weight)},
+    {"v_proj_weight", offsetof(model_layer_weights_t, v_proj_weight)},
+    {"q_norm_weight", offsetof(model_layer_weights_t, q_norm_weight)},
+    {"k_norm_weight", offsetof(model_layer_weights_t, k_norm_weight)},
+    {"out_proj_weight", offsetof(model_layer_weights_t, out_proj_weight)},
+    {"norm_ffn_weight", offsetof(model_layer_weights_t, norm_ffn_weight)},
+    {"norm_ffn_post_weight", offsetof(model_layer_weights_t, norm_ffn_post_weight)},
+    {"up_proj_weight", offsetof(model_layer_weights_t, up_proj_weight)},
+    {"gate_proj_weight", offsetof(model_layer_weights_t, gate_proj_weight)},
+    {"down_proj_weight", offsetof(model_layer_weights_t, down_proj_weight)},
+};
+
+/* Handle case where a tensor is missing from the file */
+static int handle_missing_tensor(safetensors_file_t* st,
+                                 const tensor_map_entry_t* e,
+                                 safetensors_dynamic_handler_t dyn_cb,
+                                 llm_model_t* model) {
+    // Special-case: allow lm_head to be tied to embeddings when missing
+    if (e->field_name && strcmp(e->field_name, "lm_head_weight") == 0 && model->embedding_weight) {
+        model->lm_head_weight = model->embedding_weight;
+        tensor_ref_inc(model->lm_head_weight);
+        return 0; // successfully handled
+    }
+
+    if (dyn_cb) {
+        int dr = dyn_cb((const safetensors_file_t*)st, NULL, model);
+        if (dr == 0) return 0; // handled
+        if (dr == -1) return -1; // catastrophic error
+        // dr == 1 means not handled, proceed to generic error
+    }
+
+    LOG_ERROR("Required tensor not found: %s", e->hf_name);
+    return -1;
+}
+
+/* Map a tensor to block-level layer structures (blk.N) */
+static int map_to_block_layer(llm_model_t* model, const tensor_map_entry_t* e, tensor_t* t) {
+    int layer_idx = -1;
+    if (sscanf(e->internal_key, "blk.%d", &layer_idx) != 1 || layer_idx < 0 || layer_idx >= SAPPHIRE_MAX_LAYERS) {
+        LOG_ERROR("Invalid layer key: %s", e->internal_key);
+        return -1;
+    }
+
+    model_layer_weights_t *lw = &model->layers[layer_idx];
+    
+    for (size_t i = 0; i < sizeof(LAYER_FIELD_MAP)/sizeof(LAYER_FIELD_MAP[0]); i++) {
+        if (strcmp(e->field_name, LAYER_FIELD_MAP[i].name) == 0) {
+            tensor_t **dest = (tensor_t **)((char *)lw + LAYER_FIELD_MAP[i].offset);
+            *dest = t;
+            
+            if (i == 1) { // norm_attn_post_weight debug
+                LOG_DEBUG("MAPPER: Assigned norm_attn_post_weight to layer %d", layer_idx);
+            }
+            return 0;
+        }
+    }
+
+    LOG_ERROR("Unknown layer field: %s for key %s", e->field_name, e->internal_key);
+    return -1;
+}
+
+/* Map a tensor to top-level model structures (embedding, final) */
+static int map_to_top_level(llm_model_t* model, const tensor_map_entry_t* e, tensor_t* t) {
+    if (strcmp(e->internal_key, "embedding") == 0) {
+        model->embedding_weight = t;
+        return 0;
+    }
+
+    if (strcmp(e->internal_key, "final") == 0) {
+        if (strcmp(e->field_name, "norm_final_weight") == 0) {
+            model->norm_final_weight = t;
+            return 0;
+        }
+        if (strcmp(e->field_name, "lm_head_weight") == 0) {
+            model->lm_head_weight = t;
+            return 0;
+        }
+    }
+
+    LOG_ERROR("Unknown top-level field/key: %s/%s", e->internal_key, e->field_name);
+    return -1;
+}
+
 /**
  * Map all tensors in a Safetensors file using a static table and optional dynamic handler.
  * See include/tensor_mapper.h for the public declaration and semantics.
@@ -569,10 +629,9 @@ int safetensors_map_all_tensors_with_table(safetensors_file_t* st,
                                            const tensor_map_entry_t* table,
                                            int table_size,
                                            safetensors_dynamic_handler_t dyn_cb,
-                                           llm_model_t* model,
-                                           char* error_msg, int max_error_len) {
+                                           llm_model_t* model) {
     if (!st || !table || !model) {
-        if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Invalid argument to safetensors_map_all_tensors_with_table");
+        LOG_ERROR("Invalid argument to safetensors_map_all_tensors_with_table");
         return -1;
     }
 
@@ -582,93 +641,26 @@ int safetensors_map_all_tensors_with_table(safetensors_file_t* st,
 
         const safetensors_tensor_meta_t *meta = safetensors_get_tensor_by_name(st, e->hf_name);
         if (!meta) {
-            // Special-case: allow lm_head to be tied to embeddings when missing
-            if (e->field_name && strcmp(e->field_name, "lm_head_weight") == 0 && model->embedding_weight) {
-                model->lm_head_weight = model->embedding_weight;
-                tensor_ref_inc(model->lm_head_weight);
-                continue;
-            }
-            if (dyn_cb) {
-                int dr = dyn_cb((const safetensors_file_t*)st, NULL, model, error_msg, max_error_len);
-                if (dr == 0) {
-                    continue; // dynamic handler handled this missing tensor
-                } else if (dr == 1) {
-                    if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Required tensor not found: %s", e->hf_name);
-                    return -1;
-                } else {
-                    if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Dynamic handler error for tensor: %s", e->hf_name);
-                    return -1;
-                }
-            }
-
-            if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Required tensor not found: %s", e->hf_name);
-            return -1;
+            if (handle_missing_tensor(st, e, dyn_cb, model) != 0) return -1;
+            continue;
         }
 
         tensor_t *t = safetensors_create_tensor_ref(st, meta);
         if (!t) {
-            if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Failed to create tensor for %s (unsupported dtype or corrupt data)", e->hf_name);
+            LOG_ERROR("Failed to create tensor for %s (unsupported dtype or corrupt data)", e->hf_name);
             return -1;
         }
 
-        // Top-level mappings
-        if (strcmp(e->internal_key, "embedding") == 0) {
-            model->embedding_weight = t;
-            continue;
+        int map_res = -1;
+        if (strcmp(e->internal_key, "embedding") == 0 || strcmp(e->internal_key, "final") == 0) {
+            map_res = map_to_top_level(model, e, t);
+        } else if (strncmp(e->internal_key, "blk.", 4) == 0) {
+            map_res = map_to_block_layer(model, e, t);
+        } else {
+            LOG_ERROR("Unknown internal key: %s", e->internal_key);
         }
 
-        if (strcmp(e->internal_key, "final") == 0) {
-            if (strcmp(e->field_name, "norm_final_weight") == 0) {
-                model->norm_final_weight = t;
-                continue;
-            }
-            if (strcmp(e->field_name, "lm_head_weight") == 0) {
-                model->lm_head_weight = t;
-                continue;
-            }
-            // Unknown field under final
-            if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Unknown final field: %s", e->field_name);
-            return -1;
-        }
-
-        // Per-layer mappings: expect keys like "blk.N"
-        if (strncmp(e->internal_key, "blk.", 4) == 0) {
-            int layer_idx = -1;
-            if (sscanf(e->internal_key, "blk.%d", &layer_idx) != 1 || layer_idx < 0 || layer_idx >= SAPPHIRE_MAX_LAYERS) {
-                if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Invalid layer key: %s", e->internal_key);
-                return -1;
-            }
-
-            model_layer_weights_t *lw = &model->layers[layer_idx];
-
-            // Map field names to struct members
-            if (strcmp(e->field_name, "norm_attn_weight") == 0) lw->norm_attn_weight = t;
-            else if (strcmp(e->field_name, "norm_attn_post_weight") == 0) {
-                lw->norm_attn_post_weight = t;
-                LOG_DEBUG("MAPPER: Assigned norm_attn_post_weight to layer %d", layer_idx);
-            }
-            else if (strcmp(e->field_name, "q_proj_weight") == 0) lw->q_proj_weight = t;
-            else if (strcmp(e->field_name, "k_proj_weight") == 0) lw->k_proj_weight = t;
-            else if (strcmp(e->field_name, "v_proj_weight") == 0) lw->v_proj_weight = t;
-            else if (strcmp(e->field_name, "q_norm_weight") == 0) lw->q_norm_weight = t;
-            else if (strcmp(e->field_name, "k_norm_weight") == 0) lw->k_norm_weight = t;
-            else if (strcmp(e->field_name, "out_proj_weight") == 0) lw->out_proj_weight = t;
-            else if (strcmp(e->field_name, "norm_ffn_weight") == 0) lw->norm_ffn_weight = t;
-            else if (strcmp(e->field_name, "norm_ffn_post_weight") == 0) lw->norm_ffn_post_weight = t;
-            else if (strcmp(e->field_name, "up_proj_weight") == 0) lw->up_proj_weight = t;
-            else if (strcmp(e->field_name, "gate_proj_weight") == 0) lw->gate_proj_weight = t;
-            else if (strcmp(e->field_name, "down_proj_weight") == 0) lw->down_proj_weight = t;
-            else {
-                if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Unknown layer field: %s for key %s", e->field_name, e->internal_key);
-                return -1;
-            }
-
-            continue;
-        }
-
-        // Unknown internal_key
-        if (error_msg && max_error_len > 0) snprintf(error_msg, max_error_len, "Unknown internal key: %s", e->internal_key);
-        return -1;
+        if (map_res != 0) return -1;
     }
 
     return 0;

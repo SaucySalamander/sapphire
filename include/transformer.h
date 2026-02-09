@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "llm_model.h"
+#include "gemma3_270m_config.h"
+
 struct inference_session_t;
 
 /**
@@ -45,6 +48,27 @@ void sapphire_embed_lookup(struct inference_session_t* session, int token_id, fl
 /**
  * @brief Performs LM Head calculation and softcapping.
  */
-void sapphire_lm_head(struct inference_session_t* session, float* hidden, float* logits);
+void lm_head(struct inference_session_t* session, float* hidden, float* logits);
+
+typedef struct {
+    int pm, pi, pk, pf;
+    float *residual, *norm_buf, *q_proj, *k_proj, *v_proj;
+    float *attn_out, *ffn_gate_buf, *ffn_value_buf, *geglu_buf;
+    float* weight_scratch;
+} layer_buffers_t;
+
+/**
+ * @brief Context for a single transformer layer forward pass.
+ * Used to keep function signatures clean and within project specifications.
+ */
+typedef struct {
+    struct inference_session_t* session;
+    model_layer_weights_t* layer;
+    gemma3_270m_config_t* config;
+    int layer_idx;
+    int token_pos;
+    int d_model;
+    int head_dim;
+} transformer_layer_ctx_t;
 
 #endif // TRANSFORMER_H

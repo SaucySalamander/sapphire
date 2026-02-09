@@ -1,208 +1,20 @@
 #include <math.h>
 #include <string.h>
 #include "normalization.h"
+#include "log.h"
+#include "utils.h"
+
+
 
 // ============================================================================
 // RMSNorm (Root Mean Square Normalization)
 // ============================================================================
 
 /**
- * RMSNorm computation:
- * 1. Compute RMS: sqrt(mean(x^2))
- * 2. Scale: x * weight / (RMS + eps)
+ * RMSNorm: out[i] = (in[i] / (RMS + eps)) * weight[i]
  * 
- * Efficient: Only requires one pass through data to compute RMS.
- * Used in modern LLMs (LLaMA, Mistral, etc.).
- */
-void rmsnorm(float *x, const float *weight, int n, float eps) {
-    if (!x || !weight || n <= 0) return;
-    
-    // Step 1: Compute sum of squares
-    float sum_sq = 0.0f;
-    for (int i = 0; i < n; i++) {
-        sum_sq += x[i] * x[i];
-    }
-    
-        // Step 2: Compute inverse RMS
-    float mean_sq = sum_sq / (float)n;
-    float inv_rms = 1.0f / sqrtf(mean_sq + eps);
-
-        /*
-         * Standard RMSNorm semantics:
-         * Scale the normalized signal by the learned weight[i].
-         */
-        for (int i = 0; i < n; i++) {
-            x[i] = x[i] * inv_rms * weight[i];
-        }
-}
-
-void rmsnorm_delta(float *x, const float *weight, int n, float eps) {
-    if (!x || !weight || n <= 0) return;
-
-    // Compute sum of squares
-    float sum_sq = 0.0f;
-    for (int i = 0; i < n; i++) {
-        sum_sq += x[i] * x[i];
-    }
-
-    // Compute inverse RMS
-    float mean_sq = sum_sq / (float)n;
-    float inv_rms = 1.0f / sqrtf(mean_sq + eps);
-
-    // Gemma3-style scaling: use (1 + weight[i])
-    for (int i = 0; i < n; i++) {
-        x[i] = x[i] * inv_rms * (1.0f + weight[i]);
-    }
-}
-
-void rmsnorm_no_weight(float *x, int n, float eps) {
-    if (!x || n <= 0) return;
-    
-    // Compute sum of squares
-    float sum_sq = 0.0f;
-    for (int i = 0; i < n; i++) {
-        sum_sq += x[i] * x[i];
-    }
-    
-    // Compute RMS
-    float rms = sqrtf(sum_sq / (float)n + eps);
-    
-    // Normalize
-    for (int i = 0; i < n; i++) {
-        x[i] = x[i] / rms;
-    }
-}
-
-void rmsnorm_batch(float *matrix, const float *weight, int num_rows, int row_size, float eps) {
-    if (!matrix || !weight || num_rows <= 0 || row_size <= 0) return;
-    
-    for (int row = 0; row < num_rows; row++) {
-        float *row_ptr = matrix + row * row_size;
-        
-        // Compute RMS for this row
-        float sum_sq = 0.0f;
-        for (int i = 0; i < row_size; i++) {
-            sum_sq += row_ptr[i] * row_ptr[i];
-        }
-        
-        float rms = sqrtf(sum_sq / (float)row_size + eps);
-        
-            /* Standard scaling: use weight for effective scaling */
-            for (int i = 0; i < row_size; i++) {
-                row_ptr[i] = (row_ptr[i] / rms) * weight[i];
-            }
-    }
-}
-
-// ============================================================================
-// LayerNorm (Layer Normalization)
-// ============================================================================
-
-/**
- * LayerNorm computation:
- * 1. Compute mean: mean(x)
- * 2. Compute variance: mean((x - mean)^2)
- * 3. Normalize: (x - mean) / sqrt(var + eps)
- * 4. Scale and shift: output * weight + bias
- * 
- * More expensive than RMSNorm (requires computing both mean and variance),
- * but includes learnable bias term which can be useful for fine-tuning.
- */
-void layernorm(float *x, const float *weight, const float *bias, int n, float eps) {
-    if (!x || !weight || !bias || n <= 0) return;
-    
-    // Step 1: Compute mean
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        sum += x[i];
-    }
-    float mean = sum / (float)n;
-    
-    // Step 2: Compute variance
-    float sum_sq_diff = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float diff = x[i] - mean;
-        sum_sq_diff += diff * diff;
-    }
-    float var = sum_sq_diff / (float)n;
-    
-    // Step 3: Normalize, scale, and shift
-    float inv_std = 1.0f / sqrtf(var + eps);
-    for (int i = 0; i < n; i++) {
-        x[i] = ((x[i] - mean) * inv_std) * weight[i] + bias[i];
-    }
-}
-
-void layernorm_no_params(float *x, int n, float eps) {
-    if (!x || n <= 0) return;
-    
-    // Compute mean
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        sum += x[i];
-    }
-    float mean = sum / (float)n;
-    
-    // Compute variance
-    float sum_sq_diff = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float diff = x[i] - mean;
-        sum_sq_diff += diff * diff;
-    }
-    float var = sum_sq_diff / (float)n;
-    
-    // Normalize
-    float inv_std = 1.0f / sqrtf(var + eps);
-    for (int i = 0; i < n; i++) {
-        x[i] = (x[i] - mean) * inv_std;
-    }
-}
-
-void layernorm_batch(float *matrix, const float *weight, const float *bias, 
-                     int num_rows, int row_size, float eps) {
-    if (!matrix || !weight || !bias || num_rows <= 0 || row_size <= 0) return;
-    
-    for (int row = 0; row < num_rows; row++) {
-        float *row_ptr = matrix + row * row_size;
-        
-        // Compute mean for this row
-        float sum = 0.0f;
-        for (int i = 0; i < row_size; i++) {
-            sum += row_ptr[i];
-        }
-        float mean = sum / (float)row_size;
-        
-        // Compute variance
-        float sum_sq_diff = 0.0f;
-        for (int i = 0; i < row_size; i++) {
-            float diff = row_ptr[i] - mean;
-            sum_sq_diff += diff * diff;
-        }
-        float var = sum_sq_diff / (float)row_size;
-        
-        // Normalize, scale, and shift
-        float inv_std = 1.0f / sqrtf(var + eps);
-        for (int i = 0; i < row_size; i++) {
-            row_ptr[i] = ((row_ptr[i] - mean) * inv_std) * weight[i] + bias[i];
-        }
-    }
-}
-
-// ============================================================================
-// Standardized RMSNorm (Non-In-Place)
-// ============================================================================
-
-/**
- * Standardized RMSNorm: out[i] = (in[i] / (RMS + eps)) * weight[i]
- * 
- * This is the non-in-place API version (preserves input).
+ * Non-in-place normalization with separate input/output buffers.
  * Used for transformer blocks and other pipeline stages.
- * 
- * Compared to existing rmsnorm():
- * - Separate input/output buffers
- * - Return error code instead of void
- * - Better for pipelined operations
- * - Uses direct gamma scaling (weight)
  * 
  * Algorithm:
  *   1. Compute sum of squares: sum = Σ(in[i]²)
@@ -217,11 +29,10 @@ void layernorm_batch(float *matrix, const float *weight, const float *bias,
  * Safety:
  * - NULL checks for all pointers
  * - Dimension validation (dim > 0)
- * - Epsilon validation (epsilon > 0)
- * - Bounds assertions
+ * - Epsilon validation (epsilon >= 0)
  */
-int sapphire_rmsnorm(float *out, const float *in, const float *weight,
-                     float epsilon, int dim) {
+int rmsnorm(float *out, const float *in, const float *weight,
+            float epsilon, int dim) {
     // Validate inputs
     if (!out || !in || !weight || dim <= 0 || epsilon < 0.0f) {
         return -1;
@@ -266,8 +77,8 @@ int sapphire_rmsnorm(float *out, const float *in, const float *weight,
     return 0;
 }
 
-int sapphire_rmsnorm_delta(float *out, const float *in, const float *weight,
-                           float epsilon, int dim) {
+int rmsnorm_delta(float *out, const float *in, const float *weight,
+                 float epsilon, int dim) {
     // Validate inputs
     if (!out || !in || !weight || dim <= 0 || epsilon < 0.0f) {
         return -1;
@@ -326,8 +137,8 @@ int sapphire_rmsnorm_delta(float *out, const float *in, const float *weight,
  * 
  * Performance: Useful for batched token processing in autoregressive generation
  */
-int sapphire_rmsnorm_batch(float *out, const float *in, const float *weight,
-                           float epsilon, int batch_size, int dim) {
+int rmsnorm_batch(float *out, const float *in, const float *weight,
+                 float epsilon, int batch_size, int dim) {
     if (!out || !in || !weight || batch_size <= 0 || dim <= 0 || epsilon < 0.0f) {
         return -1;
     }
@@ -356,70 +167,86 @@ int sapphire_rmsnorm_batch(float *out, const float *in, const float *weight,
 // ============================================================================
 // Gemma 3 QK-Normalization Attention Mechanism
 // ============================================================================
-
 /**
- * @brief Apply QK-Norm (RMSNorm on Q and K vectors) for Gemma 3.
+ * @brief Apply normalization to a group of attention heads (Query or Key).
  * 
- * Requirement:
- * - RMSNorm Logic: x_i = (x_i / sqrt(mean(x^2) + eps)) * g_i
- * - Single pass optimization for sum-of-squares.
- * - 1e-6 epsilon.
- * 
- * @param q Pointer to Query vectors [num_q_heads * head_dim]
- * @param k Pointer to Key vectors [num_kv_heads * head_dim]
- * @param q_scale Pointer to Query scale weights [num_q_heads * head_dim]
- * @param k_scale Pointer to Key scale weights [num_kv_heads * head_dim]
- * @param head_dim Dimension of each head
- * @param num_q_heads Number of Query heads
- * @param num_kv_heads Number of Key/Value heads
+ * @param data Target projection buffer [num_heads * head_dim]
+ * @param scale Per-head scaling weights [num_heads * head_dim]
+ * @param head_dim Dimension per head
+ * @param num_heads Number of heads in the group
  */
-void apply_qk_norm(float* q, float* k, float* q_scale, float* k_scale, int head_dim, int num_q_heads, int num_kv_heads) {
-    const float eps = 1e-6f;
-
-    // Normalize Q vectors
-    if (q && q_scale) {
-        for (int h = 0; h < num_q_heads; h++) {
-            float* head_q = q + h * head_dim;
-            float* head_scale = q_scale + h * head_dim;
-
-            // Single pass sum-of-squares
-            float sum_sq = 0.0f;
-            for (int i = 0; i < head_dim; i++) {
-                sum_sq += head_q[i] * head_q[i];
-            }
-
-            // Compute RMS and inverse
-            float mean_sq = sum_sq / (float)head_dim;
-            float inv_rms = 1.0f / sqrtf(mean_sq + eps);
-
-            // Apply normalization and Gemma3-style scaling
-            for (int i = 0; i < head_dim; i++) {
-                head_q[i] = (head_q[i] * inv_rms) * (1.0f + head_scale[i]);
-            }
-        }
-    }
-
-    // Normalize K vectors
-    if (k && k_scale) {
-        for (int h = 0; h < num_kv_heads; h++) {
-            float* head_k = k + h * head_dim;
-            float* head_scale = k_scale + h * head_dim;
-
-            // Single pass sum-of-squares
-            float sum_sq = 0.0f;
-            for (int i = 0; i < head_dim; i++) {
-                sum_sq += head_k[i] * head_k[i];
-            }
-
-            // Compute RMS and inverse
-            float mean_sq = sum_sq / (float)head_dim;
-            float inv_rms = 1.0f / sqrtf(mean_sq + eps);
-
-            // Apply normalization and Gemma3-style scaling
-            for (int i = 0; i < head_dim; i++) {
-                head_k[i] = (head_k[i] * inv_rms) * (1.0f + head_scale[i]);
-            }
-        }
+static void qk_norm_apply(float* data, const float* scale, int head_dim, int num_heads) {
+    if (!data || !scale) return;
+    for (int h = 0; h < num_heads; h++) {
+        rmsnorm_delta(data + h * head_dim, data + h * head_dim, scale + h * head_dim, 1e-6f, head_dim);
     }
 }
 
+static float* load_query_vector(layer_buffers_t buf, model_layer_weights_t* layer,
+                                 gemma3_270m_config_t* config, int head_dim, int layer_idx) {
+        int q_norm_len = tensor_shape(layer->q_norm_weight)[0];
+        const float* raw = get_norm_weights(layer->q_norm_weight, buf.weight_scratch, q_norm_len);
+        int expected_q = config->num_attention_heads * head_dim;
+        
+        if (q_norm_len == expected_q) {
+            return (float*)raw;  // per-head gamma
+        } else if (q_norm_len == head_dim) {
+            // Broadcast single-head gamma to all Q heads (common for small Gemma configs)
+            float head_gamma[head_dim];
+            memcpy(head_gamma, raw, head_dim * sizeof(float));
+            // reuse ffn_gate_buf as expanded gamma scratch (size pf >= expected_q)
+            float* q_scale_ptr = buf.ffn_gate_buf;
+            for (int h = 0; h < config->num_attention_heads; h++) {
+                memcpy(q_scale_ptr + h * head_dim, head_gamma, head_dim * sizeof(float));
+            }
+            return q_scale_ptr;
+        } else {
+            LOG_WARN("Layer %d q_norm len=%d expected=%d; disabling QK-Norm for Q", layer_idx, q_norm_len, expected_q);
+            return NULL;
+        }
+}
+
+static float* load_key_vector(layer_buffers_t buf, model_layer_weights_t* layer,
+                               gemma3_270m_config_t* config, int head_dim, int layer_idx) {
+        int k_norm_len = tensor_shape(layer->k_norm_weight)[0];
+        const float* raw = get_norm_weights(layer->k_norm_weight, buf.weight_scratch, k_norm_len);
+        int expected_k = config->num_key_value_heads * head_dim;
+        if (k_norm_len == expected_k) {
+            return (float*)raw;  // per-KV-head gamma
+        } else if (k_norm_len == head_dim) {
+            // Broadcast single-head gamma to all KV heads (GQA)
+            float head_gamma[head_dim];
+            memcpy(head_gamma, raw, head_dim * sizeof(float));
+            // reuse ffn_value_buf as expanded gamma scratch (size pf >= expected_k)
+            float* k_scale_ptr = buf.ffn_value_buf;
+            for (int h = 0; h < config->num_key_value_heads; h++) {
+                memcpy(k_scale_ptr + h * head_dim, head_gamma, head_dim * sizeof(float));
+            }
+            return k_scale_ptr;
+        } else {
+            LOG_WARN("Layer %d k_norm len=%d expected=%d; disabling QK-Norm for K", layer_idx, k_norm_len, expected_k);
+            return NULL;
+        }
+}
+
+qk_norm_result_t qk_norm_from_layer(layer_buffers_t buf,
+                                           model_layer_weights_t* layer,
+                                           gemma3_270m_config_t* config,
+                                           int head_dim,
+                                           int layer_idx) {
+    qk_norm_result_t result = {NULL, NULL};
+
+    if (layer->q_norm_weight) {
+        result.q_scale = load_query_vector(buf, layer, config, head_dim, layer_idx);
+    }
+
+    if (layer->k_norm_weight) {
+        result.k_scale = load_key_vector(buf, layer, config, head_dim, layer_idx);
+    }
+
+    // Apply normalization if we have scales
+    qk_norm_apply(buf.q_proj, result.q_scale, head_dim, config->num_attention_heads);
+    qk_norm_apply(buf.k_proj, result.k_scale, head_dim, config->num_key_value_heads);
+
+    return result;
+}

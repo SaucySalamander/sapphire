@@ -1,180 +1,115 @@
 #ifndef NORMALIZATION_H
 #define NORMALIZATION_H
 
+#include "transformer.h"
+#include "llm_model.h"
+#include "gemma3_270m_config.h"
+
 /**
  * @file normalization.h
  * @brief Layer normalization functions for transformer blocks.
  * 
- * This module provides two popular normalization schemes:
- * - RMSNorm: Root Mean Square normalization (used in modern LLMs like LLaMA)
- * - LayerNorm: Classic layer normalization (used in BERT, GPT-2)
+ * This module provides RMSNorm (Root Mean Square Normalization),
+ * which is efficient and used in modern LLMs like LLaMA, Mistral, and Gemma 3.
  */
 
 /**
- * @brief Compute RMSNorm (Root Mean Square Normalization).
+ * @brief RMSNorm (Root Mean Square Normalization).
  * 
- * Formula:
- *   RMS = sqrt(mean(x^2))
- *   output = x * (weight / (RMS + eps))
- * 
- * Used in modern LLMs (LLaMA, etc.). More efficient than LayerNorm and
- * empirically performs well. Does not include learnable bias term.
- * 
- * @param x Input values (modified in-place).
- * @param weight Learnable scale factor (per-dimension). Length: n.
- * @param n Number of elements.
- * @param eps Small constant to prevent division by zero (e.g., 1e-6f).
- * 
- * @note x and weight are both length n.
- * @note Assumes weight is already initialized to 1.0f if no training.
- */
-void rmsnorm(float *x, const float *weight, int n, float eps);
-
-/**
- * @brief Compute RMSNorm without learnable weight (scale by 1/RMS only).
- * 
- * Formula: output = x / (RMS(x) + eps)
- * 
- * Useful for testing or when weight scaling is not needed.
- * 
- * @param x Input values (modified in-place).
- * @param n Number of elements.
- * @param eps Small constant to prevent division by zero.
- */
-void rmsnorm_no_weight(float *x, int n, float eps);
-
-/**
- * @brief Compute LayerNorm (Classic Layer Normalization).
- * 
- * Formula:
- *   mean = mean(x)
- *   var = var(x) = mean((x - mean)^2)
- *   output = (x - mean) / sqrt(var + eps) * weight + bias
- * 
- * Classic normalization. More expensive than RMSNorm (requires mean and variance
- * computation) but includes learnable shift (bias).
- * 
- * @param x Input values (modified in-place with output).
- * @param weight Learnable scale factor (per-dimension). Length: n.
- * @param bias Learnable shift factor (per-dimension). Length: n.
- * @param n Number of elements.
- * @param eps Small constant to prevent division by zero (e.g., 1e-6f).
- * 
- * @note x, weight, and bias are all length n.
- * @note Assumes weight initialized to 1.0f, bias to 0.0f if no training.
- */
-void layernorm(float *x, const float *weight, const float *bias, int n, float eps);
-
-/**
- * @brief Compute LayerNorm without learnable parameters (mean-variance normalization only).
- * 
- * Formula: output = (x - mean(x)) / sqrt(var(x) + eps)
- * 
- * Useful for testing or analysis layers without learned parameters.
- * 
- * @param x Input values (modified in-place).
- * @param n Number of elements.
- * @param eps Small constant to prevent division by zero.
- */
-void layernorm_no_params(float *x, int n, float eps);
-
-/**
- * @brief Compute RMSNorm for a 2D matrix (layer-wise normalization).
- * 
- * Applies RMSNorm independently to each row of a matrix.
- * 
- * Formula (per row): output[i,:] = input[i,:] * (weight / RMS(input[i,:]) + eps)
- * 
- * @param matrix Input matrix, row-major layout. Size: [num_rows, row_size].
- *               Modified in-place with normalized output.
- * @param weight Learnable scale per feature. Length: row_size.
- * @param num_rows Number of rows to normalize.
- * @param row_size Number of columns per row (feature dimension).
- * @param eps Small constant to prevent division by zero.
- */
-void rmsnorm_batch(float *matrix, const float *weight, int num_rows, int row_size, float eps);
-
-/**
- * @brief Compute LayerNorm for a 2D matrix (layer-wise normalization).
- * 
- * Applies LayerNorm independently to each row of a matrix.
- * 
- * @param matrix Input matrix, row-major layout. Size: [num_rows, row_size].
- *               Modified in-place with normalized output.
- * @param weight Learnable scale per feature. Length: row_size.
- * @param bias Learnable shift per feature. Length: row_size.
- * @param num_rows Number of rows to normalize.
- * @param row_size Number of columns per row (feature dimension).
- * @param eps Small constant to prevent division by zero.
- */
-void layernorm_batch(float *matrix, const float *weight, const float *bias, 
-                     int num_rows, int row_size, float eps);
-
-/**
- * @brief Standardized RMSNorm (Root Mean Square Normalization).
- *
  * Computes: out[i] = (in[i] / (RMS(in) + epsilon)) * weight[i]
- *
- * This is the standardized API version of RMSNorm with separate output buffer.
+ * 
+ * Non-in-place normalization with separate input/output buffers.
  * Used for implementing pre-norm and post-norm layer positioning in transformers.
- *
+ * 
  * Formula:
  *   RMS = sqrt(mean(in^2))
  *   out[i] = (in[i] / (RMS + eps)) * weight[i]
- *
- * Key differences from in-place rmsnorm():
- * - Separate input and output buffers (non-destructive)
- * - Explicit output parameter
- * - Enables pipelining without temporary buffers
- *
+ * 
  * Algorithm:
  *   1. Compute sum of squares: sum = Σ(in[i]^2)
  *   2. Compute RMS: rms = sqrt(sum / dim)
  *   3. Normalize and scale: out[i] = (in[i] / (rms + eps)) * weight[i]
- *
- * Optimization: Inner loop is unrolled (factor 4-8) for cache efficiency.
- *
+ * 
+ * Optimization: Inner loop is unrolled (factor 4) for cache efficiency.
+ * 
  * @param out Output array where normalized values are written.
  *            Must be pre-allocated and have size >= dim.
- *            Must not overlap with 'in' (unless separate pointers needed).
  * @param in Input array to normalize (not modified).
  *           Must contain dim elements.
  * @param weight Learnable scale factors (per-dimension).
  *               Must contain dim elements.
- *               Common initialization: all 1.0f
- * @param epsilon Small constant to prevent division by zero.
- *                 Typical value: 1e-6f
- *                 Must be positive.
- * @param dim Number of dimensions (elements).
- *            Must be > 0 and match size of all arrays.
- *
+ * @param epsilon Small constant to prevent division by zero (e.g., 1e-6f).
+ * @param dim Number of dimensions (elements). Must be > 0.
+ * 
  * @return 0 on success, -1 on error (NULL pointers, invalid dim, negative epsilon).
- *
+ * 
  * @note All arrays must be pre-allocated with size >= dim.
  * @note 'in' is read-only; 'out' receives normalized values.
- * @note NULL checks are performed; function returns -1 on invalid input.
- *
- * Example:
- *   float in[] = {1.0, 2.0, 3.0};
- *   float weight[] = {1.0, 1.0, 1.0};
- *   float out[3];
- *   sapphire_rmsnorm(out, in, weight, 1e-6f, 3);
- *   // out contains RMSNorm(in) * weight
  */
-int sapphire_rmsnorm(float *out, const float *in, const float *weight,
-                     float epsilon, int dim);
-
-/* Delta semantics: weight is interpreted as zero-centered delta, apply (1.0 + weight) */
-void rmsnorm_delta(float *x, const float *weight, int n, float eps);
-int sapphire_rmsnorm_delta(float *out, const float *in, const float *weight,
-                           float epsilon, int dim);
+int rmsnorm(float *out, const float *in, const float *weight,
+            float epsilon, int dim);
 
 /**
- * @brief Apply QK-Norm (RMSNorm on Q and K vectors) for Gemma 3.
- * 
- * Integrates directly into GQA forward pass.
- * Normalizes Q and K vectors using per-head scale weights.
+ * @brief RMSNorm with delta semantics (Gemma 3 style).
+ *
+ * Applies (1.0 + weight[i]) scaling for zero-centered parameterization.
+ *
+ * Computes: out[i] = (in[i] / (RMS(in) + epsilon)) * (1.0 + weight[i])
+ *
+ * @param out Output array.
+ * @param in Input array.
+ * @param weight Delta weights (applied as 1.0 + weight).
+ * @param epsilon Small constant to prevent division by zero.
+ * @param dim Number of dimensions.
+ *
+ * @return 0 on success, -1 on error.
  */
-void apply_qk_norm(float* q, float* k, float* q_scale, float* k_scale, int head_dim, int num_q_heads, int num_kv_heads);
+int rmsnorm_delta(float *out, const float *in, const float *weight,
+                  float epsilon, int dim);
+
+/**
+ * @brief Batch RMSNorm: Process multiple vectors efficiently.
+ * 
+ * Processes batch_size vectors of dimension dim each.
+ * Memory layout: row-major, C-contiguous.
+ * 
+ * @param out Output matrix [batch_size x dim] (row-major)
+ * @param in Input matrix [batch_size x dim] (row-major)
+ * @param weight Per-dimension scaling [dim]
+ * @param epsilon Small constant (e.g., 1e-6)
+ * @param batch_size Number of vectors
+ * @param dim Dimension per vector
+ * 
+ * @return 0 on success, -1 on error
+ */
+int rmsnorm_batch(float *out, const float *in, const float *weight,
+                  float epsilon, int batch_size, int dim);
+
+/**
+ * @brief Result struct for QK-Norm weight loading.
+ */
+typedef struct {
+    float* q_scale;
+    float* k_scale;
+} qk_norm_result_t;
+
+/**
+ * @brief Apply QK-Norm with weight extraction from layer.
+ * 
+ * Loads Q and K scale weights from the layer, handles broadcasting,
+ * and applies QK-Norm in-place to query and key projections.
+ * 
+ * @param buf Layer buffers containing q_proj, k_proj, and scratch space
+ * @param layer Model layer weights containing q_norm_weight, k_norm_weight
+ * @param config Model configuration with head counts and dimensions
+ * @param head_dim Dimension per attention head
+ * @param layer_idx Layer index for logging
+ * @return Struct containing pointers to extracted q_scale and k_scale
+ */
+qk_norm_result_t qk_norm_from_layer(layer_buffers_t buf,
+                                           model_layer_weights_t* layer,
+                                           gemma3_270m_config_t* config,
+                                           int head_dim,
+                                           int layer_idx);
 
 #endif // NORMALIZATION_H

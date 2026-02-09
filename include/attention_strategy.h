@@ -98,6 +98,17 @@ void alibi_attention_strategy(
 );
 
 /**
+ * @brief Configuration for attention scoring operations.
+ * Used to group parameters and meet project-wide function signatures constraints.
+ */
+typedef struct {
+    AttentionScalingStrategy strategy;
+    void *user_data;
+    int context_length;
+    int d_k;
+} attention_scoring_config_t;
+
+/**
  * @brief Generic attention score computation with pluggable scaling strategy.
  * 
  * Performs:
@@ -106,20 +117,14 @@ void alibi_attention_strategy(
  * 
  * @param q The Query vector (d_k dimension).
  * @param kv_cache_k The Key cache (context_length x d_k, row-major).
- * @param context_length Number of tokens in the cache.
- * @param d_k Dimension of the attention head.
- * @param strategy The scaling/normalization strategy function.
- * @param user_data Strategy-specific parameters (passed to strategy).
  * @param output_scores Output attention weights (size: context_length). Modified in-place.
+ * @param config Scoring configuration (strategy, dimensions, user data).
  */
 void compute_attention_scores_with_strategy(
     const float *q,
     const float *kv_cache_k,
-    int context_length,
-    int d_k,
-    AttentionScalingStrategy strategy,
-    void *user_data,
-    float *output_scores
+    float *output_scores,
+    const attention_scoring_config_t *config
 );
 
 #endif // ATTENTION_STRATEGY_H

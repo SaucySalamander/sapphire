@@ -52,9 +52,10 @@ typedef struct model_loader_hooks {
     /**
      * Populate model fields from files referenced in the spec (config.json, tokenizer files, etc.).
      * `spec` points to the owning `model_spec_t` and may be NULL if unknown.
-     * Returns 0 on success, non-zero on error (caller may treat as warning unless strict mode enabled).
+     * Logs detailed errors directly via LOG_ERROR(); caller checks return code only.
+     * Returns 0 on success, non-zero on error.
      */
-    int (*populate_from_files)(const char* model_dir, const model_spec_t* spec, char* error_msg, int max_err_len);
+    int (*populate_from_files)(const char* model_dir, const model_spec_t* spec);
 
     /**
      * Optional postprocessing step invoked after populate_from_files. May compute derived fields.

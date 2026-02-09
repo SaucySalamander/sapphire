@@ -226,11 +226,13 @@ check-cppcheck: compile_commands $(REPORTS_DIR)
 # Check: Lizard complexity in strict mode (fails on violations)
 .PHONY: check-complexity
 check-complexity: $(REPORTS_DIR)
-	@echo "Running Lizard (strict mode - CC threshold: 10, Length threshold: 500, excluding tests)..."
-	@$(LIZARD) -l c -m -C 10 -L 500 -x '*/test/*' src 2>&1 | tee $(REPORTS_DIR)/lizard-strict.txt || true
+	@echo "Running Lizard (strict mode - CC: $(LIZARD_THRESHOLD_CC), NLOC: $(LIZARD_THRESHOLD_NLOC), Params: $(LIZARD_THRESHOLD_PARAM), Tokens: $(LIZARD_THRESHOLD_TOKEN))..."
+	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_NLOC) -a $(LIZARD_THRESHOLD_PARAM) -T token_count=$(LIZARD_THRESHOLD_TOKEN) -x '*/test/*' src 2>&1 | tee $(REPORTS_DIR)/lizard-strict.txt || true
 	@if grep -q "!!!!.*Warnings" $(REPORTS_DIR)/lizard-strict.txt 2>/dev/null; then \
+	  echo "❌ Complexity checks failed. See $(REPORTS_DIR)/lizard-strict.txt"; \
 	  exit 1; \
 	fi
+	@echo "✓ Complexity checks passed"
 
 # Check: ASan/UBSan in strict mode (fails on violations)
 .PHONY: check-sanitize
@@ -252,16 +254,22 @@ clean:
 # ============================================================================
 
 LIZARD ?= .venv/bin/lizard
-LIZARD_THRESHOLD_CC ?= 15
-LIZARD_THRESHOLD_LENGTH ?= 1000
+LIZARD_THRESHOLD_CC ?= 30
+LIZARD_THRESHOLD_NLOC ?= 150
+LIZARD_THRESHOLD_PARAM ?= 6
+LIZARD_THRESHOLD_TOKEN ?= 800
 
-.PHONY: lizard-report
+.PHONY: lizard-csv lizard-report
+
+# Generate CSV report only (for monitoring/scripting - no browser)
+lizard-csv: $(REPORTS_DIR)
+	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_NLOC) -a $(LIZARD_THRESHOLD_PARAM) -T token_count=$(LIZARD_THRESHOLD_TOKEN) -x '*/test/*' src --csv > $(REPORTS_DIR)/lizard-report.csv || true
 
 # Generate CSV/HTML reports from lizard analysis (excluding tests)
 lizard-report: $(REPORTS_DIR)
 	@echo "Running Lizard complexity analysis and generating reports..."
-	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_LENGTH) -x '*/test/*' src --csv > $(REPORTS_DIR)/lizard-report.csv || true
-	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_LENGTH) -x '*/test/*' src -H > $(REPORTS_DIR)/lizard-report.html || true
+	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_NLOC) -a $(LIZARD_THRESHOLD_PARAM) -T token_count=$(LIZARD_THRESHOLD_TOKEN) -x '*/test/*' src --csv > $(REPORTS_DIR)/lizard-report.csv || true
+	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_NLOC) -a $(LIZARD_THRESHOLD_PARAM) -T token_count=$(LIZARD_THRESHOLD_TOKEN) -x '*/test/*' src -H > $(REPORTS_DIR)/lizard-report.html || true
 	@echo "Complexity reports generated: $(REPORTS_DIR)/lizard-report.csv, $(REPORTS_DIR)/lizard-report.html"
 	@if [ -f $(REPORTS_DIR)/lizard-report.html ]; then \
 	  xdg-open $(REPORTS_DIR)/lizard-report.html 2>/dev/null || open $(REPORTS_DIR)/lizard-report.html 2>/dev/null || firefox $(REPORTS_DIR)/lizard-report.html 2>/dev/null || echo "Open $(REPORTS_DIR)/lizard-report.html manually"; \

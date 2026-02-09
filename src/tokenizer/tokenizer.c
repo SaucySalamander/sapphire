@@ -3,8 +3,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <errno.h>
 #include "../include/simple_json.h"
 #include "../include/model_spec.h"
+#include "../include/file_reader.h"
 #include "log.h"
 
 /* Simple DJB2 hash for strings */
@@ -61,171 +64,148 @@ static int tok_hash_lookup(sapphire_tokenizer_t *tok, const char *s) {
 }
 
 /**
- * Load tokenizer from JSON files with streaming parser
- * Handles both root-level and nested model.vocab structures (Gemma 3 support)
+ * Metadata from vocab JSON inspection phase
+ * Used to pass information between inspect, allocate, and populate phases
  */
-sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
-    if (!model_dir) return NULL;
-    
-    sapphire_tokenizer_t *tok = malloc(sizeof(sapphire_tokenizer_t));
-    if (!tok) return NULL;
-    memset(tok, 0, sizeof(sapphire_tokenizer_t));
-    
-    // Read tokenizer.json
-    char tokenizer_path[512];
-    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", model_dir);
-    
-    FILE *f = fopen(tokenizer_path, "rb");
-    if (!f) {
-        fprintf(stderr, "ERROR: Cannot open %s\n", tokenizer_path);
-        free(tok);
-        return NULL;
-    }
-    
-    // Get file size
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    
-    LOG_DEBUG("Loading tokenizer.json (%ld bytes)...", file_size);
-    
-    char *json_data = malloc(file_size + 1);
-    if (!json_data) {
-        fprintf(stderr, "ERROR: Cannot allocate memory for tokenizer.json (%ld bytes)\n", file_size);
-        fclose(f);
-        free(tok);
-        return NULL;
-    }
-    
-    if (fread(json_data, 1, file_size, f) != (size_t)file_size) {
-        fprintf(stderr, "ERROR: Cannot read tokenizer.json\n");
-        free(json_data);
-        fclose(f);
-        free(tok);
-        return NULL;
-    }
-    fclose(f);
-    json_data[file_size] = '\0';
-    
-    // Do not allocate vocab yet. We'll inspect the JSON `vocab` object
-    // to determine the required capacity (max token id) and allocate
-    // exactly what we need to avoid out-of-bounds writes.
-    
-    // Use simple_json tokenizer to parse nested model.vocab
-    size_t max_tokens = (size_t)(file_size / 8) + 1024;
-    if (max_tokens > 1500000) max_tokens = 1500000;
-    sjson_token_t *tokens = malloc(sizeof(sjson_token_t) * max_tokens);
-    if (!tokens) {
-        fprintf(stderr, "ERROR: cannot allocate JSON token buffer\n");
-        free(json_data);
-        free(tok->vocab);
-        free(tok);
+typedef struct {
+    int vocab_idx_token;
+    int ntokens;
+    const sjson_token_t *tokens;
+    const char *json_data;
+} vocab_inspection_t;
+
+/**
+ * Safely construct and validate tokenizer path using centralized file_reader utilities
+ * Returns allocated path on success, NULL on failure
+ */
+static char* construct_tokenizer_path(const char *model_dir) {
+    if (!model_dir) {
+        LOG_ERROR("model_dir is NULL");
         return NULL;
     }
 
-    int ntokens = sjson_tokenize(json_data, tokens, (int)max_tokens);
-    if (ntokens <= 0) {
-        LOG_ERROR("Failed to tokenize tokenizer.json");
-        free(tokens);
-        free(json_data);
-        free(tok->vocab);
-        free(tok);
-        return NULL;
-    }
+    // construct_safe_path allocates and returns the path, or NULL on error
+    return construct_safe_path(model_dir, "tokenizer.json", NULL);
+}
 
+/**
+ * Helper: Inspect JSON to find and validate vocab object
+ * Returns metadata struct containing token indices and pointers, or zeroed struct on error
+ */
+static vocab_inspection_t inspect_vocab_from_json(const char *json_data, const sjson_token_t *tokens, 
+                                                   int ntokens) {
+    vocab_inspection_t result = {0};
+    
     // Find "model" key at root (token 0 is the root object)
     int model_val_idx = sjson_find_key(json_data, tokens, ntokens, 0, "model");
     if (model_val_idx < 0) {
-        fprintf(stderr, "ERROR: No \"model\" found in tokenizer.json (expected model.vocab structure)\n");
-        free(tokens);
-        free(json_data);
-        free(tok->vocab);
-        free(tok);
-        return NULL;
+        LOG_ERROR("No \"model\" found in tokenizer.json (expected model.vocab structure)");
+        return result;
     }
 
     int vocab_idx_token = sjson_find_key(json_data, tokens, ntokens, model_val_idx, "vocab");
     if (vocab_idx_token < 0) {
-        fprintf(stderr, "ERROR: No \"vocab\" found inside model in tokenizer.json\n");
-        free(tokens);
-        free(json_data);
-        free(tok->vocab);
-        free(tok);
-        return NULL;
+        LOG_ERROR("No \"vocab\" found inside model in tokenizer.json");
+        return result;
     }
 
     if (tokens[vocab_idx_token].type != SJSON_OBJ) {
-        fprintf(stderr, "ERROR: vocab is not a JSON object\n");
-        free(tokens);
-        free(json_data);
-        free(tok);
-        return NULL;
+        LOG_ERROR("vocab is not a JSON object");
+        return result;
     }
+    
+    // Validation passed, populate result
+    result.vocab_idx_token = vocab_idx_token;
+    result.ntokens = ntokens;
+    result.tokens = tokens;
+    result.json_data = json_data;
+    return result;
+}
 
-    // Compute required capacity (two-pass): first compute max token id
-    // and child count, then allocate tok->vocab accordingly.
-    int raw_child_count = tokens[vocab_idx_token].size;
-    /* sjson records each child token (keys and values) in tokens[].size, so for
-     * an object of N pairs this value will be ~2*N. Compute actual pair count by
-     * scanning direct children and counting string keys. */
+/**
+ * Helper: Scan vocab object and allocate appropriately-sized vocabulary array
+ * Performs Pass 1: count children, find max token ID, compute capacity
+ * Returns zero-initialized vocab array ready for population, or NULL on error
+ * Sets *out_vocab_size to the allocated capacity
+ */
+static token_t* allocate_vocab_from_json(const vocab_inspection_t *inspect, int *out_vocab_size) {
+    // Count direct children (string keys = number of pairs)
     int child_count = 0;
-    int probe_idx = vocab_idx_token + 1;
-    while (probe_idx < ntokens && tokens[probe_idx].parent == vocab_idx_token) {
-        if (tokens[probe_idx].type == SJSON_STR) child_count++;
+    int probe_idx = inspect->vocab_idx_token + 1;
+    while (probe_idx < inspect->ntokens && inspect->tokens[probe_idx].parent == inspect->vocab_idx_token) {
+        if (inspect->tokens[probe_idx].type == SJSON_STR) child_count++;
         probe_idx++;
     }
-    LOG_DEBUG("tokenizer.json: ntokens=%d raw_child_tokens=%d vocab_pairs=%d", ntokens, raw_child_count, child_count);
-    int scan_idx = vocab_idx_token + 1;
+    
+    // Scan for maximum token ID
+    int scan_idx = inspect->vocab_idx_token + 1;
     int max_token_id = -1;
-    for (int i = 0; i < child_count && scan_idx + 1 < ntokens; i++) {
-        /* scan only the value token here to compute max id */
-        scan_idx++; // skip key
-        const sjson_token_t *v = &tokens[scan_idx++];
+    for (int i = 0; i < child_count && scan_idx + 1 < inspect->ntokens; i++) {
+        scan_idx++;  // skip key
+        const sjson_token_t *v = &inspect->tokens[scan_idx++];
         if (v->type != SJSON_PRIM) continue;
+        
         int vlen = v->end - v->start;
         if (vlen <= 0 || vlen >= 64) continue;
+        
         char tmp[64];
-        memcpy(tmp, json_data + v->start, vlen);
+        memcpy(tmp, inspect->json_data + v->start, vlen);
         tmp[vlen] = '\0';
         int token_id = (int)strtol(tmp, NULL, 10);
         if (token_id > max_token_id) max_token_id = token_id;
     }
-
-    LOG_DEBUG("tokenizer.json: max_token_id=%d", max_token_id);
-
+    
+    // Calculate required capacity
     int capacity = 0;
     if (max_token_id >= 0) capacity = max_token_id + 1;
     if (capacity < child_count) capacity = child_count;
     if (capacity <= 0) capacity = 1;
-
-    tok->vocab = calloc((size_t)capacity, sizeof(token_t));
-    if (!tok->vocab) {
-        fprintf(stderr, "ERROR: Cannot allocate vocabulary array (capacity=%d)\n", capacity);
-        free(tokens);
-        free(json_data);
-        free(tok);
+    
+    LOG_DEBUG("tokenizer.json: vocab_pairs=%d max_token_id=%d capacity=%d", child_count, max_token_id, capacity);
+    
+    // Allocate and zero-initialize
+    token_t *vocab = calloc((size_t)capacity, sizeof(token_t));
+    if (!vocab) {
+        LOG_ERROR("Cannot allocate vocabulary array (capacity=%d)", capacity);
         return NULL;
     }
-    // Set vocab_size to capacity so decode() bounds checks are valid.
-    tok->vocab_size = capacity;
-    LOG_DEBUG("Allocated tok->vocab capacity=%d (vocab_size=%d)", capacity, tok->vocab_size);
+    
+    if (out_vocab_size) *out_vocab_size = capacity;
+    return vocab;
+}
 
-    // Second pass: populate vocabulary entries
-    int idx = vocab_idx_token + 1;
+/**
+ * Helper: Populate vocabulary array from JSON metadata
+ * Performs Pass 2: extract token strings and IDs from tokens array
+ * Returns: number of successfully parsed entries
+ */
+static int populate_vocab_from_json(sapphire_tokenizer_t *tok, const vocab_inspection_t *inspect) {
+    if (!tok || !tok->vocab || !inspect) return 0;
+    
+    int idx = inspect->vocab_idx_token + 1;
     int parsed = 0;
     int skipped_out_of_range = 0;
     int skipped_malformed = 0;
+    
+    // Recount children for loop bounds
+    int child_count = 0;
+    int probe_idx = inspect->vocab_idx_token + 1;
+    while (probe_idx < inspect->ntokens && inspect->tokens[probe_idx].parent == inspect->vocab_idx_token) {
+        if (inspect->tokens[probe_idx].type == SJSON_STR) child_count++;
+        probe_idx++;
+    }
+    
     printf("DEBUG: Parsing vocabulary entries from nested model.vocab...\n");
-    for (int i = 0; i < child_count && idx + 1 < ntokens; i++) {
-        const sjson_token_t *k = &tokens[idx++];
-        const sjson_token_t *v = &tokens[idx++];
+    for (int i = 0; i < child_count && idx + 1 < inspect->ntokens; i++) {
+        const sjson_token_t *k = &inspect->tokens[idx++];
+        const sjson_token_t *v = &inspect->tokens[idx++];
 
         if (k->type != SJSON_STR) continue;
 
         int key_len = k->end - k->start;
         char *token_text = malloc(key_len + 1);
         if (!token_text) continue;
-        if (sjson_token_to_str(json_data, k, token_text, key_len + 1) != 0) {
+        if (sjson_token_to_str(inspect->json_data, k, token_text, key_len + 1) != 0) {
             free(token_text);
             continue;
         }
@@ -235,7 +215,7 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
         int vlen = v->end - v->start;
         if (vlen > 0 && vlen < 64) {
             char tmp[64];
-            memcpy(tmp, json_data + v->start, vlen);
+            memcpy(tmp, inspect->json_data + v->start, vlen);
             tmp[vlen] = '\0';
             token_id = (int)strtol(tmp, NULL, 10);
         } else {
@@ -265,11 +245,19 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
 
     printf("✓ Successfully parsed %d vocabulary entries (capacity=%d)\n", parsed, tok->vocab_size);
     LOG_DEBUG("Tokenizer parse summary: parsed=%d skipped_out_of_range=%d skipped_malformed=%d", parsed, skipped_out_of_range, skipped_malformed);
+    return parsed;
+}
 
-    /* Build fast lookup hash table sized to power-of-two >= 2 * parsed */
+/**
+ * Helper: Build tokenizer hash table for fast token lookup
+ * Sizes table to power-of-two >= 2 * parsed_count
+ */
+static void build_tokenizer_hash_table(sapphire_tokenizer_t *tok, int parsed) {
+    if (!tok || parsed <= 0) return;
+    
     int ht_size = next_pow2(parsed * 2 + 1);
     tok->hash_capacity = ht_size;
-    tok->hash_table = malloc(sizeof(int) * ht_size);
+    tok->hash_table = malloc(sizeof(int) * (size_t)ht_size);
     if (tok->hash_table) {
         for (int i = 0; i < ht_size; i++) tok->hash_table[i] = -1;
         for (int i = 0; i < tok->vocab_size; i++) {
@@ -283,73 +271,198 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
     } else {
         LOG_DEBUG("Failed to allocate tokenizer hash table (size=%d)", ht_size);
     }
+}
+
+/**
+ * Helper: Load and parse the main vocabulary from tokenizer.json data
+ * Consolidates tokenization, inspection, allocation, and population logic
+ * Returns 0 on success, -1 on failure
+ */
+static int load_main_vocabulary(sapphire_tokenizer_t *tok, const char *json_data, size_t json_len) {
+    if (!tok || !json_data) return -1;
+
+    // Determine max tokens for JSON buffer
+    size_t max_tokens = (json_len / 8) + 1024;
+    if (max_tokens > 1500000) max_tokens = 1500000;
+    
+    sjson_token_t *tokens = malloc(sizeof(sjson_token_t) * max_tokens);
+    if (!tokens) {
+        LOG_ERROR("Cannot allocate JSON token buffer");
+        return -1;
+    }
+
+    int ntokens = sjson_tokenize(json_data, tokens, (int)max_tokens);
+    if (ntokens <= 0) {
+        LOG_ERROR("Failed to tokenize tokenizer.json");
+        free(tokens);
+        return -1;
+    }
+
+    // Inspect vocab object structure
+    vocab_inspection_t inspect = inspect_vocab_from_json(json_data, tokens, ntokens);
+    if (inspect.vocab_idx_token == 0 && inspect.ntokens == 0) {
+        // inspect_vocab_from_json logs the specific error
+        free(tokens);
+        return -1;
+    }
+
+    // Allocate vocab array with appropriate capacity
+    tok->vocab = allocate_vocab_from_json(&inspect, &tok->vocab_size);
+    if (!tok->vocab) {
+        free(tokens);
+        return -1;
+    }
+    LOG_DEBUG("Allocated tok->vocab size=%d", tok->vocab_size);
+
+    // Populate vocabulary entries and build hash table
+    int parsed = populate_vocab_from_json(tok, &inspect);
+    build_tokenizer_hash_table(tok, parsed);
 
     free(tokens);
-    free(json_data);
-    
-    // Read tokenizer_config.json for special tokens
-    char config_path[512];
-    snprintf(config_path, sizeof(config_path), "%s/tokenizer_config.json", model_dir);
-    
-    f = fopen(config_path, "rb");
-    if (f) {
-        fseek(f, 0, SEEK_END);
-        long config_size = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        
-        char *config_data = malloc(config_size + 1);
-        if (config_data) {
-            if (fread(config_data, 1, config_size, f) == (size_t)config_size) {
-                config_data[config_size] = '\0';
-                
-                // Default special token IDs (from Gemma)
-                tok->bos_token_id = 2;     // <bos>
-                tok->eos_token_id = 1;     // <eos>
-                tok->pad_token_id = 0;     // <pad>
-                tok->unk_token_id = 3;     // <unk>
-                
-                // CRITICAL FIX: Force BOS token for Gemma 3
-                // The model expects to start with <bos> (ID 2).
-                tok->add_bos_token = 1;
+    return 0;
+}
 
-                // Try to find actual values in config
-                const char *bos_str = strstr(config_data, "\"bos_token_id\"");
-                if (bos_str) {
-                    const char *colon = strchr(bos_str, ':');
-                    if (colon) {
-                        tok->bos_token_id = strtol(colon + 1, NULL, 10);
-                    }
-                }
-                
-                const char *eos_str = strstr(config_data, "\"eos_token_id\"");
-                if (eos_str) {
-                    const char *colon = strchr(eos_str, ':');
-                    if (colon) {
-                        tok->eos_token_id = strtol(colon + 1, NULL, 10);
-                    }
-                }
-                
-                const char *pad_str = strstr(config_data, "\"pad_token_id\"");
-                if (pad_str) {
-                    const char *colon = strchr(pad_str, ':');
-                    if (colon) {
-                        tok->pad_token_id = strtol(colon + 1, NULL, 10);
-                    }
-                }
-                
-                // Parse add_bos_token and add_eos_token
-                tok->add_bos_token = (strstr(config_data, "\"add_bos_token\": true") != NULL);
-                tok->add_eos_token = (strstr(config_data, "\"add_eos_token\": true") != NULL);
-            }
-            free(config_data);
-        }
-        fclose(f);
+/**
+ * Helper: Load and parse tokenizer_config.json for special tokens
+ * Uses streaming sjson_cursor_t API for efficiency and safety
+ */
+static void load_tokenizer_config(sapphire_tokenizer_t *tok, const char *model_dir) {
+    if (!tok || !model_dir) return;
+
+    char *config_path = construct_safe_path(model_dir, "tokenizer_config.json", NULL);
+    if (!config_path) {
+        LOG_ERROR("Failed to construct tokenizer_config.json path");
+        return;
     }
+
+    size_t config_size = 0;
+    char *config_data = NULL;
+    if (file_read_json(config_path, &config_data, &config_size) != 0) {
+        // Not a fatal error, but continue without custom config
+        free(config_path);
+        
+        // Ensure defaults are set if config is missing
+        tok->bos_token_id = 2;
+        tok->eos_token_id = 1;
+        tok->pad_token_id = 0;
+        tok->unk_token_id = 3;
+        tok->add_bos_token = 1; // CRITICAL FIX: Force BOS token for Gemma 3
+        return;
+    }
+
+    // Default special token IDs (Gemma style)
+    tok->bos_token_id = 2;
+    tok->eos_token_id = 1;
+    tok->pad_token_id = 0;
+    tok->unk_token_id = 3;
+    tok->add_bos_token = 1; // CRITICAL FIX: Force BOS token for Gemma 3
+
+    // Parse config with Cursor API
+    sjson_cursor_t c = sjson_cursor_init(config_data, config_size);
+    if (sjson_cursor_consume(&c, '{')) {
+        while (sjson_cursor_peek(&c) != '}' && sjson_cursor_peek(&c) != '\0') {
+            char key[128];
+            if (sjson_cursor_parse_string(&c, key, sizeof(key)) != 0) break;
+            if (!sjson_cursor_consume(&c, ':')) break;
+
+            if (strcmp(key, "bos_token_id") == 0) {
+                uint64_t val;
+                if (sjson_cursor_parse_u64(&c, &val) == 0) tok->bos_token_id = (int)val;
+            } else if (strcmp(key, "eos_token_id") == 0) {
+                uint64_t val;
+                if (sjson_cursor_parse_u64(&c, &val) == 0) tok->eos_token_id = (int)val;
+            } else if (strcmp(key, "pad_token_id") == 0) {
+                uint64_t val;
+                if (sjson_cursor_parse_u64(&c, &val) == 0) tok->pad_token_id = (int)val;
+            } else if (strcmp(key, "add_bos_token") == 0) {
+                // Peek at the next char for booleans (true/false)
+                char peek = sjson_cursor_peek(&c);
+                if (peek == 't') { // true
+                    tok->add_bos_token = 1;
+                } else if (peek == 'f') { // false
+                    tok->add_bos_token = 0;
+                }
+                sjson_cursor_skip_value(&c); 
+            } else if (strcmp(key, "add_eos_token") == 0) {
+                char peek = sjson_cursor_peek(&c);
+                if (peek == 't') {
+                    tok->add_eos_token = 1;
+                    sjson_cursor_skip_value(&c);
+                } else if (peek == 'f') {
+                    tok->add_eos_token = 0;
+                    sjson_cursor_skip_value(&c);
+                } else {
+                    sjson_cursor_skip_value(&c);
+                }
+            } else {
+                sjson_cursor_skip_value(&c);
+            }
+            sjson_cursor_consume(&c, ','); // consume separator if exists
+        }
+    }
+
+    free(config_data);
+    free(config_path);
     
+    printf("Tokenizer special tokens: bos=%d, eos=%d, pad=%d, unk=%d, add_bos=%d, add_eos=%d\n",
+           tok->bos_token_id, tok->eos_token_id, tok->pad_token_id, tok->unk_token_id,
+           tok->add_bos_token, tok->add_eos_token);
+}
+
+/**
+ * Load tokenizer from JSON files with streaming parser
+ * Handles both root-level and nested model.vocab structures (Gemma 3 support)
+ */
+sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
+    if (!model_dir) {
+        LOG_ERROR("model_dir is NULL");
+        return NULL;
+    }
+
+    sapphire_tokenizer_t *tok = NULL;
+    char *tokenizer_path = NULL;
+    char *json_data = NULL;
+    size_t json_len = 0;
+
+    // 1. Setup path and load JSON buffer
+    tokenizer_path = construct_tokenizer_path(model_dir);
+    if (!tokenizer_path) {
+        goto cleanup;
+    }
+
+    if (file_read_json(tokenizer_path, &json_data, &json_len) != 0) {
+        goto cleanup; // Error already logged by file_read_json()
+    }
+    LOG_DEBUG("Loading tokenizer.json (%zu bytes)...", json_len);
+
+    // 2. Allocate tokenizer structure
+    tok = calloc(1, sizeof(sapphire_tokenizer_t));
+    if (!tok) {
+        LOG_ERROR("Failed to allocate sapphire_tokenizer_t");
+        goto cleanup;
+    }
+
+    // 3. Load Main Vocabulary
+    if (load_main_vocabulary(tok, json_data, json_len) != 0) {
+        goto cleanup;
+    }
+
+    // 4. Load Special Tokens Configuration
+    load_tokenizer_config(tok, model_dir);
+
+    // Success
     printf("Tokenizer loaded: vocab_size=%d\n", tok->vocab_size);
-    printf("Special tokens: bos=%d, eos=%d, pad=%d, unk=%d\n",
-           tok->bos_token_id, tok->eos_token_id, tok->pad_token_id, tok->unk_token_id);
-    
+    goto final;
+
+cleanup:
+    if (tok) {
+        tokenizer_free(tok);
+        tok = NULL;
+    }
+
+final:
+    if (tokenizer_path) free(tokenizer_path);
+    if (json_data) free(json_data);
     return tok;
 }
 
@@ -594,7 +707,7 @@ int build_gemma3_prompt_it(sapphire_tokenizer_t* tok, const char* user_prompt,
     int prompt_len = tokenize(tok, user_prompt, prompt_tokens, 512);
 
     if (prompt_len <= 0) {
-        fprintf(stderr, "WARN: Failed to tokenize user prompt, using fallback\n");
+        LOG_WARN("Failed to tokenize user prompt, using fallback");
         prompt_len = tokenize_fallback(user_prompt, prompt_tokens, 512);
     }
 
@@ -641,7 +754,7 @@ int build_gemma3_prompt_base(sapphire_tokenizer_t* tok, const char* user_prompt,
     int prompt_len = tokenize(tok, user_prompt, prompt_tokens, 512);
 
     if (prompt_len <= 0) {
-        fprintf(stderr, "WARN: Failed to tokenize user prompt, using fallback\n");
+        LOG_WARN("Failed to tokenize user prompt, using fallback");
         prompt_len = tokenize_fallback(user_prompt, prompt_tokens, 512);
     }
 
@@ -676,13 +789,13 @@ int build_gemma3_prompt_base(sapphire_tokenizer_t* tok, const char* user_prompt,
 int build_gemma3_prompt(const model_spec_t* spec, const char* user_prompt,
                         int* tokens, int max_tokens) {
     if (!spec || !spec->model_id || !user_prompt || !tokens) {
-        fprintf(stderr, "ERROR: build_gemma3_prompt() received NULL arguments\n");
+        LOG_ERROR("build_gemma3_prompt() received NULL arguments");
         return -1;
     }
 
     sapphire_tokenizer_t* tok = (sapphire_tokenizer_t*)spec->tokenizer_handle;
     if (!tok) {
-        fprintf(stderr, "ERROR: model_spec has no tokenizer loaded\n");
+        LOG_ERROR("model_spec has no tokenizer loaded");
         return -1;
     }
 

@@ -2,6 +2,7 @@
 #define UTILS_H
 
 #include <stdint.h>
+#include "tensor.h"
 
 /**
  * @brief Computes softmax with numerical stability.
@@ -74,5 +75,15 @@ float sampling_entropy_from_unnormalized(const float *exp_logits, int n, float s
  * @return cumulative probability mass of top-k (0..1)
  */
 float sampling_topk_mass_from_unnormalized(const float *exp_logits, int n, int k, float sum);
+
+/**
+ * @brief Convert BF16 norm weights to F32, or return pointer if already F32.
+ * @param weight Tensor with norm weights (BF16 or F32).
+ * @param scratch Buffer for BF16→F32 conversion (must be at least n floats).
+ * @param n Number of elements.
+ * @return Pointer to F32 weights (either converted in scratch or original data).
+ *         Returns NULL if weight is NULL.
+ */
+const float* get_norm_weights(const tensor_t* weight, float* scratch, int n);
 
 #endif // UTILS_H

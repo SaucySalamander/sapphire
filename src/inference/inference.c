@@ -25,6 +25,7 @@
 #include "../include/tensor_gemv.h"
 #include "../include/transformer.h"
 #include "../include/utils.h"
+#include "../include/file_reader.h"
 #include "tokenizer.h"
 
 static int g_attn_debug_raw_warned = 0;
@@ -32,6 +33,33 @@ static int g_attn_debug_raw_warned = 0;
 /* Note: build_gemma3_prompt moved to tokenizer module (see include/tokenizer.h)
     to centralize tokenization / prompt construction logic. The function intelligently
     detects whether the model is IT or base and calls the appropriate builder. */
+
+/**
+ * @brief Load tokenizer from model directory or reuse cached tokenizer from spec.
+ * Caches tokenizer in spec for reuse across multiple contexts.
+ * 
+ * @returns 0 on success (tokenizer loaded or cached), -1 on error
+ */
+static int load_or_reuse_tokenizer(model_spec_t* spec, const char* model_dir) {
+    if (!spec || !model_dir) return -1;
+    
+    // Tokenizer may already be cached in spec (from previous context)
+    if (spec->tokenizer_handle) {
+        LOG_INFO("Reusing cached tokenizer for model %s", spec->model_id);
+        return 0;
+    }
+    
+    LOG_INFO("Loading tokenizer from %s", model_dir);
+    sapphire_tokenizer_t* tk = tokenizer_load(model_dir);
+    if (!tk) {
+        LOG_ERROR("Failed to load tokenizer from %s", model_dir);
+        return -1;
+    }
+    
+    // Cache tokenizer in spec for reuse by future contexts
+    spec->tokenizer_handle = (void*)tk;
+    return 0;
+}
 
 /**
  * @brief Initialize inference context
@@ -48,13 +76,18 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
     }
 
     // Construct the model directory path: ./models/{model_name}
-    char model_dir[512];
-    snprintf(model_dir, sizeof(model_dir), "./models/%s", model_name);
+    // construct_safe_path allocates exact size needed and validates all components
+    char *model_dir = construct_safe_path("./models", model_name, NULL);
+    if (!model_dir) {
+        LOG_ERROR("Failed to construct model directory path");
+        return NULL;
+    }
 
     // Allocate model structure
     llm_model_t* model = (llm_model_t*)malloc(sizeof(llm_model_t));
     if (!model) {
         LOG_ERROR("Failed to allocate model structure");
+        free(model_dir);
         return NULL;
     }
     memset(model, 0, sizeof(llm_model_t));
@@ -62,17 +95,19 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
     spec->llm_model = model;
 
     // Trigger the loader hooks to populate model and config
-    char error_msg[512] = {0};
+    // The loader function logs its own detailed errors; we just check the return code
     if (spec->loader_hooks && spec->loader_hooks->populate_from_files) {
-        int rc = spec->loader_hooks->populate_from_files(model_dir, spec, error_msg, sizeof(error_msg));
+        int rc = spec->loader_hooks->populate_from_files(model_dir, spec);
         if (rc != 0) {
-            LOG_ERROR("Failed to populate model from files: %s", error_msg);
+            LOG_ERROR("Failed to populate model from files");
             free(model);
+            free(model_dir);
             return NULL;
         }
     } else {
         LOG_ERROR("Model spec has no loader hooks");
         free(model);
+        free(model_dir);
         return NULL;
     }
 
@@ -85,6 +120,7 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
     if (!ctx) {
         LOG_ERROR("Failed to allocate inference context");
         llm_model_destroy(model);
+        free(model_dir);
         return NULL;
     }
     memset(ctx, 0, sizeof(inference_context_t));
@@ -100,6 +136,7 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
     if (!ctx->logits) {
         fprintf(stderr, "ERROR: Failed to allocate logits buffer\n");
         free(ctx);
+        free(model_dir);
         return NULL;
     }
 
@@ -109,38 +146,30 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
         fprintf(stderr, "ERROR: Failed to create inference session\n");
         free(ctx->logits);
         free(ctx);
+        free(model_dir);
         return NULL;
     }
 
-    // Load tokenizer from model directory or spec; require successful load (no fallback)
-    if (!ctx->tokenizer) {
-        // Prefer tokenizer already loaded and stored in the spec
-        if (spec->tokenizer_handle) {
-            ctx->tokenizer = (sapphire_tokenizer_t*)spec->tokenizer_handle;
-            LOG_INFO("Using tokenizer from spec for model %s", spec->model_id);
+    // Load tokenizer from model directory or spec
+    // Spec caches tokenizer across multiple context creations for efficiency
+    if (load_or_reuse_tokenizer(spec, model_dir) != 0) {
+        LOG_ERROR("Failed to initialize tokenizer");
+        // Clean up allocated resources and return error
+        if (ctx->session) destroy_inference_session(ctx->session);
+        if (ctx->logits) free(ctx->logits);
+        free(ctx);
+        if (spec->llm_model) {
+            llm_model_destroy_ex((const struct model_spec*)spec);
+            spec->llm_model = NULL;
         } else {
-            LOG_INFO("Loading tokenizer from %s", model_dir);
-            sapphire_tokenizer_t* tk = tokenizer_load(model_dir);
-            if (!tk) {
-                LOG_ERROR("Failed to load tokenizer from %s", model_dir);
-                // Clean up allocated resources and return error (no fallback)
-                if (ctx->session) destroy_inference_session(ctx->session);
-                if (ctx->logits) free(ctx->logits);
-                free(ctx);
-                if (spec->llm_model) {
-                    llm_model_destroy_ex((const struct model_spec*)spec);
-                    spec->llm_model = NULL;
-                } else {
-                    free(model);
-                }
-                return NULL;
-            }
-            // Store tokenizer in spec for ownership and reuse
-            spec->tokenizer_handle = (void*)tk;
-            ctx->tokenizer = tk;
+            free(model);
         }
+        free(model_dir);
+        return NULL;
     }
-
+    
+    free(model_dir);  // We're done with the path
+    ctx->tokenizer = (sapphire_tokenizer_t*)spec->tokenizer_handle;
     return ctx;
 }
 
@@ -190,73 +219,20 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
     inference_session_t* session = ctx->session;
     gemma3_270m_config_t* config = (gemma3_270m_config_t*)ctx->spec->variant_config;
 
-    printf("\n[Generating response...]\n");
-    fflush(stdout);
-
-    LOG_DEBUG("User prompt: '%s'", prompt);
+    int* tokens = malloc((ctx->context_len) * sizeof(int));
+    int prompt_len = 0;
+    int total_tokens = 0;
+    int last_token = 0;
+    int generated_count = 0;
 
     // 1. Build prompt (intelligently selects IT or base format based on model)
-    int* tokens = malloc((ctx->context_len) * sizeof(int));
-    int prompt_len = build_gemma3_prompt(ctx->spec, prompt, tokens, ctx->context_len);
+    prompt_len = build_gemma3_prompt(ctx->spec, prompt, tokens, ctx->context_len);
 
     if (prompt_len <= 0) {
         LOG_ERROR("Failed to build prompt");
         free(tokens);
         return -1;
     }
-
-    LOG_DEBUG("Built prompt with %d tokens", prompt_len);
-
-    /* Log the entire token list. To avoid enormous logs, cap the printed
-     * tokens to `MAX_SHOW_LIMIT`. This prints a single DEBUG line with the
-     * token ids in order. */
-    {
-        int max_show = prompt_len;
-        const int MAX_SHOW_LIMIT = 10000; /* safety cap */
-        if (max_show > MAX_SHOW_LIMIT) max_show = MAX_SHOW_LIMIT;
-        size_t buf_sz = (size_t)max_show * 12 + 64;
-        char *tbuf = (char*)malloc(buf_sz);
-        if (tbuf) {
-            char *p = tbuf;
-            size_t rem = buf_sz;
-            int w = snprintf(p, rem, "Tokens (%d):", prompt_len);
-            if (w < 0) w = 0;
-            p += w; rem -= w;
-            for (int i = 0; i < max_show; ++i) {
-                int n = snprintf(p, rem, " %d", tokens[i]);
-                if (n < 0 || (size_t)n >= rem) break;
-                p += n; rem -= n;
-            }
-            if (max_show < prompt_len) snprintf(p, rem, " ...(truncated)");
-            LOG_DEBUG("%s", tbuf);
-            free(tbuf);
-        } else {
-            /* Fallback: log only the first token if allocation fails */
-            LOG_DEBUG("First token (alloc fail): %d", prompt_len > 0 ? tokens[0] : -1);
-        }
-    }
-
-    if (prompt_len <= 20) {
-        printf("DEBUG: Token sequence: [");
-        for (int i = 0; i < prompt_len; i++) {
-            printf("%d", tokens[i]);
-            if (i < prompt_len - 1) printf(", ");
-        }
-        printf("]\n");
-    }
-
-    // DEBUG: Show tokenized prompt
-    printf("DEBUG: Prompt '%s' tokenized to %d tokens: [", prompt, prompt_len);
-    for (int i = 0; i < prompt_len && i < 20; i++) {
-        printf("%d%s", tokens[i], i < prompt_len - 1 ? ", " : "");
-    }
-    if (prompt_len > 20) printf("...");
-    printf("]\n");
-    printf("DEBUG: First few decoded tokens: ");
-    for (int i = 0; i < prompt_len && i < 5; i++) {
-        printf("'%s' ", decode(ctx->tokenizer, tokens[i]));
-    }
-    printf("\n");
 
     // Reset KV cache for a clean slate
     inference_session_reset(session);
@@ -266,15 +242,10 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
         inference_forward(session, tokens[i], i, ctx->logits);
     }
 
-    int total_tokens = prompt_len;
-    int last_token = tokens[prompt_len - 1];
-    int generated_count = 0;
+    total_tokens = prompt_len;
+    last_token = tokens[prompt_len - 1];
 
-    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
-        fprintf(stderr, "[DEBUG_INIT] prompt_len=%d, total_tokens=%d, last_token=%d\n", prompt_len, total_tokens, last_token);
-    }
-
-    printf("\n[Response]\n");
+    LOG_INFO("Response generation starting");
 
     // 3. Generation loop (Auto-regressive)
     while (total_tokens < ctx->context_len && generated_count < ctx->max_tokens) {
@@ -303,46 +274,6 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
             }
         }
 
-        // FINITE/EXPLOSION CHECK: detect NaN/Inf or very large logits
-        {
-            int has_nonfinite = 0;
-            float max_abs = 0.0f;
-            for (int i = 0; i < config->vocab_size; i++) {
-                float v = ctx->logits[i];
-                if (!isfinite(v)) {
-                    has_nonfinite = 1;
-                    break;
-                }
-                float av = fabsf(v);
-                if (av > max_abs) max_abs = av;
-            }
-            if (has_nonfinite) {
-                fprintf(stderr, "WARN: Non-finite logits detected before sampling (token=%d)\n", generated_count);
-            } else if (max_abs > 1e6f) {
-                fprintf(stderr, "WARN: Very large logits detected (max_abs=%.2e) - possible internal amplification\n", max_abs);
-            }
-        }
-
-        // Optional detailed logits/softmax debugging
-        int debug_logits = getenv("SAPPHIRE_DEBUG_LOGITS") != NULL;
-        if (debug_logits && ctx->temperature <= 0.0f) {
-            // For greedy sampling, compute softmax on a temporary copy to inspect probabilities
-            float *tmp = (float*)malloc(sizeof(float) * config->vocab_size);
-            if (tmp) {
-                memcpy(tmp, ctx->logits, sizeof(float) * config->vocab_size);
-                softmax(tmp, config->vocab_size);
-                float sum_exp = 0.0f; // already normalized
-                for (int i = 0; i < config->vocab_size; ++i) sum_exp += tmp[i];
-                float ent = sampling_entropy_from_unnormalized(tmp, config->vocab_size, sum_exp);
-                float topk_mass = sampling_topk_mass_from_unnormalized(tmp, config->vocab_size, 10, sum_exp);
-                float mn, mx, rms;
-                vec_stats(ctx->logits, config->vocab_size, &mn, &mx, &rms);
-                fprintf(stderr, "DEBUG_LOGITS pre-softmax: min=%.3f max=%.3f rms=%.3f\n", mn, mx, rms);
-                fprintf(stderr, "DEBUG_LOGITS greedy softmax: entropy=%.4f topk_mass=%.4f\n", ent, topk_mass);
-                free(tmp);
-            }
-        }
-
         // Use actual temperature for sample_temperature (already scaled logits by 1/T above)
         // When temperature <= 0, sample_temperature will use greedy selection
         int debug_logits_pre_select = getenv("SAPPHIRE_DEBUG_LOGITS") != NULL;
@@ -363,83 +294,6 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
         }
         
         int next_token = sample_temperature(ctx->logits, config->vocab_size, ctx->temperature);
-
-        // After temperature sampling (when temperature>0) the `ctx->logits` buffer
-        // contains unnormalized exp(logit) values. If debugging is enabled, compute
-        // summary stats (entropy, top-k mass) and print top-k probabilities.
-        if (debug_logits && ctx->temperature > 0.0f) {
-            // sum of exp-values
-            double sum_exp = 0.0;
-            for (int i = 0; i < config->vocab_size; ++i) sum_exp += (double)ctx->logits[i];
-            float sumf = (float)sum_exp;
-            float ent = sampling_entropy_from_unnormalized(ctx->logits, config->vocab_size, sumf);
-            int topk = 10;
-            float topk_mass = sampling_topk_mass_from_unnormalized(ctx->logits, config->vocab_size, topk, sumf);
-
-            float mn, mx, rms;
-            vec_stats(ctx->logits, config->vocab_size, &mn, &mx, &rms);
-            fprintf(stderr, "DEBUG_LOGITS post-exp: min=%.3f max=%.3f rms=%.3f sum_exp=%.3e entropy=%.4f top%d_mass=%.4f\n",
-                    mn, mx, rms, sum_exp, ent, topk, topk_mass);
-
-            // Print top-k ids and probabilities
-            int K = topk;
-            float top_vals[16];
-            int top_ids[16];
-            if (K > 16) K = 16;
-            for (int i = 0; i < K; ++i) { top_vals[i] = 0.0f; top_ids[i] = -1; }
-            for (int i = 0; i < config->vocab_size; ++i) {
-                float v = ctx->logits[i];
-                for (int j = 0; j < K; ++j) {
-                    if (v > top_vals[j]) {
-                        for (int t = K - 1; t > j; --t) { top_vals[t] = top_vals[t-1]; top_ids[t] = top_ids[t-1]; }
-                        top_vals[j] = v;
-                        top_ids[j] = i;
-                        break;
-                    }
-                }
-            }
-            fprintf(stderr, "DEBUG_LOGITS Top-%d probs: ", K);
-            for (int i = 0; i < K; ++i) {
-                float prob = (sumf > 0.0f && top_ids[i] >= 0) ? top_vals[i] / sumf : 0.0f;
-                fprintf(stderr, "%d(%.6f) ", top_ids[i], prob);
-            }
-            fprintf(stderr, "\n");
-        }
-
-        // DEBUG: Show what token was selected and top-3 logits
-        if (generated_count < 10 || generated_count % 20 == 0) {
-            // Find top 3 logits
-            float top_val[3] = {-1e9, -1e9, -1e9};
-            int top_id[3] = {0, 0, 0};
-            // Calculate sum for normalization (since logits are now exponentials)
-            float sum_exp = 0.0f;
-            for (int i = 0; i < config->vocab_size; i++) sum_exp += ctx->logits[i];
-
-            for (int i = 0; i < config->vocab_size; i++) {
-                if (ctx->logits[i] > top_val[0]) {
-                    top_val[2] = top_val[1];
-                    top_id[2] = top_id[1];
-                    top_val[1] = top_val[0];
-                    top_id[1] = top_id[0];
-                    top_val[0] = ctx->logits[i];
-                    top_id[0] = i;
-                } else if (ctx->logits[i] > top_val[1]) {
-                    top_val[2] = top_val[1];
-                    top_id[2] = top_id[1];
-                    top_val[1] = ctx->logits[i];
-                    top_id[1] = i;
-                } else if (ctx->logits[i] > top_val[2]) {
-                    top_val[2] = ctx->logits[i];
-                    top_id[2] = i;
-                }
-            }
-            printf("\nDEBUG[%d]: Top-3: (%d:'%s' %.2f) (%d:'%s' %.2f) (%d:'%s' %.2f) -> selected %d:'%s'\n",
-                   generated_count,
-                   top_id[0], decode(ctx->tokenizer, top_id[0]), top_val[0] / sum_exp,
-                   top_id[1], decode(ctx->tokenizer, top_id[1]), top_val[1] / sum_exp,
-                   top_id[2], decode(ctx->tokenizer, top_id[2]), top_val[2] / sum_exp,
-                   next_token, decode(ctx->tokenizer, next_token));
-        }
 
         // Gemma 3 stop tokens:
         // - Token 1: <eos> (explicit end-of-sequence)
@@ -482,52 +336,18 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
 // Forward declarations
 
 /**
- * Create an inference session.
+ * Allocate and initialize all session buffers (scratch, attention scores, KV cache).
+ * Returns 0 on success, -1 on error. Errors are logged internally.
  */
-inference_session_t* inference_session_create(model_spec_t* spec, int max_context_len) {
-    if (!spec) {
-        fprintf(stderr, "ERROR: inference_session_create requires model\n");
-        return NULL;
-    }
-    LOG_DEBUG("Creating inference session for model: %s", spec->model_id);
-    LOG_DEBUG("Spec details: tensor_map_size=%d %s", spec->tensor_map_size, spec->variant_config != NULL ? "with variant_config" : "no variant_config");
-
-    llm_model_t* model = (llm_model_t*)spec->llm_model;
-    if (!model) {
-        fprintf(stderr, "ERROR: Model is NULL in inference_session_create\n");
-        return NULL;
-    }
-
-    gemma3_270m_config_t* config = (gemma3_270m_config_t*)spec->variant_config;
-    if (!config) {
-        fprintf(stderr, "ERROR: Model config is NULL in inference_session_create\n");
-        return NULL;
-    }
-
-    inference_session_t* session = (inference_session_t*)malloc(sizeof(inference_session_t));
-    if (!session) {
-        fprintf(stderr, "ERROR: Failed to allocate inference session\n");
-        return NULL;
-    }
-
-    session->model_spec = spec;
-    session->kv_cache = NULL;
-    session->scratch_buffer = NULL;
-    session->attn_scores = NULL;
-    session->attn_scores_raw = NULL;
-    session->rope_freqs_cos_global = NULL;
-    session->rope_freqs_sin_global = NULL;
-    session->rope_freqs_cos_local = NULL;
-    session->rope_freqs_sin_local = NULL;
-    session->gemv_ctx = NULL;
-
+static int allocate_session_buffers(inference_session_t* session, gemma3_270m_config_t* config, llm_model_t* model, int max_context_len) {
+    if (!session || !config || !model) return -1;
+    
     // Initialize d_inner (attention hidden dimension)
     // In hybrid architectures like Gemma 3, d_inner may differ from d_model
     int d_inner = config->num_attention_heads * config->head_dim;
     if (d_inner <= 0) {
         LOG_ERROR("Unable to determine d_inner (query projection dimension) %d x %d", config->num_attention_heads, config->head_dim);
-        destroy_inference_session(session);
-        return NULL;
+        return -1;
     }
 
     // Initialize d_kv (key/value projection dimension)
@@ -535,8 +355,7 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
     int d_kv = config->num_key_value_heads * config->head_dim;
     if (d_kv <= 0) {
         LOG_ERROR("Unable to determine d_kv (key/value projection dimension)");
-        destroy_inference_session(session);
-        return NULL;
+        return -1;
     }
 
     int num_heads = d_inner / config->head_dim;
@@ -545,23 +364,15 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
              num_heads, num_kv_heads, config->head_dim);
 
     int d_ff = config->intermediate_size;
+    int d_model = config->hidden_size;
 
     LOG_INFO("Model dims: d_model=%d d_inner=%d d_kv=%d d_k=%d d_ff=%d heads=%d kv_heads=%d",
-             config->hidden_size,
-             d_inner,
-             d_kv,
-             config->head_dim,
-             d_ff,
-             num_heads,
-             num_kv_heads);
+             d_model, d_inner, d_kv, config->head_dim, d_ff, num_heads, num_kv_heads);
 
-    // Compute SIMD-friendly padded dimensions (round up to multiple of 8 floats => 32 bytes)
+    // Compute SIMD-friendly padded dimensions (round up to multiple of SIMD lanes)
     // This ensures all buffers used as inputs to SIMD kernels can safely over-read
     // without triggering address sanitizer errors or segfaults. AVX2 loads read 256 bits
     // at a time without bounds checking, so we must guarantee sufficient padding.
-    int d_model = config->hidden_size;
-
-    // Choose SIMD lane count from kernel capabilities for a representative weight dtype.
     int simd_lanes = 1;
     if (model->layers && config->num_hidden_layers > 0) {
         model_layer_weights_t* lay0 = &model->layers[0];
@@ -605,9 +416,8 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
     size_t align_bytes = (size_t)simd_lanes * sizeof(float);
     if (align_bytes < 16) align_bytes = 16;
     if (posix_memalign(&aligned_ptr, align_bytes, scratch_floats * sizeof(float)) != 0) {
-        fprintf(stderr, "ERROR: Failed to allocate aligned scratch buffer\n");
-        destroy_inference_session(session);
-        return NULL;
+        LOG_ERROR("Failed to allocate aligned scratch buffer");
+        return -1;
     }
     session->scratch_buffer = (float*)aligned_ptr;
     session->scratch_size = scratch_floats;
@@ -623,9 +433,8 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
         memset(session->attn_scores, 0, max_context_len * sizeof(float));
     }
     if (!session->attn_scores) {
-        fprintf(stderr, "ERROR: Failed to allocate attention score buffer\n");
-        destroy_inference_session(session);
-        return NULL;
+        LOG_ERROR("Failed to allocate attention score buffer");
+        return -1;
     }
 
     // Create a global multi-layer KV cache
@@ -635,12 +444,20 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
         max_context_len,
         config->head_dim);
     if (!session->kv_cache) {
-        fprintf(stderr, "ERROR: Failed to create global KV cache\n");
-        destroy_inference_session(session);
-        return NULL;
+        LOG_ERROR("Failed to create global KV cache");
+        return -1;
     }
 
-    // Precompute RoPE frequencies for both possible bases (Gemma 3)
+    return 0;
+}
+
+/**
+ * Precompute RoPE frequencies for both global and local bases (Gemma 3).
+ * Returns 0 on success, -1 on error. Errors are logged internally.
+ */
+static int precompute_rope_frequencies(inference_session_t* session, gemma3_270m_config_t* config, int max_context_len) {
+    if (!session || !config) return -1;
+
     int freq_size = max_context_len * config->head_dim;
     session->rope_freqs_cos_global = (float*)malloc(freq_size * sizeof(float));
     session->rope_freqs_sin_global = (float*)malloc(freq_size * sizeof(float));
@@ -649,9 +466,8 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
 
     if (!session->rope_freqs_cos_global || !session->rope_freqs_sin_global ||
         !session->rope_freqs_cos_local || !session->rope_freqs_sin_local) {
-        fprintf(stderr, "ERROR: Failed to allocate RoPE frequencies\n");
-        destroy_inference_session(session);
-        return NULL;
+        LOG_ERROR("Failed to allocate RoPE frequency buffers");
+        return -1;
     }
 
     // Precompute for Global base (e.g. 1M)
@@ -659,8 +475,7 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
     if (rope_precompute_freqs(session->rope_freqs_cos_global, session->rope_freqs_sin_global,
                               config->head_dim, max_context_len, base_global) < 0) {
         LOG_ERROR("Failed to precompute global RoPE frequencies");
-        destroy_inference_session(session);
-        return NULL;
+        return -1;
     }
 
     // Precompute for Local base (e.g. 10k)
@@ -668,6 +483,60 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
     if (rope_precompute_freqs(session->rope_freqs_cos_local, session->rope_freqs_sin_local,
                               config->head_dim, max_context_len, base_local) < 0) {
         LOG_ERROR("Failed to precompute local RoPE frequencies");
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * Create an inference session.
+ */
+inference_session_t* inference_session_create(model_spec_t* spec, int max_context_len) {
+    if (!spec) {
+        fprintf(stderr, "ERROR: inference_session_create requires model\n");
+        return NULL;
+    }
+    LOG_DEBUG("Creating inference session for model: %s", spec->model_id);
+    LOG_DEBUG("Spec details: tensor_map_size=%d %s", spec->tensor_map_size, spec->variant_config != NULL ? "with variant_config" : "no variant_config");
+
+    llm_model_t* model = (llm_model_t*)spec->llm_model;
+    if (!model) {
+        fprintf(stderr, "ERROR: Model is NULL in inference_session_create\n");
+        return NULL;
+    }
+
+    gemma3_270m_config_t* config = (gemma3_270m_config_t*)spec->variant_config;
+    if (!config) {
+        fprintf(stderr, "ERROR: Model config is NULL in inference_session_create\n");
+        return NULL;
+    }
+
+    inference_session_t* session = (inference_session_t*)malloc(sizeof(inference_session_t));
+    if (!session) {
+        fprintf(stderr, "ERROR: Failed to allocate inference session\n");
+        return NULL;
+    }
+
+    session->model_spec = spec;
+    session->kv_cache = NULL;
+    session->scratch_buffer = NULL;
+    session->attn_scores = NULL;
+    session->attn_scores_raw = NULL;
+    session->rope_freqs_cos_global = NULL;
+    session->rope_freqs_sin_global = NULL;
+    session->rope_freqs_cos_local = NULL;
+    session->rope_freqs_sin_local = NULL;
+    session->gemv_ctx = NULL;
+
+    // Allocate all buffers (scratch, attention scores, KV cache)
+    if (allocate_session_buffers(session, config, model, max_context_len) != 0) {
+        destroy_inference_session(session);
+        return NULL;
+    }
+
+    // Precompute RoPE frequencies for both global and local bases (Gemma 3)
+    if (precompute_rope_frequencies(session, config, max_context_len) != 0) {
         destroy_inference_session(session);
         return NULL;
     }
@@ -787,7 +656,7 @@ void inference_forward(inference_session_t* session, int token_id, int token_pos
     }
 
     // 3. Final norm & LM Head
-    sapphire_lm_head(session, session->scratch_buffer, logits);
+    lm_head(session, session->scratch_buffer, logits);
 }
 
 /**

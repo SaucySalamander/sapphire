@@ -192,8 +192,7 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
      * perform_inference() does not NUL-terminate on errors. */
     output[output_size - 1] = '\0';
 
-    LOG_INFO("\nRunning prompt (non-interactive): '%s'\n", prompt);
-    LOG_INFO("\n[Running one-shot inference for prompt: '%s']\n", prompt);
+    LOG_INFO("Running prompt (non-interactive): '%s'", prompt);
 
     int rc = perform_inference(ctx, prompt, output, output_size);
     if (rc == 0) {
