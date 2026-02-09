@@ -155,7 +155,6 @@ int rmsnorm_batch(float *out, const float *in, const float *weight,
         
         float rms = sqrtf(sum_sq / (float)dim + epsilon);
         
-        // Normalize and scale (standard semantics)
         for (int i = 0; i < dim; i++) {
             row_out[i] = (row_in[i] / rms) * weight[i];
         }
