@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <assert.h>
-#include "tensor_gemv.h"
+#include "kernels.h"
 #include "tensor.h"
 #include "test_utils.h"
 

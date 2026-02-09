@@ -1,4 +1,4 @@
-#include "../../include/sapphire.h"
+#include "../../include/kernels.h"
 #include "../../include/tensor.h"  // For unified tensor_dtype_t
 
 #include <pthread.h>
@@ -28,8 +28,12 @@ struct sapphire_context {
     int stop;
 };
 
+// Internal prototype for dispatch from dispatch.c
+// Declared here to ensure implementation matches
+int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *x, float *y);
+
 static void *worker_fn(void *arg) {
-    sapphire_context *ctx = (sapphire_context*)arg;
+    kernel_context_t *ctx = (kernel_context_t*)arg;
     while (!ctx->stop) {
         int start = atomic_fetch_add(&ctx->next_row, ctx->chunk_size);
         if (start >= ctx->rows) break;
@@ -58,30 +62,35 @@ static void *worker_fn(void *arg) {
     return NULL;
 }
 
-sapphire_context *sapphire_context_create(int num_threads, int chunk_size) {
+kernel_context_t *kernel_ctx_create(int num_threads, int chunk_size) {
     if (num_threads <= 0) {
         num_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
         if (num_threads <= 0) num_threads = 1;
     }
     if (chunk_size <= 0) chunk_size = 16;
 
-    sapphire_context *ctx = (sapphire_context*)calloc(1, sizeof(*ctx));
+    kernel_context_t *ctx = (kernel_context_t*)calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
     ctx->num_threads = num_threads;
     ctx->chunk_size = chunk_size;
     ctx->threads = (pthread_t*)malloc(sizeof(pthread_t) * num_threads);
     if (!ctx->threads) { free(ctx); return NULL; }
     ctx->stop = 0;
+    
+    // Original implementation did NOT launch threads here.
+    // Threads are launched per-gemv in kernel_gemv_backend_exec.
+    // Keeping that behavior for now to avoid complexity.
     return ctx;
 }
 
-void sapphire_context_destroy(sapphire_context *ctx) {
+void kernel_ctx_destroy(kernel_context_t *ctx) {
     if (!ctx) return;
+    // Threads are joined in gemv_exec, so nothing to stop here
     free(ctx->threads);
     free(ctx);
 }
 
-int sapphire_batched_gemv(sapphire_context *ctx, const tensor_t *A, const float *x, float *y) {
+int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *x, float *y) {
     if (!ctx || !A || !x || !y) return 1;
     
     tensor_dtype_t dtype = tensor_dtype(A);

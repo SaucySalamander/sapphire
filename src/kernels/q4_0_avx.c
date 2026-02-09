@@ -2,7 +2,7 @@
 // Model-agnostic: takes void *W_row (opaque weight block data)
 
 #define _POSIX_C_SOURCE 200809L
-#include "../../include/sapphire.h"
+#include "../../include/kernels.h"
 
 #include <immintrin.h>
 #include <stdint.h>

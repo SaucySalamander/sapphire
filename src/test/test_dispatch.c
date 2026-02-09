@@ -1,4 +1,4 @@
-#include "../../include/sapphire.h"
+#include "../../include/kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>

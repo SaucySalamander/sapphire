@@ -50,7 +50,7 @@ void sapphire_embed_lookup(struct inference_session_t* session, int token_id, fl
  */
 void lm_head(struct inference_session_t* session, float* hidden, float* logits);
 
-typedef struct {
+typedef struct layer_buffers {
     int pm, pi, pk, pf;
     float *residual, *norm_buf, *q_proj, *k_proj, *v_proj;
     float *attn_out, *ffn_gate_buf, *ffn_value_buf, *geglu_buf;
@@ -61,7 +61,7 @@ typedef struct {
  * @brief Context for a single transformer layer forward pass.
  * Used to keep function signatures clean and within project specifications.
  */
-typedef struct {
+typedef struct transformer_layer_ctx {
     struct inference_session_t* session;
     model_layer_weights_t* layer;
     gemma3_270m_config_t* config;
@@ -70,5 +70,15 @@ typedef struct {
     int d_model;
     int head_dim;
 } transformer_layer_ctx_t;
+
+/**
+ * @brief Computes the Attention stage of a transformer layer.
+ * includes Norm -> Projections -> QK Norm -> RoPE -> Attention -> Output Projection -> Post Norm
+ */
+void compute_attention_stage(layer_buffers_t buf,
+                             transformer_layer_ctx_t* ctx,
+                             float* hidden,
+                             const float* rope_cos,
+                             const float* rope_sin);
 
 #endif // TRANSFORMER_H

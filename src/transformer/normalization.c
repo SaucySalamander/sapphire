@@ -1,6 +1,6 @@
 #include <math.h>
 #include <string.h>
-#include "normalization.h"
+#include "kernels.h"
 #include "log.h"
 #include "utils.h"
 
@@ -163,89 +163,3 @@ int rmsnorm_batch(float *out, const float *in, const float *weight,
     return 0;
 }
 
-// ============================================================================
-// Gemma 3 QK-Normalization Attention Mechanism
-// ============================================================================
-/**
- * @brief Apply normalization to a group of attention heads (Query or Key).
- * 
- * @param data Target projection buffer [num_heads * head_dim]
- * @param scale Per-head scaling weights [num_heads * head_dim]
- * @param head_dim Dimension per head
- * @param num_heads Number of heads in the group
- */
-static void qk_norm_apply(float* data, const float* scale, int head_dim, int num_heads) {
-    if (!data || !scale) return;
-    for (int h = 0; h < num_heads; h++) {
-        rmsnorm_delta(data + h * head_dim, data + h * head_dim, scale + h * head_dim, 1e-6f, head_dim);
-    }
-}
-
-static float* load_query_vector(layer_buffers_t buf, model_layer_weights_t* layer,
-                                 gemma3_270m_config_t* config, int head_dim, int layer_idx) {
-        int q_norm_len = tensor_shape(layer->q_norm_weight)[0];
-        const float* raw = get_norm_weights(layer->q_norm_weight, buf.weight_scratch, q_norm_len);
-        int expected_q = config->num_attention_heads * head_dim;
-        
-        if (q_norm_len == expected_q) {
-            return (float*)raw;  // per-head gamma
-        } else if (q_norm_len == head_dim) {
-            // Broadcast single-head gamma to all Q heads (common for small Gemma configs)
-            float head_gamma[head_dim];
-            memcpy(head_gamma, raw, head_dim * sizeof(float));
-            // reuse ffn_gate_buf as expanded gamma scratch (size pf >= expected_q)
-            float* q_scale_ptr = buf.ffn_gate_buf;
-            for (int h = 0; h < config->num_attention_heads; h++) {
-                memcpy(q_scale_ptr + h * head_dim, head_gamma, head_dim * sizeof(float));
-            }
-            return q_scale_ptr;
-        } else {
-            LOG_WARN("Layer %d q_norm len=%d expected=%d; disabling QK-Norm for Q", layer_idx, q_norm_len, expected_q);
-            return NULL;
-        }
-}
-
-static float* load_key_vector(layer_buffers_t buf, model_layer_weights_t* layer,
-                               gemma3_270m_config_t* config, int head_dim, int layer_idx) {
-        int k_norm_len = tensor_shape(layer->k_norm_weight)[0];
-        const float* raw = get_norm_weights(layer->k_norm_weight, buf.weight_scratch, k_norm_len);
-        int expected_k = config->num_key_value_heads * head_dim;
-        if (k_norm_len == expected_k) {
-            return (float*)raw;  // per-KV-head gamma
-        } else if (k_norm_len == head_dim) {
-            // Broadcast single-head gamma to all KV heads (GQA)
-            float head_gamma[head_dim];
-            memcpy(head_gamma, raw, head_dim * sizeof(float));
-            // reuse ffn_value_buf as expanded gamma scratch (size pf >= expected_k)
-            float* k_scale_ptr = buf.ffn_value_buf;
-            for (int h = 0; h < config->num_key_value_heads; h++) {
-                memcpy(k_scale_ptr + h * head_dim, head_gamma, head_dim * sizeof(float));
-            }
-            return k_scale_ptr;
-        } else {
-            LOG_WARN("Layer %d k_norm len=%d expected=%d; disabling QK-Norm for K", layer_idx, k_norm_len, expected_k);
-            return NULL;
-        }
-}
-
-qk_norm_result_t qk_norm_from_layer(layer_buffers_t buf,
-                                           model_layer_weights_t* layer,
-                                           gemma3_270m_config_t* config,
-                                           int head_dim,
-                                           int layer_idx) {
-    qk_norm_result_t result = {NULL, NULL};
-
-    if (layer->q_norm_weight) {
-        result.q_scale = load_query_vector(buf, layer, config, head_dim, layer_idx);
-    }
-
-    if (layer->k_norm_weight) {
-        result.k_scale = load_key_vector(buf, layer, config, head_dim, layer_idx);
-    }
-
-    // Apply normalization if we have scales
-    qk_norm_apply(buf.q_proj, result.q_scale, head_dim, config->num_attention_heads);
-    qk_norm_apply(buf.k_proj, result.k_scale, head_dim, config->num_key_value_heads);
-
-    return result;
-}

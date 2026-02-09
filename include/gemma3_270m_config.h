@@ -17,55 +17,11 @@
 extern "C" {
 #endif
 
-/* Canonical fields from models/gemma/270m-it/config.json */
-static const int GEMMA3_270M_MAX_CONTEXT = 32768;           /* max_position_embeddings */
-static const int GEMMA3_270M_NUM_LAYERS = 18;              /* num_hidden_layers */
-static const int GEMMA3_270M_VOCAB_SIZE = 262144;          /* vocab_size */
-static const int GEMMA3_270M_D_MODEL = 640;                /* hidden_size */
-static const int GEMMA3_270M_D_INNER = 1024;               /* intermediate_size */
-static const int GEMMA3_270M_NUM_HEADS = 4;                /* num_attention_heads */
-static const int GEMMA3_270M_D_K = 256;                    /* head_dim */
-static const int GEMMA3_270M_NUM_KV_HEADS = 1;             /* num_key_value_heads */
-static const int GEMMA3_270M_D_FF = 2048;                  /* FFN/intermediate size */
-static const float GEMMA3_270M_ROPE_BASE = 1000000.0f;     /* rope_theta */
-static const float GEMMA3_270M_ROPE_LOCAL_BASE = 10000.0f; /* rope_local_base_freq */
-static const int GEMMA3_270M_SLIDING_WINDOW = 512;         /* sliding_window */
-static const int GEMMA3_270M_SLIDING_PATTERN = 6;          /* _sliding_window_pattern */
-static const float GEMMA3_270M_QUERY_PRE_ATTN = 256.0f;    /* query_pre_attn_scalar */
-
-/* Additional fields present in config.json */
-static const int GEMMA3_270M_BOS_TOKEN_ID = 2;
-static const int GEMMA3_270M_EOS_TOKEN_ID = 1;
-static const int GEMMA3_270M_PAD_TOKEN_ID = 0;
-static const int GEMMA3_270M_HEAD_DIM = 256;               /* same as GEMMA3_270M_D_K */
-static const float GEMMA3_270M_INIT_RANGE = 0.02f;         /* initializer_range */
-static const char GEMMA3_270M_HIDDEN_ACTIVATION[] = "gelu_pytorch_tanh";
-static const char GEMMA3_270M_MODEL_TYPE[] = "gemma3_text";
-static const char GEMMA3_270M_TORCH_DTYPE[] = "bfloat16";
-static const char GEMMA3_270M_TRANSFORMERS_VERSION[] = "4.55.0.dev0";
-static const float GEMMA3_270M_RMS_NORM_EPS = 1e-06f;
-static const int GEMMA3_270M_USE_BIDIRECTIONAL_ATTENTION = 0; /* use_bidirectional_attention */
-static const int GEMMA3_270M_USE_CACHE = 1;                 /* use_cache */
-static const float GEMMA3_270M_ATTENTION_DROPOUT = 0.0f;     /* attention_dropout */
-static const int GEMMA3_270M_ATTENTION_BIAS = 0;            /* attention_bias (false) */
-
-/* Nullable fields in config.json (represented as NAN if missing) */
-#include <math.h>
-static const float GEMMA3_270M_ATTN_LOGIT_SOFTCAPPING = NAN; /* attn_logit_softcapping (null) */
-static const float GEMMA3_270M_FINAL_LOGIT_SOFTCAPPING = NAN; /* final_logit_softcapping (null) */
-static const float GEMMA3_270M_ROPE_SCALING = NAN;          /* rope_scaling (null) */
-
-/* Layer types - represented as a bitmask for compactness. Bit i is 1 if layer i uses full attention. */
-/* From models/gemma/270m-it/config.json: full_attention at indices 5, 11, 17 (0-based) */
-static const unsigned int GEMMA3_270M_LAYER_TYPE_FULL_MASK = 0x00020820u; /* bits: 17,11,5 */
-
+/* No default config defined here; parsing must populate a `gemma3_config_t` instance explicitly. */
 
 /**
- * Apply recommended Gemma3 defaults into an existing model_config_t.
- * Only sets fields that are zero or non-positive, preserving explicit values
- * parsed from the model files.
+ * Gemma3-specific configuration structure (maps to config.json)
  */
-/* Gemma3-specific configuration structure (maps to config.json) */
 typedef struct {
     /* Per-config fields (directly map to keys in config.json) */
     int sliding_window_pattern;      /* _sliding_window_pattern */

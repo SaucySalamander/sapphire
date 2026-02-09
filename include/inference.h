@@ -8,7 +8,7 @@
 
 #include "model_spec.h"
 #include "kv_cache.h"
-#include "tensor_gemv.h"  /* For sapphire_context in GEMV operations */
+#include "kernels.h"      /* For kernel_context_t in GEMV operations */
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,7 +78,7 @@ typedef struct inference_session_t {
     float *rope_freqs_cos_local;   /**< Local base (e.g. 10k) for RoPE. */
     float *rope_freqs_sin_local;
     
-    sapphire_context *gemv_ctx;     /**< GEMV context for matrix-vector operations. */
+    kernel_context_t *gemv_ctx;     /**< GEMV context for matrix-vector operations. */
 } inference_session_t;
 
 /**

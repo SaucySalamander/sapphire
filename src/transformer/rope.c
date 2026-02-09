@@ -1,5 +1,4 @@
 #include "rope.h"
-#include "positional_encoding.h"
 #include <stddef.h>
 #include <math.h>
 

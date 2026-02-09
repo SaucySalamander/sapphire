@@ -5,20 +5,6 @@
 #include "tensor.h"
 
 /**
- * @brief Computes softmax with numerical stability.
- * 
- * Implements the numerically stable softmax using the log-space trick:
- * softmax(z_i) = exp(z_i - max(z)) / sum(exp(z_j - max(z)) for all j)
- * 
- * This prevents overflow/underflow by subtracting the maximum value before
- * computing exponentials.
- * 
- * @param scores Input array of scores. Modified in-place to contain softmax output.
- * @param n The number of elements in the scores array.
- */
-void softmax(float *scores, int n);
-
-/**
  * @brief Computes vector statistics (min, max, RMS) for debugging.
  * 
  * @param x Input vector.
@@ -28,24 +14,6 @@ void softmax(float *scores, int n);
  * @param out_rms Output for Root Mean Square (optional).
  */
 void vec_stats(const float* x, int n, float* out_min, float* out_max, float* out_rms);
-
-/**
- * @brief Vector operations
- */
-void vec_add(float* dst, const float* src, int n);
-void vec_scale(float* x, float s, int n);
-void vec_copy(float* dst, const float* src, int n);
-float vec_dot(const float* a, const float* b, int n);
-
-/**
- * @brief Numerical softcapping (tanh clamping)
- */
-void vec_softcap(float* x, int n, float cap);
-
-/**
- * @brief BF16 to F32 conversion
- */
-void bf16_to_f32_vec(float* dst, const uint16_t* src, int n);
 
 /**
  * @brief Greedy sampler: select token with highest logit
@@ -75,15 +43,5 @@ float sampling_entropy_from_unnormalized(const float *exp_logits, int n, float s
  * @return cumulative probability mass of top-k (0..1)
  */
 float sampling_topk_mass_from_unnormalized(const float *exp_logits, int n, int k, float sum);
-
-/**
- * @brief Convert BF16 norm weights to F32, or return pointer if already F32.
- * @param weight Tensor with norm weights (BF16 or F32).
- * @param scratch Buffer for BF16→F32 conversion (must be at least n floats).
- * @param n Number of elements.
- * @return Pointer to F32 weights (either converted in scratch or original data).
- *         Returns NULL if weight is NULL.
- */
-const float* get_norm_weights(const tensor_t* weight, float* scratch, int n);
 
 #endif // UTILS_H

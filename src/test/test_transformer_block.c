@@ -3,8 +3,7 @@
 #include <math.h>
 #include <assert.h>
 #include "transformer.h"
-#include "activations.h"
-#include "normalization.h"
+#include "kernels.h"
 
 // ============================================================================
 // Transformer Block Tests

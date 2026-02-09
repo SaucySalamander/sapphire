@@ -5,8 +5,7 @@
 #include <assert.h>
 #include <time.h>
 #include "transformer.h"
-#include "activations.h"
-#include "normalization.h"
+#include "kernels.h"
 
 // ============================================================================
 // End-to-End Transformer Tests

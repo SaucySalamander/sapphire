@@ -1,4 +1,5 @@
-#include "attention_strategy.h"
+#include "attention.h"
+#include "kernels.h"
 
 #include <stdbool.h>
 #include <math.h>

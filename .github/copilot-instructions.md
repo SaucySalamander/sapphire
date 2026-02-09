@@ -250,3 +250,25 @@ Use for convenient config file parsing, introspection:
     - Paths → `construct_safe_path()` from `src/io/file_reader.c`
     - File I/O → `file_read_json()`, `file_read_to_buffer()` from `src/io/`
     - Error logging → Use `LOG_ERROR()`, `LOG_WARN()` macros (never pass error buffers)
+🛡️ Header Management & Integrity Standards
+
+    **1. Prototype-Implementation Parity:**
+    - EVERY function prototype in a header MUST have a corresponding implementation in a .c file.
+    - NO "ghost" declarations (unimplemented prototypes) allowed.
+    - If a function is removed from the implementation, it MUST be removed from all headers immediately.
+
+    **2. Static Data & Constants:**
+    - NO large static const arrays or structs in headers.
+    - Use extern declarations in headers and define the data in a single .c file to avoid object file bloat.
+    - Small constants (e.g. #define, enum) are acceptable if used across multiple domains.
+
+    **3. Header Logical Grouping (Domains):**
+    - **Core:** tensor.h, utils.h, log.h (Base types and infra)
+    - **Kernel:** kernels.h, activations.h, normalization.h, rope.h (Math & SIMD)
+    - **I/O:** file_reader.h, model_reader.h, safetensors_reader.h (Persistence)
+    - **Model:** llm_model.h, model_spec.h, transformer.h, kv_cache.h (Architecture)
+
+    **4. Clean Includes:**
+    - Headers should include ONLY what they need to define their own types.
+    - Prefer forward declarations (typedef struct foo foo_t;) over including the full header if only pointers are needed.
+    - Avoid circular dependencies by splitting headers into smaller, functional units.
