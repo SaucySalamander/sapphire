@@ -82,11 +82,6 @@ void llm_model_destroy(llm_model_t *model);
  */
 void llm_model_destroy_ex(const model_spec_t *spec);
 
-/**
- * Print model configuration and layer summary.
- */
-void llm_model_print_info(const llm_model_t *model);
-
 #ifdef __cplusplus
 }
 #endif

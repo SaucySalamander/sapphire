@@ -1,5 +1,5 @@
 #include <math.h>
-#include "activations.h"
+#include "kernels.h"
 
 // ============================================================================
 // SiLU (Sigmoid Linear Unit / Swish)

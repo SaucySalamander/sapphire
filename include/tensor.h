@@ -64,16 +64,6 @@ tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype);
 int tensor_transpose(const tensor_t *src, tensor_t **dst);
 
 /**
- * @brief Create a tensor sharing existing data (zero-copy).
- * @param ndim Number of dimensions.
- * @param shape Shape array.
- * @param dtype Data type.
- * @param data Pointer to external memory (e.g. mmap).
- * @return Tensor object.
- */
-tensor_t* tensor_create_external(int ndim, const int *shape, tensor_dtype_t dtype, void *data);
-
-/**
  * @brief Clone a tensor (deep copy).
  * 
  * Creates a new tensor with identical shape, dtype, layout, and data.

@@ -1,7 +1,7 @@
 // bench_q8.c - small benchmark for Q8 AVX2 kernels
 
 #define _POSIX_C_SOURCE 200809L
-#include "sapphire.h"
+#include "kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -2,8 +2,7 @@
 #include <math.h>
 #include <stdio.h>
 
-#include "../include/normalization.h"
-#include "../include/activations.h"
+#include "../include/kernels.h"
 
 // Small epsilon for float comparisons
 static const float EPS = 1e-3f;

@@ -8,10 +8,9 @@
 #include <string.h>
 
 #include "../include/gemma3_270m_config.h"
-#include "attention_strategy.h"
 #include "inference.h"
 #include "llm_model.h"
-#include "normalization.h"
+#include "kernels.h"
 #include "transformer.h"
 #include "rope.h"
 #include "utils.h"
@@ -185,6 +184,80 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
     return 0;
 }
 
+// ============================================================================
+// Gemma 3 QK-Normalization Internal Helpers
+// ============================================================================
+
+static void qk_norm_apply(float* data, const float* scale, int head_dim, int num_heads) {
+    if (!data || !scale) return;
+    for (int h = 0; h < num_heads; h++) {
+        rmsnorm_delta(data + h * head_dim, data + h * head_dim, scale + h * head_dim, 1e-6f, head_dim);
+    }
+}
+
+static const float* load_query_vector(layer_buffers_t buf, model_layer_weights_t* layer,
+                                 gemma3_270m_config_t* config, int head_dim, int layer_idx) {
+        int q_norm_len = tensor_shape(layer->q_norm_weight)[0];
+        const float* raw = get_norm_weights(layer->q_norm_weight, buf.weight_scratch, q_norm_len);
+        int expected_q = config->num_attention_heads * head_dim;
+        
+        if (q_norm_len == expected_q) {
+            return raw;  // per-head gamma
+        } else if (q_norm_len == head_dim) {
+            // Broadcast single-head gamma to all Q heads
+            float* q_scale_ptr = buf.ffn_gate_buf; 
+            for (int h = 0; h < config->num_attention_heads; h++) {
+                 // Note: raw is likely in mmapped memory, so unsafe to modify.
+                 // We copy TO scratch.
+                 memcpy(q_scale_ptr + h * head_dim, raw, head_dim * sizeof(float));
+            }
+            return q_scale_ptr;
+        } else {
+            LOG_WARN("Layer %d q_norm len=%d expected=%d; disabling QK-Norm for Q", layer_idx, q_norm_len, expected_q);
+            return NULL;
+        }
+}
+
+static const float* load_key_vector(layer_buffers_t buf, model_layer_weights_t* layer,
+                               gemma3_270m_config_t* config, int head_dim, int layer_idx) {
+        int k_norm_len = tensor_shape(layer->k_norm_weight)[0];
+        const float* raw = get_norm_weights(layer->k_norm_weight, buf.weight_scratch, k_norm_len);
+        int expected_k = config->num_key_value_heads * head_dim;
+        if (k_norm_len == expected_k) {
+            return raw;
+        } else if (k_norm_len == head_dim) {
+             // reuse ffn_value_buf
+            float* k_scale_ptr = buf.ffn_value_buf;
+            for (int h = 0; h < config->num_key_value_heads; h++) {
+                 memcpy(k_scale_ptr + h * head_dim, raw, head_dim * sizeof(float));
+            }
+            return k_scale_ptr;
+        } else {
+            LOG_WARN("Layer %d k_norm len=%d expected=%d; disabling QK-Norm for K", layer_idx, k_norm_len, expected_k);
+            return NULL;
+        }
+}
+
+static void apply_qk_norm_from_layer(layer_buffers_t buf,
+                                           model_layer_weights_t* layer,
+                                           gemma3_270m_config_t* config,
+                                           int head_dim,
+                                           int layer_idx) {
+    const float* q_scale = NULL;
+    const float* k_scale = NULL;
+
+    if (layer->q_norm_weight) {
+        q_scale = load_query_vector(buf, layer, config, head_dim, layer_idx);
+    }
+
+    if (layer->k_norm_weight) {
+        k_scale = load_key_vector(buf, layer, config, head_dim, layer_idx);
+    }
+
+    qk_norm_apply(buf.q_proj, q_scale, head_dim, config->num_attention_heads);
+    qk_norm_apply(buf.k_proj, k_scale, head_dim, config->num_key_value_heads);
+}
+
 void compute_attention_stage(layer_buffers_t buf,
                              transformer_layer_ctx_t* ctx,
                              float* hidden,
@@ -203,7 +276,7 @@ void compute_attention_stage(layer_buffers_t buf,
     tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.v_proj, ctx->layer->v_proj_weight, buf.norm_buf);
 
     // 4. QK-Normalization
-    qk_norm_from_layer(buf, ctx->layer, ctx->config, ctx->head_dim, ctx->layer_idx);
+    apply_qk_norm_from_layer(buf, ctx->layer, ctx->config, ctx->head_dim, ctx->layer_idx);
 
     // 5. RoPE application
     // Use the explicitly provided RoPE frequencies (toggled in inference.c based on layer type)
