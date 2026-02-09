@@ -2,9 +2,9 @@ name: Quality Checks (Cppcheck, Lizard, ASan/UBSan)
 
 on:
   push:
-    branches: [ main, standard-transformer-layers ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, standard-transformer-layers ]
+    branches: [ main ]
 
 jobs:
   quality-checks:
