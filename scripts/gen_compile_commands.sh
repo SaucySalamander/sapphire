@@ -23,7 +23,8 @@ cd "$REPO_ROOT"
 
 # Build the compile_commands.json by invoking make to get source list
 # We use make to expand $(NON_TEST_SRCS) properly
-SOURCES=$(make -n -p 2>/dev/null | grep '^NON_TEST_SRCS := ' | cut -d' ' -f4-)
+# The Makefile uses ':=' for variable assignment, so sources start at field 3
+SOURCES=$(make -n -p 2>/dev/null | grep '^NON_TEST_SRCS := ' | cut -d' ' -f3-)
 
 echo "[" > "$OUTPUT_FILE"
 

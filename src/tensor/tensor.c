@@ -184,7 +184,7 @@ int tensor_transpose(const tensor_t *src, tensor_t **dst) {
     int m = shape[0];
     int n = shape[1];
 
-    int dims[2] = { n, m };
+    const int dims[2] = { n, m };
     tensor_t *tnew = tensor_create(2, dims, DTYPE_F32);
     if (!tnew) return -1;
 
@@ -338,7 +338,7 @@ const void* tensor_data(const tensor_t *t) {
     return t->data;
 }
 
-float* tensor_data_f32(tensor_t *t) {
+float* tensor_data_f32(const tensor_t *t) {
     if (!t) return NULL;
     if (t->dtype != DTYPE_F32) {
         fprintf(stderr, "WARNING: tensor_data_f32 called on non-F32 tensor (dtype=%d)\n", t->dtype);
@@ -347,7 +347,7 @@ float* tensor_data_f32(tensor_t *t) {
     return (float *)t->data;
 }
 
-void* tensor_data_mutable(tensor_t *t) {
+void* tensor_data_mutable(const tensor_t *t) {
     if (!t) return NULL;
     return t->data;
 }
