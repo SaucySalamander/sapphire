@@ -28,8 +28,6 @@
 #include "../include/file_reader.h"
 #include "tokenizer.h"
 
-static int g_attn_debug_raw_warned = 0;
-
 /* Note: build_gemma3_prompt moved to tokenizer module (see include/tokenizer.h)
     to centralize tokenization / prompt construction logic. The function intelligently
     detects whether the model is IT or base and calls the appropriate builder. */
@@ -131,7 +129,7 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
     ctx->temperature = temperature;
 
     // Allocate logits buffer
-    gemma3_270m_config_t* config = (gemma3_270m_config_t*)spec->variant_config;
+    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)spec->variant_config;
     ctx->logits = (float*)malloc(config->vocab_size * sizeof(float));
     if (!ctx->logits) {
         fprintf(stderr, "ERROR: Failed to allocate logits buffer\n");
@@ -215,9 +213,8 @@ void destroy_inference_context(inference_context_t* ctx) {
 int perform_inference(inference_context_t* ctx, const char* prompt, char* output, int output_size) {
     if (!ctx || !prompt || !output) return -1;
 
-    llm_model_t* model = (llm_model_t*)ctx->spec->llm_model;
     inference_session_t* session = ctx->session;
-    gemma3_270m_config_t* config = (gemma3_270m_config_t*)ctx->spec->variant_config;
+    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)ctx->spec->variant_config;
 
     int* tokens = malloc((ctx->context_len) * sizeof(int));
     int prompt_len = 0;
@@ -375,7 +372,7 @@ static int allocate_session_buffers(inference_session_t* session, gemma3_270m_co
     // at a time without bounds checking, so we must guarantee sufficient padding.
     int simd_lanes = 1;
     if (model->layers && config->num_hidden_layers > 0) {
-        model_layer_weights_t* lay0 = &model->layers[0];
+        const model_layer_weights_t* lay0 = &model->layers[0];
         const tensor_t* rep = NULL;
         if (lay0->q_proj_weight)
             rep = lay0->q_proj_weight;
@@ -455,7 +452,7 @@ static int allocate_session_buffers(inference_session_t* session, gemma3_270m_co
  * Precompute RoPE frequencies for both global and local bases (Gemma 3).
  * Returns 0 on success, -1 on error. Errors are logged internally.
  */
-static int precompute_rope_frequencies(inference_session_t* session, gemma3_270m_config_t* config, int max_context_len) {
+static int precompute_rope_frequencies(inference_session_t* session, const gemma3_270m_config_t* config, int max_context_len) {
     if (!session || !config) return -1;
 
     int freq_size = max_context_len * config->head_dim;
@@ -587,8 +584,7 @@ void inference_forward(inference_session_t* session, int token_id, int token_pos
         return;
     }
 
-    gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
-    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
+    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
 
     // 1. Embedding lookup
     sapphire_embed_lookup(session, token_id, session->scratch_buffer);

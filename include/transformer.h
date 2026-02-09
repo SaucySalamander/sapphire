@@ -48,7 +48,7 @@ void sapphire_embed_lookup(struct inference_session_t* session, int token_id, fl
 /**
  * @brief Performs LM Head calculation and softcapping.
  */
-void lm_head(struct inference_session_t* session, float* hidden, float* logits);
+void lm_head(struct inference_session_t* session, const float* hidden, float* logits);
 
 typedef struct {
     int pm, pi, pk, pf;

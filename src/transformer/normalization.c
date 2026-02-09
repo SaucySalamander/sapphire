@@ -181,8 +181,8 @@ static void qk_norm_apply(float* data, const float* scale, int head_dim, int num
     }
 }
 
-static float* load_query_vector(layer_buffers_t buf, model_layer_weights_t* layer,
-                                 gemma3_270m_config_t* config, int head_dim, int layer_idx) {
+static float* load_query_vector(layer_buffers_t buf, const model_layer_weights_t* layer,
+                                 const gemma3_270m_config_t* config, int head_dim, int layer_idx) {
         int q_norm_len = tensor_shape(layer->q_norm_weight)[0];
         const float* raw = get_norm_weights(layer->q_norm_weight, buf.weight_scratch, q_norm_len);
         int expected_q = config->num_attention_heads * head_dim;
@@ -205,8 +205,8 @@ static float* load_query_vector(layer_buffers_t buf, model_layer_weights_t* laye
         }
 }
 
-static float* load_key_vector(layer_buffers_t buf, model_layer_weights_t* layer,
-                               gemma3_270m_config_t* config, int head_dim, int layer_idx) {
+static float* load_key_vector(layer_buffers_t buf, const model_layer_weights_t* layer,
+                               const gemma3_270m_config_t* config, int head_dim, int layer_idx) {
         int k_norm_len = tensor_shape(layer->k_norm_weight)[0];
         const float* raw = get_norm_weights(layer->k_norm_weight, buf.weight_scratch, k_norm_len);
         int expected_k = config->num_key_value_heads * head_dim;
@@ -229,8 +229,8 @@ static float* load_key_vector(layer_buffers_t buf, model_layer_weights_t* layer,
 }
 
 qk_norm_result_t qk_norm_from_layer(layer_buffers_t buf,
-                                           model_layer_weights_t* layer,
-                                           gemma3_270m_config_t* config,
+                                           const model_layer_weights_t* layer,
+                                           const gemma3_270m_config_t* config,
                                            int head_dim,
                                            int layer_idx) {
     qk_norm_result_t result = {NULL, NULL};

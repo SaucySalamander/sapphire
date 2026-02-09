@@ -94,7 +94,6 @@ bool attention_debug_should_log(const attention_debug_config_t* cfg, int layer_i
 
 int sapphire_attention_forward(struct inference_session_t* session, int layer_idx, int token_pos,
                                float* q_proj, float* attn_out) {
-    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
     gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
 
     int seq_len = token_pos + 1;  // Current token pos is 0-indexed, so length is pos + 1
@@ -149,7 +148,7 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
 
         const float* k_base = cached_k_data + h_kv * cache_stride + window_start * head_dim;
         const float* v_base = cached_v_data + h_kv * cache_stride + window_start * head_dim;
-        float* head_q = q_proj + h * head_dim;
+        const float* head_q = q_proj + h * head_dim;
         float* scores = session->attn_scores;
 
         // Step 1: Compute scores (Dot product)

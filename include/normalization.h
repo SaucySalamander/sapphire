@@ -107,8 +107,8 @@ typedef struct {
  * @return Struct containing pointers to extracted q_scale and k_scale
  */
 qk_norm_result_t qk_norm_from_layer(layer_buffers_t buf,
-                                           model_layer_weights_t* layer,
-                                           gemma3_270m_config_t* config,
+                                           const model_layer_weights_t* layer,
+                                           const gemma3_270m_config_t* config,
                                            int head_dim,
                                            int layer_idx);
 

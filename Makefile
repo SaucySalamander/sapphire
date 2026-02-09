@@ -193,7 +193,7 @@ compile_commands: compile_commands.json
 # Static analysis with cppcheck
 CPPCHECK ?= cppcheck
 CPPCHECK_HTMLREPORT ?= cppcheck-htmlreport
-CPPCHECK_FLAGS ?= --enable=all --inconclusive --std=c11 -I $(INCDIR) --xml-version=2 -j4 --suppressions-list=.cppcheck_suppressions --check-level=exhaustive
+CPPCHECK_FLAGS ?= --enable=all --inconclusive --std=c11 -I $(INCDIR) -j4 --suppressions-list=.cppcheck_suppressions --check-level=exhaustive
 
 .PHONY: cppcheck-report
 
@@ -201,9 +201,9 @@ CPPCHECK_FLAGS ?= --enable=all --inconclusive --std=c11 -I $(INCDIR) --xml-versi
 cppcheck-report: compile_commands $(REPORTS_DIR)
 	@echo "Running cppcheck and generating HTML report..."
 	@if [ -f compile_commands.json ]; then \
-	  $(CPPCHECK) $(CPPCHECK_FLAGS) --project=compile_commands.json 2> $(REPORTS_DIR)/cppcheck.xml || true; \
+	  $(CPPCHECK) $(CPPCHECK_FLAGS) --xml-version=2 --project=compile_commands.json 2> $(REPORTS_DIR)/cppcheck.xml || true; \
 	else \
-	  $(CPPCHECK) $(CPPCHECK_FLAGS) src 2> $(REPORTS_DIR)/cppcheck.xml || true; \
+	  $(CPPCHECK) $(CPPCHECK_FLAGS) --xml-version=2 src 2> $(REPORTS_DIR)/cppcheck.xml || true; \
 	fi
 	@{ $(CPPCHECK_HTMLREPORT) --file=$(REPORTS_DIR)/cppcheck.xml --report-dir=$(REPORTS_DIR)/cppcheck-report --source-dir=. || python3 /usr/share/cppcheck/cppcheck-htmlreport.py --file=$(REPORTS_DIR)/cppcheck.xml --report-dir=$(REPORTS_DIR)/cppcheck-report --source-dir=. ; } >/dev/null 2>&1 || true
 	@echo "HTML report available at $(REPORTS_DIR)/cppcheck-report/index.html"
@@ -217,9 +217,9 @@ cppcheck-report: compile_commands $(REPORTS_DIR)
 check-cppcheck: compile_commands $(REPORTS_DIR)
 	@echo "Running cppcheck (strict mode - fails on errors)..."
 	@if [ -f compile_commands.json ]; then \
-	  $(CPPCHECK) $(CPPCHECK_FLAGS) --project=compile_commands.json --error-exitcode=1 2> $(REPORTS_DIR)/cppcheck-strict.xml || (echo "❌ Cppcheck found issues"; exit 1); \
+	  $(CPPCHECK) $(CPPCHECK_FLAGS) --project=compile_commands.json --error-exitcode=1 || (echo "❌ Cppcheck found issues"; exit 1); \
 	else \
-	  $(CPPCHECK) $(CPPCHECK_FLAGS) src --error-exitcode=1 2> $(REPORTS_DIR)/cppcheck-strict.xml || (echo "❌ Cppcheck found issues"; exit 1); \
+	  $(CPPCHECK) $(CPPCHECK_FLAGS) src --error-exitcode=1 || (echo "❌ Cppcheck found issues"; exit 1); \
 	fi
 	@echo "✓ Cppcheck passed"
 

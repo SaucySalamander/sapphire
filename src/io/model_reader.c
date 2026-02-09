@@ -193,8 +193,8 @@ void llm_model_destroy_ex(const struct model_spec *spec) {
     if (spec->variant_config) {
         /* Best-effort: many variant configs expose `num_hidden_layers` as an int. */
         /* We attempt to read that field from the common Gemma3 config if available. */
-        gemma3_270m_config_t *cfg = (gemma3_270m_config_t *)spec->variant_config;
-        if (cfg && cfg->num_hidden_layers > 0 && cfg->num_hidden_layers <= SAPPHIRE_MAX_LAYERS) {
+        const gemma3_270m_config_t *cfg = (const gemma3_270m_config_t *)spec->variant_config;
+        if (cfg->num_hidden_layers > 0 && cfg->num_hidden_layers <= SAPPHIRE_MAX_LAYERS) {
             n_layers = cfg->num_hidden_layers;
         }
     }

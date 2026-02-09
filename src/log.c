@@ -84,7 +84,7 @@ void log_log(log_level_t level, const char *file, int line, const char *func, co
     char prefix[256];
     time_t t = time(NULL);
     struct tm tm_buf;
-    struct tm *tm = localtime_r(&t, &tm_buf);
+    const struct tm *tm = localtime_r(&t, &tm_buf);
     int pre_len = 0;
     if (tm) {
         pre_len = snprintf(prefix, sizeof(prefix), "%04d-%02d-%02d %02d:%02d:%02d [%s] %s:%d: ",

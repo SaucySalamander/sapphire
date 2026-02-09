@@ -98,7 +98,7 @@ kv_cache_t* kv_cache_create(int num_layers, int num_kv_heads, int max_seq_len, i
     
     // Create tensors for each layer
     // Shape: [num_kv_heads, max_seq_len, head_dim]
-    int shape_kv[] = {num_kv_heads, max_seq_len, head_dim};
+    const int shape_kv[] = {num_kv_heads, max_seq_len, head_dim};
     
     for (int i = 0; i < num_layers; i++) {
         cache->keys_per_layer[i] = tensor_create(3, shape_kv, DTYPE_F32);
@@ -183,12 +183,11 @@ int kv_cache_append_token(kv_cache_t *cache, const float *k_token, const float *
     }
     
     int pos = cache->current_pos;
-    int token_size = cache->num_kv_heads * cache->head_dim;
     
     // Write token to all layers at the same position
     for (int layer = 0; layer < cache->num_layers; layer++) {
-        tensor_t *keys = cache->keys_per_layer[layer];
-        tensor_t *values = cache->values_per_layer[layer];
+        const tensor_t *keys = cache->keys_per_layer[layer];
+        const tensor_t *values = cache->values_per_layer[layer];
         
         // Offset into the 3D tensor [num_kv_heads, max_seq_len, head_dim]
         // Element at [head, pos, dim] has offset: head * (max_seq_len * head_dim) + pos * head_dim + dim
@@ -263,8 +262,8 @@ int kv_cache_write_token(kv_cache_t *cache, int layer, int pos, const float *k_t
         return -1;
     }
 
-    tensor_t *keys = cache->keys_per_layer[layer];
-    tensor_t *values = cache->values_per_layer[layer];
+    const tensor_t *keys = cache->keys_per_layer[layer];
+    const tensor_t *values = cache->values_per_layer[layer];
 
     float *keys_data = (float *)tensor_data(keys);
     float *values_data = (float *)tensor_data(values);
@@ -444,8 +443,8 @@ int kv_cache_verify_entry(kv_cache_t *cache, int layer, int pos, const float *k_
     }
 
     int total = cache->num_kv_heads * cache->head_dim;
-    float *k_snap = cache->last_k_snapshot[layer];
-    float *v_snap = cache->last_v_snapshot[layer];
+    const float *k_snap = cache->last_k_snapshot[layer];
+    const float *v_snap = cache->last_v_snapshot[layer];
     if (!k_snap || !v_snap) return -1;
 
     double k_sq = 0.0, v_sq = 0.0;

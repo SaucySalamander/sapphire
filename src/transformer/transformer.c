@@ -17,8 +17,8 @@
 
 
 
-layer_buffers_t init_layer_buffers(struct inference_session_t* session,
-                                   gemma3_270m_config_t* config,
+layer_buffers_t init_layer_buffers(const struct inference_session_t* session,
+                                   const gemma3_270m_config_t* config,
                                    int d_model,
                                    int head_dim) {
     // Buffers from scratch space based on inference.c layout:
@@ -231,8 +231,8 @@ int sapphire_transformer_layer(struct inference_session_t* session, int layer_id
 }
 
 void sapphire_embed_lookup(struct inference_session_t* session, int token_id, float* hidden) {
-    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
-    gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
+    const llm_model_t* model = (const llm_model_t*)session->model_spec->llm_model;
+    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
 
     const uint16_t* embed_table_bf16 = (const uint16_t*)tensor_data(model->embedding_weight);
     bf16_to_f32_vec(hidden, embed_table_bf16 + (token_id * config->hidden_size), config->hidden_size);
@@ -268,18 +268,14 @@ void sapphire_embed_lookup(struct inference_session_t* session, int token_id, fl
  * @param hidden Final layer output [d_model], will be normalized in-place via scratch.
  * @param logits Output logits buffer [vocab_size], populated with unnormalized scores.
  */
-void lm_head(struct inference_session_t* session, float* hidden, float* logits) {
-    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
-    gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
-    int norm_weights_are_deltas = 1;
+void lm_head(struct inference_session_t* session, const float* hidden, float* logits) {
+    const llm_model_t* model = (const llm_model_t*)session->model_spec->llm_model;
+    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
     float* scratch_norm = session->scratch_buffer + 2 * session->padded_d_model;
     float* tmp_w = session->scratch_buffer + 3 * session->padded_d_model;
     const float* final_w = get_norm_weights(model->norm_final_weight, tmp_w, config->hidden_size);
 
-    if (norm_weights_are_deltas) {
-        rmsnorm_delta(scratch_norm, hidden, final_w, 1e-6f, config->hidden_size);
-    } else {
-        rmsnorm(scratch_norm, hidden, final_w, 1e-6f, config->hidden_size);
-    }
+    // Gemma 3 uses delta variant for normalization weights
+    rmsnorm_delta(scratch_norm, hidden, final_w, 1e-6f, config->hidden_size);
     tensor_gemv_with_ctx(session->gemv_ctx, logits, model->embedding_weight, scratch_norm);
 }
