@@ -1,5 +1,8 @@
-// .cppcheck_suppressions
+# .cppcheck_suppressions
 *:*/usr/include/*
 *:*/usr/lib/gcc/*
 *:*/3rdparty/*
 *:*/test/*
+missingIncludeSystem
+missingInclude
+unmatchedSuppression

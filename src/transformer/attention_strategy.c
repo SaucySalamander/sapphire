@@ -39,13 +39,13 @@ void scaled_dot_product_strategy(
     float* scores,
     int context_length,
     int d_k,
-    void* user_data) {
+    const void* user_data) {
     if (scores == NULL || context_length <= 0 || d_k <= 0) {
         return;
     }
 
     const bool debug_enabled = attention_debug_enabled();
-    gemma3_attention_params_t* params = (gemma3_attention_params_t*)user_data;
+    const gemma3_attention_params_t* params = (const gemma3_attention_params_t*)user_data;
 
     // Gemma 3: QK-norm replaces 1/sqrt(d_k) scaling
     // After QK-norm, Q and K are unit vectors, so no additional scaling needed

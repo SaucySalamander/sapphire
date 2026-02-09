@@ -162,4 +162,3 @@ int rmsnorm_batch(float *out, const float *in, const float *weight,
     
     return 0;
 }
-

@@ -36,8 +36,8 @@ for src in $SOURCES; do
   fi
 
   # Build the compile command (matching what Makefile uses)
-  # Add system include paths so cppcheck can find standard headers
-  cmd="gcc -O3 -Wall -I. -Iinclude -I/usr/lib/gcc/x86_64-pc-linux-gnu/15.2.1/include -I/usr/local/include -I/usr/include -mavx2 -mfma -c $src -o /dev/null"
+  # Standard includes only to avoid machine-specific paths in CI
+  cmd="gcc -O3 -Wall -I. -Iinclude -mavx2 -mfma -c $src -o /dev/null"
   
   # Escape for JSON
   cmd_escaped=$(echo "$cmd" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')

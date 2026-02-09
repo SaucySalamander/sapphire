@@ -93,7 +93,6 @@ bool attention_debug_should_log(const attention_debug_config_t* cfg, int layer_i
 
 int sapphire_attention_forward(struct inference_session_t* session, int layer_idx, int token_pos,
                                float* q_proj, float* attn_out) {
-    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
     gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
 
     int seq_len = token_pos + 1;  // Current token pos is 0-indexed, so length is pos + 1
@@ -148,7 +147,7 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
 
         const float* k_base = cached_k_data + h_kv * cache_stride + window_start * head_dim;
         const float* v_base = cached_v_data + h_kv * cache_stride + window_start * head_dim;
-        float* head_q = q_proj + h * head_dim;
+        const float* head_q = q_proj + h * head_dim;
         float* scores = session->attn_scores;
 
         // Step 1: Compute scores (Dot product)
@@ -195,8 +194,8 @@ static void qk_norm_apply(float* data, const float* scale, int head_dim, int num
     }
 }
 
-static const float* load_query_vector(layer_buffers_t buf, model_layer_weights_t* layer,
-                                 gemma3_270m_config_t* config, int head_dim, int layer_idx) {
+static const float* load_query_vector(layer_buffers_t buf, const model_layer_weights_t* layer,
+                                 const gemma3_270m_config_t* config, int head_dim, int layer_idx) {
         int q_norm_len = tensor_shape(layer->q_norm_weight)[0];
         const float* raw = get_norm_weights(layer->q_norm_weight, buf.weight_scratch, q_norm_len);
         int expected_q = config->num_attention_heads * head_dim;
@@ -218,8 +217,8 @@ static const float* load_query_vector(layer_buffers_t buf, model_layer_weights_t
         }
 }
 
-static const float* load_key_vector(layer_buffers_t buf, model_layer_weights_t* layer,
-                               gemma3_270m_config_t* config, int head_dim, int layer_idx) {
+static const float* load_key_vector(layer_buffers_t buf, const model_layer_weights_t* layer,
+                               const gemma3_270m_config_t* config, int head_dim, int layer_idx) {
         int k_norm_len = tensor_shape(layer->k_norm_weight)[0];
         const float* raw = get_norm_weights(layer->k_norm_weight, buf.weight_scratch, k_norm_len);
         int expected_k = config->num_key_value_heads * head_dim;
@@ -239,8 +238,8 @@ static const float* load_key_vector(layer_buffers_t buf, model_layer_weights_t* 
 }
 
 static void apply_qk_norm_from_layer(layer_buffers_t buf,
-                                           model_layer_weights_t* layer,
-                                           gemma3_270m_config_t* config,
+                                           const model_layer_weights_t* layer,
+                                           const gemma3_270m_config_t* config,
                                            int head_dim,
                                            int layer_idx) {
     const float* q_scale = NULL;

@@ -97,10 +97,10 @@ static void parse_numeric_field(const char* json, const sjson_token_t* tokens, i
     if (sjson_token_to_double(json, &tokens[v_idx], &dv) != 0) return;
     
     if (spec->type == FIELD_INT) {
-        int* field_ptr = (int*)((char*)cfg + spec->cfg_offset);
+        int* field_ptr = (int*)(void*)((char*)cfg + spec->cfg_offset);
         *field_ptr = (int)(dv + 0.5);
     } else if (spec->type == FIELD_FLOAT) {
-        float* field_ptr = (float*)((char*)cfg + spec->cfg_offset);
+        float* field_ptr = (float*)(void*)((char*)cfg + spec->cfg_offset);
         *field_ptr = (float)dv;
     }
 }
@@ -301,7 +301,7 @@ static int gemma3_populate_from_files(const char* model_dir, model_spec_t* spec)
     model->safetensors_handle = loaded_model->safetensors_handle;
 
     /* Compute derived fields on the Gemma runtime config */
-    gemma3_270m_config_t* cfg = (gemma3_270m_config_t*)spec->variant_config;
+    const gemma3_270m_config_t* cfg = (const gemma3_270m_config_t*)spec->variant_config;
 
     /* Free the shell structure (loaded_model) but keep its contents */
     free(loaded_model);
@@ -323,69 +323,6 @@ static int gemma3_populate_from_files(const char* model_dir, model_spec_t* spec)
     }
 
     return 0;
-}
-
-static float gemma3_bf16_to_f32(uint16_t bf16_val) {
-    uint32_t f32_bits = ((uint32_t)bf16_val) << 16;
-    float f;
-    memcpy(&f, &f32_bits, sizeof(float));
-    return f;
-}
-
-static tensor_t* gemma3_scale_norm_tensor(const tensor_t* src, float scale, const char* label) {
-    if (!src) return NULL;
-
-    int ndim = tensor_ndim(src);
-    const int* shape = tensor_shape(src);
-    size_t numel = tensor_numel(src);
-    if (ndim <= 0 || !shape || numel == 0) return NULL;
-
-    tensor_dtype_t dtype = tensor_dtype(src);
-    if (dtype != DTYPE_F32 && dtype != DTYPE_BF16) {
-        LOG_WARN("Gemma3 loader: skipping norm scale for %s (dtype=%s unsupported)",
-                 label ? label : "(unnamed)", dtype_name(dtype));
-        return NULL;
-    }
-
-    tensor_t* dst = tensor_create(ndim, shape, DTYPE_F32);
-    if (!dst) return NULL;
-
-    float* out = tensor_data_f32(dst);
-    if (!out) {
-        tensor_release(dst);
-        return NULL;
-    }
-
-    if (dtype == DTYPE_F32) {
-        const float* in = (const float*)tensor_data(src);
-        if (!in) {
-            tensor_release(dst);
-            return NULL;
-        }
-        for (size_t i = 0; i < numel; ++i) {
-            out[i] = in[i] * scale;
-        }
-    } else {
-        const uint16_t* in = (const uint16_t*)tensor_data(src);
-        if (!in) {
-            tensor_release(dst);
-            return NULL;
-        }
-        for (size_t i = 0; i < numel; ++i) {
-            out[i] = gemma3_bf16_to_f32(in[i]) * scale;
-        }
-    }
-
-    LOG_DEBUG("Gemma3 loader: scaled %s by %.6f into F32", label ? label : "(unnamed)", scale);
-    return dst;
-}
-
-static void gemma3_scale_norm_inplace(tensor_t** slot, float scale, const char* label) {
-    if (!slot || !*slot) return;
-    tensor_t* scaled = gemma3_scale_norm_tensor(*slot, scale, label);
-    if (!scaled) return;
-    tensor_release(*slot);
-    *slot = scaled;
 }
 
 static void gemma3_postprocess_model(const model_spec_t* model_spec) {

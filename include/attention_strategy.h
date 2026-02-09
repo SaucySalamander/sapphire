@@ -58,7 +58,7 @@ void scaled_dot_product_strategy(
     float *scores,
     int context_length,
     int d_k,
-    void *user_data
+    const void *user_data
 );
 
 /**
