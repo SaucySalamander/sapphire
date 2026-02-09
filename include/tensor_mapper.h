@@ -17,6 +17,9 @@
 #ifndef SAPPHIRE_TENSOR_MAPPER_H
 #define SAPPHIRE_TENSOR_MAPPER_H
 
+#include <stdint.h>
+#include "llm_model.h"
+#include "model_spec.h"
 #include "ggml_model.h"
 
 #ifdef __cplusplus
@@ -107,8 +110,6 @@ typedef struct tensor_mapper_plugin {
  * @return SAPPHIRE_ERR_LOAD_UNSUPPORTED_FORMAT if extension not recognized
  * @return SAPPHIRE_ERR_LOAD_* on other failures
  */
-int sapphire_load_model(const char *path, llm_model_t *out_model,
-                        char *error_message, int max_error_len);
 
 /**
  * Load model from Safetensors format file.
@@ -135,8 +136,6 @@ int sapphire_load_model(const char *path, llm_model_t *out_model,
  * @note Safetensors tensors are mmapped and remain valid after file is closed.
  * @note Caller must invoke llm_model_destroy() to free allocated layers.
  */
-int sapphire_load_safetensors(const char *safetensors_path, llm_model_t *out_model,
-                              char *error_message, int max_error_len);
 
 /*
  * Generic Safetensors mapping helpers
@@ -182,21 +181,6 @@ int safetensors_map_all_tensors_with_table(safetensors_file_t* st,
  *
  * @note Caller must invoke llm_model_destroy() to free allocated layers.
  */
-int sapphire_load_ggml(const char *ggml_path, llm_model_t *out_model,
-                       char *error_message, int max_error_len);
-
-/**
- * Utility function to validate tensor shapes match expected dimensions.
- *
- * @param actual Array of actual shape dimensions
- * @param ndim_actual Number of dimensions in actual shape
- * @param expected Array of expected shape dimensions
- * @param ndim_expected Number of dimensions in expected shape
- *
- * @return 0 if shapes match, -1 if they differ
- */
-int validate_tensor_shape(const uint32_t *actual, int ndim_actual,
-                          const uint32_t *expected, int ndim_expected);
 
 #ifdef __cplusplus
 }

@@ -1,7 +1,7 @@
 // bench_q4.c - small benchmark for Q4 kernels
 
 #define _POSIX_C_SOURCE 200809L
-#include "sapphire.h"
+#include "kernels.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

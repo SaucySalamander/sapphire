@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "model_reader.h"
 #include "model_spec.h"
 #include "gemma3_270m_spec.h"
 

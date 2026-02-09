@@ -7,7 +7,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "sapphire.h"
+#include "kernels.h"
 
 static int run_and_time(sapphire_context* ctx, const ggml_tensor_t* tensors, size_t tensor_count, int rows, int blocks_per_row, const float* x, float* y, const char* label, int repeats) {
     if (!ctx || !tensors || !x || !y || !label || repeats <= 0) return -1;

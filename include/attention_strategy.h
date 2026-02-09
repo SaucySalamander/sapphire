@@ -32,6 +32,16 @@ typedef struct {
 } gemma3_attention_params_t;
 
 /**
+ * @brief Configuration for attention scoring.
+ */
+typedef struct {
+    AttentionScalingStrategy strategy; /**< Strategy function to apply. */
+    int context_length;                /**< Length of the context (number of tokens). */
+    int d_k;                           /**< Head dimension. */
+    void *user_data;                   /**< Strategy-specific data. */
+} attention_scoring_config_t;
+
+/**
  * @brief Standard scaled dot-product attention strategy.
  * 
  * Scales scores by 1/sqrt(d_k), then applies softmax.
@@ -96,17 +106,6 @@ void alibi_attention_strategy(
     int d_k,
     void *user_data
 );
-
-/**
- * @brief Configuration for attention scoring operations.
- * Used to group parameters and meet project-wide function signatures constraints.
- */
-typedef struct {
-    AttentionScalingStrategy strategy;
-    void *user_data;
-    int context_length;
-    int d_k;
-} attention_scoring_config_t;
 
 /**
  * @brief Generic attention score computation with pluggable scaling strategy.

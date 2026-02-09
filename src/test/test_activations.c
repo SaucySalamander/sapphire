@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <assert.h>
-#include "activations.h"
+#include "kernels.h"
 #include "test_utils.h"
 
 // Global test counters

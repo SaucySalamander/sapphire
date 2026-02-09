@@ -42,12 +42,5 @@ typedef struct {
 /**
  * GGML reader API (used by GGML loader implementation and tests)
  */
-FILE* ggml_file_open_and_parse_header(const char *filename, ggml_file_header_t *header);
-
-tensor_t* ggml_load_tensor(FILE *fp, const ggml_tensor_meta_t *meta);
-
-const ggml_tensor_meta_t* ggml_find_tensor_meta(const ggml_file_header_t *header, const char *name);
-
-void ggml_header_destroy(ggml_file_header_t *header);
 
 #endif // GGML_MODEL_H

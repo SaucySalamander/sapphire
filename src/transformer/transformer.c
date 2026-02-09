@@ -6,11 +6,10 @@
 #include <string.h>
 
 #include "../include/gemma3_270m_config.h"
-#include "activations.h"
 #include "attention.h"
 #include "inference.h"
+#include "kernels.h"
 #include "log.h"
-#include "normalization.h"
 #include "rope.h"
 #include "tensor.h"
 #include "utils.h"

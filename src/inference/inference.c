@@ -12,17 +12,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../include/activations.h"
 #include "../include/attention.h"
 #include "../include/gemma3_270m_config.h"
 #include "../include/ggml_model.h"
 #include "../include/kv_cache.h"
 #include "../include/log.h"
-#include "../include/model_spec_loader.h"
-#include "../include/normalization.h"
+#include "../include/model_reader.h"
 #include "../include/rope.h"
 #include "../include/tensor.h"
-#include "../include/tensor_gemv.h"
+#include "../include/kernels.h"
 #include "../include/transformer.h"
 #include "../include/utils.h"
 #include "../include/file_reader.h"
