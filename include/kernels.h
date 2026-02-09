@@ -97,7 +97,7 @@ int kernel_gemv(kernel_context_t *ctx, float *y, const tensor_t *A, const float 
 /**
  * Tensor-to-tensor GEMV: y = A @ x (where y and x are F32 tensors).
  */
-int kernel_gemv_tensor(kernel_context_t *ctx, tensor_t *y, const tensor_t *A, const tensor_t *x);
+int kernel_gemv_tensor(kernel_context_t *ctx, const tensor_t *y, const tensor_t *A, const tensor_t *x);
 
 /**
  * GEMV with accumulation: y += alpha * (A @ x).

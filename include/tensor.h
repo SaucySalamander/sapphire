@@ -170,7 +170,7 @@ const void* tensor_data(const tensor_t *t);
  * @brief Accessor: get pointer to raw f32 data (writable) if dtype == DTYPE_F32.
  * @return pointer to internal f32 buffer or NULL (and prints a warning) if dtype != F32
  */
-float* tensor_data_f32(tensor_t *t);
+float* tensor_data_f32(const tensor_t *t);
 
 /**
  * @brief Accessor: get pointer to raw data buffer (writable) for any dtype.
@@ -181,7 +181,7 @@ float* tensor_data_f32(tensor_t *t);
  * @param t Tensor.
  * @return pointer to writable internal data buffer or NULL
  */
-void* tensor_data_mutable(tensor_t *t);
+void* tensor_data_mutable(const tensor_t *t);
 
 /**
  * @brief Accessor: get tensor dtype.

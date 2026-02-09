@@ -143,7 +143,7 @@ int kernel_gemv(kernel_context_t *ctx, float *y, const tensor_t *A, const float 
     }
 }
 
-int kernel_gemv_tensor(kernel_context_t *ctx, tensor_t *y, const tensor_t *A, const tensor_t *x) {
+int kernel_gemv_tensor(kernel_context_t *ctx, const tensor_t *y, const tensor_t *A, const tensor_t *x) {
     if (!y || !A || !x) {
         fprintf(stderr, "ERROR: kernel_gemv_tensor null pointer\n");
         return -1;
