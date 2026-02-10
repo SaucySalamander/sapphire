@@ -72,7 +72,7 @@ typedef struct transformer_layer_ctx {
 } transformer_layer_ctx_t;
 
 /**
- * @brief Computes the Attention stage of a transformer layer.
+ * @brief Computes the Attention stage of a transformer layer (softmax attention).
  * includes Norm -> Projections -> QK Norm -> RoPE -> Attention -> Output Projection -> Post Norm
  */
 void compute_attention_stage(layer_buffers_t buf,
@@ -80,5 +80,53 @@ void compute_attention_stage(layer_buffers_t buf,
                              float* hidden,
                              const float* rope_cos,
                              const float* rope_sin);
+
+/**
+ * @brief Computes a linear attention stage (LoLCATs-style linearized attention).
+ * 
+ * Placeholder for linearized attention computation. Similar to softmax attention
+ * but replaces softmax with linear (kernel-based) attention mechanism.
+ * 
+ * @param buf Layer buffers (pre-allocated, same as softmax path).
+ * @param ctx Transformer layer context.
+ * @param hidden Input/output hidden state [d_model].
+ * @param rope_cos RoPE cosine frequencies.
+ * @param rope_sin RoPE sine frequencies.
+ */
+void compute_linear_attention_stage(layer_buffers_t buf,
+                                    transformer_layer_ctx_t* ctx,
+                                    float* hidden,
+                                    const float* rope_cos,
+                                    const float* rope_sin);
+
+/**
+ * @brief Computes an SSM (state space model) stage (Mamba-style recurrence).
+ * 
+ * Placeholder for SSM computation. Replaces attention with state-space model
+ * recurrence with convolutional kernel, as in Mamba or similar architectures.
+ * 
+ * @param buf Layer buffers (pre-allocated).
+ * @param ctx Transformer layer context.
+ * @param hidden Input/output hidden state [d_model].
+ */
+void compute_ssm_stage(layer_buffers_t buf,
+                       transformer_layer_ctx_t* ctx,
+                       float* hidden);
+
+/**
+ * @brief Computes the FFN stage of a transformer layer.
+ * Shared across all layer types (softmax, linear attention, SSM).
+ */
+void compute_ffn_stage(layer_buffers_t buf,
+                       transformer_layer_ctx_t* ctx,
+                       float* hidden);
+
+/**
+ * @brief Finalizes layer output (post-FFN norm and residual).
+ * Shared across all layer types.
+ */
+void finalize_layer_output(layer_buffers_t buf,
+                           transformer_layer_ctx_t* ctx,
+                           float* hidden);
 
 #endif // TRANSFORMER_H

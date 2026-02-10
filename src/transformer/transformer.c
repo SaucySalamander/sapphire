@@ -278,3 +278,45 @@ void lm_head(struct inference_session_t* session, const float* hidden, float* lo
     rmsnorm_delta(scratch_norm, hidden, final_w, 1e-6f, config->hidden_size);
     tensor_gemv_with_ctx(session->gemv_ctx, logits, model->embedding_weight, scratch_norm);
 }
+
+/**
+ * @brief Computes a linear attention stage (LoLCATs-style linearized attention).
+ * 
+ * PLACEHOLDER: Currently a stub that logs a warning.
+ * TODO: Implement linearized attention using kernel-based approximation.
+ * 
+ * @param buf Layer buffers (pre-allocated).
+ * @param ctx Transformer layer context.
+ * @param hidden Input/output hidden state [d_model].
+ * @param rope_cos RoPE cosine frequencies.
+ * @param rope_sin RoPE sine frequencies.
+ */
+void compute_linear_attention_stage(layer_buffers_t buf,
+                                    transformer_layer_ctx_t* ctx,
+                                    float* hidden,
+                                    const float* rope_cos,
+                                    const float* rope_sin) {
+    LOG_WARN("compute_linear_attention_stage called for layer %d (not yet implemented)", ctx->layer_idx);
+    /* TODO: Implement LoLCATs linearized attention */
+    (void)buf;
+    (void)rope_cos;
+    (void)rope_sin;
+}
+
+/**
+ * @brief Computes an SSM (state space model) stage (Mamba-style recurrence).
+ * 
+ * PLACEHOLDER: Currently a stub that logs a warning.
+ * TODO: Implement SSM forward pass with state-space dynamics and convolutional kernel.
+ * 
+ * @param buf Layer buffers (pre-allocated).
+ * @param ctx Transformer layer context.
+ * @param hidden Input/output hidden state [d_model].
+ */
+void compute_ssm_stage(layer_buffers_t buf,
+                       transformer_layer_ctx_t* ctx,
+                       float* hidden) {
+    LOG_WARN("compute_ssm_stage called for layer %d (not yet implemented)", ctx->layer_idx);
+    /* TODO: Implement Mamba-style SSM forward pass */
+    (void)buf;
+}
