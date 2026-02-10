@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <stddef.h>
+#include "../include/kernels.h"
 #include "../include/log.h"
 #include "../include/safetensors_reader.h"
 #include "../include/tensor.h"

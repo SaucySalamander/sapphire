@@ -9,6 +9,7 @@
 #include "model_spec.h"
 #include "kv_cache.h"
 #include "kernels.h"      /* For kernel_context_t in GEMV operations */
+#include "layer_dispatch.h" /* For sapphire_layer_config_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,6 +80,10 @@ typedef struct inference_session_t {
     float *rope_freqs_sin_local;
     
     kernel_context_t *gemv_ctx;     /**< GEMV context for matrix-vector operations. */
+    
+    /* Layer dispatch configuration */
+    sapphire_layer_config_t *layer_configs;  /**< Per-layer type and settings [num_layers]. */
+    int num_layers;                  /**< Number of transformer layers. */
 } inference_session_t;
 
 /**

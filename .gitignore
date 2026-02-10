@@ -54,6 +54,7 @@ cscope.*
 ctags
 
 # Editor & IDE
+vision/
 feature_list.md
 COMPLEXITY_REDUCTION_PLAN.md
 scripts/monitor_lizard.py

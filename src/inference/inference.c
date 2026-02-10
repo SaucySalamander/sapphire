@@ -16,6 +16,7 @@
 #include "../include/gemma3_270m_config.h"
 #include "../include/ggml_model.h"
 #include "../include/kv_cache.h"
+#include "../include/layer_config_loader.h"
 #include "../include/log.h"
 #include "../include/model_reader.h"
 #include "../include/rope.h"
@@ -523,6 +524,8 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
     session->rope_freqs_cos_local = NULL;
     session->rope_freqs_sin_local = NULL;
     session->gemv_ctx = NULL;
+    session->layer_configs = NULL;
+    session->num_layers = 0;
 
     // Allocate all buffers (scratch, attention scores, KV cache)
     if (allocate_session_buffers(session, config, model, max_context_len) != 0) {
@@ -540,6 +543,21 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
     session->gemv_ctx = tensor_gemv_ctx_create(0, 1024);  // 0 = auto-detect threads, 1024 = chunk size
     if (!session->gemv_ctx) {
         LOG_ERROR("Failed to create GEMV context");
+        destroy_inference_session(session);
+        return NULL;
+    }
+
+    // Load and initialize layer configurations (dispatch routing)
+    session->num_layers = config->num_hidden_layers;
+    session->layer_configs = (sapphire_layer_config_t*)malloc(session->num_layers * sizeof(sapphire_layer_config_t));
+    if (!session->layer_configs) {
+        LOG_ERROR("Failed to allocate layer configs array");
+        destroy_inference_session(session);
+        return NULL;
+    }
+    
+    if (layer_config_load_from_spec(spec, session->num_layers, session->layer_configs) != 0) {
+        LOG_ERROR("Failed to load layer configurations");
         destroy_inference_session(session);
         return NULL;
     }
@@ -614,38 +632,68 @@ void inference_forward(inference_session_t* session, int token_id, int token_pos
         }
     }
 
-    // 2. Transformer layers
+    // 2. Transformer layers with layer-type dispatch
     for (int l = 0; l < config->num_hidden_layers; l++) {
-        // Determine RoPE Strategy for this layer
-        // Pattern: 5 Sliding Window (Local) : 1 Global Attention
-        // Global Layers (5, 11, 17) use Base 1,000,000
-        // Local Layers use Base 10,000
-        bool is_global_layer = false;
-        /* Use loaded bitmask if available: bit i set => full (global) attention for layer i */
-        if (config->layer_types_mask) {
-            is_global_layer = ((config->layer_types_mask >> l) & 1ULL) != 0ULL;
-        } else {
-            is_global_layer = ((l + 1) % 6 == 0);
+        if (l >= session->num_layers) {
+            LOG_ERROR("Layer index %d out of bounds (num_layers=%d)", l, session->num_layers);
+            break;
         }
-
-        const float* f_cos = is_global_layer ? session->rope_freqs_cos_global : session->rope_freqs_cos_local;
-        const float* f_sin = is_global_layer ? session->rope_freqs_sin_global : session->rope_freqs_sin_local;
-
+        
+        sapphire_layer_config_t* layer_cfg = &session->layer_configs[l];
+        
         // Debug: log layer input/output for critical positions
         if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
             float mn, mx, rms;
             vec_stats(session->scratch_buffer, config->hidden_size, &mn, &mx, &rms);
-            fprintf(stderr, "[DEBUG_LAYER_INPUT] layer=%d pos=%d min=%.6f max=%.6f rms=%.6f\n", l, token_pos, mn, mx, rms);
+            fprintf(stderr, "[DEBUG_LAYER_INPUT] layer=%d pos=%d type=%d min=%.6f max=%.6f rms=%.6f\n", 
+                    l, token_pos, layer_cfg->type, mn, mx, rms);
         }
-
-        sapphire_transformer_layer(session, l, token_pos, session->scratch_buffer, f_cos, f_sin);
+        
+        /* Dispatch based on layer type */
+        switch (layer_cfg->type) {
+            case LAYER_TYPE_ATTENTION_SOFTMAX: {
+                /* Standard softmax attention (current Gemma 3 path) */
+                bool is_global = layer_cfg->config.attention.is_global;
+                const float* f_cos = is_global ? session->rope_freqs_cos_global : session->rope_freqs_cos_local;
+                const float* f_sin = is_global ? session->rope_freqs_sin_global : session->rope_freqs_sin_local;
+                
+                sapphire_transformer_layer(session, l, token_pos, session->scratch_buffer, f_cos, f_sin);
+                break;
+            }
+            
+            case LAYER_TYPE_ATTENTION_LINEAR: {
+                /* LoLCATs linearized attention (placeholder for now) */
+                LOG_WARN("Layer %d uses linear attention (not yet implemented)", l);
+                bool is_global = layer_cfg->config.attention.is_global;
+                const float* f_cos = is_global ? session->rope_freqs_cos_global : session->rope_freqs_cos_local;
+                const float* f_sin = is_global ? session->rope_freqs_sin_global : session->rope_freqs_sin_local;
+                /* TODO: Call compute_linear_attention_stage when implemented */
+                /* For now, fall back to softmax attention */
+                sapphire_transformer_layer(session, l, token_pos, session->scratch_buffer, f_cos, f_sin);
+                break;
+            }
+            
+            case LAYER_TYPE_SSM_RECURRENT: {
+                /* Mamba-style SSM recurrence (placeholder for now) */
+                LOG_WARN("Layer %d uses SSM recurrence (not yet implemented)", l);
+                /* TODO: Call compute_ssm_stage when implemented */
+                /* For now, skip the layer (or fall back to attention) */
+                break;
+            }
+            
+            default:
+                LOG_ERROR("Unknown layer type %d for layer %d", layer_cfg->type, l);
+                break;
+        }
         
         // Debug: log layer output
         if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
             float mn, mx, rms;
             vec_stats(session->scratch_buffer, config->hidden_size, &mn, &mx, &rms);
-            fprintf(stderr, "[DEBUG_LAYER_OUTPUT] layer=%d pos=%d min=%.6f max=%.6f rms=%.6f first5: %.6f %.6f %.6f %.6f %.6f\n", l, token_pos, mn, mx, rms,
-                    session->scratch_buffer[0], session->scratch_buffer[1], session->scratch_buffer[2], session->scratch_buffer[3], session->scratch_buffer[4]);
+            fprintf(stderr, "[DEBUG_LAYER_OUTPUT] layer=%d pos=%d type=%d min=%.6f max=%.6f rms=%.6f first5: %.6f %.6f %.6f %.6f %.6f\n", 
+                    l, token_pos, layer_cfg->type, mn, mx, rms,
+                    session->scratch_buffer[0], session->scratch_buffer[1], session->scratch_buffer[2], 
+                    session->scratch_buffer[3], session->scratch_buffer[4]);
         }
     }
 
@@ -693,6 +741,10 @@ void destroy_inference_session(inference_session_t* session) {
 
     if (session->gemv_ctx) {
         tensor_gemv_ctx_destroy(session->gemv_ctx);
+    }
+
+    if (session->layer_configs) {
+        free(session->layer_configs);
     }
 
     free(session);
