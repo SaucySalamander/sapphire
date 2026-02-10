@@ -46,6 +46,8 @@ typedef struct sapphire_context kernel_context_t;
 
 /**
  * Create a kernel execution context.
+ * Allocates and initializes the context structure and synchronization primitives.
+ * Threads are NOT launched until kernel_ctx_init() is called.
  * 
  * @param num_threads  Number of worker threads (0 = autodetect CPU count)
  * @param chunk_size   Rows per task per worker (default 16)
@@ -54,7 +56,18 @@ typedef struct sapphire_context kernel_context_t;
 kernel_context_t* kernel_ctx_create(int num_threads, int chunk_size);
 
 /**
+ * Initialize persistent worker threads.
+ * Must be called after kernel_ctx_create() and before kernel_gemv calls.
+ * Threads are created once and reused across all subsequent GEMV operations.
+ * 
+ * @param ctx  Context created by kernel_ctx_create()
+ * @return 0 on success, -1 on failure (errors logged internally)
+ */
+int kernel_ctx_init(kernel_context_t *ctx);
+
+/**
  * Destroy a kernel execution context.
+ * Signals worker threads to exit, joins them, and frees all resources.
  */
 void kernel_ctx_destroy(kernel_context_t *ctx);
 

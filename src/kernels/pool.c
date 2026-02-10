@@ -1,5 +1,6 @@
 #include "../../include/kernels.h"
 #include "../../include/tensor.h"  // For unified tensor_dtype_t
+#include "../../include/log.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -12,6 +13,18 @@ struct sapphire_context {
     int num_threads;
     int chunk_size;
     pthread_t *threads;
+    
+    // Persistent thread state
+    int initialized;  // 1 if threads have been launched, 0 otherwise
+    atomic_int shutdown_flag;  // 1 to signal threads to exit
+    pthread_mutex_t work_mutex;
+    pthread_cond_t work_cond;
+    
+    // Task-based synchronization
+    atomic_int task_id;          // Incremented by main thread to start new work
+    atomic_int threads_done;     // Incremented by workers when they finish a task
+    
+    // Work queue state
     atomic_int next_row;
     
     // Generic GEMV kernel dispatch
@@ -25,40 +38,76 @@ struct sapphire_context {
     const float *x;
     float *y;
     int x_aligned;
-    int stop;
 };
 
 // Internal prototype for dispatch from dispatch.c
 // Declared here to ensure implementation matches
 int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *x, float *y);
 
+/**
+ * Persistent worker thread function.
+ * Waits on condition variable for task_id change, processes rows, signals completion.
+ * Exits when shutdown_flag is set.
+ */
 static void *worker_fn(void *arg) {
     kernel_context_t *ctx = (kernel_context_t*)arg;
-    while (!ctx->stop) {
-        int start = atomic_fetch_add(&ctx->next_row, ctx->chunk_size);
-        if (start >= ctx->rows) break;
-        int end = start + ctx->chunk_size;
-        if (end > ctx->rows) end = ctx->rows;
-        
-        // Compute row pointers and dispatch through function pointer
-        for (int r = start; r < end; ++r) {
-            // Calculate row pointer based on row_stride_bytes
-            const char *W_base = (const char *)ctx->W;
-            const void *row_ptr = (const void *)(W_base + (size_t)r * ctx->row_stride_bytes);
-            
-            // Call the kernel through function pointer
-            // For F32/BF16, passing (cols, 1) prevents over-reading beyond the true column count.
-            int count = ctx->blocks_per_row;
-            int b_size = 32;
-            if (ctx->row_stride_bytes == (size_t)ctx->cols * 2 || 
-                ctx->row_stride_bytes == (size_t)ctx->cols * 4) {
-                count = ctx->cols;
-                b_size = 1;
-            }
-            float result = ctx->kernel_fn(row_ptr, ctx->x, count, b_size);
-            ctx->y[r] = result;
+    int my_last_task_id = 0;
+    
+    while (!atomic_load(&ctx->shutdown_flag)) {
+        // 1. Wait for a new task_id
+        pthread_mutex_lock(&ctx->work_mutex);
+        while (atomic_load(&ctx->task_id) == my_last_task_id && !atomic_load(&ctx->shutdown_flag)) {
+            pthread_cond_wait(&ctx->work_cond, &ctx->work_mutex);
         }
+        
+        if (atomic_load(&ctx->shutdown_flag)) {
+            pthread_mutex_unlock(&ctx->work_mutex);
+            break;
+        }
+        
+        // 2. Snapshot task parameters
+        my_last_task_id = atomic_load(&ctx->task_id);
+        int rows = ctx->rows;
+        int cols = ctx->cols;
+        int blocks_per_row = ctx->blocks_per_row;
+        size_t row_stride_bytes = ctx->row_stride_bytes;
+        const void *W = ctx->W;
+        const float *x = ctx->x;
+        float *y = ctx->y;
+        gemv_kernel_t kernel_fn = ctx->kernel_fn;
+        int chunk_size = ctx->chunk_size;
+        pthread_mutex_unlock(&ctx->work_mutex);
+        
+        // 3. Process assigned rows
+        while (1) {
+            int start = atomic_fetch_add(&ctx->next_row, chunk_size);
+            if (start >= rows) break;
+            int end = start + chunk_size;
+            if (end > rows) end = rows;
+            
+            for (int r = start; r < end; ++r) {
+                const char *W_base = (const char *)W;
+                const void *row_ptr = (const void *)(W_base + (size_t)r * row_stride_bytes);
+                
+                int count = blocks_per_row;
+                int b_size = 32;
+                if (row_stride_bytes == (size_t)cols * 2 || 
+                    row_stride_bytes == (size_t)cols * 4) {
+                    count = cols;
+                    b_size = 1;
+                }
+                float result = kernel_fn(row_ptr, x, count, b_size);
+                y[r] = result;
+            }
+        }
+        
+        // 4. Signal completion of this thread
+        pthread_mutex_lock(&ctx->work_mutex);
+        atomic_fetch_add(&ctx->threads_done, 1);
+        pthread_cond_broadcast(&ctx->work_cond); // Notify main thread
+        pthread_mutex_unlock(&ctx->work_mutex);
     }
+    
     return NULL;
 }
 
@@ -71,27 +120,106 @@ kernel_context_t *kernel_ctx_create(int num_threads, int chunk_size) {
 
     kernel_context_t *ctx = (kernel_context_t*)calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
+    
     ctx->num_threads = num_threads;
     ctx->chunk_size = chunk_size;
     ctx->threads = (pthread_t*)malloc(sizeof(pthread_t) * num_threads);
-    if (!ctx->threads) { free(ctx); return NULL; }
-    ctx->stop = 0;
+    if (!ctx->threads) {
+        free(ctx);
+        return NULL;
+    }
     
-    // Original implementation did NOT launch threads here.
-    // Threads are launched per-gemv in kernel_gemv_backend_exec.
-    // Keeping that behavior for now to avoid complexity.
+    // Initialize synchronization primitives
+    if (pthread_mutex_init(&ctx->work_mutex, NULL) != 0) {
+        LOG_ERROR("Failed to initialize work mutex");
+        free(ctx->threads);
+        free(ctx);
+        return NULL;
+    }
+    if (pthread_cond_init(&ctx->work_cond, NULL) != 0) {
+        LOG_ERROR("Failed to initialize work condition variable");
+        pthread_mutex_destroy(&ctx->work_mutex);
+        free(ctx->threads);
+        free(ctx);
+        return NULL;
+    }
+    
+    ctx->initialized = 0;
+    atomic_store(&ctx->shutdown_flag, 0);
+    atomic_store(&ctx->task_id, 0);
+    atomic_store(&ctx->threads_done, 0);
+    
+    LOG_DEBUG("Created kernel context with %d threads, chunk_size=%d", num_threads, chunk_size);
     return ctx;
 }
 
 void kernel_ctx_destroy(kernel_context_t *ctx) {
     if (!ctx) return;
-    // Threads are joined in gemv_exec, so nothing to stop here
+    
+    // Signal threads to shut down
+    if (ctx->initialized) {
+        atomic_store(&ctx->shutdown_flag, 1);
+        
+        pthread_mutex_lock(&ctx->work_mutex);
+        pthread_cond_broadcast(&ctx->work_cond);
+        pthread_mutex_unlock(&ctx->work_mutex);
+        
+        for (int i = 0; i < ctx->num_threads; ++i) {
+            pthread_join(ctx->threads[i], NULL);
+        }
+        LOG_DEBUG("All worker threads joined");
+    }
+    
+    // Clean up synchronization primitives
+    pthread_cond_destroy(&ctx->work_cond);
+    pthread_mutex_destroy(&ctx->work_mutex);
+    
     free(ctx->threads);
     free(ctx);
 }
 
+/**
+ * Initialize persistent worker threads.
+ * Call this once per inference session to launch threads.
+ * Returns 0 on success, -1 on failure (errors logged internally).
+ */
+int kernel_ctx_init(kernel_context_t *ctx) {
+    if (!ctx) {
+        LOG_ERROR("kernel_ctx_init: context is NULL");
+        return -1;
+    }
+    
+    if (ctx->initialized) {
+        return 0;  // Already initialized
+    }
+    
+    // Launch persistent worker threads
+    for (int i = 0; i < ctx->num_threads; ++i) {
+        if (pthread_create(&ctx->threads[i], NULL, worker_fn, ctx) != 0) {
+            LOG_ERROR("Failed to create worker thread %d", i);
+            atomic_store(&ctx->shutdown_flag, 1);
+            for (int j = 0; j < i; ++j) {
+                pthread_join(ctx->threads[j], NULL);
+            }
+            return -1;
+        }
+    }
+    
+    ctx->initialized = 1;
+    LOG_INFO("Initialized %d persistent worker threads", ctx->num_threads);
+    return 0;
+}
+
 int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *x, float *y) {
-    if (!ctx || !A || !x || !y) return 1;
+    if (!ctx || !A || !x || !y) {
+        LOG_ERROR("kernel_gemv_backend_exec: null pointer");
+        return 1;
+    }
+    
+    if (!ctx->initialized) {
+        LOG_ERROR("kernel_gemv_backend_exec: context not initialized");
+        return 1;
+    }
     
     tensor_dtype_t dtype = tensor_dtype(A);
     const void *W_data = tensor_data(A);
@@ -102,43 +230,32 @@ int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const flo
     
     if (!W_data) return 1;
     
-    // Dispatcher: Select kernel and calculate row stride based on dtype
     int x_aligned = (((uintptr_t)(const void*)x) & 31) == 0;
     
     switch (dtype) {
-        case DTYPE_Q4_0: {
+        case DTYPE_Q4_0:
             ctx->kernel_fn = x_aligned ? quantized_gemv_q4_0_aligned : quantized_gemv_q4_0_unaligned;
             row_stride_bytes = (size_t)blocks_per_row * sizeof(ggml_block_q4_0);
             break;
-        }
-        case DTYPE_Q8_0: {
+        case DTYPE_Q8_0:
             ctx->kernel_fn = x_aligned ? quantized_gemv_q8_0_aligned : quantized_gemv_q8_0_unaligned;
             row_stride_bytes = (size_t)blocks_per_row * sizeof(ggml_block_q8_0);
             break;
-        }
-        case DTYPE_BF16: {
+        case DTYPE_BF16:
             ctx->kernel_fn = quantized_gemv_bf16_avx2;
-            row_stride_bytes = (size_t)cols * 2; // 2 bytes per element
-            break;
-        }
-        case DTYPE_F32: {
-            ctx->kernel_fn = quantized_gemv_f32_avx2;
-            row_stride_bytes = (size_t)cols * 4; // 4 bytes per element
-            break;
-        }
-        case DTYPE_F16: {
-            // F16 fallback
-            ctx->kernel_fn = quantized_gemv_f32_avx2;
             row_stride_bytes = (size_t)cols * 2;
             break;
-        }
-        default: {
-            fprintf(stderr, "ERROR: Unsupported dtype %d\n", (int)dtype);
+        case DTYPE_F32:
+            ctx->kernel_fn = quantized_gemv_f32_avx2;
+            row_stride_bytes = (size_t)cols * 4;
+            break;
+        default:
+            LOG_ERROR("kernel_gemv_backend_exec: unsupported dtype %d", (int)dtype);
             return -1;
-        }
     }
     
-    // Setup context for worker threads
+    // Set up work parameters
+    pthread_mutex_lock(&ctx->work_mutex);
     ctx->W = W_data;
     ctx->rows = rows;
     ctx->cols = cols;
@@ -148,19 +265,18 @@ int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const flo
     ctx->y = y;
     ctx->x_aligned = x_aligned;
     atomic_store(&ctx->next_row, 0);
-    ctx->stop = 0;
-
-    // Create and join worker threads
-    for (int i = 0; i < ctx->num_threads; ++i) {
-        if (pthread_create(&ctx->threads[i], NULL, worker_fn, ctx) != 0) {
-            ctx->stop = 1;
-            for (int j = 0; j < i; ++j) pthread_join(ctx->threads[j], NULL);
-            return 2;
-        }
+    atomic_store(&ctx->threads_done, 0);
+    
+    // Trigger task by incrementing task_id
+    atomic_fetch_add(&ctx->task_id, 1);
+    pthread_cond_broadcast(&ctx->work_cond);
+    
+    // Wait for all threads to complete
+    while (atomic_load(&ctx->threads_done) < ctx->num_threads) {
+        pthread_cond_wait(&ctx->work_cond, &ctx->work_mutex);
     }
-
-    for (int i = 0; i < ctx->num_threads; ++i) pthread_join(ctx->threads[i], NULL);
-    ctx->stop = 1;
+    pthread_mutex_unlock(&ctx->work_mutex);
+    
     return 0;
 }
 
