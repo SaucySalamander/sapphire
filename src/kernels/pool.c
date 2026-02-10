@@ -19,6 +19,7 @@ struct sapphire_context {
     atomic_int shutdown_flag;  // 1 to signal threads to exit
     pthread_mutex_t work_mutex;
     pthread_cond_t work_cond;
+    pthread_mutex_t exec_mutex;  // Serializes kernel_gemv_backend_exec calls
     
     // Task-based synchronization
     atomic_int task_id;          // Incremented by main thread to start new work
@@ -143,6 +144,14 @@ kernel_context_t *kernel_ctx_create(int num_threads, int chunk_size) {
         free(ctx);
         return NULL;
     }
+    if (pthread_mutex_init(&ctx->exec_mutex, NULL) != 0) {
+        LOG_ERROR("Failed to initialize exec mutex");
+        pthread_cond_destroy(&ctx->work_cond);
+        pthread_mutex_destroy(&ctx->work_mutex);
+        free(ctx->threads);
+        free(ctx);
+        return NULL;
+    }
     
     ctx->initialized = 0;
     atomic_store(&ctx->shutdown_flag, 0);
@@ -173,6 +182,7 @@ void kernel_ctx_destroy(kernel_context_t *ctx) {
     // Clean up synchronization primitives
     pthread_cond_destroy(&ctx->work_cond);
     pthread_mutex_destroy(&ctx->work_mutex);
+    pthread_mutex_destroy(&ctx->exec_mutex);
     
     free(ctx->threads);
     free(ctx);
@@ -197,7 +207,12 @@ int kernel_ctx_init(kernel_context_t *ctx) {
     for (int i = 0; i < ctx->num_threads; ++i) {
         if (pthread_create(&ctx->threads[i], NULL, worker_fn, ctx) != 0) {
             LOG_ERROR("Failed to create worker thread %d", i);
+            
             atomic_store(&ctx->shutdown_flag, 1);
+            pthread_mutex_lock(&ctx->work_mutex);
+            pthread_cond_broadcast(&ctx->work_cond);
+            pthread_mutex_unlock(&ctx->work_mutex);
+
             for (int j = 0; j < i; ++j) {
                 pthread_join(ctx->threads[j], NULL);
             }
@@ -231,22 +246,23 @@ int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const flo
     if (!W_data) return 1;
     
     int x_aligned = (((uintptr_t)(const void*)x) & 31) == 0;
+    gemv_kernel_t kernel_fn = NULL;
     
     switch (dtype) {
         case DTYPE_Q4_0:
-            ctx->kernel_fn = x_aligned ? quantized_gemv_q4_0_aligned : quantized_gemv_q4_0_unaligned;
+            kernel_fn = x_aligned ? quantized_gemv_q4_0_aligned : quantized_gemv_q4_0_unaligned;
             row_stride_bytes = (size_t)blocks_per_row * sizeof(ggml_block_q4_0);
             break;
         case DTYPE_Q8_0:
-            ctx->kernel_fn = x_aligned ? quantized_gemv_q8_0_aligned : quantized_gemv_q8_0_unaligned;
+            kernel_fn = x_aligned ? quantized_gemv_q8_0_aligned : quantized_gemv_q8_0_unaligned;
             row_stride_bytes = (size_t)blocks_per_row * sizeof(ggml_block_q8_0);
             break;
         case DTYPE_BF16:
-            ctx->kernel_fn = quantized_gemv_bf16_avx2;
+            kernel_fn = quantized_gemv_bf16_avx2;
             row_stride_bytes = (size_t)cols * 2;
             break;
         case DTYPE_F32:
-            ctx->kernel_fn = quantized_gemv_f32_avx2;
+            kernel_fn = quantized_gemv_f32_avx2;
             row_stride_bytes = (size_t)cols * 4;
             break;
         default:
@@ -254,8 +270,12 @@ int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const flo
             return -1;
     }
     
+    // Serialize execution to prevent re-entry corruption
+    pthread_mutex_lock(&ctx->exec_mutex);
+
     // Set up work parameters
     pthread_mutex_lock(&ctx->work_mutex);
+    ctx->kernel_fn = kernel_fn;
     ctx->W = W_data;
     ctx->rows = rows;
     ctx->cols = cols;
@@ -276,6 +296,7 @@ int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const flo
         pthread_cond_wait(&ctx->work_cond, &ctx->work_mutex);
     }
     pthread_mutex_unlock(&ctx->work_mutex);
+    pthread_mutex_unlock(&ctx->exec_mutex);
     
     return 0;
 }
