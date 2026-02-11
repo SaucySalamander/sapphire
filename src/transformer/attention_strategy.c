@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "utils.h"
+#include "log.h"
 
 #define GEMMA3_QK_HEAD_DIM 256
 /* NOTE: Use model->config.query_pre_attn_scalar at runtime (e.g., 256).
@@ -72,16 +73,14 @@ void scaled_dot_product_strategy(
 
     if (debug_enabled) {
         if (context_length <= 20) {
-            fprintf(stderr, "DEBUG: Attention scores (after scaling by %.4f, before softmax):\n", scale_factor);
+            LOG_DEBUG("Attention scores (after scaling by %.4f, before softmax):", scale_factor);
             for (int i = 0; i < context_length; i++) {
-                fprintf(stderr, "  scores[%d] = %.6f\n", i, scores[i]);
+                LOG_DEBUG("  scores[%d] = %.6f", i, scores[i]);
             }
         } else {
-            fprintf(stderr, "DEBUG: Scaled scores (first 10 of %d): ", context_length);
-            for (int i = 0; i < 10; i++) {
-                fprintf(stderr, "%.4f ", scores[i]);
-            }
-            fprintf(stderr, "\n");
+            LOG_DEBUG("Scaled scores (first 10 of %d): %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f",
+                      context_length, scores[0], scores[1], scores[2], scores[3], scores[4],
+                      scores[5], scores[6], scores[7], scores[8], scores[9]);
         }
     }
 

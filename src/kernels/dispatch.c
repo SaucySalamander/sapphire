@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../include/log.h"
 #include <stdint.h>
 #include <math.h>
 #include <pthread.h>
@@ -85,12 +86,12 @@ static void gemv_bf16(float *y, const uint16_t *A, const float *x, int m, int n)
 
 int kernel_gemm(kernel_context_t *ctx, float *Y, const tensor_t *A, const float *X, int batch_size, int out_stride) {
     if (!Y || !A || !X || batch_size <= 0) {
-        fprintf(stderr, "ERROR: kernel_gemm invalid arguments\n");
+        LOG_ERROR("kernel_gemm invalid arguments");
         return -1;
     }
 
     if (!ctx) {
-        fprintf(stderr, "ERROR: kernel_gemm requires non-NULL context\n");
+        LOG_ERROR("kernel_gemm requires non-NULL context");
         return -1;
     }
 
@@ -99,18 +100,18 @@ int kernel_gemm(kernel_context_t *ctx, float *Y, const tensor_t *A, const float 
 
 int kernel_gemv(kernel_context_t *ctx, float *y, const tensor_t *A, const float *x) {
     if (!y || !A || !x) {
-        fprintf(stderr, "ERROR: kernel_gemv null pointer\n");
+        LOG_ERROR("kernel_gemv null pointer");
         return -1;
     }
 
     if (tensor_ndim(A) != 2) {
-        fprintf(stderr, "ERROR: kernel_gemv weight must be 2D\n");
+        LOG_ERROR("kernel_gemv weight must be 2D");
         return -1;
     }
 
     const int *shape = tensor_shape(A);
     if (!shape) {
-        fprintf(stderr, "ERROR: kernel_gemv invalid shape\n");
+        LOG_ERROR("kernel_gemv invalid shape");
         return -1;
     }
 
@@ -118,7 +119,7 @@ int kernel_gemv(kernel_context_t *ctx, float *y, const tensor_t *A, const float 
     int n = shape[1];
 
     if (m <= 0 || n <= 0) {
-        fprintf(stderr, "ERROR: kernel_gemv invalid shape [%d, %d]\n", m, n);
+        LOG_ERROR("kernel_gemv invalid shape [%d, %d]", m, n);
         return -1;
     }
 
@@ -136,37 +137,37 @@ int kernel_gemv(kernel_context_t *ctx, float *y, const tensor_t *A, const float 
                     gemv_bf16(y, (const uint16_t *)tensor_data(A), x, m, n);
                     return 0;
                 }
-                fprintf(stderr, "ERROR: kernel_gemv requires non-NULL context for quantized weights\n");
+                LOG_ERROR("kernel_gemv requires non-NULL context for quantized weights");
                 return -1;
             }
             // Use the optimized and multithreaded pool implementations
             int ret = kernel_backend_exec(ctx, A, x, y, 0, 1);
             if (ret != 0) {
-                fprintf(stderr, "ERROR: kernel_backend_exec failed with code %d\n", ret);
+                LOG_ERROR("kernel_backend_exec failed with code %d", ret);
                 return -1;
             }
             return 0;
         }
 
         default:
-            fprintf(stderr, "ERROR: kernel_gemv unsupported dtype %d\n", (int)tensor_dtype(A));
+            LOG_ERROR("kernel_gemv unsupported dtype %d", (int)tensor_dtype(A));
             return -1;
     }
 }
 
 int kernel_gemv_tensor(kernel_context_t *ctx, const tensor_t *y, const tensor_t *A, const tensor_t *x) {
     if (!y || !A || !x) {
-        fprintf(stderr, "ERROR: kernel_gemv_tensor null pointer\n");
+        LOG_ERROR("kernel_gemv_tensor null pointer");
         return -1;
     }
 
     if (tensor_ndim(y) != 1 || tensor_dtype(y) != DTYPE_F32) {
-        fprintf(stderr, "ERROR: kernel_gemv_tensor output must be 1D F32 tensor\n");
+        LOG_ERROR("kernel_gemv_tensor output must be 1D F32 tensor");
         return -1;
     }
 
     if (tensor_ndim(x) != 1 || tensor_dtype(x) != DTYPE_F32) {
-        fprintf(stderr, "ERROR: kernel_gemv_tensor input must be 1D F32 tensor\n");
+        LOG_ERROR("kernel_gemv_tensor input must be 1D F32 tensor");
         return -1;
     }
 
@@ -174,19 +175,19 @@ int kernel_gemv_tensor(kernel_context_t *ctx, const tensor_t *y, const tensor_t 
     const int *shape_x = tensor_shape(x);
     const int *shape_y = tensor_shape(y);
     if (!shape_A || !shape_x || !shape_y) {
-        fprintf(stderr, "ERROR: kernel_gemv_tensor shapes invalid\n");
+        LOG_ERROR("kernel_gemv_tensor shapes invalid");
         return -1;
     }
 
     if (shape_A[1] != shape_x[0]) {
-        fprintf(stderr, "ERROR: kernel_gemv_tensor shape mismatch: A[*,%d] vs x[%d]\n",
-                shape_A[1], shape_x[0]);
+        LOG_ERROR("kernel_gemv_tensor shape mismatch: A[*,%d] vs x[%d]",
+                  shape_A[1], shape_x[0]);
         return -1;
     }
 
     if (shape_y[0] != shape_A[0]) {
-        fprintf(stderr, "ERROR: kernel_gemv_tensor output size mismatch: y[%d] vs A[%d,*]\n",
-                shape_y[0], shape_A[0]);
+        LOG_ERROR("kernel_gemv_tensor output size mismatch: y[%d] vs A[%d,*]",
+                  shape_y[0], shape_A[0]);
         return -1;
     }
 
@@ -198,12 +199,12 @@ int kernel_gemv_tensor(kernel_context_t *ctx, const tensor_t *y, const tensor_t 
 
 int kernel_gemv_add(kernel_context_t *ctx, float *y, const tensor_t *A, const float *x, float alpha) {
     if (!y || !A || !x) {
-        fprintf(stderr, "ERROR: kernel_gemv_add null pointer\n");
+        LOG_ERROR("kernel_gemv_add null pointer");
         return -1;
     }
 
     if (tensor_ndim(A) != 2) {
-        fprintf(stderr, "ERROR: kernel_gemv_add weight must be 2D\n");
+        LOG_ERROR("kernel_gemv_add weight must be 2D");
         return -1;
     }
 
@@ -212,7 +213,7 @@ int kernel_gemv_add(kernel_context_t *ctx, float *y, const tensor_t *A, const fl
 
     float *temp = (float *)malloc(m * sizeof(float));
     if (!temp) {
-        fprintf(stderr, "ERROR: kernel_gemv_add malloc failed\n");
+        LOG_ERROR("kernel_gemv_add malloc failed");
         return -1;
     }
 
@@ -232,12 +233,12 @@ int kernel_gemv_add(kernel_context_t *ctx, float *y, const tensor_t *A, const fl
 
 int kernel_gemv_batch(kernel_context_t *ctx, float *Y, const tensor_t *A, const float *X, int batch_size) {
     if (!Y || !A || !X || batch_size <= 0) {
-        fprintf(stderr, "ERROR: kernel_gemv_batch invalid arguments\n");
+        LOG_ERROR("kernel_gemv_batch invalid arguments");
         return -1;
     }
 
     if (tensor_ndim(A) != 2) {
-        fprintf(stderr, "ERROR: kernel_gemv_batch weight must be 2D\n");
+        LOG_ERROR("kernel_gemv_batch weight must be 2D");
         return -1;
     }
 

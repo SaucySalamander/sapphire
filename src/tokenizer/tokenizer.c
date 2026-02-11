@@ -195,7 +195,7 @@ static int populate_vocab_from_json(sapphire_tokenizer_t *tok, const vocab_inspe
         probe_idx++;
     }
     
-    printf("DEBUG: Parsing vocabulary entries from nested model.vocab...\n");
+    LOG_DEBUG("Parsing vocabulary entries from nested model.vocab...");
     for (int i = 0; i < child_count && idx + 1 < inspect->ntokens; i++) {
         const sjson_token_t *k = &inspect->tokens[idx++];
         const sjson_token_t *v = &inspect->tokens[idx++];
@@ -237,13 +237,12 @@ static int populate_vocab_from_json(sapphire_tokenizer_t *tok, const vocab_inspe
 
         if ((parsed & 0xFFFF) == 0) {
             if (parsed % 50000 == 0) {
-                printf("DEBUG: Parsed %d entries...\n", parsed);
-                fflush(stdout);
+                LOG_DEBUG("Parsed %d entries...", parsed);
             }
         }
     }
 
-    printf("✓ Successfully parsed %d vocabulary entries (capacity=%d)\n", parsed, tok->vocab_size);
+    LOG_INFO("Successfully parsed %d vocabulary entries (capacity=%d)", parsed, tok->vocab_size);
     LOG_DEBUG("Tokenizer parse summary: parsed=%d skipped_out_of_range=%d skipped_malformed=%d", parsed, skipped_out_of_range, skipped_malformed);
     return parsed;
 }
@@ -404,9 +403,9 @@ static void load_tokenizer_config(sapphire_tokenizer_t *tok, const char *model_d
     free(config_data);
     free(config_path);
     
-    printf("Tokenizer special tokens: bos=%d, eos=%d, pad=%d, unk=%d, add_bos=%d, add_eos=%d\n",
-           tok->bos_token_id, tok->eos_token_id, tok->pad_token_id, tok->unk_token_id,
-           tok->add_bos_token, tok->add_eos_token);
+    LOG_DEBUG("Tokenizer special tokens: bos=%d, eos=%d, pad=%d, unk=%d, add_bos=%d, add_eos=%d",
+              tok->bos_token_id, tok->eos_token_id, tok->pad_token_id, tok->unk_token_id,
+              tok->add_bos_token, tok->add_eos_token);
 }
 
 /**
@@ -451,7 +450,7 @@ sapphire_tokenizer_t* tokenizer_load(const char *model_dir) {
     load_tokenizer_config(tok, model_dir);
 
     // Success
-    printf("Tokenizer loaded: vocab_size=%d\n", tok->vocab_size);
+    LOG_INFO("Tokenizer loaded: vocab_size=%d", tok->vocab_size);
     goto final;
 
 cleanup:

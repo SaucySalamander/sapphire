@@ -409,7 +409,7 @@ tensor_t* safetensors_create_tensor_ref(safetensors_file_t *st,
         case SAFETENSORS_BF16: dtype = DTYPE_BF16; break;
         case SAFETENSORS_F16:  dtype = DTYPE_F16; break;
         default:
-            fprintf(stderr, "ERROR: Unsupported dtype in safetensors: %d\n", meta->dtype);
+            LOG_ERROR("Unsupported dtype in safetensors: %d", meta->dtype);
             return NULL;
     }
     
@@ -417,7 +417,7 @@ tensor_t* safetensors_create_tensor_ref(safetensors_file_t *st,
     
     // Validate we're not reading beyond the mmap
     if (data_section_start + meta->offset + meta->size_bytes > st->mmap_size) {
-        fprintf(stderr, "ERROR: Tensor '%s' data extends beyond file\n", meta->name);
+        LOG_ERROR("Tensor '%s' data extends beyond file", meta->name);
         return NULL;
     }
 
@@ -490,28 +490,29 @@ void safetensors_close(safetensors_file_t *st) {
  */
 void safetensors_print_info(const safetensors_file_t *st) {
     if (!st) {
-        printf("NULL safetensors file\n");
+        LOG_INFO("NULL safetensors file");
         return;
     }
     
-    printf("================================================================================\n");
-    printf("                         Safetensors File Information\n");
-    printf("================================================================================\n");
-    printf("Header size: %lu bytes\n", (unsigned long)st->header_size);
-    printf("File size: %zu bytes\n", st->mmap_size);
-    printf("Tensor count: %d\n\n", st->tensor_count);
+    LOG_INFO("================================================================================");
+    LOG_INFO("                         Safetensors File Information");
+    LOG_INFO("================================================================================");
+    LOG_INFO("Header size: %lu bytes", (unsigned long)st->header_size);
+    LOG_INFO("File size: %zu bytes", st->mmap_size);
+    LOG_INFO("Tensor count: %d", st->tensor_count);
     
     for (int i = 0; i < st->tensor_count; i++) {
         const safetensors_tensor_meta_t *t = &st->tensors[i];
         
-        printf("Tensor %d: %s\n", i, t->name);
-        printf("  Shape: [");
+        char shape_buf[128];
+        int pos = 0;
+        pos += snprintf(shape_buf + pos, sizeof(shape_buf) - pos, "[");
         for (int j = 0; j < t->ndim; j++) {
-            printf("%u", t->shape[j]);
-            if (j < t->ndim - 1) printf(", ");
+            if (j > 0) pos += snprintf(shape_buf + pos, sizeof(shape_buf) - pos, ", ");
+            pos += snprintf(shape_buf + pos, sizeof(shape_buf) - pos, "%u", t->shape[j]);
         }
-        printf("]\n");
-        
+        snprintf(shape_buf + pos, sizeof(shape_buf) - pos, "]");
+
         const char *dtype_str = "UNKNOWN";
         switch (t->dtype) {
             case SAFETENSORS_F32: dtype_str = "F32"; break;
@@ -521,12 +522,15 @@ void safetensors_print_info(const safetensors_file_t *st) {
             case SAFETENSORS_I64: dtype_str = "I64"; break;
             default: break;
         }
-        printf("  Dtype: %s\n", dtype_str);
-        printf("  Offset: %lu bytes\n", (unsigned long)t->offset);
-        printf("  Size: %lu bytes\n\n", (unsigned long)t->size_bytes);
+
+        LOG_INFO("Tensor %d: %s", i, t->name);
+        LOG_INFO("  Shape: %s", shape_buf);
+        LOG_INFO("  Dtype: %s", dtype_str);
+        LOG_INFO("  Offset: %lu bytes", (unsigned long)t->offset);
+        LOG_INFO("  Size: %lu bytes", (unsigned long)t->size_bytes);
     }
     
-    printf("================================================================================\n");
+    LOG_INFO("================================================================================");
 }
 
 /* Helper for mapping individual layer fields */
