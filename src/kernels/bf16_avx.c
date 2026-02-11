@@ -106,3 +106,13 @@ float quantized_gemv_bf16_avx2(const void *W_row, const float *x, int block_coun
     float final = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7] + remainder;
     return final;
 }
+
+/**
+ * BF16 GEMM Row Kernel: Process N tokens against 1 BF16 weight row.
+ */
+void kernel_gemm_bf16_avx2(const gemm_args_t* args) {
+    const uint16_t *w = (const uint16_t *)args->w_row;
+    for (int b = 0; b < args->batch_size; b++) {
+        args->Y[(size_t)b * args->out_stride] = quantized_gemv_bf16_avx2(w, args->X + (size_t)b * args->d_model, args->blocks, args->block_size);
+    }
+}

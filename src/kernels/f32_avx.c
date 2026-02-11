@@ -81,3 +81,23 @@ float quantized_gemv_f32_avx2(const void *W_row, const float *x, int block_count
     float final = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7] + remainder;
     return final;
 }
+
+/**
+ * F32 GEMM Row Kernel: Process N tokens against 1 weight row.
+ * Multiplies one row of W against each token in the batch X.
+ * 
+ * @param W_row Pointer to the F32 weight row.
+ * @param X Pointer to the start of the batch input [batch_size, d_model].
+ * @param Y Pointer to the output targets for this row [batch_size]. 
+ *          The caller provides the address and the specific tokens to write.
+ * @param batch_size Number of tokens in the batch.
+ * @param d_model Stride between tokens in X.
+ * @param blocks cols/32 for quantized, or cols for scalar (unused here as d_model is used)
+ */
+void kernel_gemm_f32_avx2(const gemm_args_t* args) {
+    const float *w = (const float *)args->w_row;
+    
+    for (int b = 0; b < args->batch_size; b++) {
+        args->Y[(size_t)b * args->out_stride] = quantized_gemv_f32_avx2(w, args->X + (size_t)b * args->d_model, args->blocks, args->block_size);
+    }
+}

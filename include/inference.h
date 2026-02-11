@@ -116,6 +116,17 @@ void inference_session_reset(inference_session_t *session);
 void inference_forward(inference_session_t *session, int token_id, int token_pos, float *logits);
 
 /**
+ * Batched forward pass (prefill).
+ * 
+ * @param session Inference session.
+ * @param token_ids Array of input token IDs [batch_size].
+ * @param start_pos Starting position in sequence.
+ * @param batch_size Number of tokens to process.
+ * @param logits Optional output logits for the LAST token in the batch.
+ */
+void inference_forward_batch(inference_session_t* session, const int* token_ids, int start_pos, int batch_size, float* logits);
+
+/**
  * Free inference session.
  *
  * @param session Session to free.

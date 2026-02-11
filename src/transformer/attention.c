@@ -99,6 +99,7 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
 
     // Use the model's head dimension (d_k) if set, otherwise fallback to d_model / num_heads
     int head_dim = config->head_dim;
+    int max_seq = kv_cache_get_max_seq_len(session->kv_cache);
 
     // Determine if this is a global layer (full context) or local layer (sliding window)
     bool is_global_layer = false;
@@ -114,10 +115,9 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
 
     const float* cached_k_data = tensor_data(kv_cache_get_keys(session->kv_cache, layer_idx));
     const float* cached_v_data = tensor_data(kv_cache_get_values(session->kv_cache, layer_idx));
-    int cache_stride = kv_cache_get_max_seq_len(session->kv_cache) * head_dim;
+    int cache_stride = max_seq * head_dim;
 
     // Zero attn_out - ensure we zero the full projection width (num_heads * head_dim)
-    // In hybrid models like Gemma 3, this may be larger than d_model.
     memset(attn_out, 0, config->num_attention_heads * head_dim * sizeof(float));
 
     int window_start = 0;
@@ -127,17 +127,7 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
         attn_len = swa_window;
     }
 
-    /*
-     * Gemma 3 Attention Scaling: 
-     * Dot product is scaled by query_pre_attn_scalar ** -0.5.
-     * If not provided, fallback to 1/sqrt(head_dim).
-     */
-    float head_scalar = 1.0f;
-    if (config->query_pre_attn_scalar > 0.0f) {
-        head_scalar = 1.0f / sqrtf(config->query_pre_attn_scalar);
-    } else {
-        head_scalar = 1.0f / sqrtf((float)head_dim);
-    }
+    float head_scalar = (config->query_pre_attn_scalar > 0.0f) ? (1.0f / sqrtf(config->query_pre_attn_scalar)) : (1.0f / sqrtf((float)head_dim));
 
     int group_size = config->num_attention_heads / config->num_key_value_heads;
 
@@ -156,20 +146,10 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
             scores[t] = raw_dot * head_scalar;
         }
 
-        // Step 2: Attention Softcap
-        // UPDATE: Removed per new Gemma 3 technical report ("replace... with QK-norm").
-        /*
-        float attn_softcap = 50.0f;
-        float inv_softcap = 1.0f / attn_softcap;
-        for (int t = 0; t < attn_len; t++) {
-            scores[t] = attn_softcap * tanhf(scores[t] * inv_softcap);
-        }
-        */
-
-        // Step 3: Softmax
+        // Step 2: Softmax
         softmax(scores, attn_len);
 
-        // Step 4: Accumulate Attention Output
+        // Step 3: Accumulate Attention Output
         float* h_out = attn_out + h * head_dim;
         for (int t = 0; t < attn_len; t++) {
             float alpha = scores[t];
@@ -180,6 +160,27 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
         }
     }
 
+    return 0;
+}
+
+int sapphire_attention_forward_batch(struct inference_session_t* session, int layer_idx, int start_pos, int batch_size,
+                                     float* q_proj, float* attn_out) {
+    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
+    int head_dim = config->head_dim;
+    int q_stride = config->num_attention_heads * head_dim;
+    int max_seq = kv_cache_get_max_seq_len(session->kv_cache);
+
+    // For now, we use a loop over tokens. This is correct and functional.
+    // We save the original session->attn_scores and restore it to ensure
+    // we don't break thread-local assumptions (though session is shared).
+    float* orig_scores = session->attn_scores;
+
+    for (int b = 0; b < batch_size; b++) {
+        session->attn_scores = orig_scores + b * max_seq;
+        sapphire_attention_forward(session, layer_idx, start_pos + b, q_proj + b * q_stride, attn_out + b * q_stride);
+    }
+
+    session->attn_scores = orig_scores;
     return 0;
 }
 
@@ -257,47 +258,88 @@ static void apply_qk_norm_from_layer(layer_buffers_t buf,
     qk_norm_apply(buf.k_proj, k_scale, head_dim, config->num_key_value_heads);
 }
 
+
+static void attention_apply_rope_cache(layer_buffers_t buf, transformer_layer_ctx_t* ctx, const float* rope_cos, const float* rope_sin) {
+    for (int b = 0; b < ctx->batch_size; b++) {
+        layer_buffers_t b_buf = buf;
+        b_buf.q_proj = buf.q_proj + b * buf.pi;
+        b_buf.k_proj = buf.k_proj + b * buf.pk;
+        apply_qk_norm_from_layer(b_buf, ctx->layer, ctx->config, ctx->head_dim, ctx->layer_idx);
+        
+        int pos = ctx->token_pos + b;
+        for (int h = 0; h < ctx->config->num_attention_heads; h++) {
+            rope_apply_fast(b_buf.q_proj + h * ctx->head_dim, pos, ctx->head_dim, rope_cos, rope_sin);
+        }
+        for (int h = 0; h < ctx->config->num_key_value_heads; h++) {
+            rope_apply_fast(b_buf.k_proj + h * ctx->head_dim, pos, ctx->head_dim, rope_cos, rope_sin);
+        }
+        
+        kv_cache_write_token(ctx->session->kv_cache, ctx->layer_idx, pos, b_buf.k_proj, buf.v_proj + b * buf.pk);
+    }
+}
+
 void compute_attention_stage(layer_buffers_t buf,
                              transformer_layer_ctx_t* ctx,
                              float* hidden,
                              const float* rope_cos,
                              const float* rope_sin) {
     // 1. Residual Connection (Save hidden to residual)
-    vec_copy(buf.residual, hidden, ctx->d_model);
+    for (int b = 0; b < ctx->batch_size; b++) {
+        vec_copy(buf.residual + b * buf.pm, hidden + b * ctx->d_model, ctx->d_model);
+    }
 
     // 2. Pre-attention RMSNorm
     const float* norm_attn_data = get_norm_weights(ctx->layer->norm_attn_weight, buf.weight_scratch, ctx->d_model);
-    rmsnorm_delta(buf.norm_buf, hidden, norm_attn_data, 1e-6f, ctx->d_model);
+    for (int b = 0; b < ctx->batch_size; b++) {
+        rmsnorm_delta(buf.norm_buf + b * buf.pm, hidden + b * ctx->d_model, norm_attn_data, 1e-6f, ctx->d_model);
+    }
 
     // 3. Projections (Q, K, V)
-    tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.q_proj, ctx->layer->q_proj_weight, buf.norm_buf);
-    tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.k_proj, ctx->layer->k_proj_weight, buf.norm_buf);
-    tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.v_proj, ctx->layer->v_proj_weight, buf.norm_buf);
+    if (ctx->batch_size == 1) {
+        tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.q_proj, ctx->layer->q_proj_weight, buf.norm_buf);
+        tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.k_proj, ctx->layer->k_proj_weight, buf.norm_buf);
+        tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.v_proj, ctx->layer->v_proj_weight, buf.norm_buf);
+    } else {
+        tensor_gemm_with_ctx(ctx->session->gemv_ctx, buf.q_proj, ctx->layer->q_proj_weight, buf.norm_buf, ctx->batch_size, buf.pi);
+        tensor_gemm_with_ctx(ctx->session->gemv_ctx, buf.k_proj, ctx->layer->k_proj_weight, buf.norm_buf, ctx->batch_size, buf.pk);
+        tensor_gemm_with_ctx(ctx->session->gemv_ctx, buf.v_proj, ctx->layer->v_proj_weight, buf.norm_buf, ctx->batch_size, buf.pk);
+    }
 
-    // 4. QK-Normalization
-    apply_qk_norm_from_layer(buf, ctx->layer, ctx->config, ctx->head_dim, ctx->layer_idx);
+    // 4. QK-Normalization, RoPE, and KV-Cache
+    attention_apply_rope_cache(buf, ctx, rope_cos, rope_sin);
 
-    // 5. RoPE application
-    // Use the explicitly provided RoPE frequencies (toggled in inference.c based on layer type)
-    for (int h = 0; h < ctx->config->num_attention_heads; h++) rope_apply_fast(buf.q_proj + h * ctx->head_dim, ctx->token_pos, ctx->head_dim, rope_cos, rope_sin);
-    for (int h = 0; h < ctx->config->num_key_value_heads; h++) rope_apply_fast(buf.k_proj + h * ctx->head_dim, ctx->token_pos, ctx->head_dim, rope_cos, rope_sin);
+    // 5. Attention Forward Pass
+    if (ctx->batch_size == 1) {
+        sapphire_attention_forward(ctx->session, ctx->layer_idx, ctx->token_pos, buf.q_proj, buf.attn_out);
+    } else {
+        sapphire_attention_forward_batch(ctx->session, ctx->layer_idx, ctx->token_pos, ctx->batch_size, buf.q_proj, buf.attn_out);
+    }
 
-    // 6. KV-Cache Commit
-    kv_cache_write_token(ctx->session->kv_cache, ctx->layer_idx, ctx->token_pos, buf.k_proj, buf.v_proj);
-    // 7. Attention Forward Pass
-    sapphire_attention_forward(ctx->session, ctx->layer_idx, ctx->token_pos, buf.q_proj, buf.attn_out);
+    // 6. Output projection
+    if (ctx->batch_size == 1) {
+        tensor_gemv_with_ctx(ctx->session->gemv_ctx, hidden, ctx->layer->out_proj_weight, buf.attn_out);
+    } else {
+        tensor_gemm_with_ctx(ctx->session->gemv_ctx, hidden, ctx->layer->out_proj_weight, buf.attn_out, ctx->batch_size, ctx->d_model);
+    }
 
-    // 8. Output projection
-    tensor_gemv_with_ctx(ctx->session->gemv_ctx, hidden, ctx->layer->out_proj_weight, buf.attn_out);
-
-    // 9. Post-Attention RMSNorm (Gemma 3) & Residual Sum
+    // 7. Post-Attention RMSNorm (Gemma 3) & Residual Sum
     if (ctx->layer->norm_attn_post_weight) {
         const float* norm_post_w = get_norm_weights(ctx->layer->norm_attn_post_weight, buf.weight_scratch, ctx->d_model);
 
-        rmsnorm_delta(buf.norm_buf, hidden, norm_post_w, 1e-6f, ctx->d_model);
-
-        vec_add(buf.residual, buf.norm_buf, ctx->d_model);
+        for (int b = 0; b < ctx->batch_size; b++) {
+            float* h_b = hidden + b * ctx->d_model;
+            float* r_b = buf.residual + b * buf.pm;
+            float* n_b = buf.norm_buf + b * buf.pm;
+            rmsnorm_delta(n_b, h_b, norm_post_w, 1e-6f, ctx->d_model);
+            vec_add(r_b, n_b, ctx->d_model);
+            vec_copy(h_b, r_b, ctx->d_model);
+        }
+    } else {
+        for (int b = 0; b < ctx->batch_size; b++) {
+            float* h_b = hidden + b * ctx->d_model;
+            float* r_b = buf.residual + b * buf.pm;
+            vec_add(r_b, h_b, ctx->d_model);
+            vec_copy(h_b, r_b, ctx->d_model);
+        }
     }
-
-    vec_copy(hidden, buf.residual, ctx->d_model);
 }

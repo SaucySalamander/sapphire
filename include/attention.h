@@ -48,6 +48,12 @@ typedef struct layer_buffers layer_buffers_t;
 int sapphire_attention_forward(struct inference_session_t* session, int layer_idx, int token_pos,
                                float* q_proj, float* attn_out);
 
+/**
+ * @brief Batched forward pass for multi-head attention.
+ */
+int sapphire_attention_forward_batch(struct inference_session_t* session, int layer_idx, int start_pos, int batch_size,
+                                     float* q_proj, float* attn_out);
+
 // ============================================================================
 // DEBUGGING & INSTRUMENTATION
 // ============================================================================
