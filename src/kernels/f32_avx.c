@@ -96,8 +96,40 @@ float quantized_gemv_f32_avx2(const void *W_row, const float *x, int block_count
  */
 void kernel_gemm_f32_avx2(const gemm_args_t* args) {
     const float *w = (const float *)args->w_row;
-    
-    for (int b = 0; b < args->batch_size; b++) {
-        args->Y[(size_t)b * args->out_stride] = quantized_gemv_f32_avx2(w, args->X + (size_t)b * args->d_model, args->blocks, args->block_size);
+    const float *X = args->X;
+    float *Y = args->Y;
+    int batch = args->batch_size;
+    int cols = args->d_model;
+    int out_stride = args->out_stride;
+
+    // Use local accumulators to amortize weight loading
+    // Process the batch in sub-blocks of 8 to balance register pressure and throughput
+    // Max batch 32 is handled in 4 passes of 8 tokens.
+    for (int bs = 0; bs < batch; bs += 8) {
+        int cur_batch = (batch - bs > 8) ? 8 : (batch - bs);
+        __m256 acc[8];
+        for (int i = 0; i < cur_batch; i++) acc[i] = _mm256_setzero_ps();
+
+        int j;
+        for (j = 0; j + 8 <= cols; j += 8) {
+            __m256 wv = _mm256_loadu_ps(w + j);
+            for (int i = 0; i < cur_batch; i++) {
+                __m256 xv = _mm256_loadu_ps(X + (size_t)(bs + i) * cols + j);
+                acc[i] = _mm256_fmadd_ps(wv, xv, acc[i]);
+            }
+        }
+
+        // Horizontal sum and store
+        for (int i = 0; i < cur_batch; i++) {
+            float tmp[8];
+            _mm256_storeu_ps(tmp, acc[i]);
+            float sum = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+            
+            // Handle remainder for this token
+            for (int r = j; r < cols; r++) {
+                sum += w[r] * X[(size_t)(bs + i) * cols + r];
+            }
+            Y[(size_t)(bs + i) * out_stride] = sum;
+        }
     }
 }

@@ -20,24 +20,41 @@ void softmax(float *scores, int n) {
         return;
     }
 
-    // Step 1: Find the maximum score to prevent overflow.
+    // Step 1: Find the maximum score to prevent overflow with AVX.
     float max_score = scores[0];
-    for (int i = 1; i < n; i++) {
-        if (scores[i] > max_score) {
-            max_score = scores[i];
-        }
+    int i = 0;
+    __m256 v_max = _mm256_set1_ps(-1e38f); // Close to -INFINITY
+    for (; i + 8 <= n; i += 8) {
+        __m256 v_s = _mm256_loadu_ps(scores + i);
+        v_max = _mm256_max_ps(v_max, v_s);
+    }
+    
+    float tmp[8];
+    _mm256_storeu_ps(tmp, v_max);
+    for (int j = 0; j < 8; j++) {
+        if (tmp[j] > max_score) max_score = tmp[j];
+    }
+    for (; i < n; i++) {
+        if (scores[i] > max_score) max_score = scores[i];
     }
 
     // Step 2: Compute exp(scores[i] - max_score) and accumulate sum.
     float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
+    for (i = 0; i < n; i++) {
         scores[i] = expf(scores[i] - max_score);
         sum += scores[i];
     }
 
-    // Step 3: Normalize by the sum to produce final softmax weights.
-    for (int i = 0; i < n; i++) {
-        scores[i] /= sum;
+    // Step 3: Normalize by the sum with AVX.
+    float sum_inv = 1.0f / sum;
+    __m256 v_inv = _mm256_set1_ps(sum_inv);
+    i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v_s = _mm256_loadu_ps(scores + i);
+        _mm256_storeu_ps(scores + i, _mm256_mul_ps(v_s, v_inv));
+    }
+    for (; i < n; i++) {
+        scores[i] *= sum_inv;
     }
 }
 

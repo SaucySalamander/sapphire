@@ -75,6 +75,24 @@ layer_buffers_t init_layer_buffers(const struct inference_session_t* session,
     return buf;
 }
 
+typedef struct {
+    float* gate;
+    const float* up;
+    int size;
+    int stride;
+} geglu_parallel_args_t;
+
+static void geglu_parallel_fn(void* arg, int idx) {
+    geglu_parallel_args_t* a = (geglu_parallel_args_t*)arg;
+    float* g = a->gate + (size_t)idx * a->stride;
+    const float* u = a->up + (size_t)idx * a->stride;
+    
+    gelu_inplace(g, a->size);
+    for (int i = 0; i < a->size; ++i) {
+        g[i] *= u[i];
+    }
+}
+
 void compute_ffn_stage(layer_buffers_t buf,
                        transformer_layer_ctx_t* ctx,
                        float* hidden) {
@@ -120,12 +138,22 @@ void compute_ffn_stage(layer_buffers_t buf,
     }
 
     // Combine Gate (apply GELU on gate) and Value via GeGLU into `ffn_gate_buf` output
-    for (int b = 0; b < ctx->batch_size; b++) {
-        float* g = buf.ffn_gate_buf + b * buf.pf;
-        const float* u = buf.ffn_value_buf + b * buf.pf;
-        gelu_inplace(g, ctx->config->intermediate_size);
-        for (int _i = 0; _i < ctx->config->intermediate_size; ++_i) {
-            g[_i] *= u[_i];
+    if (ctx->session->gemv_ctx && ctx->batch_size > 1) {
+        geglu_parallel_args_t g_args = {
+            .gate = buf.ffn_gate_buf,
+            .up = buf.ffn_value_buf,
+            .size = ctx->config->intermediate_size,
+            .stride = buf.pf
+        };
+        kernel_parallel_for(ctx->session->gemv_ctx, geglu_parallel_fn, &g_args, ctx->batch_size);
+    } else {
+        for (int b = 0; b < ctx->batch_size; b++) {
+            float* g = buf.ffn_gate_buf + b * buf.pf;
+            const float* u = buf.ffn_value_buf + b * buf.pf;
+            gelu_inplace(g, ctx->config->intermediate_size);
+            for (int _i = 0; _i < ctx->config->intermediate_size; ++_i) {
+                g[_i] *= u[_i];
+            }
         }
     }
 
@@ -142,6 +170,44 @@ void compute_ffn_stage(layer_buffers_t buf,
     }
 }
 
+typedef struct {
+    float* hidden;
+    const float* residual;
+    float* norm_buf;
+    const float* weight;
+    int d_model;
+    bool is_delta;
+} parallel_norm_args_t;
+
+static void parallel_finalize_fn(void* arg, int b) {
+    parallel_norm_args_t* a = (parallel_norm_args_t*)arg;
+    float* h_b = a->hidden + b * a->d_model;
+    const float* r_b_const = a->residual + b * a->d_model;
+    float* r_b = (float*)r_b_const; // We know it's mutable in this context
+    float* n_b = a->norm_buf + b * a->d_model;
+
+    if (a->weight) {
+        if (a->is_delta) {
+            rmsnorm_delta(n_b, h_b, a->weight, 1e-6f, a->d_model);
+            for (int i = 0; i < a->d_model; i++) {
+                r_b[i] += n_b[i];
+                h_b[i] = r_b[i];
+            }
+        } else {
+            rmsnorm(n_b, h_b, a->weight, a->d_model, 1e-6f);
+            for (int i = 0; i < a->d_model; i++) {
+                r_b[i] += n_b[i];
+                h_b[i] = r_b[i];
+            }
+        }
+    } else {
+        for (int i = 0; i < a->d_model; i++) {
+            r_b[i] += h_b[i];
+            h_b[i] = r_b[i];
+        }
+    }
+}
+
 void finalize_layer_output(layer_buffers_t buf,
                            transformer_layer_ctx_t* ctx,
                            float* hidden) {
@@ -155,41 +221,55 @@ void finalize_layer_output(layer_buffers_t buf,
         if (n_post == ctx->d_model) {
             const float* norm_post_w = get_norm_weights(ctx->layer->norm_ffn_post_weight, buf.weight_scratch, ctx->d_model);
             
-            for (int b = 0; b < ctx->batch_size; b++) {
-                float* h_b = hidden + b * ctx->d_model;
-                float* r_b = buf.residual + b * buf.pm;
-                float* n_b = buf.norm_buf + b * buf.pm;
-                
-                rmsnorm_delta(n_b, h_b, norm_post_w, 1e-6f, ctx->d_model);
-                vec_add(r_b, n_b, ctx->d_model);
-                vec_copy(h_b, r_b, ctx->d_model);
+            if (ctx->session->gemv_ctx && ctx->batch_size > 1) {
+                parallel_norm_args_t p_args = {
+                    .hidden = hidden, .residual = buf.residual, .norm_buf = buf.norm_buf,
+                    .weight = norm_post_w, .d_model = ctx->d_model, .is_delta = true
+                };
+                kernel_parallel_for(ctx->session->gemv_ctx, parallel_finalize_fn, &p_args, ctx->batch_size);
+            } else {
+                for (int b = 0; b < ctx->batch_size; b++) {
+                    float* h_b = hidden + b * ctx->d_model;
+                    float* r_b = buf.residual + b * buf.pm;
+                    float* n_b = buf.norm_buf + b * buf.pm;
+                    
+                    rmsnorm_delta(n_b, h_b, norm_post_w, 1e-6f, ctx->d_model);
+                    vec_add(r_b, n_b, ctx->d_model);
+                    vec_copy(h_b, r_b, ctx->d_model);
+                }
             }
         } else {
             LOG_WARN("using weightless RMSNorm for layer %d", ctx->layer_idx);
             float* ones = (float*)malloc(ctx->d_model * sizeof(float));
-            if (!ones) {
-                LOG_ERROR("Failed to allocate 'ones' buffer in finalize_layer_output");
-                return;
+            if (ones) {
+                for (int i = 0; i < ctx->d_model; i++) ones[i] = 1.0f;
+                
+                for (int b = 0; b < ctx->batch_size; b++) {
+                    float* h_b = hidden + b * ctx->d_model;
+                    float* r_b = buf.residual + b * buf.pm;
+                    float* n_b = buf.norm_buf + b * buf.pm;
+                    
+                    rmsnorm(n_b, h_b, ones, 1e-6f, ctx->d_model);
+                    vec_add(r_b, n_b, ctx->d_model);
+                    vec_copy(h_b, r_b, ctx->d_model);
+                }
+                free(ones);
             }
-            for (int i = 0; i < ctx->d_model; i++) ones[i] = 1.0f;
-            
+        }
+    } else {
+        if (ctx->session->gemv_ctx && ctx->batch_size > 1) {
+             parallel_norm_args_t p_args = {
+                .hidden = hidden, .residual = buf.residual, .norm_buf = buf.norm_buf,
+                .weight = NULL, .d_model = ctx->d_model, .is_delta = false
+            };
+            kernel_parallel_for(ctx->session->gemv_ctx, parallel_finalize_fn, &p_args, ctx->batch_size);
+        } else {
             for (int b = 0; b < ctx->batch_size; b++) {
                 float* h_b = hidden + b * ctx->d_model;
                 float* r_b = buf.residual + b * buf.pm;
-                float* n_b = buf.norm_buf + b * buf.pm;
-                
-                rmsnorm(n_b, h_b, ones, 1e-6f, ctx->d_model);
-                vec_add(r_b, n_b, ctx->d_model);
+                vec_add(r_b, h_b, ctx->d_model);
                 vec_copy(h_b, r_b, ctx->d_model);
             }
-            free(ones);
-        }
-    } else {
-        for (int b = 0; b < ctx->batch_size; b++) {
-            float* h_b = hidden + b * ctx->d_model;
-            float* r_b = buf.residual + b * buf.pm;
-            vec_add(r_b, h_b, ctx->d_model);
-            vec_copy(h_b, r_b, ctx->d_model);
         }
     }
 

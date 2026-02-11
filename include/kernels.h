@@ -94,6 +94,21 @@ typedef struct {
 
 typedef void (*gemm_kernel_t)(const gemm_args_t* args);
 
+/** Function signature for parallel_for loops. */
+typedef void (*parallel_for_fn_t)(void* arg, int idx);
+
+/**
+ * Execute a loop in parallel using the persistent worker pool.
+ * Distributes 'n' iterations across pool threads.
+ * 
+ * @param ctx  Worker context
+ * @param fn   Function to call for each iteration
+ * @param arg  User data passed to each function call
+ * @param n    Total number of iterations
+ * @return 0 on success, -1 on error
+ */
+int kernel_parallel_for(kernel_context_t *ctx, parallel_for_fn_t fn, void* arg, int n);
+
 // Q4_0 kernels
 float quantized_gemv_q4_0_aligned(const void *W_row, const float *x, int block_count, int block_size);
 float quantized_gemv_q4_0_unaligned(const void *W_row, const float *x, int block_count, int block_size);

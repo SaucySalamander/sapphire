@@ -45,6 +45,10 @@ struct sapphire_context {
     int is_gemm;
     int batch_size;
     int d_model;    // input dimension for batching stride
+
+    // Parallel For Extension
+    parallel_for_fn_t parallel_fn;
+    void *parallel_arg;
 };
 
 // Internal prototype for dispatch from dispatch.c
@@ -87,10 +91,19 @@ static void *worker_fn(void *arg) {
         int batch_size = ctx->batch_size;
         int d_model = ctx->d_model;
         int chunk_size = ctx->chunk_size;
+        parallel_for_fn_t parallel_fn = ctx->parallel_fn;
+        void *parallel_arg = ctx->parallel_arg;
         pthread_mutex_unlock(&ctx->work_mutex);
         
-        // 3. Process assigned rows
-        while (1) {
+        // 3. Process assigned rows / iterations
+        if (parallel_fn) {
+            while (1) {
+                int idx = atomic_fetch_add(&ctx->next_row, 1);
+                if (idx >= rows) break;
+                parallel_fn(parallel_arg, idx);
+            }
+        } else {
+            while (1) {
             int start = atomic_fetch_add(&ctx->next_row, chunk_size);
             if (start >= rows) break;
             int end = start + chunk_size;
@@ -128,12 +141,14 @@ static void *worker_fn(void *arg) {
                 }
             }
         }
+    }
         
-        // 4. Signal completion of this thread
-        pthread_mutex_lock(&ctx->work_mutex);
-        atomic_fetch_add(&ctx->threads_done, 1);
-        pthread_cond_broadcast(&ctx->work_cond); // Notify main thread
-        pthread_mutex_unlock(&ctx->work_mutex);
+    // 4. Signal completion of this thread
+        if (atomic_fetch_add(&ctx->threads_done, 1) + 1 == ctx->num_threads) {
+            pthread_mutex_lock(&ctx->work_mutex);
+            pthread_cond_broadcast(&ctx->work_cond); // Notify main thread
+            pthread_mutex_unlock(&ctx->work_mutex);
+        }
     }
     
     return NULL;
@@ -308,6 +323,11 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
     // Serialize execution to prevent re-entry corruption
     pthread_mutex_lock(&ctx->exec_mutex);
 
+    // Dynamic chunk size to ensure all threads get work
+    int num_threads = ctx->num_threads;
+    int chunk_size = (rows + num_threads - 1) / num_threads;
+    if (chunk_size < 1) chunk_size = 1;
+
     // Set up work parameters
     pthread_mutex_lock(&ctx->work_mutex);
     ctx->is_gemm = is_gemm;
@@ -323,6 +343,7 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
     ctx->x = X;
     ctx->y = Y;
     ctx->x_aligned = x_aligned;
+    ctx->chunk_size = chunk_size; // Override with optimal chunk size
     atomic_store(&ctx->next_row, 0);
     atomic_store(&ctx->threads_done, 0);
     
@@ -334,6 +355,40 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
     while (atomic_load(&ctx->threads_done) < ctx->num_threads) {
         pthread_cond_wait(&ctx->work_cond, &ctx->work_mutex);
     }
+    pthread_mutex_unlock(&ctx->work_mutex);
+    pthread_mutex_unlock(&ctx->exec_mutex);
+    
+    return 0;
+}
+
+int kernel_parallel_for(kernel_context_t *ctx, parallel_for_fn_t fn, void* arg, int n) {
+    if (!ctx || !fn || n <= 0) return -1;
+    
+    pthread_mutex_lock(&ctx->exec_mutex);
+    pthread_mutex_lock(&ctx->work_mutex);
+    
+    // Clear GEMV state to indicate parallel_for
+    ctx->kernel_fn = NULL;
+    ctx->gemm_kernel_fn = NULL;
+    ctx->W = NULL;
+    ctx->parallel_fn = fn;
+    ctx->parallel_arg = arg;
+    ctx->rows = n;
+    
+    atomic_store(&ctx->next_row, 0);
+    atomic_store(&ctx->threads_done, 0);
+    
+    // Trigger task
+    atomic_fetch_add(&ctx->task_id, 1);
+    pthread_cond_broadcast(&ctx->work_cond);
+    
+    while (atomic_load(&ctx->threads_done) < ctx->num_threads) {
+        pthread_cond_wait(&ctx->work_cond, &ctx->work_mutex);
+    }
+    
+    // Reset parallel_fn for next task
+    ctx->parallel_fn = NULL;
+    
     pthread_mutex_unlock(&ctx->work_mutex);
     pthread_mutex_unlock(&ctx->exec_mutex);
     

@@ -46,7 +46,7 @@ typedef struct layer_buffers layer_buffers_t;
  * @brief Forward pass for multi-head attention (GQA supported).
  */
 int sapphire_attention_forward(struct inference_session_t* session, int layer_idx, int token_pos,
-                               float* q_proj, float* attn_out);
+                               float* q_proj, float* attn_out, float* scores_buf);
 
 /**
  * @brief Batched forward pass for multi-head attention.

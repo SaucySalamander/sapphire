@@ -241,9 +241,15 @@ int kernel_gemv_batch(kernel_context_t *ctx, float *Y, const tensor_t *A, const 
         return -1;
     }
 
+    // Optimization: Use the batched GEMM backend to amortize weight loading costs
+    // and reduce thread synchronization overhead.
+    if (batch_size > 1 && ctx) {
+        return kernel_backend_exec(ctx, A, X, Y, 1, batch_size);
+    }
+
     const int *shape = tensor_shape(A);
-    int m = shape[0];  // Output rows
-    int n = shape[1];  // Input columns
+    int m = shape[0];
+    int n = shape[1];
 
     for (int k = 0; k < batch_size; k++) {
         const float *x_k = X + k * n;

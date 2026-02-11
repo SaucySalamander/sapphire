@@ -1,10 +1,65 @@
 #include <math.h>
 #include <string.h>
+#include <immintrin.h>
 #include "kernels.h"
 #include "log.h"
 #include "utils.h"
 
+// ============================================================================
+// AVX Helper Functions for RMSNorm
+// ============================================================================
 
+static inline float sum_sq_avx2(const float *in, int dim) {
+    int i = 0;
+    __m256 v_sum = _mm256_setzero_ps();
+    for (; i + 8 <= dim; i += 8) {
+        __m256 v_in = _mm256_loadu_ps(in + i);
+        v_sum = _mm256_fmadd_ps(v_in, v_in, v_sum);
+    }
+    
+    // Horizontal reduction
+    __m128 v_low = _mm256_castps256_ps128(v_sum);
+    __m128 v_high = _mm256_extractf128_ps(v_sum, 1);
+    v_low = _mm_add_ps(v_low, v_high);
+    v_low = _mm_hadd_ps(v_low, v_low);
+    v_low = _mm_hadd_ps(v_low, v_low);
+    float sum = _mm_cvtss_f32(v_low);
+
+    for (; i < dim; i++) {
+        sum += in[i] * in[i];
+    }
+    return sum;
+}
+
+static inline void rmsnorm_apply_avx2(float *out, const float *in, const float *weight, float rms_inv, int dim) {
+    int i = 0;
+    __m256 v_rms_inv = _mm256_set1_ps(rms_inv);
+    for (; i + 8 <= dim; i += 8) {
+        __m256 v_in = _mm256_loadu_ps(in + i);
+        __m256 v_w = _mm256_loadu_ps(weight + i);
+        __m256 v_out = _mm256_mul_ps(_mm256_mul_ps(v_in, v_rms_inv), v_w);
+        _mm256_storeu_ps(out + i, v_out);
+    }
+    for (; i < dim; i++) {
+        out[i] = (in[i] * rms_inv) * weight[i];
+    }
+}
+
+static inline void rmsnorm_delta_apply_avx2(float *out, const float *in, const float *weight, float rms_inv, int dim) {
+    int i = 0;
+    __m256 v_rms_inv = _mm256_set1_ps(rms_inv);
+    __m256 v_one = _mm256_set1_ps(1.0f);
+    for (; i + 8 <= dim; i += 8) {
+        __m256 v_in = _mm256_loadu_ps(in + i);
+        __m256 v_w = _mm256_loadu_ps(weight + i);
+        __m256 v_scale = _mm256_add_ps(v_one, v_w);
+        __m256 v_out = _mm256_mul_ps(_mm256_mul_ps(v_in, v_rms_inv), v_scale);
+        _mm256_storeu_ps(out + i, v_out);
+    }
+    for (; i < dim; i++) {
+        out[i] = (in[i] * rms_inv) * (1.0f + weight[i]);
+    }
+}
 
 // ============================================================================
 // RMSNorm (Root Mean Square Normalization)
@@ -38,41 +93,10 @@ int rmsnorm(float *out, const float *in, const float *weight,
         return -1;
     }
     
-    // Step 1: Compute sum of squares with loop unrolling (factor 4)
-    float sum_sq = 0.0f;
+    float sum_sq = sum_sq_avx2(in, dim);
+    float rms_inv = 1.0f / sqrtf(sum_sq / (float)dim + epsilon);
     
-    int unroll_limit = (dim / 4) * 4;
-    int i = 0;
-    
-    // Main unrolled loop (4x per iteration)
-    for (i = 0; i < unroll_limit; i += 4) {
-        sum_sq += in[i + 0] * in[i + 0];
-        sum_sq += in[i + 1] * in[i + 1];
-        sum_sq += in[i + 2] * in[i + 2];
-        sum_sq += in[i + 3] * in[i + 3];
-    }
-    
-    // Handle remaining elements (0-3)
-    for (; i < dim; i++) {
-        sum_sq += in[i] * in[i];
-    }
-    
-    // Step 2: Compute RMS
-    float rms = sqrtf(sum_sq / (float)dim + epsilon);
-    
-    // Step 3: Normalize and scale with loop unrolling
-    i = 0;
-    for (i = 0; i < unroll_limit; i += 4) {
-        out[i + 0] = (in[i + 0] / rms) * weight[i + 0];
-        out[i + 1] = (in[i + 1] / rms) * weight[i + 1];
-        out[i + 2] = (in[i + 2] / rms) * weight[i + 2];
-        out[i + 3] = (in[i + 3] / rms) * weight[i + 3];
-    }
-    
-    // Handle remaining elements
-    for (; i < dim; i++) {
-        out[i] = (in[i] / rms) * weight[i];
-    }
+    rmsnorm_apply_avx2(out, in, weight, rms_inv, dim);
     
     return 0;
 }
@@ -84,31 +108,10 @@ int rmsnorm_delta(float *out, const float *in, const float *weight,
         return -1;
     }
 
-    // Compute sum of squares
-    float sum_sq = 0.0f;
-    int unroll_limit = (dim / 4) * 4;
-    int i = 0;
-    for (i = 0; i < unroll_limit; i += 4) {
-        sum_sq += in[i + 0] * in[i + 0];
-        sum_sq += in[i + 1] * in[i + 1];
-        sum_sq += in[i + 2] * in[i + 2];
-        sum_sq += in[i + 3] * in[i + 3];
-    }
-    for (; i < dim; i++) sum_sq += in[i] * in[i];
+    float sum_sq = sum_sq_avx2(in, dim);
+    float rms_inv = 1.0f / sqrtf(sum_sq / (float)dim + epsilon);
 
-    float rms = sqrtf(sum_sq / (float)dim + epsilon);
-
-    // Normalize and apply Gemma3-style scaling: (1 + weight[i])
-    i = 0;
-    for (i = 0; i < unroll_limit; i += 4) {
-        out[i + 0] = (in[i + 0] / rms) * (1.0f + weight[i + 0]);
-        out[i + 1] = (in[i + 1] / rms) * (1.0f + weight[i + 1]);
-        out[i + 2] = (in[i + 2] / rms) * (1.0f + weight[i + 2]);
-        out[i + 3] = (in[i + 3] / rms) * (1.0f + weight[i + 3]);
-    }
-    for (; i < dim; i++) {
-        out[i] = (in[i] / rms) * (1.0f + weight[i]);
-    }
+    rmsnorm_delta_apply_avx2(out, in, weight, rms_inv, dim);
 
     return 0;
 }
@@ -147,17 +150,10 @@ int rmsnorm_batch(float *out, const float *in, const float *weight,
         float *row_out = out + b * dim;
         const float *row_in = in + b * dim;
         
-        // Compute RMS for this row
-        float sum_sq = 0.0f;
-        for (int i = 0; i < dim; i++) {
-            sum_sq += row_in[i] * row_in[i];
-        }
+        float sum_sq = sum_sq_avx2(row_in, dim);
+        float rms_inv = 1.0f / sqrtf(sum_sq / (float)dim + epsilon);
         
-        float rms = sqrtf(sum_sq / (float)dim + epsilon);
-        
-        for (int i = 0; i < dim; i++) {
-            row_out[i] = (row_in[i] / rms) * weight[i];
-        }
+        rmsnorm_apply_avx2(row_out, row_in, weight, rms_inv, dim);
     }
     
     return 0;

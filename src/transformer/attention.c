@@ -92,7 +92,7 @@ bool attention_debug_should_log(const attention_debug_config_t* cfg, int layer_i
 }
 
 int sapphire_attention_forward(struct inference_session_t* session, int layer_idx, int token_pos,
-                               float* q_proj, float* attn_out) {
+                               float* q_proj, float* attn_out, float* scores_buf) {
     gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
 
     int seq_len = token_pos + 1;  // Current token pos is 0-indexed, so length is pos + 1
@@ -138,7 +138,7 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
         const float* k_base = cached_k_data + h_kv * cache_stride + window_start * head_dim;
         const float* v_base = cached_v_data + h_kv * cache_stride + window_start * head_dim;
         const float* head_q = q_proj + h * head_dim;
-        float* scores = session->attn_scores;
+        float* scores = scores_buf;
 
         // Step 1: Compute scores (Dot product)
         for (int t = 0; t < attn_len; t++) {
@@ -163,6 +163,25 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
     return 0;
 }
 
+typedef struct {
+    struct inference_session_t* session;
+    int layer_idx;
+    int start_pos;
+    float* q_proj;
+    float* attn_out;
+    int q_stride;
+    int max_seq;
+} parallel_attn_args_t;
+
+static void parallel_attn_fn(void* arg, int idx) {
+    parallel_attn_args_t* a = (parallel_attn_args_t*)arg;
+    float* scores_buf = a->session->attn_scores + (size_t)idx * a->max_seq;
+    sapphire_attention_forward(a->session, a->layer_idx, a->start_pos + idx, 
+                               a->q_proj + (size_t)idx * a->q_stride, 
+                               a->attn_out + (size_t)idx * a->q_stride,
+                               scores_buf);
+}
+
 int sapphire_attention_forward_batch(struct inference_session_t* session, int layer_idx, int start_pos, int batch_size,
                                      float* q_proj, float* attn_out) {
     const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
@@ -170,17 +189,29 @@ int sapphire_attention_forward_batch(struct inference_session_t* session, int la
     int q_stride = config->num_attention_heads * head_dim;
     int max_seq = kv_cache_get_max_seq_len(session->kv_cache);
 
-    // For now, we use a loop over tokens. This is correct and functional.
-    // We save the original session->attn_scores and restore it to ensure
-    // we don't break thread-local assumptions (though session is shared).
-    float* orig_scores = session->attn_scores;
+    parallel_attn_args_t args = {
+        .session = session,
+        .layer_idx = layer_idx,
+        .start_pos = start_pos,
+        .q_proj = q_proj,
+        .attn_out = attn_out,
+        .q_stride = q_stride,
+        .max_seq = max_seq
+    };
 
-    for (int b = 0; b < batch_size; b++) {
-        session->attn_scores = orig_scores + b * max_seq;
-        sapphire_attention_forward(session, layer_idx, start_pos + b, q_proj + b * q_stride, attn_out + b * q_stride);
+    if (session->gemv_ctx && batch_size > 1) {
+        return kernel_parallel_for(session->gemv_ctx, parallel_attn_fn, &args, batch_size);
     }
 
-    session->attn_scores = orig_scores;
+    /* Fallback for single batch or unthreaded context */
+    for (int b = 0; b < batch_size; b++) {
+        float* token_scores = session->attn_scores + (size_t)b * max_seq;
+        sapphire_attention_forward(session, layer_idx, start_pos + b, 
+                                   q_proj + (size_t)b * q_stride, 
+                                   attn_out + (size_t)b * q_stride,
+                                   token_scores);
+    }
+
     return 0;
 }
 
@@ -310,7 +341,7 @@ void compute_attention_stage(layer_buffers_t buf,
 
     // 5. Attention Forward Pass
     if (ctx->batch_size == 1) {
-        sapphire_attention_forward(ctx->session, ctx->layer_idx, ctx->token_pos, buf.q_proj, buf.attn_out);
+        sapphire_attention_forward(ctx->session, ctx->layer_idx, ctx->token_pos, buf.q_proj, buf.attn_out, ctx->session->attn_scores);
     } else {
         sapphire_attention_forward_batch(ctx->session, ctx->layer_idx, ctx->token_pos, ctx->batch_size, buf.q_proj, buf.attn_out);
     }
