@@ -30,6 +30,7 @@ struct sapphire_context {
     
     // Generic GEMV kernel dispatch
     gemv_kernel_t kernel_fn;  // Function pointer to the selected kernel
+    gemm_kernel_t gemm_kernel_fn; // Function pointer for batched GEMM
     const void *W;            // Opaque weight data pointer
     
     int rows;
@@ -39,11 +40,20 @@ struct sapphire_context {
     const float *x;
     float *y;
     int x_aligned;
+
+    // GEMM (Batched prefill) extension
+    int is_gemm;
+    int batch_size;
+    int d_model;    // input dimension for batching stride
+
+    // Parallel For Extension
+    parallel_for_fn_t parallel_fn;
+    void *parallel_arg;
 };
 
 // Internal prototype for dispatch from dispatch.c
 // Declared here to ensure implementation matches
-int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *x, float *y);
+int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X, float *Y, int is_gemm, int batch_size);
 
 /**
  * Persistent worker thread function.
@@ -76,11 +86,24 @@ static void *worker_fn(void *arg) {
         const float *x = ctx->x;
         float *y = ctx->y;
         gemv_kernel_t kernel_fn = ctx->kernel_fn;
+        gemm_kernel_t gemm_kernel_fn = ctx->gemm_kernel_fn;
+        int is_gemm = ctx->is_gemm;
+        int batch_size = ctx->batch_size;
+        int d_model = ctx->d_model;
         int chunk_size = ctx->chunk_size;
+        parallel_for_fn_t parallel_fn = ctx->parallel_fn;
+        void *parallel_arg = ctx->parallel_arg;
         pthread_mutex_unlock(&ctx->work_mutex);
         
-        // 3. Process assigned rows
-        while (1) {
+        // 3. Process assigned rows / iterations
+        if (parallel_fn) {
+            while (1) {
+                int idx = atomic_fetch_add(&ctx->next_row, 1);
+                if (idx >= rows) break;
+                parallel_fn(parallel_arg, idx);
+            }
+        } else {
+            while (1) {
             int start = atomic_fetch_add(&ctx->next_row, chunk_size);
             if (start >= rows) break;
             int end = start + chunk_size;
@@ -97,16 +120,35 @@ static void *worker_fn(void *arg) {
                     count = cols;
                     b_size = 1;
                 }
-                float result = kernel_fn(row_ptr, x, count, b_size);
-                y[r] = result;
+
+                if (is_gemm) {
+                    // Batched path: Y[token][row]
+                    // pass y + r as the start address for this row's column in Y
+                    gemm_args_t g_args = {
+                        .w_row = row_ptr,
+                        .X = x,
+                        .Y = y + r,
+                        .batch_size = batch_size,
+                        .d_model = d_model,
+                        .out_stride = rows,
+                        .blocks = count,
+                        .block_size = b_size
+                    };
+                    gemm_kernel_fn(&g_args);
+                } else {
+                    float result = kernel_fn(row_ptr, x, count, b_size);
+                    y[r] = result;
+                }
             }
         }
+    }
         
-        // 4. Signal completion of this thread
-        pthread_mutex_lock(&ctx->work_mutex);
-        atomic_fetch_add(&ctx->threads_done, 1);
-        pthread_cond_broadcast(&ctx->work_cond); // Notify main thread
-        pthread_mutex_unlock(&ctx->work_mutex);
+    // 4. Signal completion of this thread
+        if (atomic_fetch_add(&ctx->threads_done, 1) + 1 == ctx->num_threads) {
+            pthread_mutex_lock(&ctx->work_mutex);
+            pthread_cond_broadcast(&ctx->work_cond); // Notify main thread
+            pthread_mutex_unlock(&ctx->work_mutex);
+        }
     }
     
     return NULL;
@@ -225,14 +267,14 @@ int kernel_ctx_init(kernel_context_t *ctx) {
     return 0;
 }
 
-int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *x, float *y) {
-    if (!ctx || !A || !x || !y) {
-        LOG_ERROR("kernel_gemv_backend_exec: null pointer");
+int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X, float *Y, int is_gemm, int batch_size) {
+    if (!ctx || !A || !X || !Y) {
+        LOG_ERROR("kernel_backend_exec: null pointer");
         return 1;
     }
     
     if (!ctx->initialized) {
-        LOG_ERROR("kernel_gemv_backend_exec: context not initialized");
+        LOG_ERROR("kernel_backend_exec: context not initialized");
         return 1;
     }
     
@@ -245,8 +287,9 @@ int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const flo
     
     if (!W_data) return 1;
     
-    int x_aligned = (((uintptr_t)(const void*)x) & 31) == 0;
+    int x_aligned = (((uintptr_t)(const void*)X) & 31) == 0;
     gemv_kernel_t kernel_fn = NULL;
+    gemm_kernel_t gemm_kernel_fn = NULL;
     
     switch (dtype) {
         case DTYPE_Q4_0:
@@ -259,31 +302,48 @@ int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const flo
             break;
         case DTYPE_BF16:
             kernel_fn = quantized_gemv_bf16_avx2;
+            gemm_kernel_fn = kernel_gemm_bf16_avx2;
             row_stride_bytes = (size_t)cols * 2;
             break;
         case DTYPE_F32:
             kernel_fn = quantized_gemv_f32_avx2;
+            gemm_kernel_fn = kernel_gemm_f32_avx2;
             row_stride_bytes = (size_t)cols * 4;
             break;
         default:
-            LOG_ERROR("kernel_gemv_backend_exec: unsupported dtype %d", (int)dtype);
+            LOG_ERROR("kernel_backend_exec: unsupported dtype %d", (int)dtype);
             return -1;
+    }
+
+    if (is_gemm && gemm_kernel_fn == NULL) {
+        LOG_ERROR("kernel_backend_exec: dtype %d does not support batching yet", (int)dtype);
+        return -1;
     }
     
     // Serialize execution to prevent re-entry corruption
     pthread_mutex_lock(&ctx->exec_mutex);
 
+    // Dynamic chunk size to ensure all threads get work
+    int num_threads = ctx->num_threads;
+    int chunk_size = (rows + num_threads - 1) / num_threads;
+    if (chunk_size < 1) chunk_size = 1;
+
     // Set up work parameters
     pthread_mutex_lock(&ctx->work_mutex);
+    ctx->is_gemm = is_gemm;
+    ctx->batch_size = batch_size;
+    ctx->d_model = cols;
     ctx->kernel_fn = kernel_fn;
+    ctx->gemm_kernel_fn = gemm_kernel_fn;
     ctx->W = W_data;
     ctx->rows = rows;
     ctx->cols = cols;
     ctx->blocks_per_row = blocks_per_row;
     ctx->row_stride_bytes = row_stride_bytes;
-    ctx->x = x;
-    ctx->y = y;
+    ctx->x = X;
+    ctx->y = Y;
     ctx->x_aligned = x_aligned;
+    ctx->chunk_size = chunk_size; // Override with optimal chunk size
     atomic_store(&ctx->next_row, 0);
     atomic_store(&ctx->threads_done, 0);
     
@@ -295,6 +355,40 @@ int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const flo
     while (atomic_load(&ctx->threads_done) < ctx->num_threads) {
         pthread_cond_wait(&ctx->work_cond, &ctx->work_mutex);
     }
+    pthread_mutex_unlock(&ctx->work_mutex);
+    pthread_mutex_unlock(&ctx->exec_mutex);
+    
+    return 0;
+}
+
+int kernel_parallel_for(kernel_context_t *ctx, parallel_for_fn_t fn, void* arg, int n) {
+    if (!ctx || !fn || n <= 0) return -1;
+    
+    pthread_mutex_lock(&ctx->exec_mutex);
+    pthread_mutex_lock(&ctx->work_mutex);
+    
+    // Clear GEMV state to indicate parallel_for
+    ctx->kernel_fn = NULL;
+    ctx->gemm_kernel_fn = NULL;
+    ctx->W = NULL;
+    ctx->parallel_fn = fn;
+    ctx->parallel_arg = arg;
+    ctx->rows = n;
+    
+    atomic_store(&ctx->next_row, 0);
+    atomic_store(&ctx->threads_done, 0);
+    
+    // Trigger task
+    atomic_fetch_add(&ctx->task_id, 1);
+    pthread_cond_broadcast(&ctx->work_cond);
+    
+    while (atomic_load(&ctx->threads_done) < ctx->num_threads) {
+        pthread_cond_wait(&ctx->work_cond, &ctx->work_mutex);
+    }
+    
+    // Reset parallel_fn for next task
+    ctx->parallel_fn = NULL;
+    
     pthread_mutex_unlock(&ctx->work_mutex);
     pthread_mutex_unlock(&ctx->exec_mutex);
     

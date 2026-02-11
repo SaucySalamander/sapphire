@@ -11,6 +11,11 @@
 
 struct inference_session_t;
 
+typedef struct {
+    const float* cos;
+    const float* sin;
+} transformer_rope_t;
+
 /**
  * @brief Forward pass for a single transformer layer.
  * 
@@ -33,17 +38,27 @@ struct inference_session_t;
  * @param layer_idx Layer index.
  * @param token_pos Current token position.
  * @param hidden Input/Output hidden state [d_model].
- * @param rope_cos Cosine frequencies for RoPE.
- * @param rope_sin Sine frequencies for RoPE.
+ * @param rope RoPE cosine/sine frequencies.
  * @return 0 on success.
  */
 int sapphire_transformer_layer(struct inference_session_t* session, int layer_idx, int token_pos, float* hidden,
-                               const float* rope_cos, const float* rope_sin);
+                               transformer_rope_t rope);
+
+/**
+ * @brief Forward pass for a single transformer layer in batched mode.
+ */
+int sapphire_transformer_layer_batch(struct inference_session_t* session, int layer_idx, int start_pos, int batch_size, float* hidden,
+                                     transformer_rope_t rope);
 
 /**
  * @brief Performs embedding lookup.
  */
 void sapphire_embed_lookup(struct inference_session_t* session, int token_id, float* hidden);
+
+/**
+ * @brief Performs batched embedding lookup.
+ */
+void sapphire_embed_lookup_batch(struct inference_session_t* session, const int* token_ids, int batch_size, float* hidden);
 
 /**
  * @brief Performs LM Head calculation and softcapping.
@@ -52,6 +67,7 @@ void lm_head(struct inference_session_t* session, const float* hidden, float* lo
 
 typedef struct layer_buffers {
     int pm, pi, pk, pf;
+    int batch_size;
     float *residual, *norm_buf, *q_proj, *k_proj, *v_proj;
     float *attn_out, *ffn_gate_buf, *ffn_value_buf, *geglu_buf;
     float* weight_scratch;
@@ -67,6 +83,7 @@ typedef struct transformer_layer_ctx {
     gemma3_270m_config_t* config;
     int layer_idx;
     int token_pos;
+    int batch_size;
     int d_model;
     int head_dim;
 } transformer_layer_ctx_t;

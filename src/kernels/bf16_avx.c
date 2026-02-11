@@ -106,3 +106,45 @@ float quantized_gemv_bf16_avx2(const void *W_row, const float *x, int block_coun
     float final = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7] + remainder;
     return final;
 }
+
+void kernel_gemm_bf16_avx2(const gemm_args_t* args) {
+    const uint16_t *w = (const uint16_t *)args->w_row;
+    const float *X = args->X;
+    float *Y = args->Y;
+    int batch = args->batch_size;
+    int cols = args->d_model;
+    int out_stride = args->out_stride;
+
+    for (int bs = 0; bs < batch; bs += 8) {
+        int cur_batch = (batch - bs > 8) ? 8 : (batch - bs);
+        __m256 acc[8];
+        for (int i = 0; i < cur_batch; i++) acc[i] = _mm256_setzero_ps();
+
+        int j;
+        for (j = 0; j + 8 <= cols; j += 8) {
+            // Load 8 BF16 weights and convert to F32
+            __m128i bf_packed = _mm_loadu_si128((const __m128i*)(w + j));
+            __m256i bf_expanded = _mm256_cvtepu16_epi32(bf_packed);
+            __m256 wv = _mm256_castsi256_ps(_mm256_slli_epi32(bf_expanded, 16));
+
+            for (int i = 0; i < cur_batch; i++) {
+                __m256 xv = _mm256_loadu_ps(X + (size_t)(bs + i) * cols + j);
+                acc[i] = _mm256_fmadd_ps(wv, xv, acc[i]);
+            }
+        }
+
+        for (int i = 0; i < cur_batch; i++) {
+            float tmp[8];
+            _mm256_storeu_ps(tmp, acc[i]);
+            float sum = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+            
+            for (int r = j; r < cols; r++) {
+                uint32_t f32_bits = ((uint32_t)w[r]) << 16;
+                float wf;
+                memcpy(&wf, &f32_bits, sizeof(float));
+                sum += wf * X[(size_t)(bs + i) * cols + r];
+            }
+            Y[(size_t)(bs + i) * out_stride] = sum;
+        }
+    }
+}

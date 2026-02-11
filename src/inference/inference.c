@@ -234,8 +234,13 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
     inference_session_reset(session);
 
     // 2. Pre-fill the KV cache with the prompt (Prompt Processing)
-    for (int i = 0; i < prompt_len - 1; i++) {
-        inference_forward(session, tokens[i], i, ctx->logits);
+    // We process tokens in batches of up to 32 to utilize GEMM math and reduce memory traffic.
+    int p_idx = 0;
+    while (p_idx < prompt_len - 1) {
+        int b_size = (prompt_len - 1) - p_idx;
+        if (b_size > 32) b_size = 32;
+        inference_forward_batch(session, tokens + p_idx, p_idx, b_size, NULL);
+        p_idx += b_size;
     }
 
     total_tokens = prompt_len;
@@ -401,8 +406,10 @@ static int allocate_session_buffers(inference_session_t* session, gemma3_270m_co
     // - ffn_gate (pad_ff):    gate/activation branch of FFN
     // - ffn_value (pad_ff):   value branch of FFN
     // - geglu_input (2*pad_ff): concatenated buffer for GEGLU activation
-    // Total: 3*pad_m + 2*pad_inner + 2*pad_kv + 6*pad_ff floats
-    size_t scratch_floats = (size_t)3 * pad_m + (size_t)2 * pad_inner + (size_t)2 * pad_kv + (size_t)6 * pad_ff;
+    // Total: (3*pad_m + 2*pad_inner + 2*pad_kv + 6*pad_ff) * 32 floats
+    // We allocate enough scratch for a batch of 32 tokens during prefill.
+    int max_batch = 32;
+    size_t scratch_floats = (size_t)max_batch * ((size_t)3 * pad_m + (size_t)2 * pad_inner + (size_t)2 * pad_kv + (size_t)6 * pad_ff);
     scratch_floats += 32;
 
     // Allocate aligned scratch buffer (32-byte aligned for AVX2)
@@ -416,17 +423,18 @@ static int allocate_session_buffers(inference_session_t* session, gemma3_270m_co
         return -1;
     }
     session->scratch_buffer = (float*)aligned_ptr;
-    session->scratch_size = scratch_floats;
+    session->scratch_size = (size_t)scratch_floats * sizeof(float);
     session->padded_d_model = pad_m;
     session->padded_d_inner = pad_inner;
     session->padded_d_kv = pad_kv;
     session->padded_d_ff = pad_ff;
     memset(session->scratch_buffer, 0, scratch_floats * sizeof(float));
 
-    // Pre-allocate attention scores buffer (max_context_len)
-    session->attn_scores = (float*)malloc(max_context_len * sizeof(float));
+    // Pre-allocate attention scores buffer (max_batch * max_context_len)
+    // This supports batched Q-K calculation during prefill.
+    session->attn_scores = (float*)malloc((size_t)max_batch * max_context_len * sizeof(float));
     if (session->attn_scores) {
-        memset(session->attn_scores, 0, max_context_len * sizeof(float));
+        memset(session->attn_scores, 0, (size_t)max_batch * max_context_len * sizeof(float));
     }
     if (!session->attn_scores) {
         LOG_ERROR("Failed to allocate attention score buffer");
@@ -602,110 +610,44 @@ void inference_session_reset(inference_session_t* session) {
  * Performance target: ~2.67ms/token at -O3 with AVX2
  */
 void inference_forward(inference_session_t* session, int token_id, int token_pos, float* logits) {
-    if (!session || !logits) {
-        LOG_ERROR("inference_forward requires session and logits buffer");
+    inference_forward_batch(session, &token_id, token_pos, 1, logits);
+}
+
+void inference_forward_batch(inference_session_t* session, const int* token_ids, int start_pos, int batch_size, float* logits) {
+    if (!session) {
+        LOG_ERROR("inference_forward_batch requires session");
         return;
     }
 
     const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
 
     // 1. Embedding lookup
-    sapphire_embed_lookup(session, token_id, session->scratch_buffer);
-
-    // Debug: log embeddings
-    if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
-        float mn, mx, rms;
-        vec_stats(session->scratch_buffer, config->hidden_size, &mn, &mx, &rms);
-        fprintf(stderr, "[DEBUG_EMBEDDING] pos=%d min=%.6f max=%.6f rms=%.6f first5: %.6f %.6f %.6f %.6f %.6f\n", 
-                token_pos, mn, mx, rms,
-                session->scratch_buffer[0], session->scratch_buffer[1], session->scratch_buffer[2], 
-                session->scratch_buffer[3], session->scratch_buffer[4]);
-    }
-
-    // Targeted dump: embeddings for token 0
-    if (token_pos == 0 && getenv("SAPPHIRE_DEBUG_DUMPS")) {
-        float mn, mx, rms;
-        int d_model = config->hidden_size;
-        vec_stats(session->scratch_buffer, d_model, &mn, &mx, &rms);
-        LOG_DEBUG("DUMP EMBED: token=%d stats min=%.6f max=%.6f rms=%.6f", token_id, mn, mx, rms);
-        int nonfinite = 0;
-        int N = d_model < 16 ? d_model : 16;
-        for (int i = 0; i < d_model; ++i) {
-            if (!isfinite(session->scratch_buffer[i])) nonfinite++;
-        }
-        LOG_DEBUG("DUMP EMBED: non-finite count=%d (first %d values):", nonfinite, N);
-        for (int i = 0; i < N; ++i) {
-            LOG_DEBUG("DUMP EMBED: idx=%d val=%.9g", i, session->scratch_buffer[i]);
-        }
-    }
+    sapphire_embed_lookup_batch(session, token_ids, batch_size, session->scratch_buffer);
 
     // 2. Transformer layers with layer-type dispatch
     for (int l = 0; l < config->num_hidden_layers; l++) {
-        if (l >= session->num_layers) {
-            LOG_ERROR("Layer index %d out of bounds (num_layers=%d)", l, session->num_layers);
-            break;
-        }
-        
         sapphire_layer_config_t* layer_cfg = &session->layer_configs[l];
-        
-        // Debug: log layer input/output for critical positions
-        if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
-            float mn, mx, rms;
-            vec_stats(session->scratch_buffer, config->hidden_size, &mn, &mx, &rms);
-            fprintf(stderr, "[DEBUG_LAYER_INPUT] layer=%d pos=%d type=%d min=%.6f max=%.6f rms=%.6f\n", 
-                    l, token_pos, layer_cfg->type, mn, mx, rms);
-        }
-        
-        /* Dispatch based on layer type */
-        switch (layer_cfg->type) {
-            case LAYER_TYPE_ATTENTION_SOFTMAX: {
-                /* Standard softmax attention (current Gemma 3 path) */
-                bool is_global = layer_cfg->config.attention.is_global;
-                const float* f_cos = is_global ? session->rope_freqs_cos_global : session->rope_freqs_cos_local;
-                const float* f_sin = is_global ? session->rope_freqs_sin_global : session->rope_freqs_sin_local;
-                
-                sapphire_transformer_layer(session, l, token_pos, session->scratch_buffer, f_cos, f_sin);
-                break;
+        bool is_global = layer_cfg->config.attention.is_global;
+        const float* f_cos = is_global ? session->rope_freqs_cos_global : session->rope_freqs_cos_local;
+        const float* f_sin = is_global ? session->rope_freqs_sin_global : session->rope_freqs_sin_local;
+
+        /* Dispatch based on layer type (currently only attention supported in batched) */
+        if (layer_cfg->type == LAYER_TYPE_ATTENTION_SOFTMAX || layer_cfg->type == LAYER_TYPE_ATTENTION_LINEAR) {
+            sapphire_transformer_layer_batch(session, l, start_pos, batch_size, session->scratch_buffer, (transformer_rope_t){f_cos, f_sin});
+        } else {
+            // For non-attention layers (e.g. SSM), we loop.
+            // Note: Currently no SSM implementation, so this is just for code path completeness.
+            for (int b = 0; b < batch_size; b++) {
+                sapphire_transformer_layer(session, l, start_pos + b, session->scratch_buffer + b * config->hidden_size, (transformer_rope_t){f_cos, f_sin});
             }
-            
-            case LAYER_TYPE_ATTENTION_LINEAR: {
-                /* LoLCATs linearized attention (placeholder for now) */
-                LOG_WARN("Layer %d uses linear attention (not yet implemented)", l);
-                bool is_global = layer_cfg->config.attention.is_global;
-                const float* f_cos = is_global ? session->rope_freqs_cos_global : session->rope_freqs_cos_local;
-                const float* f_sin = is_global ? session->rope_freqs_sin_global : session->rope_freqs_sin_local;
-                /* TODO: Call compute_linear_attention_stage when implemented */
-                /* For now, fall back to softmax attention */
-                sapphire_transformer_layer(session, l, token_pos, session->scratch_buffer, f_cos, f_sin);
-                break;
-            }
-            
-            case LAYER_TYPE_SSM_RECURRENT: {
-                /* Mamba-style SSM recurrence (placeholder for now) */
-                LOG_WARN("Layer %d uses SSM recurrence (not yet implemented)", l);
-                /* TODO: Call compute_ssm_stage when implemented */
-                /* For now, skip the layer (or fall back to attention) */
-                break;
-            }
-            
-            default:
-                LOG_ERROR("Unknown layer type %d for layer %d", layer_cfg->type, l);
-                break;
-        }
-        
-        // Debug: log layer output
-        if (getenv("SAPPHIRE_DEBUG_LOGITS")) {
-            float mn, mx, rms;
-            vec_stats(session->scratch_buffer, config->hidden_size, &mn, &mx, &rms);
-            fprintf(stderr, "[DEBUG_LAYER_OUTPUT] layer=%d pos=%d type=%d min=%.6f max=%.6f rms=%.6f first5: %.6f %.6f %.6f %.6f %.6f\n", 
-                    l, token_pos, layer_cfg->type, mn, mx, rms,
-                    session->scratch_buffer[0], session->scratch_buffer[1], session->scratch_buffer[2], 
-                    session->scratch_buffer[3], session->scratch_buffer[4]);
         }
     }
 
-    // 3. Final norm & LM Head
-    lm_head(session, session->scratch_buffer, logits);
+    // 3. Final norm & LM Head (for the last token in the batch)
+    if (logits) {
+        const float* last_hidden = session->scratch_buffer + (batch_size - 1) * config->hidden_size;
+        lm_head(session, (float*)last_hidden, logits);
+    }
 }
 
 /**

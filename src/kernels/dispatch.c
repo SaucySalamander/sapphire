@@ -35,7 +35,7 @@
 // ============================================================================
 
 // Internal backend prototype (from pool.c)
-int kernel_gemv_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *x, float *y);
+int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X, float *Y, int is_gemm, int batch_size);
 
 /**
  * Convert BF16 (bfloat16) to F32.
@@ -83,8 +83,19 @@ static void gemv_bf16(float *y, const uint16_t *A, const float *x, int m, int n)
     }
 }
 
-/* Context-based APIs implemented in pool.c directly now */
-/* kernel_ctx_create and kernel_ctx_destroy are in pool.c */
+int kernel_gemm(kernel_context_t *ctx, float *Y, const tensor_t *A, const float *X, int batch_size, int out_stride) {
+    if (!Y || !A || !X || batch_size <= 0) {
+        fprintf(stderr, "ERROR: kernel_gemm invalid arguments\n");
+        return -1;
+    }
+
+    if (!ctx) {
+        fprintf(stderr, "ERROR: kernel_gemm requires non-NULL context\n");
+        return -1;
+    }
+
+    return kernel_backend_exec(ctx, A, X, Y, out_stride, batch_size);
+}
 
 int kernel_gemv(kernel_context_t *ctx, float *y, const tensor_t *A, const float *x) {
     if (!y || !A || !x) {
@@ -129,9 +140,9 @@ int kernel_gemv(kernel_context_t *ctx, float *y, const tensor_t *A, const float 
                 return -1;
             }
             // Use the optimized and multithreaded pool implementations
-            int ret = kernel_gemv_backend_exec(ctx, A, x, y);
+            int ret = kernel_backend_exec(ctx, A, x, y, 0, 1);
             if (ret != 0) {
-                fprintf(stderr, "ERROR: kernel_gemv_backend_exec failed with code %d\n", ret);
+                fprintf(stderr, "ERROR: kernel_backend_exec failed with code %d\n", ret);
                 return -1;
             }
             return 0;
@@ -230,9 +241,15 @@ int kernel_gemv_batch(kernel_context_t *ctx, float *Y, const tensor_t *A, const 
         return -1;
     }
 
+    // Optimization: Use the batched GEMM backend to amortize weight loading costs
+    // and reduce thread synchronization overhead.
+    if (batch_size > 1 && ctx) {
+        return kernel_backend_exec(ctx, A, X, Y, 1, batch_size);
+    }
+
     const int *shape = tensor_shape(A);
-    int m = shape[0];  // Output rows
-    int n = shape[1];  // Input columns
+    int m = shape[0];
+    int n = shape[1];
 
     for (int k = 0; k < batch_size; k++) {
         const float *x_k = X + k * n;

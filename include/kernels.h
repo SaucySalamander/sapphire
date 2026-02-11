@@ -81,6 +81,34 @@ typedef float (*kernel_fn_t)(const void* w_row, const float* x, int blocks, int 
 // Forward compatibility alias
 typedef float (*gemv_kernel_t)(const void* w_row, const float* x, int blocks, int block_size);
 
+typedef struct {
+    const void* w_row;
+    const float* X;
+    float* Y;
+    int batch_size;
+    int d_model;
+    int out_stride;
+    int blocks;
+    int block_size;
+} gemm_args_t;
+
+typedef void (*gemm_kernel_t)(const gemm_args_t* args);
+
+/** Function signature for parallel_for loops. */
+typedef void (*parallel_for_fn_t)(void* arg, int idx);
+
+/**
+ * Execute a loop in parallel using the persistent worker pool.
+ * Distributes 'n' iterations across pool threads.
+ * 
+ * @param ctx  Worker context
+ * @param fn   Function to call for each iteration
+ * @param arg  User data passed to each function call
+ * @param n    Total number of iterations
+ * @return 0 on success, -1 on error
+ */
+int kernel_parallel_for(kernel_context_t *ctx, parallel_for_fn_t fn, void* arg, int n);
+
 // Q4_0 kernels
 float quantized_gemv_q4_0_aligned(const void *W_row, const float *x, int block_count, int block_size);
 float quantized_gemv_q4_0_unaligned(const void *W_row, const float *x, int block_count, int block_size);
@@ -97,6 +125,10 @@ float quantized_gemv_bf16_scalar(const void *W_row, const float *x, int block_co
 float quantized_gemv_f32_avx2(const void *W_row, const float *x, int block_count, int block_size);
 float quantized_gemv_f32_scalar(const void *W_row, const float *x, int block_count, int block_size);
 
+// Batched kernels (GEMM)
+void kernel_gemm_f32_avx2(const gemm_args_t* args);
+void kernel_gemm_bf16_avx2(const gemm_args_t* args);
+
 // ============================================================================
 // HIGH-LEVEL TENSOR OPERATIONS (Thread-safe, dtype-aware)
 // ============================================================================
@@ -106,6 +138,12 @@ float quantized_gemv_f32_scalar(const void *W_row, const float *x, int block_cou
  * Dispatches to best kernel based on A's dtype.
  */
 int kernel_gemv(kernel_context_t *ctx, float *y, const tensor_t *A, const float *x);
+
+/**
+ * Batched prefill operation (GEMM): Y = A @ X.
+ * X is [batch_size, context_len], Y is output buffer [batch_size, hidden_size].
+ */
+int kernel_gemm(kernel_context_t *ctx, float *Y, const tensor_t *A, const float *X, int batch_size, int out_stride);
 
 /**
  * Tensor-to-tensor GEMV: y = A @ x (where y and x are F32 tensors).
@@ -181,6 +219,7 @@ const float* get_norm_weights(const tensor_t *weight, float *scratch, int n);
 #define tensor_gemv_ctx_create kernel_ctx_create
 #define tensor_gemv_ctx_destroy kernel_ctx_destroy
 #define tensor_gemv_with_ctx kernel_gemv
+#define tensor_gemm_with_ctx kernel_gemm
 #define tensor_gemv_tensor_with_ctx kernel_gemv_tensor
 #define tensor_gemv_add_with_ctx kernel_gemv_add
 #define tensor_gemv_batch_with_ctx kernel_gemv_batch

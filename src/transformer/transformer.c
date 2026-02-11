@@ -19,18 +19,15 @@
 layer_buffers_t init_layer_buffers(const struct inference_session_t* session,
                                    const gemma3_270m_config_t* config,
                                    int d_model,
-                                   int head_dim) {
+                                   int head_dim,
+                                   int batch_size) {
     // Buffers from scratch space based on inference.c layout:
-    // 0: hidden (passed in)
+    // Layout is (Batch x Dim) for each buffer type.
+    // 0: hidden (passed in, at session->scratch_buffer)
     // 1: residual
     // 2: norm_buf
-    // 3: q_proj
-    // 4: k_proj
-    // 5: v_proj
-    // 6: attn_out
-    // 7: ffn_gate
-    // 8: ffn_value
-    // 9: geglu_input
+    // ...
+    int max_batch = 32;
 
     layer_buffers_t buf = {0};
 
@@ -38,16 +35,22 @@ layer_buffers_t init_layer_buffers(const struct inference_session_t* session,
     buf.pi = session->padded_d_inner;
     buf.pk = session->padded_d_kv;
     buf.pf = session->padded_d_ff;
+    buf.batch_size = batch_size;
 
-    buf.residual = session->scratch_buffer + buf.pm;
-    buf.norm_buf = session->scratch_buffer + 2 * buf.pm;
-    buf.q_proj = session->scratch_buffer + 3 * buf.pm;
-    buf.k_proj = buf.q_proj + buf.pi;
-    buf.v_proj = buf.k_proj + buf.pk;
-    buf.attn_out = buf.v_proj + buf.pk;
-    buf.ffn_gate_buf = buf.attn_out + buf.pi;
-    buf.ffn_value_buf = buf.ffn_gate_buf + buf.pf;
-    buf.geglu_buf = buf.ffn_value_buf + buf.pf;
+    size_t batch_m = (size_t)max_batch * buf.pm;
+    size_t batch_i = (size_t)max_batch * buf.pi;
+    size_t batch_k = (size_t)max_batch * buf.pk;
+    size_t batch_f = (size_t)max_batch * buf.pf;
+
+    buf.residual = session->scratch_buffer + batch_m;
+    buf.norm_buf = session->scratch_buffer + 2 * batch_m;
+    buf.q_proj = session->scratch_buffer + 3 * batch_m;
+    buf.k_proj = buf.q_proj + batch_i;
+    buf.v_proj = buf.k_proj + batch_k;
+    buf.attn_out = buf.v_proj + batch_k;
+    buf.ffn_gate_buf = buf.attn_out + batch_i;
+    buf.ffn_value_buf = buf.ffn_gate_buf + batch_f;
+    buf.geglu_buf = buf.ffn_value_buf + batch_f;
 
     /*
      * Dedicated scratch region for dequantized weight rows returned by
@@ -65,11 +68,29 @@ layer_buffers_t init_layer_buffers(const struct inference_session_t* session,
     if ((size_t)max_needed <= scratch_floats) {
         buf.weight_scratch = session->scratch_buffer + (scratch_floats - max_needed);
     } else {
-        LOG_WARN("Insufficient scratch for weight_scratch: need=%d have=%zu; falling back to q_proj (may alias)",
+        LOG_WARN("Insufficient scratch for weight_scratch: need=%d have=%zu; falling back to q_proj",
                  max_needed, scratch_floats);
-        buf.weight_scratch = buf.q_proj; /* best-effort fallback to previous behavior */
+        buf.weight_scratch = buf.q_proj;
     }
     return buf;
+}
+
+typedef struct {
+    float* gate;
+    const float* up;
+    int size;
+    int stride;
+} geglu_parallel_args_t;
+
+static void geglu_parallel_fn(void* arg, int idx) {
+    geglu_parallel_args_t* a = (geglu_parallel_args_t*)arg;
+    float* g = a->gate + (size_t)idx * a->stride;
+    const float* u = a->up + (size_t)idx * a->stride;
+    
+    gelu_inplace(g, a->size);
+    for (int i = 0; i < a->size; ++i) {
+        g[i] *= u[i];
+    }
 }
 
 void compute_ffn_stage(layer_buffers_t buf,
@@ -95,12 +116,19 @@ void compute_ffn_stage(layer_buffers_t buf,
         }
     }
 
-    rmsnorm_delta(buf.norm_buf, buf.residual, norm_ffn_data, 1e-6f, ctx->d_model);
+    for (int b = 0; b < ctx->batch_size; b++) {
+        rmsnorm_delta(buf.norm_buf + b * buf.pm, buf.residual + b * buf.pm, norm_ffn_data, 1e-6f, ctx->d_model);
+    }
 
     /* 11. GEMMA3: GeGLU FFN. Compute gate and value projections, apply GeGLU,
      * then project down. */
-    tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.ffn_gate_buf, ctx->layer->gate_proj_weight, buf.norm_buf);
-    tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.ffn_value_buf, ctx->layer->up_proj_weight, buf.norm_buf);
+    if (ctx->batch_size == 1) {
+        tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.ffn_gate_buf, ctx->layer->gate_proj_weight, buf.norm_buf);
+        tensor_gemv_with_ctx(ctx->session->gemv_ctx, buf.ffn_value_buf, ctx->layer->up_proj_weight, buf.norm_buf);
+    } else {
+        tensor_gemm_with_ctx(ctx->session->gemv_ctx, buf.ffn_gate_buf, ctx->layer->gate_proj_weight, buf.norm_buf, ctx->batch_size, buf.pf);
+        tensor_gemm_with_ctx(ctx->session->gemv_ctx, buf.ffn_value_buf, ctx->layer->up_proj_weight, buf.norm_buf, ctx->batch_size, buf.pf);
+    }
 
     if (getenv("SAPPHIRE_LOG_TENSORS") && ctx->token_pos == 0) {
         float r_g = 0, r_u = 0;
@@ -109,26 +137,24 @@ void compute_ffn_stage(layer_buffers_t buf,
         LOG_DEBUG("Layer %d FFN Proj RMS: G=%.3f U=%.3f", ctx->layer_idx, r_g, r_u);
     }
 
-    // Targeted dump: GEGLU inputs for Layer 0 Token 0
-    if (ctx->layer_idx == 0 && ctx->token_pos == 0 && getenv("SAPPHIRE_DEBUG_DUMPS")) {
-        int n_print = ctx->config->intermediate_size < 16 ? ctx->config->intermediate_size : 16;
-        int nonfinite_gate = 0, nonfinite_val = 0;
-        for (int i = 0; i < ctx->config->intermediate_size; ++i) {
-            if (!isfinite(buf.ffn_gate_buf[i])) nonfinite_gate++;
-            if (!isfinite(buf.ffn_value_buf[i])) nonfinite_val++;
-        }
-        LOG_DEBUG("DUMP GEGLU L0: non-finite Gate=%d Value=%d size=%d", nonfinite_gate, nonfinite_val, ctx->config->intermediate_size);
-        for (int i = 0; i < n_print; ++i) {
-            LOG_DEBUG("DUMP GEGLU L0 Gate[%d]=%.9g Value[%d]=%.9g", i, buf.ffn_gate_buf[i], i, buf.ffn_value_buf[i]);
-        }
-    }
-
     // Combine Gate (apply GELU on gate) and Value via GeGLU into `ffn_gate_buf` output
-    // Optimized in-place GeGLU: apply GELU to gate buffer then element-wise multiply
-    // by the value buffer to avoid extra memcpy and temporary buffer usage.
-    gelu_inplace(buf.ffn_gate_buf, ctx->config->intermediate_size);
-    for (int _i = 0; _i < ctx->config->intermediate_size; ++_i) {
-        buf.ffn_gate_buf[_i] *= buf.ffn_value_buf[_i];
+    if (ctx->session->gemv_ctx && ctx->batch_size > 1) {
+        geglu_parallel_args_t g_args = {
+            .gate = buf.ffn_gate_buf,
+            .up = buf.ffn_value_buf,
+            .size = ctx->config->intermediate_size,
+            .stride = buf.pf
+        };
+        kernel_parallel_for(ctx->session->gemv_ctx, geglu_parallel_fn, &g_args, ctx->batch_size);
+    } else {
+        for (int b = 0; b < ctx->batch_size; b++) {
+            float* g = buf.ffn_gate_buf + b * buf.pf;
+            const float* u = buf.ffn_value_buf + b * buf.pf;
+            gelu_inplace(g, ctx->config->intermediate_size);
+            for (int _i = 0; _i < ctx->config->intermediate_size; ++_i) {
+                g[_i] *= u[_i];
+            }
+        }
     }
 
     if (getenv("SAPPHIRE_LOG_TENSORS") && ctx->token_pos == 0) {
@@ -137,22 +163,48 @@ void compute_ffn_stage(layer_buffers_t buf,
         LOG_DEBUG("Layer %d Activation RMS: %.3f", ctx->layer_idx, r_a);
     }
 
-    tensor_gemv_with_ctx(ctx->session->gemv_ctx, hidden, ctx->layer->down_proj_weight, buf.ffn_gate_buf);
+    if (ctx->batch_size == 1) {
+        tensor_gemv_with_ctx(ctx->session->gemv_ctx, hidden, ctx->layer->down_proj_weight, buf.ffn_gate_buf);
+    } else {
+        tensor_gemm_with_ctx(ctx->session->gemv_ctx, hidden, ctx->layer->down_proj_weight, buf.ffn_gate_buf, ctx->batch_size, ctx->d_model);
+    }
 }
 
-static void debug_log_ffn_norm(const transformer_layer_ctx_t* ctx, const layer_buffers_t* buf, const float* norm_post_w, const float* hidden) {
-    if (ctx->layer_idx == 0 && ctx->token_pos == 0) {
-        float mn, mx, rms;
-        vec_stats(norm_post_w, ctx->d_model, &mn, &mx, &rms);
-        LOG_DEBUG("DEBUG: Layer %d Norm FFN Post weights ptr=%p len=%d RMS=%.6f",
-                  ctx->layer_idx, (void*)ctx->layer->norm_ffn_post_weight, ctx->d_model, rms);
-        LOG_DEBUG("DEBUG: scratch pointers: attn_out=%p norm_buf=%p residual=%p",
-                  buf->attn_out, buf->norm_buf, buf->residual);
-    }
-    if (getenv("SAPPHIRE_DEBUG_LOGITS") && ctx->layer_idx == 17 && ctx->token_pos == 0) {
-        float mn, mx, rms;
-        vec_stats(hidden, ctx->d_model, &mn, &mx, &rms);
-        fprintf(stderr, "[DEBUG_L17_FFN_PRE_NORM] hidden RMS before ffn post-norm: min=%.6f max=%.6f rms=%.6f\n", mn, mx, rms);
+typedef struct {
+    float* hidden;
+    const float* residual;
+    float* norm_buf;
+    const float* weight;
+    int d_model;
+    bool is_delta;
+} parallel_norm_args_t;
+
+static void parallel_finalize_fn(void* arg, int b) {
+    parallel_norm_args_t* a = (parallel_norm_args_t*)arg;
+    float* h_b = a->hidden + b * a->d_model;
+    const float* r_b_const = a->residual + b * a->d_model;
+    float* r_b = (float*)r_b_const; // We know it's mutable in this context
+    float* n_b = a->norm_buf + b * a->d_model;
+
+    if (a->weight) {
+        if (a->is_delta) {
+            rmsnorm_delta(n_b, h_b, a->weight, 1e-6f, a->d_model);
+            for (int i = 0; i < a->d_model; i++) {
+                r_b[i] += n_b[i];
+                h_b[i] = r_b[i];
+            }
+        } else {
+            rmsnorm(n_b, h_b, a->weight, a->d_model, 1e-6f);
+            for (int i = 0; i < a->d_model; i++) {
+                r_b[i] += n_b[i];
+                h_b[i] = r_b[i];
+            }
+        }
+    } else {
+        for (int i = 0; i < a->d_model; i++) {
+            r_b[i] += h_b[i];
+            h_b[i] = r_b[i];
+        }
     }
 }
 
@@ -168,25 +220,58 @@ void finalize_layer_output(layer_buffers_t buf,
         int n_post = tensor_shape(ctx->layer->norm_ffn_post_weight)[0];
         if (n_post == ctx->d_model) {
             const float* norm_post_w = get_norm_weights(ctx->layer->norm_ffn_post_weight, buf.weight_scratch, ctx->d_model);
-            debug_log_ffn_norm(ctx, &buf, norm_post_w, hidden);
-            rmsnorm_delta(buf.norm_buf, hidden, norm_post_w, 1e-6f, ctx->d_model);
-
-            if (getenv("SAPPHIRE_DEBUG_LOGITS") && ctx->layer_idx == 17 && ctx->token_pos == 0) {
-                float mn, mx, rms;
-                vec_stats(buf.norm_buf, ctx->d_model, &mn, &mx, &rms);
-                fprintf(stderr, "[DEBUG_L17_FFN_POST_NORM] norm_buf RMS after ffn post-norm: min=%.6f max=%.6f rms=%.6f\n", mn, mx, rms);
+            
+            if (ctx->session->gemv_ctx && ctx->batch_size > 1) {
+                parallel_norm_args_t p_args = {
+                    .hidden = hidden, .residual = buf.residual, .norm_buf = buf.norm_buf,
+                    .weight = norm_post_w, .d_model = ctx->d_model, .is_delta = true
+                };
+                kernel_parallel_for(ctx->session->gemv_ctx, parallel_finalize_fn, &p_args, ctx->batch_size);
+            } else {
+                for (int b = 0; b < ctx->batch_size; b++) {
+                    float* h_b = hidden + b * ctx->d_model;
+                    float* r_b = buf.residual + b * buf.pm;
+                    float* n_b = buf.norm_buf + b * buf.pm;
+                    
+                    rmsnorm_delta(n_b, h_b, norm_post_w, 1e-6f, ctx->d_model);
+                    vec_add(r_b, n_b, ctx->d_model);
+                    vec_copy(h_b, r_b, ctx->d_model);
+                }
             }
-            vec_add(buf.residual, buf.norm_buf, ctx->d_model);
         } else {
             LOG_WARN("using weightless RMSNorm for layer %d", ctx->layer_idx);
-            for (int i = 0; i < ctx->d_model; i++) buf.q_proj[i] = 1.0f;
-            rmsnorm(buf.norm_buf, hidden, buf.q_proj, 1e-6f, ctx->d_model);
-            vec_add(buf.residual, buf.norm_buf, ctx->d_model);
+            float* ones = (float*)malloc(ctx->d_model * sizeof(float));
+            if (ones) {
+                for (int i = 0; i < ctx->d_model; i++) ones[i] = 1.0f;
+                
+                for (int b = 0; b < ctx->batch_size; b++) {
+                    float* h_b = hidden + b * ctx->d_model;
+                    float* r_b = buf.residual + b * buf.pm;
+                    float* n_b = buf.norm_buf + b * buf.pm;
+                    
+                    rmsnorm(n_b, h_b, ones, 1e-6f, ctx->d_model);
+                    vec_add(r_b, n_b, ctx->d_model);
+                    vec_copy(h_b, r_b, ctx->d_model);
+                }
+                free(ones);
+            }
         }
     } else {
-        vec_add(buf.residual, hidden, ctx->d_model);
+        if (ctx->session->gemv_ctx && ctx->batch_size > 1) {
+             parallel_norm_args_t p_args = {
+                .hidden = hidden, .residual = buf.residual, .norm_buf = buf.norm_buf,
+                .weight = NULL, .d_model = ctx->d_model, .is_delta = false
+            };
+            kernel_parallel_for(ctx->session->gemv_ctx, parallel_finalize_fn, &p_args, ctx->batch_size);
+        } else {
+            for (int b = 0; b < ctx->batch_size; b++) {
+                float* h_b = hidden + b * ctx->d_model;
+                float* r_b = buf.residual + b * buf.pm;
+                vec_add(r_b, h_b, ctx->d_model);
+                vec_copy(h_b, r_b, ctx->d_model);
+            }
+        }
     }
-    vec_copy(hidden, buf.residual, ctx->d_model);
 
     /* Comparator-friendly per-layer output RMS (env-var controlled).
      * Print after layer output is finalized. */
@@ -202,7 +287,7 @@ void finalize_layer_output(layer_buffers_t buf,
  * @brief Forward pass for a single transformer layer.
  */
 int sapphire_transformer_layer(struct inference_session_t* session, int layer_idx, int token_pos, float* hidden,
-                               const float* rope_cos, const float* rope_sin) {
+                               transformer_rope_t rope) {
     llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
     model_layer_weights_t* layer = &model->layers[layer_idx];
     gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
@@ -210,7 +295,7 @@ int sapphire_transformer_layer(struct inference_session_t* session, int layer_id
     int d_model = config->hidden_size;
     int head_dim = config->head_dim > 0 ? config->head_dim : (d_model / config->num_attention_heads);
 
-    layer_buffers_t buf = init_layer_buffers(session, config, d_model, head_dim);
+    layer_buffers_t buf = init_layer_buffers(session, config, d_model, head_dim, 1);
 
     transformer_layer_ctx_t ctx = {
         .session = session,
@@ -218,11 +303,41 @@ int sapphire_transformer_layer(struct inference_session_t* session, int layer_id
         .config = config,
         .layer_idx = layer_idx,
         .token_pos = token_pos,
+        .batch_size = 1,
         .d_model = d_model,
         .head_dim = head_dim
     };
 
-    compute_attention_stage(buf, &ctx, hidden, rope_cos, rope_sin);
+    compute_attention_stage(buf, &ctx, hidden, rope.cos, rope.sin);
+    compute_ffn_stage(buf, &ctx, hidden);
+    finalize_layer_output(buf, &ctx, hidden);
+
+    return 0;
+}
+
+int sapphire_transformer_layer_batch(struct inference_session_t* session, int layer_idx, int start_pos, int batch_size, float* hidden,
+                                     transformer_rope_t rope) {
+    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
+    model_layer_weights_t* layer = &model->layers[layer_idx];
+    gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
+
+    int d_model = config->hidden_size;
+    int head_dim = config->head_dim > 0 ? config->head_dim : (d_model / config->num_attention_heads);
+
+    layer_buffers_t buf = init_layer_buffers(session, config, d_model, head_dim, batch_size);
+
+    transformer_layer_ctx_t ctx = {
+        .session = session,
+        .layer = layer,
+        .config = config,
+        .layer_idx = layer_idx,
+        .token_pos = start_pos,
+        .batch_size = batch_size,
+        .d_model = d_model,
+        .head_dim = head_dim
+    };
+
+    compute_attention_stage(buf, &ctx, hidden, rope.cos, rope.sin);
     compute_ffn_stage(buf, &ctx, hidden);
     finalize_layer_output(buf, &ctx, hidden);
 
@@ -243,15 +358,23 @@ void sapphire_embed_lookup(struct inference_session_t* session, int token_id, fl
     }
 
     // Gemma 3 requires input embeddings to be scaled by sqrt(d_model)
-    // ENABLED: RMS=0.04 (raw) * 25.3 = ~1.0 (correct for transformer inputs)
     if (!getenv("SAPPHIRE_NO_EMBED_SCALE")) {
         float embed_scale = sqrtf((float)config->hidden_size);
         vec_scale(hidden, embed_scale, config->hidden_size);
+    }
+}
 
-        if (getenv("SAPPHIRE_LOG_TENSORS")) {
-            float mn, mx, rms;
-            vec_stats(hidden, config->hidden_size, &mn, &mx, &rms);
-            LOG_DEBUG("DEBUG[EMBED]: token=%d after_scale rms=%.4f scale=%.4f", token_id, rms, embed_scale);
+void sapphire_embed_lookup_batch(struct inference_session_t* session, const int* token_ids, int batch_size, float* hidden) {
+    const llm_model_t* model = (const llm_model_t*)session->model_spec->llm_model;
+    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
+    const uint16_t* embed_table_bf16 = (const uint16_t*)tensor_data(model->embedding_weight);
+    float embed_scale = getenv("SAPPHIRE_NO_EMBED_SCALE") ? 1.0f : sqrtf((float)config->hidden_size);
+
+    for (int i = 0; i < batch_size; i++) {
+        float* h_i = hidden + i * config->hidden_size;
+        bf16_to_f32_vec(h_i, embed_table_bf16 + (token_ids[i] * config->hidden_size), config->hidden_size);
+        if (embed_scale != 1.0f) {
+            vec_scale(h_i, embed_scale, config->hidden_size);
         }
     }
 }
@@ -270,8 +393,13 @@ void sapphire_embed_lookup(struct inference_session_t* session, int token_id, fl
 void lm_head(struct inference_session_t* session, const float* hidden, float* logits) {
     const llm_model_t* model = (const llm_model_t*)session->model_spec->llm_model;
     const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
-    float* scratch_norm = session->scratch_buffer + 2 * session->padded_d_model;
-    float* tmp_w = session->scratch_buffer + 3 * session->padded_d_model;
+    
+    // We use a temporary slice from the end of the scratch buffer for normalization
+    // to avoid clobbering the batched hidden states.
+    int pad_m = session->padded_d_model;
+    float* scratch_norm = session->scratch_buffer + (session->scratch_size / sizeof(float)) - (size_t)2 * pad_m;
+    float* tmp_w = scratch_norm + pad_m;
+    
     const float* final_w = get_norm_weights(model->norm_final_weight, tmp_w, config->hidden_size);
 
     // Gemma 3 uses delta variant for normalization weights
