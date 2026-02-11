@@ -546,6 +546,13 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
         destroy_inference_session(session);
         return NULL;
     }
+    
+    // Initialize persistent worker threads
+    if (kernel_ctx_init(session->gemv_ctx) != 0) {
+        LOG_ERROR("Failed to initialize GEMV worker threads");
+        destroy_inference_session(session);
+        return NULL;
+    }
 
     // Load and initialize layer configurations (dispatch routing)
     session->num_layers = config->num_hidden_layers;
