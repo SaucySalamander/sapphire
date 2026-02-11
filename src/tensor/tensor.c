@@ -308,14 +308,22 @@ void tensor_print_info(const tensor_t *t) {
         return;
     }
 
-    char shape_buf[128];
-    int pos = 0;
-    pos += snprintf(shape_buf + pos, sizeof(shape_buf) - pos, "[");
-    for (int i = 0; i < t->ndim; i++) {
-        if (i > 0) pos += snprintf(shape_buf + pos, sizeof(shape_buf) - pos, ",");
-        pos += snprintf(shape_buf + pos, sizeof(shape_buf) - pos, "%d", t->shape[i]);
+    // Safely format shape into an allocated string
+    // Max 12 chars per dimension (10 digits + comma + space) + 3 for brackets/null
+    size_t shape_size = (size_t)t->ndim * 12 + 3;
+    char *shape_buf = malloc(shape_size);
+    if (!shape_buf) {
+        LOG_ERROR("Failed to allocate shape buffer");
+        return;
     }
-    snprintf(shape_buf + pos, sizeof(shape_buf) - pos, "]");
+
+    int pos = 0;
+    pos += snprintf(shape_buf + pos, shape_size - pos, "[");
+    for (int i = 0; i < t->ndim; i++) {
+        if (i > 0) pos += snprintf(shape_buf + pos, shape_size - pos, ",");
+        pos += snprintf(shape_buf + pos, shape_size - pos, "%d", t->shape[i]);
+    }
+    snprintf(shape_buf + pos, shape_size - pos, "]");
 
     LOG_INFO("Tensor shape=%s dtype=%s layout=%s %zu bytes ref_count=%d",
              shape_buf,
@@ -323,6 +331,8 @@ void tensor_print_info(const tensor_t *t) {
              t->layout == LAYOUT_ROW_MAJOR ? "row-major" : "col-major",
              t->nbytes,
              t->ref_count);
+    
+    free(shape_buf);
 }
 
 // ============================================================================

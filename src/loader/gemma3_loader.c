@@ -225,8 +225,10 @@ static void populate_config_layer_types(const char* json, const sjson_token_t* t
 static int load_gemma3_config_json_from_dir(const char* dir, model_spec_t* spec) {
     if (!dir || !spec) return -1;
 
-    char cfg_path[1200];
-    snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", dir);
+    char *cfg_path = construct_safe_path(dir, "config.json", NULL);
+    if (!cfg_path) {
+        return -1;
+    }
 
     char* json = NULL;
     size_t json_len = 0;
@@ -234,8 +236,10 @@ static int load_gemma3_config_json_from_dir(const char* dir, model_spec_t* spec)
     int result = -1;
 
     if (file_read_json(cfg_path, &json, &json_len) != 0) {
+        free(cfg_path);
         return -1;
     }
+    free(cfg_path);
 
     sjson_token_t tokens[2048];
     int nt = sjson_tokenize(json, tokens, (int)(sizeof(tokens) / sizeof(tokens[0])));

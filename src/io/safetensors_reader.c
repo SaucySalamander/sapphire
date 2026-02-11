@@ -504,14 +504,22 @@ void safetensors_print_info(const safetensors_file_t *st) {
     for (int i = 0; i < st->tensor_count; i++) {
         const safetensors_tensor_meta_t *t = &st->tensors[i];
         
-        char shape_buf[128];
-        int pos = 0;
-        pos += snprintf(shape_buf + pos, sizeof(shape_buf) - pos, "[");
-        for (int j = 0; j < t->ndim; j++) {
-            if (j > 0) pos += snprintf(shape_buf + pos, sizeof(shape_buf) - pos, ", ");
-            pos += snprintf(shape_buf + pos, sizeof(shape_buf) - pos, "%u", t->shape[j]);
+        // Safely format shape into an allocated string
+        // Max 12 chars per dimension (10 digits + comma + space) + 3 for brackets/null
+        size_t shape_size = (size_t)t->ndim * 12 + 3;
+        char *shape_buf = malloc(shape_size);
+        if (!shape_buf) {
+            LOG_ERROR("Failed to allocate shape buffer for tensor %s", t->name);
+            continue;
         }
-        snprintf(shape_buf + pos, sizeof(shape_buf) - pos, "]");
+
+        int pos = 0;
+        pos += snprintf(shape_buf + pos, shape_size - pos, "[");
+        for (int j = 0; j < t->ndim; j++) {
+            if (j > 0) pos += snprintf(shape_buf + pos, shape_size - pos, ", ");
+            pos += snprintf(shape_buf + pos, shape_size - pos, "%u", t->shape[j]);
+        }
+        snprintf(shape_buf + pos, shape_size - pos, "]");
 
         const char *dtype_str = "UNKNOWN";
         switch (t->dtype) {
@@ -528,6 +536,8 @@ void safetensors_print_info(const safetensors_file_t *st) {
         LOG_INFO("  Dtype: %s", dtype_str);
         LOG_INFO("  Offset: %lu bytes", (unsigned long)t->offset);
         LOG_INFO("  Size: %lu bytes", (unsigned long)t->size_bytes);
+        
+        free(shape_buf);
     }
     
     LOG_INFO("================================================================================");
