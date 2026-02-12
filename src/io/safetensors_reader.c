@@ -514,10 +514,16 @@ void safetensors_print_info(const safetensors_file_t *st) {
         }
 
         int pos = 0;
-        pos += snprintf(shape_buf + pos, shape_size - pos, "[");
+        int n = snprintf(shape_buf + pos, shape_size - pos, "[");
+        if (n > 0 && (size_t)n < shape_size - pos) pos += n;
+
         for (int j = 0; j < t->ndim; j++) {
-            if (j > 0) pos += snprintf(shape_buf + pos, shape_size - pos, ", ");
-            pos += snprintf(shape_buf + pos, shape_size - pos, "%u", t->shape[j]);
+            if (j > 0) {
+                n = snprintf(shape_buf + pos, shape_size - pos, ", ");
+                if (n > 0 && (size_t)n < shape_size - pos) pos += n;
+            }
+            n = snprintf(shape_buf + pos, shape_size - pos, "%u", t->shape[j]);
+            if (n > 0 && (size_t)n < shape_size - pos) pos += n;
         }
         snprintf(shape_buf + pos, shape_size - pos, "]");
 

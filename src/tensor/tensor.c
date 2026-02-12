@@ -318,10 +318,16 @@ void tensor_print_info(const tensor_t *t) {
     }
 
     int pos = 0;
-    pos += snprintf(shape_buf + pos, shape_size - pos, "[");
+    int n = snprintf(shape_buf + pos, shape_size - pos, "[");
+    if (n > 0 && (size_t)n < shape_size - pos) pos += n;
+
     for (int i = 0; i < t->ndim; i++) {
-        if (i > 0) pos += snprintf(shape_buf + pos, shape_size - pos, ",");
-        pos += snprintf(shape_buf + pos, shape_size - pos, "%d", t->shape[i]);
+        if (i > 0) {
+            n = snprintf(shape_buf + pos, shape_size - pos, ",");
+            if (n > 0 && (size_t)n < shape_size - pos) pos += n;
+        }
+        n = snprintf(shape_buf + pos, shape_size - pos, "%d", t->shape[i]);
+        if (n > 0 && (size_t)n < shape_size - pos) pos += n;
     }
     snprintf(shape_buf + pos, shape_size - pos, "]");
 
