@@ -30,7 +30,7 @@ TARGETS = \
 	$(OUTDIR)/sapphire \
 
 
-.PHONY: all bench test clean
+.PHONY: all bench check-bench bench_f32 bench_bf16 test clean
 
 all: $(TARGETS)
 
@@ -84,8 +84,40 @@ $(OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(OUTDIR)
 NON_TEST_SRCS := $(shell find $(SRCDIR) -type f -name '*.c' ! -path '$(SRCDIR)/test/*' ! -name 'test_*.c' ! -name '*_test.c' -print)
 NON_TEST_OBJS := $(patsubst $(SRCDIR)/%.c,$(OUTDIR)/%.o,$(NON_TEST_SRCS))
 
+# Library objects (non-test objects excluding main.o)
+LIB_OBJS := $(filter-out $(OUTDIR)/main.o, $(NON_TEST_OBJS))
+
 $(OUTDIR)/sapphire: $(NON_TEST_OBJS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+
+# ============================================================================
+# Test Build Rules
+# ============================================================================
+
+# Test sources
+TEST_SRCS := $(shell find $(SRCDIR)/test -name 'test_*.c' ! -name 'test_tokenizer_debug.c')
+TEST_BINS := $(patsubst $(SRCDIR)/test/%.c, $(OUTDIR)/test/%, $(TEST_SRCS))
+
+# Rule for test objects
+$(OUTDIR)/test/%.o: $(SRCDIR)/test/%.c | $(OUTDIR)
+	mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Rule for test binaries
+$(OUTDIR)/test/%: $(OUTDIR)/test/%.o $(LIB_OBJS)
+	$(CC) $(CFLAGS) $< $(LIB_OBJS) -o $@ $(LDFLAGS)
+
+# Test target
+test: $(TEST_BINS)
+	@echo "Running tests..."
+	@for test in $(TEST_BINS); do \
+		echo "----------------------------------------------------------------"; \
+		echo "Running $$test..."; \
+		$$test || exit 1; \
+	done
+	@echo "----------------------------------------------------------------"
+	@echo "All tests passed!"
 
 
 # ============================================================================
@@ -274,3 +306,30 @@ lizard-report: $(REPORTS_DIR)
 	@if [ -f $(REPORTS_DIR)/lizard-report.html ]; then \
 	  xdg-open $(REPORTS_DIR)/lizard-report.html 2>/dev/null || open $(REPORTS_DIR)/lizard-report.html 2>/dev/null || firefox $(REPORTS_DIR)/lizard-report.html 2>/dev/null || echo "Open $(REPORTS_DIR)/lizard-report.html manually"; \
 	fi
+
+BENCH_BINS := $(OUTDIR)/bench_q4 $(OUTDIR)/bench_q8 $(OUTDIR)/bench_end_to_end $(OUTDIR)/bench_f32 $(OUTDIR)/bench_bf16
+
+bench: $(BENCH_BINS) check-bench
+
+check-bench: $(BENCH_BINS)
+	@bash scripts/check_benchmarks.sh
+
+$(OUTDIR)/bench_q4: $(OUTDIR)/test/bench/bench_q4.o $(LIB_OBJS)
+	$(CC) $(CFLAGS) $< $(LIB_OBJS) -o $@ $(LDFLAGS)
+
+$(OUTDIR)/bench_q8: $(OUTDIR)/test/bench/bench_q8.o $(LIB_OBJS)
+	$(CC) $(CFLAGS) $< $(LIB_OBJS) -o $@ $(LDFLAGS)
+
+$(OUTDIR)/bench_end_to_end: $(OUTDIR)/test/bench/bench_sapphire_end_to_end.o $(LIB_OBJS)
+	$(CC) $(CFLAGS) $< $(LIB_OBJS) -o $@ $(LDFLAGS)
+
+
+bench_f32: $(OUTDIR)/bench_f32
+bench_bf16: $(OUTDIR)/bench_bf16
+
+$(OUTDIR)/bench_f32: $(OUTDIR)/test/bench/bench_f32.o $(LIB_OBJS)
+	$(CC) $(CFLAGS) $< $(LIB_OBJS) -o $@ $(LDFLAGS)
+
+$(OUTDIR)/bench_bf16: $(OUTDIR)/test/bench/bench_bf16.o $(LIB_OBJS)
+	$(CC) $(CFLAGS) $< $(LIB_OBJS) -o $@ $(LDFLAGS)
+

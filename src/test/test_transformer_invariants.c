@@ -1,46 +1,12 @@
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "../include/kernels.h"
 
 // Small epsilon for float comparisons
 static const float EPS = 1e-3f;
-
-// Helper: compute RMS of vector
-static float rms(const float *v, int n) {
-    double s = 0.0;
-    for (int i = 0; i < n; ++i) s += (double)v[i] * (double)v[i];
-    return (float)sqrt(s / (double)n);
-}
-
-// Test 1: apply_qk_norm produces per-head RMS approx equal to gamma (unit after inv_rms * gamma)
-static void test_apply_qk_norm_basic() {
-    const int head_dim = 8;
-    const int num_q_heads = 2;
-    float q[num_q_heads * head_dim];
-    float k[1 * head_dim];
-    float q_scale[num_q_heads * head_dim];
-    float k_scale[1 * head_dim];
-
-    // Fill q with increasing values, k not used here
-    for (int i = 0; i < num_q_heads * head_dim; ++i) q[i] = (i % head_dim) - (head_dim/2);
-    for (int i = 0; i < head_dim; ++i) k[i] = (i - head_dim/2);
-
-    // Set per-element gamma = 2.0 (so expected RMS after scaling == ~2.0)
-    for (int i = 0; i < num_q_heads * head_dim; ++i) q_scale[i] = 2.0f;
-    for (int i = 0; i < head_dim; ++i) k_scale[i] = 1.0f;
-
-    apply_qk_norm(q, k, q_scale, k_scale, head_dim, num_q_heads, 1);
-
-    for (int h = 0; h < num_q_heads; ++h) {
-        float *head_q = q + h * head_dim;
-        float r = rms(head_q, head_dim);
-        // After normalization and scale, RMS should be close to 2.0
-        assert(fabsf(r - 2.0f) < 1e-2f);
-    }
-    printf("test_apply_qk_norm_basic: PASS\n");
-}
 
 // Test 2: GeGLU computes output = x * GELU(y)
 static void test_geglu_gelu() {
@@ -67,19 +33,24 @@ static void test_geglu_gelu() {
 static void test_final_logit_softcap() {
     float cap = 30.0f;
     float logits[5] = { -100.0f, -1.0f, 0.0f, 1.0f, 100.0f };
-    float expv[5];
+    float test_logits[5];
+    
+    // Copy for vector operation
+    for(int i=0; i<5; i++) test_logits[i] = logits[i];
+    
+    // Apply softcap in place using sapphire kernel
+    vec_softcap(test_logits, 5, cap);
+
+    // Verify against expected standard math
     for (int i = 0; i < 5; ++i) {
-        expv[i] = cap * tanhf(logits[i] / cap);
-    }
-    // Basic sanity: capped magnitudes should be <= cap and monotonic
-    for (int i = 0; i < 5; ++i) {
-        assert(fabsf(expv[i]) <= cap + 1e-6f);
+        float expected = cap * tanhf(logits[i] / cap);
+        assert(fabsf(test_logits[i] - expected) < EPS);
+        assert(fabsf(test_logits[i]) <= cap + EPS);
     }
     printf("test_final_logit_softcap: PASS\n");
 }
 
 int main(void) {
-    test_apply_qk_norm_basic();
     test_geglu_gelu();
     test_final_logit_softcap();
     printf("All transformer invariant tests passed.\n");

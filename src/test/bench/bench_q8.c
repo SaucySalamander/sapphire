@@ -57,6 +57,7 @@ int main(int argc, char **argv) {
     }
     double t1 = now_s();
     double elapsed_aligned = (t1 - t0) / repeats;
+    double wops_aligned = ((double)rows * (double)blocks_per_row * (double)block_size) / elapsed_aligned;
 
     // verify
     double max_diff = 0.0;
@@ -65,8 +66,8 @@ int main(int argc, char **argv) {
         if (d > max_diff) max_diff = d;
     }
 
-    printf("Q8 aligned: rows=%d blocks_per_row=%d elapsed_per_iter=%.6f s max_diff=%.6f\n",
-           rows, blocks_per_row, elapsed_aligned, max_diff);
+        printf("Q8 aligned: rows=%d blocks_per_row=%d elapsed_per_iter=%.6f s wops/s=%.2f max_diff=%.6f\n",
+            rows, blocks_per_row, elapsed_aligned, wops_aligned, max_diff);
 
     // benchmark unaligned (use x+1 to force unaligned loads)
     double t2 = now_s();
@@ -77,8 +78,9 @@ int main(int argc, char **argv) {
     }
     double t3 = now_s();
     double elapsed_unaligned = (t3 - t2) / repeats;
+    double wops_unaligned = ((double)rows * (double)blocks_per_row * (double)block_size) / elapsed_unaligned;
 
-    printf("Q8 unaligned (x+1): elapsed_per_iter=%.6f s\n", elapsed_unaligned);
+    printf("Q8 unaligned (x+1): elapsed_per_iter=%.6f s wops/s=%.2f\n", elapsed_unaligned, wops_unaligned);
 
     free(W); free(x); free(y_ref); free(y_avx);
     return 0;
