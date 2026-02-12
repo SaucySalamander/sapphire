@@ -52,6 +52,23 @@ jobs:
           make check-complexity
         continue-on-error: false
 
+      - name: Run Standard Tests
+        run: |
+          echo "Running standard unit tests..."
+          make test
+        continue-on-error: false
+
+      - name: Run Benchmarks (Throughput Gates)
+        env:
+          MIN_Q4_WOPS: "100000000"
+          MIN_Q8_WOPS: "100000000"
+          MIN_F32_WOPS: "1000000000"
+          MIN_BF16_WOPS: "1000000000"
+        run: |
+          echo "Building and validating benchmark throughput..."
+          make bench
+        continue-on-error: false
+
       - name: Build ASan/UBSan Binary
         run: |
           echo "Building with AddressSanitizer and UndefinedBehaviorSanitizer..."

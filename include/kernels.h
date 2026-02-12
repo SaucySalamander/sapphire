@@ -175,10 +175,21 @@ void silu_inplace(float *x, int n);
 
 /** ReLU: max(0, x) */
 float relu(float x);
+void relu_inplace(float *x, int n);
 
 /** GELU (approximate) */
 float gelu(float x);
 void gelu_inplace(float *x, int n);
+
+/** GeGLU helper: x * gelu(y) */
+float geglu(float x, float y);
+
+/** 
+ * GeGLU vector operation. 
+ * Input layout: [x_1...x_n, y_1...y_n] (size elements, n = size/2)
+ * Output: x[i] * GELU(y[i])
+ */
+int sapphire_geglu(float *output, const float *input, size_t size);
 
 /** RMSNorm: out[i] = (in[i] / RMS) * weight[i] */
 int rmsnorm(float *out, const float *in, const float *weight, float epsilon, int dim);

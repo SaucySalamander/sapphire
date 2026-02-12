@@ -37,8 +37,9 @@ static void test_tensor_gemv_f32_basic(void) {
     float x[] = {1, 1, 1, 1};
     
     // Initialize GEMV system (use explicit context)
-    sapphire_context *ctx = tensor_gemv_ctx_create(0, 1024);
+    kernel_context_t *ctx = tensor_gemv_ctx_create(0, 1024);
     assert(ctx != NULL);
+    assert(kernel_ctx_init(ctx) == 0);
     
     // Compute y = A @ x
     float y[m];
@@ -80,8 +81,9 @@ static void test_tensor_gemv_f32_random(void) {
     }
     
     // Initialize and compute (explicit context)
-    sapphire_context *ctx = tensor_gemv_ctx_create(0, 1024);
+    kernel_context_t *ctx = tensor_gemv_ctx_create(0, 1024);
     assert(ctx != NULL);
+    assert(kernel_ctx_init(ctx) == 0);
     
     float *y = (float *)malloc(m * sizeof(float));
     int ret = tensor_gemv_with_ctx(ctx, y, A, x);
@@ -132,8 +134,9 @@ static void test_tensor_gemv_tensor_wrapper(void) {
     }
     
     // Compute with explicit context
-    sapphire_context *ctx = tensor_gemv_ctx_create(0, 1024);
+    kernel_context_t *ctx = tensor_gemv_ctx_create(0, 1024);
     assert(ctx != NULL);
+    assert(kernel_ctx_init(ctx) == 0);
     int ret = tensor_gemv_tensor_with_ctx(ctx, y, A, x);
     assert(ret == 0);
     
@@ -181,8 +184,9 @@ static void test_tensor_gemv_add(void) {
     // Compute y += 1.0 * (A @ x)
     // A @ x = [2, 3, 5]
     // y should become [12, 23, 35]
-    sapphire_context *ctx = tensor_gemv_ctx_create(0, 1024);
+    kernel_context_t *ctx = tensor_gemv_ctx_create(0, 1024);
     assert(ctx != NULL);
+    assert(kernel_ctx_init(ctx) == 0);
     int ret = tensor_gemv_add_with_ctx(ctx, y, A, x, 1.0f);
     assert(ret == 0);
     
@@ -217,8 +221,9 @@ static void test_tensor_gemv_add_with_scaling(void) {
     // Compute y += 0.5 * (A @ x)
     // A @ x = [4, 4]
     // y should become [2, 2]
-    sapphire_context *ctx = tensor_gemv_ctx_create(0, 1024);
+    kernel_context_t *ctx = tensor_gemv_ctx_create(0, 1024);
     assert(ctx != NULL);
+    assert(kernel_ctx_init(ctx) == 0);
     int ret = tensor_gemv_add_with_ctx(ctx, y, A, x, 0.5f);
     assert(ret == 0);
     
@@ -257,8 +262,9 @@ static void test_tensor_gemv_batch(void) {
     float X[] = {1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
     float Y[batch_size * m];
     
-    sapphire_context *ctx = tensor_gemv_ctx_create(0, 1024);
+    kernel_context_t *ctx = tensor_gemv_ctx_create(0, 1024);
     assert(ctx != NULL);
+    assert(kernel_ctx_init(ctx) == 0);
     int ret = tensor_gemv_batch_with_ctx(ctx, Y, A, X, batch_size);
     assert(ret == 0);
     
@@ -321,8 +327,9 @@ static void test_tensor_gemv_init_cleanup_idempotent(void) {
     printf("TEST: tensor_gemv_init/cleanup idempotency\n");
     
     // We'll test context creation/destroy idempotency
-    sapphire_context *ctx = tensor_gemv_ctx_create(0, 1024);
+    kernel_context_t *ctx = tensor_gemv_ctx_create(0, 1024);
     assert(ctx != NULL);
+    assert(kernel_ctx_init(ctx) == 0);
     tensor_gemv_ctx_destroy(ctx);
     tensor_gemv_ctx_destroy(NULL); // destroy NULL-safe
     
@@ -354,8 +361,9 @@ static void test_tensor_gemv_large(void) {
         x[i] = 1.0f;
     }
     
-    sapphire_context *ctx = tensor_gemv_ctx_create(0, 1024);
+    kernel_context_t *ctx = tensor_gemv_ctx_create(0, 1024);
     assert(ctx != NULL);
+    assert(kernel_ctx_init(ctx) == 0);
     int ret = tensor_gemv_with_ctx(ctx, y, A, x);
     assert(ret == 0);
 
