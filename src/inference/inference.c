@@ -131,7 +131,7 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
     const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)spec->variant_config;
     ctx->logits = (float*)malloc(config->vocab_size * sizeof(float));
     if (!ctx->logits) {
-        fprintf(stderr, "ERROR: Failed to allocate logits buffer\n");
+        LOG_ERROR("Failed to allocate logits buffer");
         free(ctx);
         free(model_dir);
         return NULL;
@@ -140,7 +140,7 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
     // Create a single inference session for convenience (1:many supported via model_spec)
     ctx->session = inference_session_create(spec, context_len);
     if (!ctx->session) {
-        fprintf(stderr, "ERROR: Failed to create inference session\n");
+        LOG_ERROR("Failed to create inference session");
         free(ctx->logits);
         free(ctx);
         free(model_dir);
@@ -255,7 +255,7 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
         inference_forward(session, last_token, cur_pos, ctx->logits);
 
         if (generated_count == 0 && getenv("SAPPHIRE_DEBUG_LOGITS")) {
-            fprintf(stderr, "[DEBUG_GEN_LOOP] generated_count=%d, cur_pos=%d, total_tokens=%d\n", generated_count, cur_pos, total_tokens);
+            LOG_DEBUG("generated_count=%d, cur_pos=%d, total_tokens=%d", generated_count, cur_pos, total_tokens);
         }
 
         // Sample next token (Greedy or Temperature)
@@ -271,7 +271,7 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
             float min_l, max_l, rms_l;
             vec_stats(ctx->logits, config->vocab_size, &min_l, &max_l, &rms_l);
             if (rms_l < 0.5f) {
-                fprintf(stderr, "WARN: Logit RMS Low (%.4f) - Possible Probability Collapse / Uniform Distribution\n", rms_l);
+                LOG_WARN("Logit RMS Low (%.4f) - Possible Probability Collapse / Uniform Distribution", rms_l);
             }
         }
 
@@ -280,8 +280,8 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
         int debug_logits_pre_select = getenv("SAPPHIRE_DEBUG_LOGITS") != NULL;
         if (debug_logits_pre_select && generated_count == 0) {
             // Print actual logits for key tokens BEFORE sampling
-            fprintf(stderr, "[DEBUG_LOGITS_PRE_SELECT] token_106=%.6f token_818=%.6f token_236776=%.6f\n",
-                    ctx->logits[106], ctx->logits[818], ctx->logits[236776]);
+            LOG_DEBUG("token_106=%.6f token_818=%.6f token_236776=%.6f",
+                      ctx->logits[106], ctx->logits[818], ctx->logits[236776]);
             // Find argmax
             int max_idx = 0;
             float max_logit = ctx->logits[0];
@@ -291,7 +291,7 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
                     max_idx = i;
                 }
             }
-            fprintf(stderr, "[DEBUG_LOGITS_PRE_SELECT] argmax=token_%d with logit=%.6f\n", max_idx, max_logit);
+            LOG_DEBUG("argmax=token_%d with logit=%.6f", max_idx, max_logit);
         }
         
         int next_token = sample_temperature(ctx->logits, config->vocab_size, ctx->temperature);
@@ -327,7 +327,7 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
     // 4. Final Detokenization into the output buffer for the caller
     detokenize(ctx->tokenizer, tokens + prompt_len, generated_count, output, output_size);
 
-    printf("\n\nDEBUG: Generated %d tokens\n", generated_count);
+    LOG_DEBUG("Generated %d tokens", generated_count);
 
     free(tokens);
 
@@ -498,7 +498,7 @@ static int precompute_rope_frequencies(inference_session_t* session, const gemma
  */
 inference_session_t* inference_session_create(model_spec_t* spec, int max_context_len) {
     if (!spec) {
-        fprintf(stderr, "ERROR: inference_session_create requires model\n");
+        LOG_ERROR("inference_session_create requires model");
         return NULL;
     }
     LOG_DEBUG("Creating inference session for model: %s", spec->model_id);
@@ -506,19 +506,19 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
 
     llm_model_t* model = (llm_model_t*)spec->llm_model;
     if (!model) {
-        fprintf(stderr, "ERROR: Model is NULL in inference_session_create\n");
+        LOG_ERROR("Model is NULL in inference_session_create");
         return NULL;
     }
 
     gemma3_270m_config_t* config = (gemma3_270m_config_t*)spec->variant_config;
     if (!config) {
-        fprintf(stderr, "ERROR: Model config is NULL in inference_session_create\n");
+        LOG_ERROR("Model config is NULL in inference_session_create");
         return NULL;
     }
 
     inference_session_t* session = (inference_session_t*)malloc(sizeof(inference_session_t));
     if (!session) {
-        fprintf(stderr, "ERROR: Failed to allocate inference session\n");
+        LOG_ERROR("Failed to allocate inference session");
         return NULL;
     }
 

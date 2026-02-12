@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <log.h>
+#include <file_reader.h>
 
 typedef enum {
     MODEL_FORMAT_UNKNOWN = 0,
@@ -113,8 +114,10 @@ llm_model_t* load_model(const char *model_dir, const model_spec_t *model_spec) {
     }
     
     // Try to find model.safetensors first
-    char model_path[512];
-    snprintf(model_path, sizeof(model_path), "%s/model.safetensors", model_dir);
+    char *model_path = construct_safe_path(model_dir, "model.safetensors", NULL);
+    if (!model_path) {
+        return NULL;
+    }
     
     // Check if model.safetensors exists
     if (access(model_path, F_OK) != -1) {
@@ -122,6 +125,8 @@ llm_model_t* load_model(const char *model_dir, const model_spec_t *model_spec) {
         
         LOG_INFO("Loading Safetensors format model...");
         llm_model_t *model = load_model_safetensors(model_spec, model_path);
+        free(model_path);
+        
         if (model) {
             LOG_INFO("Model loaded successfully from Safetensors");
             return model;
@@ -130,7 +135,9 @@ llm_model_t* load_model(const char *model_dir, const model_spec_t *model_spec) {
             return NULL;
         }
     }
+    
     LOG_ERROR("No supported model file found in directory: %s", model_dir);
+    free(model_path);
     return NULL;
 }
 

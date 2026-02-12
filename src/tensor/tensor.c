@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "tensor.h"
+#include "../include/log.h"
 
 // Concrete definition of the tensor structure (private to this .c file)
 struct tensor_t {
@@ -80,14 +81,14 @@ static size_t shape_product(int ndim, const int *shape) {
 tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype) {
     // Validate inputs
     if (ndim < 1 || ndim > 8 || !shape) {
-        fprintf(stderr, "ERROR: tensor_create invalid ndim=%d or null shape\n", ndim);
+        LOG_ERROR("tensor_create invalid ndim=%d or null shape", ndim);
         return NULL;
     }
 
     // Allocate tensor struct
     tensor_t *t = (tensor_t *)malloc(sizeof(tensor_t));
     if (!t) {
-        fprintf(stderr, "ERROR: tensor_create malloc failed for tensor_t\n");
+        LOG_ERROR("tensor_create malloc failed for tensor_t");
         return NULL;
     }
 
@@ -113,7 +114,7 @@ tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype) {
     // Allocate tensor data (zero-initialized)
     t->data = calloc(t->nbytes, 1);
     if (!t->data) {
-        fprintf(stderr, "ERROR: tensor_create calloc failed for %zu bytes\n", t->nbytes);
+        LOG_ERROR("tensor_create calloc failed for %zu bytes", t->nbytes);
         free(t);
         return NULL;
     }
@@ -226,7 +227,7 @@ size_t tensor_numel(const tensor_t *t) {
  */
 float tensor_get_f32(const tensor_t *t, size_t idx) {
     if (!t || idx >= tensor_numel(t)) {
-        fprintf(stderr, "ERROR: tensor_get_f32 invalid index %zu\n", idx);
+        LOG_ERROR("tensor_get_f32 invalid index %zu", idx);
         return 0.0f;
     }
 
@@ -238,7 +239,7 @@ float tensor_get_f32(const tensor_t *t, size_t idx) {
         // Placeholder: quantized dequantization
         // TODO: Integrate actual dequantization from Phase 1 (ggml_reader.c)
         // For now, return 0.0 to indicate unsupported
-        fprintf(stderr, "WARNING: tensor_get_f32 quantized dequantization not yet implemented\n");
+        LOG_WARN("tensor_get_f32 quantized dequantization not yet implemented");
         return 0.0f;
     }
 
@@ -255,12 +256,12 @@ float tensor_get_f32(const tensor_t *t, size_t idx) {
  */
 int tensor_set_f32(tensor_t *t, size_t idx, float val) {
     if (!t || idx >= tensor_numel(t)) {
-        fprintf(stderr, "ERROR: tensor_set_f32 invalid index %zu\n", idx);
+        LOG_ERROR("tensor_set_f32 invalid index %zu", idx);
         return -1;
     }
 
     if (t->dtype != DTYPE_F32) {
-        fprintf(stderr, "ERROR: tensor_set_f32 only works with DTYPE_F32\n");
+        LOG_ERROR("tensor_set_f32 only works with DTYPE_F32");
         return -1;
     }
 
@@ -303,20 +304,41 @@ void tensor_release(tensor_t *t) {
  */
 void tensor_print_info(const tensor_t *t) {
     if (!t) {
-        printf("Tensor: NULL\n");
+        LOG_INFO("Tensor: NULL");
         return;
     }
 
-    printf("Tensor shape=[");
-    for (int i = 0; i < t->ndim; i++) {
-        if (i > 0) printf(",");
-        printf("%d", t->shape[i]);
+    // Safely format shape into an allocated string
+    // Max 12 chars per dimension (10 digits + comma + space) + 3 for brackets/null
+    size_t shape_size = (size_t)t->ndim * 12 + 3;
+    char *shape_buf = malloc(shape_size);
+    if (!shape_buf) {
+        LOG_ERROR("Failed to allocate shape buffer");
+        return;
     }
-    printf("] dtype=%s layout=%s %zu bytes ref_count=%d\n",
-           dtype_name(t->dtype),
-           t->layout == LAYOUT_ROW_MAJOR ? "row-major" : "col-major",
-           t->nbytes,
-           t->ref_count);
+
+    int pos = 0;
+    int n = snprintf(shape_buf + pos, shape_size - pos, "[");
+    if (n > 0 && (size_t)n < shape_size - pos) pos += n;
+
+    for (int i = 0; i < t->ndim; i++) {
+        if (i > 0) {
+            n = snprintf(shape_buf + pos, shape_size - pos, ",");
+            if (n > 0 && (size_t)n < shape_size - pos) pos += n;
+        }
+        n = snprintf(shape_buf + pos, shape_size - pos, "%d", t->shape[i]);
+        if (n > 0 && (size_t)n < shape_size - pos) pos += n;
+    }
+    snprintf(shape_buf + pos, shape_size - pos, "]");
+
+    LOG_INFO("Tensor shape=%s dtype=%s layout=%s %zu bytes ref_count=%d",
+             shape_buf,
+             dtype_name(t->dtype),
+             t->layout == LAYOUT_ROW_MAJOR ? "row-major" : "col-major",
+             t->nbytes,
+             t->ref_count);
+    
+    free(shape_buf);
 }
 
 // ============================================================================
@@ -341,7 +363,7 @@ const void* tensor_data(const tensor_t *t) {
 float* tensor_data_f32(const tensor_t *t) {
     if (!t) return NULL;
     if (t->dtype != DTYPE_F32) {
-        fprintf(stderr, "WARNING: tensor_data_f32 called on non-F32 tensor (dtype=%d)\n", t->dtype);
+        LOG_WARN("tensor_data_f32 called on non-F32 tensor (dtype=%d)", t->dtype);
         return NULL;
     }
     return (float *)t->data;

@@ -55,15 +55,15 @@ struct kv_cache_t {
  */
 kv_cache_t* kv_cache_create(int num_layers, int num_kv_heads, int max_seq_len, int head_dim) {
     if (num_layers <= 0 || num_kv_heads <= 0 || max_seq_len <= 0 || head_dim <= 0) {
-        fprintf(stderr, "ERROR: Invalid KV cache parameters: "
-                "num_layers=%d, num_kv_heads=%d, max_seq_len=%d, head_dim=%d\n",
-                num_layers, num_kv_heads, max_seq_len, head_dim);
+        LOG_ERROR("Invalid KV cache parameters: "
+                  "num_layers=%d, num_kv_heads=%d, max_seq_len=%d, head_dim=%d",
+                  num_layers, num_kv_heads, max_seq_len, head_dim);
         return NULL;
     }
     
     kv_cache_t *cache = (kv_cache_t *)malloc(sizeof(kv_cache_t));
     if (!cache) {
-        fprintf(stderr, "ERROR: Failed to allocate KV cache structure\n");
+        LOG_ERROR("Failed to allocate KV cache structure");
         return NULL;
     }
     
@@ -84,7 +84,7 @@ kv_cache_t* kv_cache_create(int num_layers, int num_kv_heads, int max_seq_len, i
     
     if (!cache->keys_per_layer || !cache->values_per_layer || 
         !cache->layer_window_size || !cache->layer_is_local) {
-        fprintf(stderr, "ERROR: Failed to allocate layer arrays\n");
+        LOG_ERROR("Failed to allocate layer arrays");
         if (cache->keys_per_layer) free(cache->keys_per_layer);
         if (cache->values_per_layer) free(cache->values_per_layer);
         if (cache->layer_window_size) free(cache->layer_window_size);
@@ -105,7 +105,7 @@ kv_cache_t* kv_cache_create(int num_layers, int num_kv_heads, int max_seq_len, i
         cache->values_per_layer[i] = tensor_create(3, shape_kv, DTYPE_F32);
         
         if (!cache->keys_per_layer[i] || !cache->values_per_layer[i]) {
-            fprintf(stderr, "ERROR: Failed to create tensors for layer %d\n", i);
+            LOG_ERROR("Failed to create tensors for layer %d", i);
             for (int j = 0; j < i; j++) {
                 tensor_release(cache->keys_per_layer[j]);
                 tensor_release(cache->values_per_layer[j]);
@@ -378,17 +378,17 @@ void kv_cache_release(kv_cache_t *cache) {
 void kv_cache_print_info(const kv_cache_t *cache) {
     if (!cache) return;
     
-    printf("KV Cache Info:\n");
-    printf("  Layers: %d, KV Heads: %d, Max Seq Len: %d, Head Dim: %d\n",
-           cache->num_layers, cache->num_kv_heads, cache->max_seq_len, cache->head_dim);
-    printf("  Current Seq Len: %d / %d\n", cache->current_pos, cache->max_seq_len);
-    printf("  Per-Layer Config:\n");
+    LOG_INFO("KV Cache Info:");
+    LOG_INFO("  Layers: %d, KV Heads: %d, Max Seq Len: %d, Head Dim: %d",
+             cache->num_layers, cache->num_kv_heads, cache->max_seq_len, cache->head_dim);
+    LOG_INFO("  Current Seq Len: %d / %d", cache->current_pos, cache->max_seq_len);
+    LOG_INFO("  Per-Layer Config:");
     
     for (int i = 0; i < cache->num_layers; i++) {
         if (cache->layer_is_local[i]) {
-            printf("    Layer %d: LOCAL (window_size=%d)\n", i, cache->layer_window_size[i]);
+            LOG_INFO("    Layer %d: LOCAL (window_size=%d)", i, cache->layer_window_size[i]);
         } else {
-            printf("    Layer %d: GLOBAL\n", i);
+            LOG_INFO("    Layer %d: GLOBAL", i);
         }
     }
 }

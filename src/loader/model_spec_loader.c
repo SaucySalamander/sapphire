@@ -8,6 +8,7 @@
 #include "model_reader.h"
 #include "model_spec.h"
 #include "gemma3_270m_spec.h"
+#include "log.h"
 
 /**
  * @brief Get the model specification for a given model name.
@@ -31,6 +32,6 @@ model_spec_t* get_model_spec(const char *model_name) {
     }
     
     
-    fprintf(stderr, "ERROR: Unknown model: %s\n", model_name);
+    LOG_ERROR("Unknown model: %s", model_name);
     return NULL;
 }

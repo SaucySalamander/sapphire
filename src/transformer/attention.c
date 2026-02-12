@@ -60,13 +60,12 @@ static void attention_debug_config_init(void) {
     g_attn_debug_cfg.initialized = 1;
 
     if (g_attn_debug_cfg.enabled) {
-        fprintf(stderr,
-                "INFO: Attention diagnostics enabled (layer=%d head=%d tokens=%d topk=%d window_print=%d)\n",
-                g_attn_debug_cfg.layer_filter,
-                g_attn_debug_cfg.head_filter,
-                g_attn_debug_cfg.token_limit,
-                g_attn_debug_cfg.top_k,
-                g_attn_debug_cfg.max_print);
+        LOG_INFO("Attention diagnostics enabled (layer=%d head=%d tokens=%d topk=%d window_print=%d)",
+                 g_attn_debug_cfg.layer_filter,
+                 g_attn_debug_cfg.head_filter,
+                 g_attn_debug_cfg.token_limit,
+                 g_attn_debug_cfg.top_k,
+                 g_attn_debug_cfg.max_print);
     }
 }
 
