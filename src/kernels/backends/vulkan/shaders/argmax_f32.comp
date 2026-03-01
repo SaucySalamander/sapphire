@@ -1,0 +1,52 @@
+#version 450
+
+/* Argmax over logits for each batch sample.
+ * Input layout: logits[sample * vocab_size + vocab_idx]
+ * Output: out_ids[sample] = argmax index
+ */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict readonly buffer LogitsBuffer {
+    float data[];
+} logitsBuffer;
+
+layout(std430, binding = 1) restrict writeonly buffer IdsBuffer {
+    int data[];
+} idsBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;      // vocab_size
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+void main() {
+    uint sample_idx = gl_GlobalInvocationID.x;
+    if (sample_idx >= pc.batch_size) return;
+
+    uint vocab_size = pc.stride_0;
+    uint base = sample_idx * vocab_size;
+
+    float best = logitsBuffer.data[base];
+    int best_idx = 0;
+
+    for (uint i = 1u; i < vocab_size; ++i) {
+        float v = logitsBuffer.data[base + i];
+        if (v > best) {
+            best = v;
+            best_idx = int(i);
+        }
+    }
+
+    idsBuffer.data[sample_idx] = best_idx;
+}

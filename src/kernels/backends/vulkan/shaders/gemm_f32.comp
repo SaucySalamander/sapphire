@@ -1,0 +1,106 @@
+/**
+ * @file gemm_f32.comp
+ * @brief Batched matrix multiplication shader (F32 precision).
+ *
+ * Computes Y[batch, d_out] = X[batch, d_in] @ W[d_out, d_in]^T
+ * Used for prefill (batch_size > 1).
+ *
+ * Optimization: 16×16 shared-memory tiled GEMM.
+ *   Each 16×16 workgroup computes one 16×16 output tile.
+ *   For each K-tile step, 16 input elements (per batch row) and 16 weight
+ *   elements (per output row) are loaded into shared memory and reused 16×
+ *   by all threads in the WG, reducing global memory reads by 16×.
+ *
+ * Dispatch: (ceil(batch_size/16), ceil(d_out/16), 1) workgroups.
+ */
+#version 450 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Descriptor bindings
+layout(std430, binding = 0) restrict readonly buffer InputBuffer {
+    float data[];
+} inputBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer WeightBuffer {
+    float data[];
+} weightBuffer;
+
+layout(std430, binding = 2) restrict writeonly buffer OutputBuffer {
+    float data[];
+} outputBuffer;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;       // d_in (K dimension)
+    uint num_heads;     // d_out (N dimension)
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;      // in_stride
+    uint stride_1;      // out_stride
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+/* 16×16 shared memory tiles: one for input rows, one for weight rows. */
+shared float sh_x[16][16];  /* sh_x[local_y][k] — a row tile of X  */
+shared float sh_w[16][16];  /* sh_w[local_x][k] — a row tile of W  */
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;   /* maps to output column: out_idx   */
+    uint ty = gl_LocalInvocationID.y;   /* maps to batch row:     batch_idx */
+
+    uint tile_batch = gl_WorkGroupID.y * 16u;
+    uint tile_out   = gl_WorkGroupID.x * 16u;
+
+    uint batch_idx = tile_batch + ty;
+    uint out_idx   = tile_out   + tx;
+
+    uint d_in       = pc.d_model;
+    uint d_out      = pc.num_heads;
+    uint in_stride  = (pc.stride_0 > 0u) ? pc.stride_0 : d_in;
+    uint out_stride = (pc.stride_1 > 0u) ? pc.stride_1 : d_out;
+
+    float acc = 0.0;
+
+    /* Iterate over K-tiles. */
+    uint num_tiles = (d_in + 15u) >> 4u;  /* ceil(d_in / 16) */
+    for (uint tile = 0u; tile < num_tiles; tile++) {
+        uint k_base = tile * 16u;
+
+        /* ── Load input tile: row (batch) = ty, col = k_base + tx ── */
+        /* ty-th thread in Y loads one element of its input row.      */
+        uint k_x = k_base + tx;
+        if (batch_idx < pc.batch_size && k_x < d_in) {
+            sh_x[ty][tx] = inputBuffer.data[batch_idx * in_stride + k_x];
+        } else {
+            sh_x[ty][tx] = 0.0;
+        }
+
+        /* ── Load weight tile: row = out_idx, col = k_base + ty ──── */
+        /* tx-th thread in X loads one element of its weight row.     */
+        uint k_w = k_base + ty;
+        if (out_idx < d_out && k_w < d_in) {
+            sh_w[tx][ty] = weightBuffer.data[out_idx * d_in + k_w];
+        } else {
+            sh_w[tx][ty] = 0.0;
+        }
+
+        barrier();
+
+        /* ── Compute partial dot product for this K-tile ─────────── */
+        for (uint k = 0u; k < 16u; k++) {
+            acc += sh_x[ty][k] * sh_w[tx][k];
+        }
+
+        barrier();
+    }
+
+    if (batch_idx < pc.batch_size && out_idx < d_out) {
+        outputBuffer.data[batch_idx * out_stride + out_idx] = acc;
+    }
+}

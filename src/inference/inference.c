@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>  /* clock_gettime for high-resolution wall-clock timing */
 
 #include "../include/attention.h"
 #include "../include/gemma3_270m_config.h"
@@ -60,6 +61,12 @@ static int load_or_reuse_tokenizer(model_spec_t* spec, const char* model_dir) {
 
 /**
  * @brief Initialize inference context
+ *
+ * Creates an inference context with the specified parameters:
+ * - Loads model weights from disk
+ * - Detects and initializes the hardware backend (CPU or Vulkan)
+ * - Allocates backend-specific buffers (scratch, KV cache, RoPE frequencies)
+ * - Initializes tokenizer
  */
 inference_context_t* create_inference_context(float temperature, int max_tokens, int context_len, const char* model_name) {
     // Allow max_tokens == 0 for diagnostic-only initialization runs
@@ -209,11 +216,89 @@ void destroy_inference_context(inference_context_t* ctx) {
     free(ctx);
 }
 
+/**
+ * Print one decoded token to stdout, replacing the SentencePiece
+ * U+2581 (▁) prefix byte sequence (0xE2 0x96 0x81) with a space.
+ */
+static void print_decoded_token_chars(const char *token_str) {
+    if (!token_str) return;
+    int j = 0;
+    if ((unsigned char)token_str[0] == 0xE2 &&
+        (unsigned char)token_str[1] == 0x96 &&
+        (unsigned char)token_str[2] == 0x81) {
+        printf(" ");
+        j = 3;
+    }
+    for (; token_str[j] != '\0'; j++) {
+        printf("%c", token_str[j]);
+    }
+    fflush(stdout);
+}
+
+/**
+ * CPU decode path: run forward pass, optionally scale logits by temperature,
+ * run logit collapse diagnostic, optionally log first-token debug info, then
+ * sample and return the next token.
+ *
+ * @param session        Active inference session
+ * @param ctx            Inference context (holds logits, temperature)
+ * @param last_token     Current token id fed as input
+ * @param cur_pos        Current sequence position
+ * @param generated_count Number of tokens generated so far
+ * @return Sampled next token id
+ */
+static int cpu_forward_and_sample(inference_session_t *session,
+                                  inference_context_t  *ctx,
+                                  int last_token, int cur_pos,
+                                  int generated_count) {
+    const gemma3_270m_config_t *config =
+        (const gemma3_270m_config_t *)ctx->spec->variant_config;
+
+    inference_forward(session, last_token, cur_pos, ctx->logits);
+
+    if (generated_count == 0 && getenv("SAPPHIRE_DEBUG_LOGITS")) {
+        LOG_DEBUG("generated_count=%d, cur_pos=%d", generated_count, cur_pos);
+    }
+
+    if (ctx->temperature > 0.0f) {
+        vec_scale(ctx->logits, 1.0f / ctx->temperature, config->vocab_size);
+    }
+
+    /* Logit collapse diagnostic */
+    if (generated_count == 0 || generated_count % 10 == 0) {
+        float min_l, max_l, rms_l;
+        vec_stats(ctx->logits, config->vocab_size, &min_l, &max_l, &rms_l);
+        if (rms_l < 0.5f) {
+            LOG_WARN("Logit RMS Low (%.4f) - Possible Probability Collapse", rms_l);
+        }
+    }
+
+    /* Debug: print argmax logit for first generated token */
+    if (getenv("SAPPHIRE_DEBUG_LOGITS") && generated_count == 0) {
+        LOG_DEBUG("token_106=%.6f token_818=%.6f token_236776=%.6f",
+                  ctx->logits[106], ctx->logits[818], ctx->logits[236776]);
+        int max_idx = 0;
+        float max_logit = ctx->logits[0];
+        for (int i = 1; i < config->vocab_size; ++i) {
+            if (ctx->logits[i] > max_logit) {
+                max_logit = ctx->logits[i];
+                max_idx = i;
+            }
+        }
+        LOG_DEBUG("argmax=token_%d with logit=%.6f", max_idx, max_logit);
+    }
+
+    return sample_temperature(ctx->logits, config->vocab_size, ctx->temperature);
+}
+
 int perform_inference(inference_context_t* ctx, const char* prompt, char* output, int output_size) {
     if (!ctx || !prompt || !output) return -1;
 
+    /* Start high-resolution wall-clock timer for this inference call */
+    struct timespec __perf_start_ts;
+    clock_gettime(CLOCK_MONOTONIC, &__perf_start_ts);
+
     inference_session_t* session = ctx->session;
-    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)ctx->spec->variant_config;
 
     int* tokens = malloc((ctx->context_len) * sizeof(int));
     int prompt_len = 0;
@@ -235,10 +320,13 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
 
     // 2. Pre-fill the KV cache with the prompt (Prompt Processing)
     // We process tokens in batches of up to 32 to utilize GEMM math and reduce memory traffic.
+    // Set SAPPHIRE_SERIAL_PREFILL=1 to force single-token batches (isolates GEMM bugs).
+    int serial_prefill = (getenv("SAPPHIRE_SERIAL_PREFILL") != NULL);
     int p_idx = 0;
     while (p_idx < prompt_len - 1) {
         int b_size = (prompt_len - 1) - p_idx;
         if (b_size > 32) b_size = 32;
+        if (serial_prefill) b_size = 1;
         inference_forward_batch(session, tokens + p_idx, p_idx, b_size, NULL);
         p_idx += b_size;
     }
@@ -250,51 +338,26 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
 
     // 3. Generation loop (Auto-regressive)
     while (total_tokens < ctx->context_len && generated_count < ctx->max_tokens) {
-        // Forward pass for the current token
         int cur_pos = total_tokens - 1;
-        inference_forward(session, last_token, cur_pos, ctx->logits);
+        int next_token = -1;
 
-        if (generated_count == 0 && getenv("SAPPHIRE_DEBUG_LOGITS")) {
-            LOG_DEBUG("generated_count=%d, cur_pos=%d, total_tokens=%d", generated_count, cur_pos, total_tokens);
-        }
-
-        // Sample next token (Greedy or Temperature)
-        // Adjust logits by temperature BEFORE passing to sampler (Phase 8 Stability)
-        if (ctx->temperature > 0.0f) {
-            float inv_temp = 1.0f / ctx->temperature;
-            vec_scale(ctx->logits, inv_temp, config->vocab_size);
-        }
-
-        // FIX (Phase 8): Logit Collapse Diagnostic
-        // Check if the entropy of the distribution has collapsed
-        if (generated_count == 0 || generated_count % 10 == 0) {
-            float min_l, max_l, rms_l;
-            vec_stats(ctx->logits, config->vocab_size, &min_l, &max_l, &rms_l);
-            if (rms_l < 0.5f) {
-                LOG_WARN("Logit RMS Low (%.4f) - Possible Probability Collapse / Uniform Distribution", rms_l);
+        /* Vulkan fast path: backend performs token selection on GPU and returns ids.
+         * CPU backend remains unchanged and uses logits+CPU sampling below. */
+        if (session->backend &&
+            session->backend->type == SAPPHIRE_BACKEND_TYPE_VULKAN &&
+            session->backend->forward_select_batch) {
+            int rc_sel = session->backend->forward_select_batch(
+                session, &last_token, cur_pos, 1, &next_token);
+            if (rc_sel != 0) {
+                LOG_ERROR("Vulkan GPU token selection failed at pos=%d", cur_pos);
+                free(tokens);
+                return -1;
             }
+        } else {
+            next_token = cpu_forward_and_sample(session, ctx,
+                                                last_token, cur_pos,
+                                                generated_count);
         }
-
-        // Use actual temperature for sample_temperature (already scaled logits by 1/T above)
-        // When temperature <= 0, sample_temperature will use greedy selection
-        int debug_logits_pre_select = getenv("SAPPHIRE_DEBUG_LOGITS") != NULL;
-        if (debug_logits_pre_select && generated_count == 0) {
-            // Print actual logits for key tokens BEFORE sampling
-            LOG_DEBUG("token_106=%.6f token_818=%.6f token_236776=%.6f",
-                      ctx->logits[106], ctx->logits[818], ctx->logits[236776]);
-            // Find argmax
-            int max_idx = 0;
-            float max_logit = ctx->logits[0];
-            for (int i = 1; i < config->vocab_size; ++i) {
-                if (ctx->logits[i] > max_logit) {
-                    max_logit = ctx->logits[i];
-                    max_idx = i;
-                }
-            }
-            LOG_DEBUG("argmax=token_%d with logit=%.6f", max_idx, max_logit);
-        }
-        
-        int next_token = sample_temperature(ctx->logits, config->vocab_size, ctx->temperature);
 
         // Gemma 3 stop tokens:
         // - Token 1: <eos> (explicit end-of-sequence)
@@ -302,21 +365,7 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
         if (next_token == 1 || next_token == 106) break;
 
         // --- STREAMING DECODE WITH SPIECE HANDLING ---
-        const char* token_str = decode(ctx->tokenizer, next_token);
-        if (token_str) {
-            // Gemma 3 uses SPIECE prefix: 0xE2 0x96 0x81 (UTF-8 for U+2581 = ▁)
-            // Replace with space for readable output
-            int j = 0;
-            if ((unsigned char)token_str[0] == 0xE2 && (unsigned char)token_str[1] == 0x96 && (unsigned char)token_str[2] == 0x81) {
-                printf(" ");
-                j = 3;  // Skip the 3-byte SPIECE prefix
-            }
-            // Print the rest of the token
-            for (; token_str[j] != '\0'; j++) {
-                printf("%c", token_str[j]);
-            }
-            fflush(stdout);
-        }
+        print_decoded_token_chars(decode(ctx->tokenizer, next_token));
 
         // Store for next iteration
         tokens[total_tokens++] = next_token;
@@ -327,6 +376,16 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
     // 4. Final Detokenization into the output buffer for the caller
     detokenize(ctx->tokenizer, tokens + prompt_len, generated_count, output, output_size);
 
+    /* Stop timer and record elapsed seconds in the context for callers to inspect */
+    struct timespec __perf_end_ts;
+    clock_gettime(CLOCK_MONOTONIC, &__perf_end_ts);
+    double __elapsed = (__perf_end_ts.tv_sec - __perf_start_ts.tv_sec) +
+                       (__perf_end_ts.tv_nsec - __perf_start_ts.tv_nsec) / 1e9;
+    ctx->last_inference_time = __elapsed;
+
+    LOG_INFO("perform_inference: elapsed=%.3f sec (backend=%s)", __elapsed,
+             (session && session->backend) ? session->backend->name : "unknown");
+
     LOG_DEBUG("Generated %d tokens", generated_count);
 
     free(tokens);
@@ -334,167 +393,18 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
     return 0;
 }
 
-// Forward declarations
+// Forward declarations for functions used by CPU backend
 
-/**
- * Allocate and initialize all session buffers (scratch, attention scores, KV cache).
- * Returns 0 on success, -1 on error. Errors are logged internally.
- */
-static int allocate_session_buffers(inference_session_t* session, gemma3_270m_config_t* config, llm_model_t* model, int max_context_len) {
-    if (!session || !config || !model) return -1;
-    
-    // Initialize d_inner (attention hidden dimension)
-    // In hybrid architectures like Gemma 3, d_inner may differ from d_model
-    int d_inner = config->num_attention_heads * config->head_dim;
-    if (d_inner <= 0) {
-        LOG_ERROR("Unable to determine d_inner (query projection dimension) %d x %d", config->num_attention_heads, config->head_dim);
-        return -1;
-    }
-
-    // Initialize d_kv (key/value projection dimension)
-    // In GQA architectures, this may differ from d_inner (query dimension)
-    int d_kv = config->num_key_value_heads * config->head_dim;
-    if (d_kv <= 0) {
-        LOG_ERROR("Unable to determine d_kv (key/value projection dimension)");
-        return -1;
-    }
-
-    int num_heads = d_inner / config->head_dim;
-    int num_kv_heads = d_kv / config->head_dim;
-    LOG_INFO("Inferred num_heads = %d, num_kv_heads = %d (head_dim=%d)",
-             num_heads, num_kv_heads, config->head_dim);
-
-    int d_ff = config->intermediate_size;
-    int d_model = config->hidden_size;
-
-    LOG_INFO("Model dims: d_model=%d d_inner=%d d_kv=%d d_k=%d d_ff=%d heads=%d kv_heads=%d",
-             d_model, d_inner, d_kv, config->head_dim, d_ff, num_heads, num_kv_heads);
-
-    // Compute SIMD-friendly padded dimensions (round up to multiple of SIMD lanes)
-    // This ensures all buffers used as inputs to SIMD kernels can safely over-read
-    // without triggering address sanitizer errors or segfaults. AVX2 loads read 256 bits
-    // at a time without bounds checking, so we must guarantee sufficient padding.
-    int simd_lanes = 1;
-    if (model->layers && config->num_hidden_layers > 0) {
-        const model_layer_weights_t* lay0 = &model->layers[0];
-        const tensor_t* rep = NULL;
-        if (lay0->q_proj_weight)
-            rep = lay0->q_proj_weight;
-        else if (lay0->k_proj_weight)
-            rep = lay0->k_proj_weight;
-        if (rep) {
-            simd_lanes = tensor_gemv_simd_lane_count_for_dtype(tensor_dtype(rep));
-        }
-    }
-    if (simd_lanes <= 0) simd_lanes = 1;
-
-    int pad_m = (d_model + simd_lanes - 1) & ~(simd_lanes - 1);
-    int pad_inner = (d_inner + simd_lanes - 1) & ~(simd_lanes - 1);
-    int pad_kv = (d_kv + simd_lanes - 1) & ~(simd_lanes - 1);
-    int pad_ff = (d_ff + simd_lanes - 1) & ~(simd_lanes - 1);
-
-    // Scratch buffer layout: all buffers are padded to their respective dimensions
-    // In hybrid architectures (e.g., Gemma 3), d_inner may differ from d_model.
-    // In GQA (Grouped-Query Attention), d_kv may differ from d_inner.
-    // - hidden (pad_m):       embedding lookup result, input to transformer layers
-    // - residual (pad_m):     residual pathway, accumulated across blocks
-    // - norm_buf (pad_m):     output of RMSNorm, input to FFN/attention
-    // - q_proj (pad_inner):   query projection (query head dimension)
-    // - k_proj (pad_kv):      key projection (KV head dimension, may be smaller in GQA)
-    // - v_proj (pad_kv):      value projection (KV head dimension, may be smaller in GQA)
-    // - attn_out (pad_inner):  attention output (num_heads * head_dim)
-    // - ffn_gate (pad_ff):    gate/activation branch of FFN
-    // - ffn_value (pad_ff):   value branch of FFN
-    // - geglu_input (2*pad_ff): concatenated buffer for GEGLU activation
-    // Total: (3*pad_m + 2*pad_inner + 2*pad_kv + 6*pad_ff) * 32 floats
-    // We allocate enough scratch for a batch of 32 tokens during prefill.
-    int max_batch = 32;
-    size_t scratch_floats = (size_t)max_batch * ((size_t)3 * pad_m + (size_t)2 * pad_inner + (size_t)2 * pad_kv + (size_t)6 * pad_ff);
-    scratch_floats += 32;
-
-    // Allocate aligned scratch buffer (32-byte aligned for AVX2)
-    // posix_memalign ensures the buffer starts at a 32-byte boundary,
-    // and the padding ensures each slice can safely be read by SIMD kernels.
-    void* aligned_ptr = NULL;
-    size_t align_bytes = (size_t)simd_lanes * sizeof(float);
-    if (align_bytes < 16) align_bytes = 16;
-    if (posix_memalign(&aligned_ptr, align_bytes, scratch_floats * sizeof(float)) != 0) {
-        LOG_ERROR("Failed to allocate aligned scratch buffer");
-        return -1;
-    }
-    session->scratch_buffer = (float*)aligned_ptr;
-    session->scratch_size = (size_t)scratch_floats * sizeof(float);
-    session->padded_d_model = pad_m;
-    session->padded_d_inner = pad_inner;
-    session->padded_d_kv = pad_kv;
-    session->padded_d_ff = pad_ff;
-    memset(session->scratch_buffer, 0, scratch_floats * sizeof(float));
-
-    // Pre-allocate attention scores buffer (max_batch * max_context_len)
-    // This supports batched Q-K calculation during prefill.
-    session->attn_scores = (float*)malloc((size_t)max_batch * max_context_len * sizeof(float));
-    if (session->attn_scores) {
-        memset(session->attn_scores, 0, (size_t)max_batch * max_context_len * sizeof(float));
-    }
-    if (!session->attn_scores) {
-        LOG_ERROR("Failed to allocate attention score buffer");
-        return -1;
-    }
-
-    // Create a global multi-layer KV cache
-    session->kv_cache = kv_cache_create(
-        config->num_hidden_layers,
-        num_kv_heads,
-        max_context_len,
-        config->head_dim);
-    if (!session->kv_cache) {
-        LOG_ERROR("Failed to create global KV cache");
-        return -1;
-    }
-
-    return 0;
-}
-
-/**
- * Precompute RoPE frequencies for both global and local bases (Gemma 3).
- * Returns 0 on success, -1 on error. Errors are logged internally.
- */
-static int precompute_rope_frequencies(inference_session_t* session, const gemma3_270m_config_t* config, int max_context_len) {
-    if (!session || !config) return -1;
-
-    int freq_size = max_context_len * config->head_dim;
-    session->rope_freqs_cos_global = (float*)malloc(freq_size * sizeof(float));
-    session->rope_freqs_sin_global = (float*)malloc(freq_size * sizeof(float));
-    session->rope_freqs_cos_local = (float*)malloc(freq_size * sizeof(float));
-    session->rope_freqs_sin_local = (float*)malloc(freq_size * sizeof(float));
-
-    if (!session->rope_freqs_cos_global || !session->rope_freqs_sin_global ||
-        !session->rope_freqs_cos_local || !session->rope_freqs_sin_local) {
-        LOG_ERROR("Failed to allocate RoPE frequency buffers");
-        return -1;
-    }
-
-    // Precompute for Global base (e.g. 1M)
-    float base_global = config->rope_theta;
-    if (rope_precompute_freqs(session->rope_freqs_cos_global, session->rope_freqs_sin_global,
-                              config->head_dim, max_context_len, base_global) < 0) {
-        LOG_ERROR("Failed to precompute global RoPE frequencies");
-        return -1;
-    }
-
-    // Precompute for Local base (e.g. 10k)
-    float base_local = config->rope_local_base_freq;
-    if (rope_precompute_freqs(session->rope_freqs_cos_local, session->rope_freqs_sin_local,
-                              config->head_dim, max_context_len, base_local) < 0) {
-        LOG_ERROR("Failed to precompute local RoPE frequencies");
-        return -1;
-    }
-
-    return 0;
-}
 
 /**
  * Create an inference session.
+ *
+ * Creates a new session and delegates all backend-specific initialization
+ * to the selected backend (CPU or Vulkan).
+ *
+ * @param spec Model specification with loaded model and config
+ * @param max_context_len Maximum sequence length for KV cache
+ * @return Allocated session with backend initialized, or NULL on failure
  */
 inference_session_t* inference_session_create(model_spec_t* spec, int max_context_len) {
     if (!spec) {
@@ -502,13 +412,6 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
         return NULL;
     }
     LOG_DEBUG("Creating inference session for model: %s", spec->model_id);
-    LOG_DEBUG("Spec details: tensor_map_size=%d %s", spec->tensor_map_size, spec->variant_config != NULL ? "with variant_config" : "no variant_config");
-
-    llm_model_t* model = (llm_model_t*)spec->llm_model;
-    if (!model) {
-        LOG_ERROR("Model is NULL in inference_session_create");
-        return NULL;
-    }
 
     gemma3_270m_config_t* config = (gemma3_270m_config_t*)spec->variant_config;
     if (!config) {
@@ -516,80 +419,64 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
         return NULL;
     }
 
+    // Allocate the session structure
     inference_session_t* session = (inference_session_t*)malloc(sizeof(inference_session_t));
     if (!session) {
         LOG_ERROR("Failed to allocate inference session");
         return NULL;
     }
+    memset(session, 0, sizeof(inference_session_t));
 
     session->model_spec = spec;
-    session->kv_cache = NULL;
-    session->scratch_buffer = NULL;
-    session->attn_scores = NULL;
-    session->attn_scores_raw = NULL;
-    session->rope_freqs_cos_global = NULL;
-    session->rope_freqs_sin_global = NULL;
-    session->rope_freqs_cos_local = NULL;
-    session->rope_freqs_sin_local = NULL;
-    session->gemv_ctx = NULL;
-    session->layer_configs = NULL;
-    session->num_layers = 0;
-
-    // Allocate all buffers (scratch, attention scores, KV cache)
-    if (allocate_session_buffers(session, config, model, max_context_len) != 0) {
-        destroy_inference_session(session);
-        return NULL;
-    }
-
-    // Precompute RoPE frequencies for both global and local bases (Gemma 3)
-    if (precompute_rope_frequencies(session, config, max_context_len) != 0) {
-        destroy_inference_session(session);
-        return NULL;
-    }
-
-    // Create GEMV context for matrix-vector operations (LM head, etc.)
-    session->gemv_ctx = tensor_gemv_ctx_create(0, 1024);  // 0 = auto-detect threads, 1024 = chunk size
-    if (!session->gemv_ctx) {
-        LOG_ERROR("Failed to create GEMV context");
-        destroy_inference_session(session);
-        return NULL;
-    }
-    
-    // Initialize persistent worker threads
-    if (kernel_ctx_init(session->gemv_ctx) != 0) {
-        LOG_ERROR("Failed to initialize GEMV worker threads");
-        destroy_inference_session(session);
-        return NULL;
-    }
-
-    // Load and initialize layer configurations (dispatch routing)
     session->num_layers = config->num_hidden_layers;
     session->layer_configs = (sapphire_layer_config_t*)malloc(session->num_layers * sizeof(sapphire_layer_config_t));
     if (!session->layer_configs) {
         LOG_ERROR("Failed to allocate layer configs array");
-        destroy_inference_session(session);
-        return NULL;
-    }
-    
-    if (layer_config_load_from_spec(spec, session->num_layers, session->layer_configs) != 0) {
-        LOG_ERROR("Failed to load layer configurations");
-        destroy_inference_session(session);
+        free(session);
         return NULL;
     }
 
-    LOG_INFO("Inference session created with %d layers, context_len=%d",
-             config->num_hidden_layers, max_context_len);
+    // Load layer configurations (dispatch routing)
+    if (layer_config_load_from_spec(spec, session->num_layers, session->layer_configs) != 0) {
+        LOG_ERROR("Failed to load layer configurations");
+        free(session->layer_configs);
+        free(session);
+        return NULL;
+    }
+
+    // Detect and select backend
+    sapphire_backend_type_t backend_type = backend_detect();
+    session->backend = backend_get(backend_type);
+    if (!session->backend) {
+        LOG_ERROR("Failed to get backend implementation for type %d", (int)backend_type);
+        free(session->layer_configs);
+        free(session);
+        return NULL;
+    }
+
+    // Initialize backend-specific session data
+    if (session->backend->session_init(session, spec, max_context_len) != 0) {
+        LOG_ERROR("Backend initialization failed for type %d", (int)backend_type);
+        free(session->layer_configs);
+        free(session);
+        return NULL;
+    }
+
+    LOG_INFO("Inference session created with %d layers, context_len=%d, backend=%s",
+             config->num_hidden_layers, max_context_len, session->backend->name);
 
     return session;
 }
 
 /**
  * Reset KV caches for a new sequence.
+ *
+ * Delegates to backend->reset() to clear any sequence-specific state.
  */
 void inference_session_reset(inference_session_t* session) {
-    if (!session || !session->kv_cache) return;
+    if (!session || !session->backend) return;
 
-    kv_cache_reset(session->kv_cache);
+    session->backend->reset(session);
 }
 
 /**
@@ -613,83 +500,31 @@ void inference_forward(inference_session_t* session, int token_id, int token_pos
     inference_forward_batch(session, &token_id, token_pos, 1, logits);
 }
 
+/**
+ * Execute forward batch pass via the selected backend.
+ *
+ * Delegates all computation to the backend's forward_batch implementation.
+ * The backend handles layer-by-layer execution (CPU) or GPU dispatch (Vulkan).
+ */
 void inference_forward_batch(inference_session_t* session, const int* token_ids, int start_pos, int batch_size, float* logits) {
-    if (!session) {
-        LOG_ERROR("inference_forward_batch requires session");
+    if (!session || !session->backend) {
+        LOG_ERROR("inference_forward_batch requires session with backend");
         return;
     }
 
-    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
-
-    // 1. Embedding lookup
-    sapphire_embed_lookup_batch(session, token_ids, batch_size, session->scratch_buffer);
-
-    // 2. Transformer layers with layer-type dispatch
-    for (int l = 0; l < config->num_hidden_layers; l++) {
-        sapphire_layer_config_t* layer_cfg = &session->layer_configs[l];
-        bool is_global = layer_cfg->config.attention.is_global;
-        const float* f_cos = is_global ? session->rope_freqs_cos_global : session->rope_freqs_cos_local;
-        const float* f_sin = is_global ? session->rope_freqs_sin_global : session->rope_freqs_sin_local;
-
-        /* Dispatch based on layer type (currently only attention supported in batched) */
-        if (layer_cfg->type == LAYER_TYPE_ATTENTION_SOFTMAX || layer_cfg->type == LAYER_TYPE_ATTENTION_LINEAR) {
-            sapphire_transformer_layer_batch(session, l, start_pos, batch_size, session->scratch_buffer, (transformer_rope_t){f_cos, f_sin});
-        } else {
-            // For non-attention layers (e.g. SSM), we loop.
-            // Note: Currently no SSM implementation, so this is just for code path completeness.
-            for (int b = 0; b < batch_size; b++) {
-                sapphire_transformer_layer(session, l, start_pos + b, session->scratch_buffer + b * config->hidden_size, (transformer_rope_t){f_cos, f_sin});
-            }
-        }
-    }
-
-    // 3. Final norm & LM Head (for the last token in the batch)
-    if (logits) {
-        const float* last_hidden = session->scratch_buffer + (batch_size - 1) * config->hidden_size;
-        lm_head(session, (float*)last_hidden, logits);
-    }
+    session->backend->forward_batch(session, token_ids, start_pos, batch_size, logits);
 }
 
 /**
  * Free inference session.
+ *
+ * Delegates cleanup to the backend and frees shared metadata.
  */
 void destroy_inference_session(inference_session_t* session) {
     if (!session) return;
 
-    if (session->kv_cache) {
-        kv_cache_release(session->kv_cache);
-    }
-
-    if (session->scratch_buffer) {
-        free(session->scratch_buffer);
-    }
-
-    if (session->attn_scores) {
-        free(session->attn_scores);
-    }
-
-    if (session->attn_scores_raw) {
-        free(session->attn_scores_raw);
-    }
-
-    if (session->rope_freqs_cos_global) {
-        free(session->rope_freqs_cos_global);
-    }
-
-    if (session->rope_freqs_sin_global) {
-        free(session->rope_freqs_sin_global);
-    }
-
-    if (session->rope_freqs_cos_local) {
-        free(session->rope_freqs_cos_local);
-    }
-
-    if (session->rope_freqs_sin_local) {
-        free(session->rope_freqs_sin_local);
-    }
-
-    if (session->gemv_ctx) {
-        tensor_gemv_ctx_destroy(session->gemv_ctx);
+    if (session->backend) {
+        session->backend->session_destroy(session);
     }
 
     if (session->layer_configs) {

@@ -4,16 +4,20 @@ INCDIR = include
 OUTDIR = out
 ASAN_OUTDIR = out/asan
 
+# Vulkan SDK detection (find vulkan headers and libraries)
+VK_INCLUDE_PATHS = $(shell for p in /usr/include /usr/local/include /opt/vulkan/include; do [ -f $$p/vulkan/vulkan.h ] && { echo -I$$p; break; }; done)
+VK_LIB_PATHS = $(shell for p in /usr/lib /usr/lib64 /usr/local/lib /opt/vulkan/lib; do [ -f $$p/libvulkan.so ] && { echo -L$$p; break; }; done)
+
 # Compilation flags
-CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma
-LDFLAGS = -lm -pthread
+CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma $(VK_INCLUDE_PATHS)
+LDFLAGS = -lm -pthread -lvulkan $(VK_LIB_PATHS)
 
 # AddressSanitizer + UndefinedBehaviorSanitizer flags
 # Use -g for debug info (better error messages), -O1 for reasonable speed
 # Include paths (-I. -I$(INCDIR)) must be present for sanitizer builds
 # IMPORTANT: must include -mavx2 -mfma for AVX/FMA intrinsics in kernel code
-SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer
-SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined
+SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer $(VK_INCLUDE_PATHS)
+SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined $(VK_LIB_PATHS)
 
 # HIP configuration (optional ROCm support)
 HIPCC = hipcc
@@ -30,9 +34,26 @@ TARGETS = \
 	$(OUTDIR)/sapphire \
 
 
-.PHONY: all bench check-bench bench_f32 bench_bf16 test clean
+.PHONY: all bench check-bench bench_f32 bench_bf16 test clean shaders
 
-all: $(TARGETS)
+# ============================================================================
+# SPIR-V Shader Compilation (Phase 11-04)
+# ============================================================================
+
+GLSLANG ?= glslangValidator
+SHADER_DIR = src/kernels/backends/vulkan/shaders
+SHADER_SRCS := $(wildcard $(SHADER_DIR)/*.comp)
+SHADER_SPVS := $(patsubst %.comp,%.comp.spv,$(SHADER_SRCS))
+
+# Rule for GLSL -> SPIR-V compilation
+$(SHADER_DIR)/%.comp.spv: $(SHADER_DIR)/%.comp
+	$(GLSLANG) -V $< -o $@
+
+# Compile all shaders
+shaders: $(SHADER_SPVS)
+	@echo "Compiled $(words $(SHADER_SPVS)) shaders to SPIR-V"
+
+all: $(TARGETS) $(SHADER_SPVS)
 
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
@@ -280,6 +301,7 @@ check-all:
 
 clean:
 	rm -rf $(OUTDIR) $(ASAN_OUTDIR) $(REPORTS_DIR) compile_commands.json
+	rm -f $(SHADER_DIR)/*.comp.spv
 
 # ============================================================================
 # Complexity Analysis with Lizard (Phase 2 Quality Metrics)

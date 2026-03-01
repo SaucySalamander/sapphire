@@ -1,0 +1,99 @@
+/**
+ * @file rope_apply_f32.comp
+ * @brief RoPE (Rotary Position Embedding) application shader (F32 precision).
+ *
+ * Applies rotary embeddings to Q and K projections in-place.
+ * Uses precomputed cos/sin cache indexed by sequence position.
+ *
+ * Parallelization: One thread per (head, dim_pair).
+ * Grid: (num_heads, head_dim/2)
+ */
+#version 450 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Descriptor bindings
+layout(std430, binding = 0) restrict buffer QBuffer {
+    float data[];
+} qBuffer;
+
+layout(std430, binding = 1) restrict buffer KBuffer {
+    float data[];
+} kBuffer;
+
+layout(std430, binding = 2) restrict readonly buffer CosCache {
+    float data[];
+} cosCache;
+
+layout(std430, binding = 3) restrict readonly buffer SinCache {
+    float data[];
+} sinCache;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;       // last absolute pos (start_pos + batch_size - 1)
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;     // num_attention_heads
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;      // num_kv_heads
+    uint stride_1;
+    uint start_pos;     // first absolute pos of this batch
+    uint reserved[5];
+} pc;
+
+void main() {
+    uint head_idx  = gl_GlobalInvocationID.x;
+    uint dim_pair  = gl_GlobalInvocationID.y;
+    uint token_idx = gl_GlobalInvocationID.z;  /* batch token index (0 for decode) */
+
+    uint num_kv_heads = pc.stride_0;
+    uint half_dim = pc.head_dim / 2;
+
+    if (dim_pair >= half_dim) return;
+    if (token_idx >= pc.batch_size) return;
+
+    /* Each token in the batch occupies its own position: start_pos + token_idx.
+     * pc.start_pos holds the base position of this batch. */
+    uint token_seq_pos = pc.start_pos + token_idx;
+
+    /* Load cos/sin from precomputed cache for this token's position.
+     * Cache layout: [max_seq_len][head_dim] — stride is pc.head_dim (not half_dim).
+     * rope_precompute_freqs stores head_dim values per position.
+     * We only need the first half_dim values (indices 0..half_dim-1). */
+    float cos_val = cosCache.data[token_seq_pos * pc.head_dim + dim_pair];
+    float sin_val = sinCache.data[token_seq_pos * pc.head_dim + dim_pair];
+
+    /* Base offset for this token's Q/K data: token_idx * (num_heads * head_dim) */
+    uint q_token_base = token_idx * pc.num_heads * pc.head_dim;
+    uint k_token_base = token_idx * num_kv_heads * pc.head_dim;
+
+    /* Apply RoPE to Q heads using half-split convention (same as CPU rope_apply_fast):
+     * Pair (x[dim_pair], x[dim_pair + half_dim]) — NOT adjacent pairs (x[2i], x[2i+1]).
+     * This matches the Gemma3 / GPT-NeoX "neox-style" RoPE used in HuggingFace. */
+    if (head_idx < pc.num_heads) {
+        uint real_idx = q_token_base + head_idx * pc.head_dim + dim_pair;
+        uint imag_idx = q_token_base + head_idx * pc.head_dim + dim_pair + half_dim;
+
+        float q_real = qBuffer.data[real_idx];
+        float q_imag = qBuffer.data[imag_idx];
+
+        qBuffer.data[real_idx] = q_real * cos_val - q_imag * sin_val;
+        qBuffer.data[imag_idx] = q_imag * cos_val + q_real * sin_val;
+    }
+
+    /* Apply RoPE to K heads using same half-split convention */
+    if (head_idx < num_kv_heads) {
+        uint k_real_idx = k_token_base + head_idx * pc.head_dim + dim_pair;
+        uint k_imag_idx = k_token_base + head_idx * pc.head_dim + dim_pair + half_dim;
+
+        float k_real = kBuffer.data[k_real_idx];
+        float k_imag = kBuffer.data[k_imag_idx];
+
+        kBuffer.data[k_real_idx] = k_real * cos_val - k_imag * sin_val;
+        kBuffer.data[k_imag_idx] = k_imag * cos_val + k_real * sin_val;
+    }
+}

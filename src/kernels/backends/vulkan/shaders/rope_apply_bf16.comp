@@ -1,0 +1,141 @@
+/**
+ * @file rope_apply_bf16.comp
+ * @brief RoPE application shader (BF16 precision).
+ *
+ * Applies rotary embeddings to Q and K projections in-place.
+ * Q/K buffers are BF16 packed in uint[]. Cos/sin cache is F32.
+ *
+ * Parallelization: 3D grid (Heads, Dims/2, Batch).
+ * Each token in a prefill batch gets its own absolute position:
+ *   token_seq_pos = pc.start_pos + gl_GlobalInvocationID.z
+ */
+#version 450 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict buffer QBuffer {
+    uint data[];
+} qBuffer;
+
+layout(std430, binding = 1) restrict buffer KBuffer {
+    uint data[];
+} kBuffer;
+
+layout(std430, binding = 2) restrict readonly buffer CosCache {
+    float data[];
+} cosCache;
+
+layout(std430, binding = 3) restrict readonly buffer SinCache {
+    float data[];
+} sinCache;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;       // last absolute pos (start_pos + batch_size - 1)
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;      // num_kv_heads
+    uint stride_1;
+    uint start_pos;     // first absolute pos of this batch
+    uint reserved[5];
+} pc;
+
+float bf16_unpack(uint bf16_val) {
+    return uintBitsToFloat(bf16_val << 16);
+}
+
+uint bf16_pack(float fp32_val) {
+    uint bits = floatBitsToUint(fp32_val);
+    return (bits + 0x7FFFu) >> 16;
+}
+
+void main() {
+    uint head_idx  = gl_GlobalInvocationID.x;
+    uint dim_pair  = gl_GlobalInvocationID.y;
+    uint token_idx = gl_GlobalInvocationID.z;  /* batch token index */
+
+    uint num_kv_heads = pc.stride_0;
+    uint half_dim = pc.head_dim / 2u;
+
+    if (dim_pair >= half_dim) return;
+    if (token_idx >= pc.batch_size) return;
+
+    /* Each token gets its own absolute sequence position */
+    uint token_seq_pos = pc.start_pos + token_idx;
+
+    /* Cache layout: [max_seq_len][head_dim] floats — stride is pc.head_dim (full head_dim),
+     * matching rope_precompute_freqs() which stores head_dim values per position.
+     * Using half_dim here was a bug: it indexed into the wrong position's frequencies. */
+    float cos_val = cosCache.data[token_seq_pos * pc.head_dim + dim_pair];
+    float sin_val = sinCache.data[token_seq_pos * pc.head_dim + dim_pair];
+
+    /* Base element offset for this token's Q/K data */
+    uint q_token_base = token_idx * pc.num_heads * pc.head_dim;
+    uint k_token_base = token_idx * num_kv_heads * pc.head_dim;
+
+    /* Apply RoPE to Q heads using half-split convention (matches rope_precompute_freqs and
+     * the F32 rope_apply_f32.comp shader).  Elements at dim_pair and dim_pair+half_dim form
+     * the (real, imag) pair — NOT adjacent elements (2*dim_pair, 2*dim_pair+1).
+     * BF16 packing: each uint32 holds two BF16 values (even index=low 16 bits, odd=high 16). */
+    if (head_idx < pc.num_heads) {
+        uint real_idx = q_token_base + head_idx * pc.head_dim + dim_pair;
+        uint imag_idx = q_token_base + head_idx * pc.head_dim + dim_pair + half_dim;
+
+        uint real_word = qBuffer.data[real_idx >> 1u];
+        float q_real = bf16_unpack(((real_idx & 1u) == 0u) ? (real_word & 0xFFFFu) : (real_word >> 16u));
+
+        uint imag_word = qBuffer.data[imag_idx >> 1u];
+        float q_imag = bf16_unpack(((imag_idx & 1u) == 0u) ? (imag_word & 0xFFFFu) : (imag_word >> 16u));
+
+        float q_real_new = q_real * cos_val - q_imag * sin_val;
+        float q_imag_new = q_imag * cos_val + q_real * sin_val;
+
+        /* Write real component back */
+        uint rw = qBuffer.data[real_idx >> 1u];
+        uint rp = bf16_pack(q_real_new);
+        qBuffer.data[real_idx >> 1u] = ((real_idx & 1u) == 0u)
+            ? ((rw & 0xFFFF0000u) | (rp & 0xFFFFu))
+            : ((rw & 0x0000FFFFu) | (rp << 16u));
+
+        /* Write imag component back */
+        uint iw = qBuffer.data[imag_idx >> 1u];
+        uint ip = bf16_pack(q_imag_new);
+        qBuffer.data[imag_idx >> 1u] = ((imag_idx & 1u) == 0u)
+            ? ((iw & 0xFFFF0000u) | (ip & 0xFFFFu))
+            : ((iw & 0x0000FFFFu) | (ip << 16u));
+    }
+
+    /* Apply RoPE to K heads using same half-split convention */
+    if (head_idx < num_kv_heads) {
+        uint k_real_idx = k_token_base + head_idx * pc.head_dim + dim_pair;
+        uint k_imag_idx = k_token_base + head_idx * pc.head_dim + dim_pair + half_dim;
+
+        uint kr_word = kBuffer.data[k_real_idx >> 1u];
+        float k_real = bf16_unpack(((k_real_idx & 1u) == 0u) ? (kr_word & 0xFFFFu) : (kr_word >> 16u));
+
+        uint ki_word = kBuffer.data[k_imag_idx >> 1u];
+        float k_imag = bf16_unpack(((k_imag_idx & 1u) == 0u) ? (ki_word & 0xFFFFu) : (ki_word >> 16u));
+
+        float k_real_new = k_real * cos_val - k_imag * sin_val;
+        float k_imag_new = k_imag * cos_val + k_real * sin_val;
+
+        /* Write real component back */
+        uint krw = kBuffer.data[k_real_idx >> 1u];
+        uint krp = bf16_pack(k_real_new);
+        kBuffer.data[k_real_idx >> 1u] = ((k_real_idx & 1u) == 0u)
+            ? ((krw & 0xFFFF0000u) | (krp & 0xFFFFu))
+            : ((krw & 0x0000FFFFu) | (krp << 16u));
+
+        /* Write imag component back */
+        uint kiw = kBuffer.data[k_imag_idx >> 1u];
+        uint kip = bf16_pack(k_imag_new);
+        kBuffer.data[k_imag_idx >> 1u] = ((k_imag_idx & 1u) == 0u)
+            ? ((kiw & 0xFFFF0000u) | (kip & 0xFFFFu))
+            : ((kiw & 0x0000FFFFu) | (kip << 16u));
+    }
+}
+

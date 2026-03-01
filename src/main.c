@@ -133,14 +133,13 @@ static int interactive_loop(inference_context_t* ctx) {
             // Perform inference
             printf("\n[Generating response...]\n");
 
-            clock_t start = clock();
             int result = perform_inference(ctx, prompt, output, sizeof(output));
-            clock_t end = clock();
 
             if (result == 0) {
-                double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
+                double elapsed = ctx->last_inference_time;
+                const char *backend_name = (ctx->session && ctx->session->backend) ? ctx->session->backend->name : "unknown";
                 printf("\n[Response]\n%s\n", output);
-                printf("\n[Generation time: %.3f seconds]\n", elapsed);
+                printf("\n[Generation time: %.3f seconds] (backend=%s)\n", elapsed, backend_name);
             } else {
                 printf("Inference failed\n");
             }
@@ -197,6 +196,8 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
     int rc = perform_inference(ctx, prompt, output, output_size);
     if (rc == 0) {
         LOG_INFO("\n[Response]\n%s\n", output);
+        LOG_INFO("[Inference time: %.3f seconds] (backend=%s)", ctx->last_inference_time,
+                 (ctx->session && ctx->session->backend) ? ctx->session->backend->name : "unknown");
     } else {
         LOG_ERROR("One-shot inference failed");
     }
