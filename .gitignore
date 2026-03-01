@@ -14,7 +14,7 @@ models/
 logs/
 ./logs/
 reports/
-
+docs/
 
 # Object and library files
 *.o
