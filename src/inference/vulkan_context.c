@@ -326,7 +326,7 @@ int vk_backend_init(vk_backend_context_t **ctx_out) {
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
         .pEngineName = "Sapphire",
         .engineVersion = VK_MAKE_VERSION(SAPPHIRE_VK_MAJOR, SAPPHIRE_VK_MINOR, 0),
-        .apiVersion = VK_API_VERSION_1_0,
+        .apiVersion = VK_API_VERSION_1_4,
     };
 
     int enable_validation = vk_validation_enabled();
@@ -508,6 +508,13 @@ VkPhysicalDevice vk_backend_get_physical_device(const vk_backend_context_t *ctx)
         return VK_NULL_HANDLE;
     }
     return ctx->physical_device;
+}
+
+VkInstance vk_backend_get_instance(const vk_backend_context_t *ctx) {
+    if (!ctx) {
+        return VK_NULL_HANDLE;
+    }
+    return ctx->instance;
 }
 
 VkQueue vk_backend_get_compute_queue(const vk_backend_context_t *ctx) {

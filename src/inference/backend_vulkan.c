@@ -37,6 +37,7 @@
 #include <time.h>
 #include <stdint.h>
 #include "../../include/log.h"
+#include "vk_mem_alloc.h"
 
 /* Alignment helper macro */
 #define ALIGN_UP(value, alignment) (((value) + (alignment) - 1) & ~((alignment) - 1))
@@ -446,6 +447,40 @@ static inline int select_pipeline(int f32_idx, int bf16_idx, int is_bf16) {
     return is_bf16 ? bf16_idx : f32_idx;
 }
 
+static int init_vma_allocator(backend_vulkan_session_data_t *bd, VkInstance instance) {
+    if (!bd || !instance || !bd->device || !bd->phys_dev) {
+        LOG_ERROR("Invalid parameters for VMA allocator init");
+        return -1;
+    }
+
+    VmaVulkanFunctions vkf = {0};
+    vkf.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+    vkf.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+
+    VmaAllocatorCreateInfo ci = {0};
+    ci.physicalDevice = bd->phys_dev;
+    ci.device = bd->device;
+    ci.instance = instance;
+    ci.vulkanApiVersion = VK_API_VERSION_1_4;
+    ci.pVulkanFunctions = &vkf;
+
+    VkResult vr = vmaCreateAllocator(&ci, &bd->vma_allocator);
+    if (vr != VK_SUCCESS || !bd->vma_allocator) {
+        LOG_ERROR("vmaCreateAllocator failed: %d", (int)vr);
+        bd->vma_allocator = NULL;
+        return -1;
+    }
+
+    if (vk_buffer_set_vma_allocator(bd->vma_allocator) != 0) {
+        LOG_ERROR("Failed to register VMA allocator with vk_buffer subsystem");
+        vmaDestroyAllocator(bd->vma_allocator);
+        bd->vma_allocator = NULL;
+        return -1;
+    }
+
+    return 0;
+}
+
 /**
  * Build base push constants for a layer dispatch.
  * Caller overrides stride_0/stride_1/reserved for shader-specific semantics.
@@ -500,7 +535,7 @@ static void destroy_backend_data(backend_vulkan_session_data_t *bd) {
     if (bd->timing_query_pool != VK_NULL_HANDLE)
         vkDestroyQueryPool(dev, bd->timing_query_pool, NULL);
     if (bd->embedding_staging_mapped)
-        vkUnmapMemory(dev, bd->embedding_staging.memory);
+        vk_buffer_unmap(dev, &bd->embedding_staging);
     if (bd->transfer_cmd)
         vkFreeCommandBuffers(dev, bd->cmd_pool, 1, &bd->transfer_cmd);
     if (bd->transfer_fence)   vkDestroyFence(dev, bd->transfer_fence, NULL);
@@ -532,6 +567,11 @@ static void destroy_backend_data(backend_vulkan_session_data_t *bd) {
         for (size_t i = 0; i < bd->num_weight_buffers; i++)
             vk_buffer_destroy(dev, &bd->weight_buffers[i]);
         free(bd->weight_buffers);
+    }
+    if (bd->vma_allocator) {
+        vmaDestroyAllocator(bd->vma_allocator);
+        bd->vma_allocator = NULL;
+        vk_buffer_clear_vma_allocator();
     }
     free(bd->weight_layer_strides);
     free(bd);
@@ -726,12 +766,12 @@ static int chunk_upload_to_device(backend_vulkan_session_data_t *bd,
         vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
         vkResetFences(bd->device, 1, &bd->transfer_fence);
         void *mapped = NULL;
-        if (vkMapMemory(bd->device, bd->embedding_staging.memory,
-                        0, chunk, 0, &mapped) != VK_SUCCESS) {
+        if (vk_buffer_map(bd->device, &bd->embedding_staging,
+                          0, chunk, &mapped) != 0) {
             LOG_ERROR("Failed to map staging buffer for chunk upload"); return -1;
         }
         memcpy(mapped, (const void *)(packed_data + uploaded / sizeof(float)), chunk);
-        vkUnmapMemory(bd->device, bd->embedding_staging.memory);
+        vk_buffer_unmap(bd->device, &bd->embedding_staging);
         vkResetCommandBuffer(bd->transfer_cmd, 0);
         vkBeginCommandBuffer(bd->transfer_cmd, &beg);
         VkBufferCopy cp = { .srcOffset = 0, .dstOffset = uploaded, .size = chunk };
@@ -848,9 +888,12 @@ static int upload_rope_pair(backend_vulkan_session_data_t *bd,
         void *mapped = NULL;
         vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
         vkResetFences(bd->device, 1, &bd->transfer_fence);
-        vkMapMemory(bd->device, bd->embedding_staging.memory, 0, sz, 0, &mapped);
+        if (vk_buffer_map(bd->device, &bd->embedding_staging, 0, sz, &mapped) != 0) {
+            LOG_ERROR("Failed to map staging buffer for RoPE upload");
+            return -1;
+        }
         memcpy(mapped, bufs[b], sz);
-        vkUnmapMemory(bd->device, bd->embedding_staging.memory);
+        vk_buffer_unmap(bd->device, &bd->embedding_staging);
         vkResetCommandBuffer(bd->transfer_cmd, 0);
         vkBeginCommandBuffer(bd->transfer_cmd, &beg);
         vkCmdCopyBuffer(bd->transfer_cmd, bd->embedding_staging.buffer,
@@ -1095,11 +1138,12 @@ static int setup_vk_timing_and_staging(backend_vulkan_session_data_t *bd,
         }
     }
 
-    VkResult mr = vkMapMemory(bd->device, bd->embedding_staging.memory,
-                              0, bd->embedding_staging.size, 0,
-                              &bd->embedding_staging_mapped);
-    if (mr != VK_SUCCESS || !bd->embedding_staging_mapped) {
-        LOG_ERROR("Failed to create persistent staging mapping: %d", (int)mr);
+    if (vk_buffer_map(bd->device,
+                      &bd->embedding_staging,
+                      0,
+                      bd->embedding_staging.size,
+                      &bd->embedding_staging_mapped) != 0 || !bd->embedding_staging_mapped) {
+        LOG_ERROR("Failed to create persistent staging mapping");
         return -1;
     }
     bd->frame_counter = 0;
@@ -1128,12 +1172,20 @@ static int vulkan_session_init(inference_session_t* session, const model_spec_t*
 
     bd->device          = vk_backend_get_device(vk_ctx);
     bd->phys_dev        = vk_backend_get_physical_device(vk_ctx);
+    VkInstance vk_instance = vk_backend_get_instance(vk_ctx);
     bd->compute_queue   = vk_backend_get_compute_queue(vk_ctx);
     bd->cmd_pool        = vk_backend_get_command_pool(vk_ctx);
     bd->queue_family_idx = vk_backend_get_compute_queue_family_idx(vk_ctx);
 
-    if (!bd->device || !bd->phys_dev || !bd->compute_queue || !bd->cmd_pool) {
+    if (!bd->device || !bd->phys_dev || !vk_instance || !bd->compute_queue || !bd->cmd_pool) {
         LOG_ERROR("Failed to extract Vulkan handles from context");
+        free(bd);
+        vk_backend_shutdown(vk_ctx);
+        return -1;
+    }
+
+    if (init_vma_allocator(bd, vk_instance) != 0) {
+        LOG_ERROR("Failed to initialize VMA allocator");
         free(bd);
         vk_backend_shutdown(vk_ctx);
         return -1;
@@ -1211,7 +1263,7 @@ static void vulkan_session_destroy(inference_session_t* session) {
 
     /* Free persistent transfer resources */
     if (backend_data->embedding_staging_mapped) {
-        vkUnmapMemory(backend_data->device, backend_data->embedding_staging.memory);
+        vk_buffer_unmap(backend_data->device, &backend_data->embedding_staging);
         backend_data->embedding_staging_mapped = NULL;
     }
     if (backend_data->transfer_cmd) {
@@ -1279,6 +1331,12 @@ static void vulkan_session_destroy(inference_session_t* session) {
         free(backend_data->weight_layer_strides);
     }
 
+    if (backend_data->vma_allocator) {
+        vmaDestroyAllocator(backend_data->vma_allocator);
+        backend_data->vma_allocator = NULL;
+        vk_buffer_clear_vma_allocator();
+    }
+
     /* Free backend data */
     free(backend_data);
     session->backend_data = NULL;
@@ -1301,11 +1359,13 @@ static void vulkan_session_destroy(inference_session_t* session) {
  * pre-allocated pool and return it.  We use a per-pipeline cursor.
  * ------------------------------------------------------------------ */
 static uint32_t g_sdt_cursor[NUM_PIPELINES];  /* allocation cursors, reset before prepopulate */
+static int g_sdt_alloc_failed = 0;
 
 static VkDescriptorSet sdt_alloc_ds(backend_vulkan_session_data_t *bd, int pipeline_idx) {
     vk_compute_pipeline_t *p = &bd->pipelines[pipeline_idx];
     uint32_t idx = g_sdt_cursor[pipeline_idx]++;
     if (idx >= p->num_desc_sets) {
+        g_sdt_alloc_failed = 1;
         LOG_ERROR("SDT: descriptor set overflow for pipeline %d (cursor=%u, max=%u)",
                   pipeline_idx, idx, p->num_desc_sets);
         return VK_NULL_HANDLE;
@@ -1316,6 +1376,11 @@ static VkDescriptorSet sdt_alloc_ds(backend_vulkan_session_data_t *bd, int pipel
 /* Shorthand: write one STORAGE_BUFFER binding into a descriptor set. */
 static void sdt_write_buf(VkDevice device, VkDescriptorSet ds, uint32_t binding,
                            VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range) {
+    if (ds == VK_NULL_HANDLE || buffer == VK_NULL_HANDLE) {
+        g_sdt_alloc_failed = 1;
+        LOG_ERROR("SDT write skipped: invalid descriptor set/buffer (binding=%u)", binding);
+        return;
+    }
     VkDescriptorBufferInfo buf_info = { .buffer = buffer, .offset = offset, .range = range };
     VkWriteDescriptorSet w = {
         .sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -1530,6 +1595,7 @@ static int vulkan_prepopulate_descriptors(backend_vulkan_session_data_t *bd,
 
     /* Reset allocation cursors */
     memset(g_sdt_cursor, 0, sizeof(g_sdt_cursor));
+    g_sdt_alloc_failed = 0;
     vk_gpu_scratchpad_t *sp = &bd->scratchpad;
     bd->sdt.num_layers = num_layers;
     VkDevice dev = bd->device;
@@ -1560,6 +1626,11 @@ static int vulkan_prepopulate_descriptors(backend_vulkan_session_data_t *bd,
     bd->sdt.lmhead_argmax.ds = sdt_alloc_ds(bd, PIPELINE_ARGMAX_F32);
     sdt_write_buf(dev, bd->sdt.lmhead_argmax.ds, 0, bd->lm_head_logits.buffer,      0, VK_WHOLE_SIZE);
     sdt_write_buf(dev, bd->sdt.lmhead_argmax.ds, 1, bd->selected_token_ids.buffer,  0, VK_WHOLE_SIZE);
+
+    if (g_sdt_alloc_failed) {
+        LOG_ERROR("SDT pre-population failed due to invalid descriptor allocation/binding");
+        return -1;
+    }
 
     LOG_INFO("SDT pre-populated: %d layers × %d kernel slots + 3 lm_head = %d total descriptor sets",
              num_layers, SDT_KERNELS_PER_LAYER,
@@ -2852,18 +2923,16 @@ static int vulkan_forward_select_batch(inference_session_t* session, const int* 
 
     double t_download_start_ms = monotonic_ms();
     void *mapped_ids = NULL;
-    vr = vkMapMemory(bd->device,
-                     bd->selected_token_ids.memory,
-                     0,
-                     (VkDeviceSize)((size_t)batch_size * sizeof(int32_t)),
-                     0,
-                     &mapped_ids);
-    if (vr != VK_SUCCESS || !mapped_ids) {
-        LOG_ERROR("Failed to map selected token id buffer: %d", (int)vr);
+    if (vk_buffer_map(bd->device,
+                      &bd->selected_token_ids,
+                      0,
+                      (size_t)batch_size * sizeof(int32_t),
+                      &mapped_ids) != 0 || !mapped_ids) {
+        LOG_ERROR("Failed to map selected token id buffer");
         return -1;
     }
     memcpy(selected_ids, mapped_ids, (size_t)batch_size * sizeof(int32_t));
-    vkUnmapMemory(bd->device, bd->selected_token_ids.memory);
+    vk_buffer_unmap(bd->device, &bd->selected_token_ids);
 
     download_ms = monotonic_ms() - t_download_start_ms;
 

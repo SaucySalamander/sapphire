@@ -157,6 +157,7 @@ typedef struct {
     /* Vulkan context handles (from vk_backend_context_t) */
     VkDevice device;
     VkPhysicalDevice phys_dev;
+    VmaAllocator vma_allocator;
     VkQueue compute_queue;
     VkCommandPool cmd_pool;
     uint32_t queue_family_idx;

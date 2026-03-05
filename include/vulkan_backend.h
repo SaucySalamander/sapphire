@@ -20,7 +20,7 @@ extern "C" {
 
 /* Version constants */
 #define SAPPHIRE_VK_MAJOR 1
-#define SAPPHIRE_VK_MINOR 0
+#define SAPPHIRE_VK_MINOR 4
 
 /**
  * Opaque Vulkan backend context.
@@ -116,6 +116,16 @@ VkDevice vk_backend_get_device(const vk_backend_context_t *ctx);
  * @return VkPhysicalDevice handle, or VK_NULL_HANDLE if ctx is NULL
  */
 VkPhysicalDevice vk_backend_get_physical_device(const vk_backend_context_t *ctx);
+
+/**
+ * Get Vulkan instance from context.
+ *
+ * Required for VMA allocator creation.
+ *
+ * @param ctx Vulkan context (must not be NULL)
+ * @return VkInstance handle, or VK_NULL_HANDLE if ctx is NULL
+ */
+VkInstance vk_backend_get_instance(const vk_backend_context_t *ctx);
 
 /**
  * Get Vulkan compute queue from context.

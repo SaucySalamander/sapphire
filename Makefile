@@ -1,4 +1,5 @@
 CC = gcc
+CXX = g++
 SRCDIR = src
 INCDIR = include
 OUTDIR = out
@@ -7,17 +8,18 @@ ASAN_OUTDIR = out/asan
 # Vulkan SDK detection (find vulkan headers and libraries)
 VK_INCLUDE_PATHS = $(shell for p in /usr/include /usr/local/include /opt/vulkan/include; do [ -f $$p/vulkan/vulkan.h ] && { echo -I$$p; break; }; done)
 VK_LIB_PATHS = $(shell for p in /usr/lib /usr/lib64 /usr/local/lib /opt/vulkan/lib; do [ -f $$p/libvulkan.so ] && { echo -L$$p; break; }; done)
+VMA_INCLUDE_PATHS = $(shell for p in $(INCDIR) $(INCDIR)/third_party/vma /usr/include /usr/local/include; do [ -f $$p/vk_mem_alloc.h ] && { echo -I$$p; break; }; done)
 
 # Compilation flags
-CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma $(VK_INCLUDE_PATHS)
-LDFLAGS = -lm -pthread -lvulkan $(VK_LIB_PATHS)
+CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS)
+LDFLAGS = -lm -pthread -lvulkan -lstdc++ $(VK_LIB_PATHS)
 
 # AddressSanitizer + UndefinedBehaviorSanitizer flags
 # Use -g for debug info (better error messages), -O1 for reasonable speed
 # Include paths (-I. -I$(INCDIR)) must be present for sanitizer builds
 # IMPORTANT: must include -mavx2 -mfma for AVX/FMA intrinsics in kernel code
-SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer $(VK_INCLUDE_PATHS)
-SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined $(VK_LIB_PATHS)
+SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS)
+SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined -lstdc++ $(VK_LIB_PATHS)
 
 # HIP configuration (optional ROCm support)
 HIPCC = hipcc
@@ -75,6 +77,10 @@ $(OUTDIR)/%.o: $(SRCDIR)/kernels/%.c | $(OUTDIR)
 	mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(OUTDIR)/kernels/backends/vulkan/%.o: $(SRCDIR)/kernels/backends/vulkan/%.cpp | $(OUTDIR)
+	mkdir -p $(@D)
+	$(CXX) $(CFLAGS) -c $< -o $@
+
 $(OUTDIR)/%.o: $(SRCDIR)/loader/%.c | $(OUTDIR)
 	mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -104,6 +110,7 @@ $(OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(OUTDIR)
 /* Discover non-test sources: exclude src/test/ directory and common test filename patterns */
 NON_TEST_SRCS := $(shell find $(SRCDIR) -type f -name '*.c' ! -path '$(SRCDIR)/test/*' ! -name 'test_*.c' ! -name '*_test.c' -print)
 NON_TEST_OBJS := $(patsubst $(SRCDIR)/%.c,$(OUTDIR)/%.o,$(NON_TEST_SRCS))
+NON_TEST_OBJS += $(OUTDIR)/kernels/backends/vulkan/vma_impl.o
 
 # Library objects (non-test objects excluding main.o)
 LIB_OBJS := $(filter-out $(OUTDIR)/main.o, $(NON_TEST_OBJS))
@@ -187,6 +194,10 @@ $(ASAN_OUTDIR)/%.o: $(SRCDIR)/kernels/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
 	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
 
+$(ASAN_OUTDIR)/kernels/backends/vulkan/%.o: $(SRCDIR)/kernels/backends/vulkan/%.cpp | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CXX) $(SANITIZER_FLAGS) -c $< -o $@
+
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/loader/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
 	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
@@ -213,6 +224,7 @@ $(ASAN_OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(ASAN_OUTDIR)
 
 # Reuse NON_TEST_SRCS and NON_TEST_OBJS but map to asan directory
 ASAN_TEST_OBJS := $(patsubst $(SRCDIR)/%.c,$(ASAN_OUTDIR)/%.o,$(NON_TEST_SRCS))
+ASAN_TEST_OBJS += $(ASAN_OUTDIR)/kernels/backends/vulkan/vma_impl.o
 
 $(ASAN_OUTDIR)/sapphire: $(ASAN_TEST_OBJS)
 	$(CC) $(SANITIZER_FLAGS) $^ -o $@ $(SANITIZER_LDFLAGS)

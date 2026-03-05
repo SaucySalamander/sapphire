@@ -24,6 +24,10 @@ extern "C" {
 /* Include Vulkan headers */
 #include <vulkan/vulkan.h>
 
+/* Forward declarations for Vulkan Memory Allocator (VMA) opaque handles. */
+typedef struct VmaAllocator_T* VmaAllocator;
+typedef struct VmaAllocation_T* VmaAllocation;
+
 /* ========================================================================
  * Config Structs (for parameter reduction)
  * ======================================================================== */
@@ -66,9 +70,28 @@ typedef struct {
 typedef struct {
     VkBuffer buffer;
     VkDeviceMemory memory;
+    VmaAllocation allocation;
     size_t size;
     VkMemoryPropertyFlags memory_flags;  /* Device-local? Host-visible? Coherent? */
 } vk_buffer_t;
+
+/* Set/clear active VMA allocator used by vk_buffer_create/destroy/map helpers. */
+int vk_buffer_set_vma_allocator(VmaAllocator allocator);
+void vk_buffer_clear_vma_allocator(void);
+
+/* Map/unmap buffer memory through VMA. */
+int vk_buffer_map(
+    VkDevice device,
+    vk_buffer_t *buffer,
+    size_t offset,
+    size_t size,
+    void **out_mapped
+);
+
+void vk_buffer_unmap(
+    VkDevice device,
+    vk_buffer_t *buffer
+);
 
 /**
  * Create a Vulkan buffer with specified usage and memory properties.

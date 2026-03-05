@@ -14,40 +14,33 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
-/* ========================================================================
- * Memory Type Selection
- * ======================================================================== */
+#include "vk_mem_alloc.h"
 
-/**
- * Find memory type index matching required properties.
- *
- * @param phys_dev          Physical device
- * @param type_filter       Memory type bits from VkMemoryRequirements
- * @param properties        Required VkMemoryPropertyFlags
- * @param out_type_index    Output memory type index
- *
- * @return 0 on success, -1 if no suitable memory type found
- */
-static int find_memory_type(
-    VkPhysicalDevice phys_dev,
-    uint32_t type_filter,
-    VkMemoryPropertyFlags properties,
-    uint32_t *out_type_index
-) {
-    VkPhysicalDeviceMemoryProperties mem_props;
-    vkGetPhysicalDeviceMemoryProperties(phys_dev, &mem_props);
+static VmaAllocator g_vk_vma_allocator = NULL;
 
-    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
-        if ((type_filter & (1 << i)) &&
-            (mem_props.memoryTypes[i].propertyFlags & properties) == properties) {
-            *out_type_index = i;
-            return 0;
-        }
+int vk_buffer_set_vma_allocator(VmaAllocator allocator) {
+    if (!allocator) {
+        LOG_ERROR("vk_buffer_set_vma_allocator: allocator is NULL");
+        return -1;
     }
+    g_vk_vma_allocator = allocator;
+    return 0;
+}
 
-    LOG_ERROR("Failed to find suitable memory type (filter=0x%x, props=0x%x)", type_filter, properties);
-    return -1;
+void vk_buffer_clear_vma_allocator(void) {
+    g_vk_vma_allocator = NULL;
+}
+
+static VmaMemoryUsage select_vma_usage(VkMemoryPropertyFlags flags) {
+    if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+        return VMA_MEMORY_USAGE_CPU_TO_GPU;
+    }
+    if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+        return VMA_MEMORY_USAGE_GPU_ONLY;
+    }
+    return VMA_MEMORY_USAGE_AUTO;
 }
 
 /* ========================================================================
@@ -67,6 +60,11 @@ int vk_buffer_create(
         return -1;
     }
 
+    if (!g_vk_vma_allocator) {
+        LOG_ERROR("VMA allocator not configured before vk_buffer_create");
+        return -1;
+    }
+
     if (size == 0) {
         LOG_ERROR("Buffer size cannot be 0");
         return -1;
@@ -75,57 +73,34 @@ int vk_buffer_create(
     /* Zero-initialize output */
     memset(out_buffer, 0, sizeof(vk_buffer_t));
 
-    /* Create VkBuffer */
     VkBufferCreateInfo buf_info = {0};
     buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buf_info.size = size;
     buf_info.usage = usage;
     buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    VkResult res = vkCreateBuffer(device, &buf_info, NULL, &out_buffer->buffer);
+    VmaAllocationCreateInfo alloc_info = {0};
+    alloc_info.usage = select_vma_usage(flags);
+    alloc_info.requiredFlags = flags;
+
+    VmaAllocationInfo vma_alloc_info = {0};
+    VkResult res = vmaCreateBuffer(
+        g_vk_vma_allocator,
+        &buf_info,
+        &alloc_info,
+        &out_buffer->buffer,
+        &out_buffer->allocation,
+        &vma_alloc_info
+    );
     if (res != VK_SUCCESS) {
-        LOG_ERROR("vkCreateBuffer failed: %d", res);
-        return -1;
-    }
-
-    /* Get memory requirements */
-    VkMemoryRequirements mem_reqs;
-    vkGetBufferMemoryRequirements(device, out_buffer->buffer, &mem_reqs);
-
-    /* Find suitable memory type */
-    uint32_t mem_type_idx;
-    if (find_memory_type(phys_dev, mem_reqs.memoryTypeBits, flags, &mem_type_idx) != 0) {
-        vkDestroyBuffer(device, out_buffer->buffer, NULL);
-        memset(out_buffer, 0, sizeof(vk_buffer_t));
-        return -1;
-    }
-
-    /* Allocate memory */
-    VkMemoryAllocateInfo alloc_info = {0};
-    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc_info.allocationSize = mem_reqs.size;
-    alloc_info.memoryTypeIndex = mem_type_idx;
-
-    res = vkAllocateMemory(device, &alloc_info, NULL, &out_buffer->memory);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkAllocateMemory failed: %d (size=%zu)", res, (size_t)mem_reqs.size);
-        vkDestroyBuffer(device, out_buffer->buffer, NULL);
-        memset(out_buffer, 0, sizeof(vk_buffer_t));
-        return -1;
-    }
-
-    /* Bind memory to buffer */
-    res = vkBindBufferMemory(device, out_buffer->buffer, out_buffer->memory, 0);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkBindBufferMemory failed: %d", res);
-        vkFreeMemory(device, out_buffer->memory, NULL);
-        vkDestroyBuffer(device, out_buffer->buffer, NULL);
+        LOG_ERROR("vmaCreateBuffer failed: %d (size=%zu)", (int)res, size);
         memset(out_buffer, 0, sizeof(vk_buffer_t));
         return -1;
     }
 
     out_buffer->size = size;
     out_buffer->memory_flags = flags;
+    out_buffer->memory = vma_alloc_info.deviceMemory;
 
     LOG_DEBUG("Created buffer: size=%zu, usage=0x%x, flags=0x%x", size, usage, flags);
     return 0;
@@ -136,10 +111,9 @@ void vk_buffer_destroy(VkDevice device, vk_buffer_t *buffer) {
         return;  /* Safe no-op */
     }
 
-    if (buffer->memory) {
-        vkFreeMemory(device, buffer->memory, NULL);
-    }
-    if (buffer->buffer) {
+    if ((buffer->buffer || buffer->allocation) && g_vk_vma_allocator) {
+        vmaDestroyBuffer(g_vk_vma_allocator, buffer->buffer, buffer->allocation);
+    } else if (buffer->buffer) {
         vkDestroyBuffer(device, buffer->buffer, NULL);
     }
 
@@ -173,19 +147,17 @@ int vk_buffer_stage_data(
         return -1;
     }
 
-    /* Map memory */
     void *mapped = NULL;
-    VkResult res = vkMapMemory(device, host_visible_buf->memory, offset_in_buffer, size, 0, &mapped);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkMapMemory failed: %d", res);
+    int rc = vk_buffer_map(device, host_visible_buf, offset_in_buffer, size, &mapped);
+    if (rc != 0) {
+        LOG_ERROR("vk_buffer_map failed for staging");
         return -1;
     }
 
     /* Copy data */
     memcpy(mapped, data, size);
 
-    /* Unmap */
-    vkUnmapMemory(device, host_visible_buf->memory);
+    vk_buffer_unmap(device, host_visible_buf);
 
     LOG_DEBUG("Staged %zu bytes at offset %zu", size, offset_in_buffer);
     return 0;
@@ -328,20 +300,67 @@ int vk_buffer_download(
         return -1;
     }
 
-    /* Map staging buffer and copy to host */
     void *mapped = NULL;
-    VkResult res = vkMapMemory(ctx->device, staging.memory, 0, size, 0, &mapped);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkMapMemory failed: %d", res);
+    rc = vk_buffer_map(ctx->device, &staging, 0, size, &mapped);
+    if (rc != 0) {
+        LOG_ERROR("vk_buffer_map failed in vk_buffer_download");
         vk_buffer_destroy(ctx->device, &staging);
         return -1;
     }
 
     memcpy(out_host_data, mapped, size);
-    vkUnmapMemory(ctx->device, staging.memory);
+    vk_buffer_unmap(ctx->device, &staging);
 
     vk_buffer_destroy(ctx->device, &staging);
 
     LOG_DEBUG("Downloaded %zu bytes from device buffer", size);
     return 0;
+}
+
+int vk_buffer_map(
+    VkDevice device,
+    vk_buffer_t *buffer,
+    size_t offset,
+    size_t size,
+    void **out_mapped
+) {
+    (void)device;
+    if (!buffer || !out_mapped) {
+        LOG_ERROR("vk_buffer_map: invalid parameters");
+        return -1;
+    }
+    if (!g_vk_vma_allocator || !buffer->allocation) {
+        LOG_ERROR("vk_buffer_map: VMA allocator/allocation unavailable");
+        return -1;
+    }
+    if (offset > buffer->size) {
+        LOG_ERROR("vk_buffer_map: offset out of bounds (offset=%zu, size=%zu)", offset, buffer->size);
+        return -1;
+    }
+    if (size > 0 && (offset + size > buffer->size)) {
+        LOG_ERROR("vk_buffer_map: range out of bounds (offset=%zu, size=%zu, buf_size=%zu)",
+                  offset, size, buffer->size);
+        return -1;
+    }
+
+    void *base = NULL;
+    VkResult res = vmaMapMemory(g_vk_vma_allocator, buffer->allocation, &base);
+    if (res != VK_SUCCESS || !base) {
+        LOG_ERROR("vmaMapMemory failed: %d", (int)res);
+        return -1;
+    }
+
+    *out_mapped = (void *)((uint8_t *)base + offset);
+    return 0;
+}
+
+void vk_buffer_unmap(
+    VkDevice device,
+    vk_buffer_t *buffer
+) {
+    (void)device;
+    if (!buffer || !buffer->allocation || !g_vk_vma_allocator) {
+        return;
+    }
+    vmaUnmapMemory(g_vk_vma_allocator, buffer->allocation);
 }

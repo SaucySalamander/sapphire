@@ -171,9 +171,8 @@ int vk_ring_buffer_acquire_write(
 
     /* Map slot for CPU write */
     void *mapped = NULL;
-    res = vkMapMemory(device, slot->memory, 0, slot->size, 0, &mapped);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkMapMemory failed for write slot %zu: %d", slot_idx, res);
+    if (vk_buffer_map(device, slot, 0, slot->size, &mapped) != 0) {
+        LOG_ERROR("vk_buffer_map failed for write slot %zu", slot_idx);
         return -1;
     }
 
