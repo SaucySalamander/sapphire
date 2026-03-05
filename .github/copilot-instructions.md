@@ -17,6 +17,58 @@ You are the Lead Systems Architect specializing in low-level GPU acceleration an
 
     Memory: Strict manual allocation with null-checks. Use mmap for weights.
 
+🔥 Vulkan Performance Guardrails (Permanent)
+
+These rules are mandatory for all future AI sessions and must never be violated:
+
+1. VMA-only allocation policy
+
+    ALL Vulkan buffers MUST be allocated through VMA.
+
+    NEVER call vkAllocateMemory or vkBindBufferMemory directly.
+
+2. No per-operation waits in hot path
+
+    Zero per-operation fences and zero vkQueueWaitIdle inside inference hot paths.
+
+    Use a persistent transfer command buffer and a single fence at frame end.
+
+3. Buffer-specific synchronization only
+
+    Use narrow VkBufferMemoryBarrier for synchronization.
+
+    NEVER use global VkMemoryBarrier for hot-path compute/dataflow synchronization.
+
+4. Readback policy (zero-copy)
+
+    All readback buffers (logits, selected tokens) MUST be HOST_VISIBLE | HOST_COHERENT.
+
+    Prefer persistent mapped readback paths.
+
+5. Decode transfer architecture
+
+    Ring buffer decode path is replaced by a single persistent mapped staging buffer + timeline semaphore.
+
+6. Recording strategy
+
+    Use secondary command buffers for per-layer recording to parallelize CPU work.
+
+7. Transfer source usage contract
+
+    Every buffer that is ever copied from MUST include VK_BUFFER_USAGE_TRANSFER_SRC_BIT.
+
+Persistent hot-path prohibitions:
+
+    Never introduce allocations, maps, or waits inside vulkan_forward_batch.
+
+    Never introduce allocations, maps, or waits inside record_transformer_layer.
+
+    Timeline semaphores are the only synchronization primitive allowed in hot paths.
+
+    CP1/CP2/CP3 debug probes must be zero-cost when SAPPHIRE_DEBUG_GPU=0.
+
+    If a change adds measurable latency (~0.1 ms or more), reject it unless required for correctness.
+
 🎯 Vulkan Hardware Contract (The "Laws")
 
 The Vulkan backend has historically failed due to "Junior" implementation errors. You must adhere to these laws to ensure non-zero, high-performance output:
