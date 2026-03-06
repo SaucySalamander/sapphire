@@ -694,12 +694,25 @@ int build_gemma3_prompt_it(sapphire_tokenizer_t* tok, const char* user_prompt,
 
     int idx = 0;
 
-    /* CRITICAL: Hardcoded Gemma 3 IT turn markers (matches HuggingFace template) */
-    tokens[idx++] = 2;     // <bos>
-    tokens[idx++] = 2;     // <bos> (duplicate, as per HF template)
-    tokens[idx++] = 105;   // <start_of_turn>
-    tokens[idx++] = 2364;  // "user"
-    tokens[idx++] = 107;   // "\n"
+    int tok_bos = tok_hash_lookup(tok, "<bos>");
+    int tok_start_of_turn = tok_hash_lookup(tok, "<start_of_turn>");
+    int tok_end_of_turn = tok_hash_lookup(tok, "<end_of_turn>");
+    int tok_newline = tok_hash_lookup(tok, "\n");
+    int tok_user = tok_hash_lookup(tok, "user");
+    int tok_model = tok_hash_lookup(tok, "model");
+
+    if (tok_bos < 0) tok_bos = 2;
+    if (tok_start_of_turn < 0) tok_start_of_turn = 105;
+    if (tok_end_of_turn < 0) tok_end_of_turn = 106;
+    if (tok_newline < 0) tok_newline = 107;
+    if (tok_user < 0) tok_user = 2364;
+    if (tok_model < 0) tok_model = 4368;
+
+    /* CRITICAL: Hardcoded Gemma 3 IT turn markers (matches chat_template.jinja) */
+    tokens[idx++] = tok_bos;
+    tokens[idx++] = tok_start_of_turn;
+    tokens[idx++] = tok_user;
+    tokens[idx++] = tok_newline;
 
     /* Tokenize user's actual prompt message */
     int prompt_tokens[512];
@@ -719,11 +732,11 @@ int build_gemma3_prompt_it(sapphire_tokenizer_t* tok, const char* user_prompt,
     }
 
     /* End user turn and start model turn (hardcoded token sequence) */
-    tokens[idx++] = 106;   // <end_of_turn>
-    tokens[idx++] = 107;   // "\n" (added to match HF template)
-    tokens[idx++] = 105;   // <start_of_turn>
-    tokens[idx++] = 4368;  // "model"
-    tokens[idx++] = 107;   // "\n"
+    tokens[idx++] = tok_end_of_turn;
+    tokens[idx++] = tok_newline;
+    tokens[idx++] = tok_start_of_turn;
+    tokens[idx++] = tok_model;
+    tokens[idx++] = tok_newline;
 
     return idx;  /* Return actual prompt length */
 }
@@ -765,10 +778,7 @@ int build_gemma3_prompt_base(sapphire_tokenizer_t* tok, const char* user_prompt,
         }
     }
 
-    /* Add EOS token */
-    if (idx < max_tokens) {
-        tokens[idx++] = 1;  // <eos>
-    }
+    /* Base generation prompt should not force EOS before decoding. */
 
     return idx;  /* Return actual prompt length */
 }

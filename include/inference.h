@@ -25,6 +25,8 @@ typedef struct {
     inference_session_t *session;
     sapphire_tokenizer_t *tokenizer;
     float *logits;          // Buffer for logits
+    int *conversation_tokens; // Persistent token history for interactive chat
+    int conversation_len;     // Number of valid tokens in conversation_tokens
     int max_tokens;
     float temperature;
     int context_len;

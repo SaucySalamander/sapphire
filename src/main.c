@@ -112,6 +112,7 @@ static int interactive_loop(inference_context_t* ctx) {
                     destroy_inference_session(ctx->session);
                     ctx->session = inference_session_create(ctx->spec, ctx->context_len);
                 }
+                ctx->conversation_len = 0;
             } else if (strcmp(prompt, "/info") == 0) {
                 printf("\nModel Information:\n");
                 printf("\nInference Settings:\n");
@@ -192,6 +193,11 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
     output[output_size - 1] = '\0';
 
     LOG_INFO("Running prompt (non-interactive): '%s'", prompt);
+
+    if (ctx->session) {
+        inference_session_reset(ctx->session);
+    }
+    ctx->conversation_len = 0;
 
     int rc = perform_inference(ctx, prompt, output, output_size);
     if (rc == 0) {

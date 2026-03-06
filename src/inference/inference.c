@@ -144,10 +144,21 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
         return NULL;
     }
 
+    ctx->conversation_tokens = (int*)malloc((size_t)context_len * sizeof(int));
+    if (!ctx->conversation_tokens) {
+        LOG_ERROR("Failed to allocate conversation token buffer");
+        free(ctx->logits);
+        free(ctx);
+        free(model_dir);
+        return NULL;
+    }
+    ctx->conversation_len = 0;
+
     // Create a single inference session for convenience (1:many supported via model_spec)
     ctx->session = inference_session_create(spec, context_len);
     if (!ctx->session) {
         LOG_ERROR("Failed to create inference session");
+        free(ctx->conversation_tokens);
         free(ctx->logits);
         free(ctx);
         free(model_dir);
@@ -160,6 +171,7 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
         LOG_ERROR("Failed to initialize tokenizer");
         // Clean up allocated resources and return error
         if (ctx->session) destroy_inference_session(ctx->session);
+        if (ctx->conversation_tokens) free(ctx->conversation_tokens);
         if (ctx->logits) free(ctx->logits);
         free(ctx);
         if (spec->llm_model) {
@@ -189,6 +201,10 @@ void destroy_inference_context(inference_context_t* ctx) {
 
     if (ctx->logits) {
         free(ctx->logits);
+    }
+
+    if (ctx->conversation_tokens) {
+        free(ctx->conversation_tokens);
     }
 
     // Tokenizer ownership: prefer spec-owned tokenizer. Only free ctx->tokenizer
@@ -291,6 +307,196 @@ static int cpu_forward_and_sample(inference_session_t *session,
     return sample_temperature(ctx->logits, config->vocab_size, ctx->temperature);
 }
 
+static int is_instruction_tuned_model(const model_spec_t *spec) {
+    if (!spec || !spec->model_id) return 0;
+    return (strstr(spec->model_id, "-it") != NULL);
+}
+
+typedef struct {
+    int *turn_tokens;
+    int prompt_len;
+    int total_tokens;
+    int gen_start_idx;
+    int last_token;
+    int generated_count;
+    int is_it_model;
+} inference_run_state_t;
+
+static int prepare_turn_and_prefill(inference_context_t *ctx,
+                                    inference_session_t *session,
+                                    const char *prompt,
+                                    inference_run_state_t *st) {
+    st->turn_tokens = malloc((size_t)ctx->context_len * sizeof(int));
+    if (!st->turn_tokens) {
+        LOG_ERROR("Failed to allocate turn token buffer");
+        return -1;
+    }
+
+    if (!ctx->conversation_tokens) {
+        LOG_ERROR("Conversation token buffer is not initialized");
+        free(st->turn_tokens);
+        st->turn_tokens = NULL;
+        return -1;
+    }
+
+    st->prompt_len = build_gemma3_prompt(ctx->spec, prompt, st->turn_tokens, ctx->context_len);
+    if (st->prompt_len <= 0) {
+        LOG_ERROR("Failed to build prompt");
+        free(st->turn_tokens);
+        st->turn_tokens = NULL;
+        return -1;
+    }
+
+    if (st->is_it_model && ctx->conversation_len > 0) {
+        int leading_bos = 0;
+        while (leading_bos < st->prompt_len && st->turn_tokens[leading_bos] == 2) {
+            leading_bos++;
+        }
+        if (leading_bos > 0) {
+            memmove(st->turn_tokens,
+                    st->turn_tokens + leading_bos,
+                    (size_t)(st->prompt_len - leading_bos) * sizeof(int));
+            st->prompt_len -= leading_bos;
+        }
+
+        if (st->prompt_len > 0 && st->turn_tokens[0] == 105) {
+            if (ctx->conversation_tokens[ctx->conversation_len - 1] != 107) {
+                if (st->prompt_len >= ctx->context_len) {
+                    LOG_ERROR("Not enough room to normalize continuation boundary");
+                    free(st->turn_tokens);
+                    st->turn_tokens = NULL;
+                    return -1;
+                }
+                memmove(st->turn_tokens + 1,
+                        st->turn_tokens,
+                        (size_t)st->prompt_len * sizeof(int));
+                st->turn_tokens[0] = 107;
+                st->prompt_len += 1;
+            }
+        }
+    }
+
+    if (st->prompt_len <= 0) {
+        LOG_ERROR("Prompt became empty after continuation normalization");
+        free(st->turn_tokens);
+        st->turn_tokens = NULL;
+        return -1;
+    }
+
+    if (!st->is_it_model) {
+        ctx->conversation_len = 0;
+        st->total_tokens = 0;
+        st->gen_start_idx = 0;
+    }
+
+    if (ctx->conversation_len + st->prompt_len >= ctx->context_len) {
+        LOG_WARN("Context full (existing=%d, new=%d, max=%d); resetting session context",
+                 ctx->conversation_len, st->prompt_len, ctx->context_len);
+        inference_session_reset(session);
+        ctx->conversation_len = 0;
+        st->total_tokens = 0;
+        st->gen_start_idx = 0;
+    }
+
+    if (ctx->conversation_len + st->prompt_len >= ctx->context_len) {
+        LOG_ERROR("Prompt too long for available context after reset");
+        free(st->turn_tokens);
+        st->turn_tokens = NULL;
+        return -1;
+    }
+
+    memcpy(ctx->conversation_tokens + ctx->conversation_len,
+           st->turn_tokens,
+           (size_t)st->prompt_len * sizeof(int));
+    ctx->conversation_len += st->prompt_len;
+    st->total_tokens = ctx->conversation_len;
+
+    inference_session_reset(session);
+
+    int serial_prefill = (getenv("SAPPHIRE_SERIAL_PREFILL") != NULL);
+    int p_idx = 0;
+    while (p_idx < ctx->conversation_len - 1) {
+        int b_size = (ctx->conversation_len - 1) - p_idx;
+        if (b_size > 32) b_size = 32;
+        if (serial_prefill) b_size = 1;
+        inference_forward_batch(session, ctx->conversation_tokens + p_idx, p_idx, b_size, NULL);
+        p_idx += b_size;
+    }
+
+    st->last_token = ctx->conversation_tokens[ctx->conversation_len - 1];
+
+    free(st->turn_tokens);
+    st->turn_tokens = NULL;
+    return 0;
+}
+
+static int run_generation_loop(inference_context_t *ctx,
+                               inference_session_t *session,
+                               inference_run_state_t *st) {
+    while (st->total_tokens < ctx->context_len && st->generated_count < ctx->max_tokens) {
+        int cur_pos = st->total_tokens - 1;
+        int next_token = -1;
+
+        if (session->backend &&
+            session->backend->type == SAPPHIRE_BACKEND_TYPE_VULKAN &&
+            session->backend->forward_select_batch) {
+            int rc_sel = session->backend->forward_select_batch(
+                session, &st->last_token, cur_pos, 1, &next_token);
+            if (rc_sel != 0) {
+                LOG_ERROR("Vulkan GPU token selection failed at pos=%d", cur_pos);
+                return -1;
+            }
+        } else {
+            next_token = cpu_forward_and_sample(session, ctx,
+                                                st->last_token, cur_pos,
+                                                st->generated_count);
+        }
+
+        if (st->total_tokens >= ctx->context_len) {
+            LOG_WARN("Reached maximum context length during generation");
+            break;
+        }
+
+        ctx->conversation_tokens[st->total_tokens++] = next_token;
+        ctx->conversation_len = st->total_tokens;
+
+        if (next_token == 1 || (st->is_it_model && next_token == 106)) break;
+
+        print_decoded_token_chars(decode(ctx->tokenizer, next_token));
+
+        st->last_token = next_token;
+        st->generated_count++;
+    }
+
+    return 0;
+}
+
+static void append_assistant_terminator(inference_context_t *ctx,
+                                        const inference_run_state_t *st) {
+    if (st->is_it_model && ctx->conversation_len > 0 && ctx->conversation_tokens[ctx->conversation_len - 1] != 106) {
+        if (ctx->conversation_len < ctx->context_len) {
+            ctx->conversation_tokens[ctx->conversation_len++] = 106;
+        } else {
+            LOG_WARN("Context full; unable to append assistant turn terminator");
+        }
+    }
+}
+
+static void write_output_text(inference_context_t *ctx,
+                              const inference_run_state_t *st,
+                              char *output,
+                              int output_size) {
+    if (st->generated_count > 0) {
+        detokenize(ctx->tokenizer,
+                   ctx->conversation_tokens + st->gen_start_idx + st->prompt_len,
+                   st->generated_count,
+                   output,
+                   output_size);
+    } else if (output_size > 0) {
+        output[0] = '\0';
+    }
+}
+
 int perform_inference(inference_context_t* ctx, const char* prompt, char* output, int output_size) {
     if (!ctx || !prompt || !output) return -1;
 
@@ -299,82 +505,29 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
     clock_gettime(CLOCK_MONOTONIC, &__perf_start_ts);
 
     inference_session_t* session = ctx->session;
+    inference_run_state_t st = {
+        .turn_tokens = NULL,
+        .prompt_len = 0,
+        .total_tokens = ctx->conversation_len,
+        .gen_start_idx = ctx->conversation_len,
+        .last_token = 0,
+        .generated_count = 0,
+        .is_it_model = is_instruction_tuned_model(ctx->spec)
+    };
 
-    int* tokens = malloc((ctx->context_len) * sizeof(int));
-    int prompt_len = 0;
-    int total_tokens = 0;
-    int last_token = 0;
-    int generated_count = 0;
-
-    // 1. Build prompt (intelligently selects IT or base format based on model)
-    prompt_len = build_gemma3_prompt(ctx->spec, prompt, tokens, ctx->context_len);
-
-    if (prompt_len <= 0) {
-        LOG_ERROR("Failed to build prompt");
-        free(tokens);
+    if (prepare_turn_and_prefill(ctx, session, prompt, &st) != 0) {
         return -1;
     }
 
-    // Reset KV cache for a clean slate
-    inference_session_reset(session);
-
-    // 2. Pre-fill the KV cache with the prompt (Prompt Processing)
-    // We process tokens in batches of up to 32 to utilize GEMM math and reduce memory traffic.
-    // Set SAPPHIRE_SERIAL_PREFILL=1 to force single-token batches (isolates GEMM bugs).
-    int serial_prefill = (getenv("SAPPHIRE_SERIAL_PREFILL") != NULL);
-    int p_idx = 0;
-    while (p_idx < prompt_len - 1) {
-        int b_size = (prompt_len - 1) - p_idx;
-        if (b_size > 32) b_size = 32;
-        if (serial_prefill) b_size = 1;
-        inference_forward_batch(session, tokens + p_idx, p_idx, b_size, NULL);
-        p_idx += b_size;
-    }
-
-    total_tokens = prompt_len;
-    last_token = tokens[prompt_len - 1];
-
     LOG_INFO("Response generation starting");
 
-    // 3. Generation loop (Auto-regressive)
-    while (total_tokens < ctx->context_len && generated_count < ctx->max_tokens) {
-        int cur_pos = total_tokens - 1;
-        int next_token = -1;
-
-        /* Vulkan fast path: backend performs token selection on GPU and returns ids.
-         * CPU backend remains unchanged and uses logits+CPU sampling below. */
-        if (session->backend &&
-            session->backend->type == SAPPHIRE_BACKEND_TYPE_VULKAN &&
-            session->backend->forward_select_batch) {
-            int rc_sel = session->backend->forward_select_batch(
-                session, &last_token, cur_pos, 1, &next_token);
-            if (rc_sel != 0) {
-                LOG_ERROR("Vulkan GPU token selection failed at pos=%d", cur_pos);
-                free(tokens);
-                return -1;
-            }
-        } else {
-            next_token = cpu_forward_and_sample(session, ctx,
-                                                last_token, cur_pos,
-                                                generated_count);
-        }
-
-        // Gemma 3 stop tokens:
-        // - Token 1: <eos> (explicit end-of-sequence)
-        // - Token 106: <end_of_turn> (marks end of model's turn in chat format)
-        if (next_token == 1 || next_token == 106) break;
-
-        // --- STREAMING DECODE WITH SPIECE HANDLING ---
-        print_decoded_token_chars(decode(ctx->tokenizer, next_token));
-
-        // Store for next iteration
-        tokens[total_tokens++] = next_token;
-        last_token = next_token;
-        generated_count++;
+    if (run_generation_loop(ctx, session, &st) != 0) {
+        return -1;
     }
 
-    // 4. Final Detokenization into the output buffer for the caller
-    detokenize(ctx->tokenizer, tokens + prompt_len, generated_count, output, output_size);
+    append_assistant_terminator(ctx, &st);
+
+    write_output_text(ctx, &st, output, output_size);
 
     /* Stop timer and record elapsed seconds in the context for callers to inspect */
     struct timespec __perf_end_ts;
@@ -386,9 +539,7 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
     LOG_INFO("perform_inference: elapsed=%.3f sec (backend=%s)", __elapsed,
              (session && session->backend) ? session->backend->name : "unknown");
 
-    LOG_DEBUG("Generated %d tokens", generated_count);
-
-    free(tokens);
+    LOG_DEBUG("Generated %d tokens", st.generated_count);
 
     return 0;
 }
