@@ -1,14 +1,9 @@
 /**
  * @file vk_ring_buffer.c
- * @brief Ring buffer implementation with timeline semaphores (Vulkan 1.2).
+ * @brief Fast persistent mapped streaming buffer with timeline semaphore.
  *
- * Implements CPU↔GPU producer-consumer streaming with zero allocation in hot loop.
- * Uses timeline semaphores for monotonic frame tracking (no fence reuse races).
- *
- * Implements:
- * - vk_ring_buffer_create/destroy (allocation at init, deallocation at shutdown)
- * - vk_ring_buffer_acquire_write/commit_write (CPU producer, hot loop safe)
- * - vk_ring_buffer_acquire_read/commit_read (GPU consumer, hot loop safe)
+ * Public API remains ring-buffer compatible, but the implementation uses a
+ * single persistent HOST_VISIBLE slot optimized for decode (batch=1).
  */
 
 #include "../../../../include/vk_buffers.h"
@@ -30,8 +25,10 @@ extern int vk_buffer_create(
 extern void vk_buffer_destroy(VkDevice device, vk_buffer_t *buffer);
 
 /* ========================================================================
- * Ring Buffer with Timeline Semaphores
+ * Single-slot Persistent Streaming Buffer
  * ======================================================================== */
+
+#define VK_STREAMING_SLOTS 1u
 
 int vk_ring_buffer_create(
     VkDevice device,
@@ -45,7 +42,7 @@ int vk_ring_buffer_create(
         return -1;
     }
 
-    if (num_slots == 0 || slot_size == 0) {
+    if (slot_size == 0) {
         LOG_ERROR("Invalid ring buffer dimensions (num_slots=%zu, slot_size=%zu)", num_slots, slot_size);
         return -1;
     }
@@ -53,52 +50,65 @@ int vk_ring_buffer_create(
     /* Zero-initialize output */
     memset(out_ring, 0, sizeof(vk_ring_buffer_t));
 
-    /* Allocate slot array */
-    out_ring->slots = calloc(num_slots, sizeof(vk_buffer_t));
-    if (!out_ring->slots) {
-        LOG_ERROR("Failed to allocate slot array (num_slots=%zu)", num_slots);
-        return -1;
-    }
-
-    /* Allocate timeline semaphore array */
-    out_ring->timeline_semaphore = calloc(num_slots, sizeof(VkSemaphore));
-    if (!out_ring->timeline_semaphore) {
-        LOG_ERROR("Failed to allocate timeline semaphore array");
-        free(out_ring->slots);
-        memset(out_ring, 0, sizeof(vk_ring_buffer_t));
-        return -1;
-    }
-
-    /* Allocate timeline counter array */
-    out_ring->timeline_counter = calloc(num_slots, sizeof(uint64_t));
-    if (!out_ring->timeline_counter) {
-        LOG_ERROR("Failed to allocate timeline counter array");
-        free(out_ring->timeline_semaphore);
-        free(out_ring->slots);
-        memset(out_ring, 0, sizeof(vk_ring_buffer_t));
-        return -1;
-    }
-
-    out_ring->num_slots = num_slots;
+    out_ring->num_slots = VK_STREAMING_SLOTS;
     out_ring->slot_size = slot_size;
     out_ring->cpu_write_idx = 0;
     out_ring->gpu_read_idx = 0;
-    out_ring->generation_stride = num_slots;  /* Safe default stride */
+    out_ring->generation_stride = 1;
 
-    /* Allocate all slot buffers (host-visible for CPU writes) */
+    out_ring->slots = calloc(out_ring->num_slots, sizeof(vk_buffer_t));
+    if (!out_ring->slots) {
+        LOG_ERROR("Failed to allocate slot array");
+        return -1;
+    }
+
+    out_ring->mapped_slots = calloc(out_ring->num_slots, sizeof(void *));
+    if (!out_ring->mapped_slots) {
+        LOG_ERROR("Failed to allocate mapped slot array");
+        free(out_ring->slots);
+        memset(out_ring, 0, sizeof(vk_ring_buffer_t));
+        return -1;
+    }
+
+    out_ring->timeline_semaphore = calloc(out_ring->num_slots, sizeof(VkSemaphore));
+    if (!out_ring->timeline_semaphore) {
+        LOG_ERROR("Failed to allocate timeline semaphore array");
+        free(out_ring->mapped_slots);
+        free(out_ring->slots);
+        memset(out_ring, 0, sizeof(vk_ring_buffer_t));
+        return -1;
+    }
+
+    out_ring->timeline_counter = calloc(out_ring->num_slots, sizeof(uint64_t));
+    if (!out_ring->timeline_counter) {
+        LOG_ERROR("Failed to allocate timeline counter array");
+        free(out_ring->timeline_semaphore);
+        free(out_ring->mapped_slots);
+        free(out_ring->slots);
+        memset(out_ring, 0, sizeof(vk_ring_buffer_t));
+        return -1;
+    }
+
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-    for (size_t i = 0; i < num_slots; i++) {
+    for (size_t i = 0; i < out_ring->num_slots; i++) {
         int rc = vk_buffer_create(device, phys_dev, slot_size, usage, flags, &out_ring->slots[i]);
         if (rc != 0) {
             LOG_ERROR("Failed to create ring buffer slot %zu", i);
             vk_ring_buffer_destroy(device, out_ring);
             return -1;
         }
+
+        void *mapped = NULL;
+        if (vk_buffer_map(device, &out_ring->slots[i], 0, out_ring->slots[i].size, &mapped) != 0 || !mapped) {
+            LOG_ERROR("Failed to persistently map ring buffer slot %zu", i);
+            vk_ring_buffer_destroy(device, out_ring);
+            return -1;
+        }
+        out_ring->mapped_slots[i] = mapped;
     }
 
-    /* Create timeline semaphores (Vulkan 1.2 feature) */
     VkSemaphoreTypeCreateInfo timeline_info = {0};
     timeline_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
     timeline_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -108,18 +118,18 @@ int vk_ring_buffer_create(
     sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     sem_info.pNext = &timeline_info;
 
-    for (size_t i = 0; i < num_slots; i++) {
+    for (size_t i = 0; i < out_ring->num_slots; i++) {
         VkResult res = vkCreateSemaphore(device, &sem_info, NULL, &out_ring->timeline_semaphore[i]);
         if (res != VK_SUCCESS) {
             LOG_ERROR("Failed to create timeline semaphore for slot %zu: %d", i, res);
             vk_ring_buffer_destroy(device, out_ring);
             return -1;
         }
-        out_ring->timeline_counter[i] = 0;  /* Initialize counter to 0 */
+        out_ring->timeline_counter[i] = 0;
     }
 
-    LOG_INFO("Created ring buffer: %zu slots × %zu bytes = %zu total (%zu semaphores)",
-             num_slots, slot_size, num_slots * slot_size, num_slots);
+    LOG_INFO("Created streaming buffer: requested_slots=%zu using_slots=%u slot_size=%zu",
+             num_slots, (unsigned)VK_STREAMING_SLOTS, slot_size);
     return 0;
 }
 
@@ -139,48 +149,17 @@ int vk_ring_buffer_acquire_write(
         return -1;
     }
 
-    size_t slot_idx = ring->cpu_write_idx % ring->num_slots;
-    vk_buffer_t *slot = &ring->slots[slot_idx];
-
-    /* Wait for GPU to finish reading this slot (timeline semaphore wait)
-     * We need to wait until counter >= (current_counter - generation_stride)
-     * to ensure slot is free for reuse.
-     */
-    uint64_t wait_value = ring->timeline_counter[slot_idx];
-    if (ring->cpu_write_idx >= ring->num_slots) {
-        /* After first full cycle, wait for GPU to release slot: use (counter - generation_stride)
-         * but guard against underflow. */
-        if (wait_value >= ring->generation_stride) {
-            wait_value -= ring->generation_stride;
-        } else {
-            wait_value = 0;
-        }
-    }
-
-    VkSemaphoreWaitInfo wait_info = {0};
-    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-    wait_info.semaphoreCount = 1;
-    wait_info.pSemaphores = &ring->timeline_semaphore[slot_idx];
-    wait_info.pValues = &wait_value;
-
-    VkResult res = vkWaitSemaphores(device, &wait_info, UINT64_MAX);  /* Infinite wait */
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkWaitSemaphores failed for write acquire (slot=%zu): %d", slot_idx, res);
+    (void)device;
+    size_t slot_idx = 0;
+    if (!ring->mapped_slots || !ring->mapped_slots[slot_idx]) {
+        LOG_ERROR("Persistent mapped slot is unavailable");
         return -1;
     }
 
-    /* Map slot for CPU write */
-    void *mapped = NULL;
-    if (vk_buffer_map(device, slot, 0, slot->size, &mapped) != 0) {
-        LOG_ERROR("vk_buffer_map failed for write slot %zu", slot_idx);
-        return -1;
-    }
-
-    *out_mapped_slot = mapped;
+    *out_mapped_slot = ring->mapped_slots[slot_idx];
     *out_slot_index = slot_idx;
-    *out_write_counter = ring->timeline_counter[slot_idx] + 1;  /* Next counter value */
+    *out_write_counter = ring->timeline_counter[slot_idx] + 1;
 
-    LOG_DEBUG("Acquired write slot %zu (counter will signal %llu)", slot_idx, (unsigned long long)*out_write_counter);
     return 0;
 }
 
@@ -193,27 +172,9 @@ int vk_ring_buffer_commit_write(
         return -1;
     }
 
-    size_t slot_idx = ring->cpu_write_idx % ring->num_slots;
-
-    /* Unmap slot (no device parameter needed, handled in acquire) */
-    /* Note: Unmapping should happen via device, but we don't have it here.
-     * This is a design issue - we need device for unmapping.
-     * Let's skip unmapping for now and document it as a caller responsibility.
-     */
-
-    /* Update timeline counter */
+    size_t slot_idx = 0;
     ring->timeline_counter[slot_idx] = counter_value;
-
-    /* Signal timeline semaphore (CPU-side signal for Vulkan 1.2) */
-    /* Note: CPU-side timeline signal requires VkSemaphoreSignalInfo, but we need device.
-     * This is another design issue. Let's document that commit_write needs device parameter.
-     * For now, we'll assume the GPU submission will handle the signal.
-     */
-
-    /* Advance write index */
     ring->cpu_write_idx++;
-
-    LOG_DEBUG("Committed write slot %zu (counter=%llu)", slot_idx, (unsigned long long)counter_value);
     return 0;
 }
 
@@ -233,25 +194,15 @@ int vk_ring_buffer_acquire_read(
         return -1;
     }
 
-    size_t slot_idx = ring->gpu_read_idx % ring->num_slots;
-
-    /* Check if slot is ready (CPU has written to it)
-     * Non-blocking check: counter should be >= expected value.
-     */
-    uint64_t expected_counter = (ring->gpu_read_idx / ring->num_slots) + 1;
-    if (ring->timeline_counter[slot_idx] < expected_counter) {
-        LOG_DEBUG("Read slot %zu not ready (counter=%llu, expected=%llu)",
-                  slot_idx, (unsigned long long)ring->timeline_counter[slot_idx],
-                  (unsigned long long)expected_counter);
-        return -1;  /* Not ready */
+    size_t slot_idx = 0;
+    if (ring->timeline_counter[slot_idx] == 0) {
+        return -1;
     }
 
     *out_slot_buffer = &ring->slots[slot_idx];
     *out_timeline_semaphore = ring->timeline_semaphore[slot_idx];
-    *out_wait_counter = expected_counter;
+    *out_wait_counter = ring->timeline_counter[slot_idx];
     *out_slot_index = slot_idx;
-
-    LOG_DEBUG("Acquired read slot %zu (wait_counter=%llu)", slot_idx, (unsigned long long)*out_wait_counter);
     return 0;
 }
 
@@ -264,12 +215,7 @@ int vk_ring_buffer_commit_read(
         return -1;
     }
 
-    size_t slot_idx = ring->gpu_read_idx % ring->num_slots;
-
-    /* Advance timeline counter for GPU completion */
-    ring->timeline_counter[slot_idx] += ring->generation_stride;
-
-    /* Signal timeline semaphore (GPU has finished processing) */
+    size_t slot_idx = 0;
     VkSemaphoreSignalInfo signal_info = {0};
     signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
     signal_info.semaphore = ring->timeline_semaphore[slot_idx];
@@ -281,10 +227,7 @@ int vk_ring_buffer_commit_read(
         return -1;
     }
 
-    /* Advance read index */
     ring->gpu_read_idx++;
-
-    LOG_DEBUG("Committed read slot %zu (counter=%llu)", slot_idx, (unsigned long long)ring->timeline_counter[slot_idx]);
     return 0;
 }
 
@@ -297,7 +240,6 @@ void vk_ring_buffer_destroy(VkDevice device, vk_ring_buffer_t *ring) {
         return;
     }
 
-    /* Destroy timeline semaphores */
     if (ring->timeline_semaphore) {
         for (size_t i = 0; i < ring->num_slots; i++) {
             if (ring->timeline_semaphore[i]) {
@@ -307,7 +249,15 @@ void vk_ring_buffer_destroy(VkDevice device, vk_ring_buffer_t *ring) {
         free(ring->timeline_semaphore);
     }
 
-    /* Destroy slot buffers */
+    if (ring->mapped_slots && ring->slots) {
+        for (size_t i = 0; i < ring->num_slots; i++) {
+            if (ring->mapped_slots[i]) {
+                vk_buffer_unmap(device, &ring->slots[i]);
+            }
+        }
+        free(ring->mapped_slots);
+    }
+
     if (ring->slots) {
         for (size_t i = 0; i < ring->num_slots; i++) {
             vk_buffer_destroy(device, &ring->slots[i]);
@@ -315,12 +265,11 @@ void vk_ring_buffer_destroy(VkDevice device, vk_ring_buffer_t *ring) {
         free(ring->slots);
     }
 
-    /* Free counter array */
     if (ring->timeline_counter) {
         free(ring->timeline_counter);
     }
 
     memset(ring, 0, sizeof(vk_ring_buffer_t));
 
-    LOG_DEBUG("Destroyed ring buffer");
+    LOG_DEBUG("Destroyed streaming buffer");
 }

@@ -163,97 +163,6 @@ int vk_buffer_stage_data(
     return 0;
 }
 
-/**
- * Helper: Submit one-time command buffer for transfers.
- */
-static int submit_one_time_command(
-    VkDevice device,
-    VkCommandPool cmd_pool,
-    VkQueue queue,
-    VkCommandBuffer *out_cmd_buf
-) {
-    VkCommandBufferAllocateInfo alloc_info = {0};
-    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc_info.commandPool = cmd_pool;
-    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc_info.commandBufferCount = 1;
-
-    VkResult res = vkAllocateCommandBuffers(device, &alloc_info, out_cmd_buf);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkAllocateCommandBuffers failed: %d", res);
-        return -1;
-    }
-
-    VkCommandBufferBeginInfo begin_info = {0};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    res = vkBeginCommandBuffer(*out_cmd_buf, &begin_info);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkBeginCommandBuffer failed: %d", res);
-        return -1;
-    }
-
-    return 0;
-}
-
-/**
- * Helper: End and submit one-time command buffer.
- */
-static int end_one_time_command(
-    VkDevice device,
-    VkCommandPool cmd_pool,
-    VkQueue queue,
-    VkCommandBuffer cmd_buf
-) {
-    VkResult res = vkEndCommandBuffer(cmd_buf);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkEndCommandBuffer failed: %d", res);
-        vkFreeCommandBuffers(device, cmd_pool, 1, &cmd_buf);
-        return -1;
-    }
-
-    /* Create fence for proper GPU synchronization (prevents RADV context loss) */
-    VkFenceCreateInfo fence_info = {0};
-    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fence_info.flags = 0;  /* Create unsignaled */
-
-    VkFence fence;
-    res = vkCreateFence(device, &fence_info, NULL, &fence);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkCreateFence failed: %d", res);
-        vkFreeCommandBuffers(device, cmd_pool, 1, &cmd_buf);
-        return -1;
-    }
-
-    VkSubmitInfo submit_info = {0};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &cmd_buf;
-
-    res = vkQueueSubmit(queue, 1, &submit_info, fence);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkQueueSubmit failed: %d", res);
-        vkDestroyFence(device, fence, NULL);
-        vkFreeCommandBuffers(device, cmd_pool, 1, &cmd_buf);
-        return -1;
-    }
-
-    /* Wait for fence (GPU explicitly signals when operation is complete) */
-    res = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
-    if (res != VK_SUCCESS) {
-        LOG_ERROR("vkWaitForFences failed: %d", res);
-        vkDestroyFence(device, fence, NULL);
-        vkFreeCommandBuffers(device, cmd_pool, 1, &cmd_buf);
-        return -1;
-    }
-
-    /* Cleanup (safe now that GPU has signaled completion via fence) */
-    vkDestroyFence(device, fence, NULL);
-    vkFreeCommandBuffers(device, cmd_pool, 1, &cmd_buf);
-    return 0;
-}
-
 int vk_buffer_download(
     const vk_transfer_ctx_t *ctx,
     vk_buffer_t *device_buf,
@@ -270,22 +179,35 @@ int vk_buffer_download(
         return -1;
     }
 
-    /* Create staging buffer (host-visible) */
-    vk_buffer_t staging = {0};
-    int rc = vk_buffer_create(
-        ctx->device, ctx->phys_dev, size,
-        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        &staging
-    );
-    if (rc != 0) {
+    if (!ctx->transfer_cmd || !ctx->transfer_fence ||
+        !ctx->download_staging_buffer || !ctx->download_staging_mapped ||
+        ctx->download_staging_size < size) {
+        LOG_ERROR("Persistent transfer/download resources are not configured");
         return -1;
     }
 
-    /* Record copy command */
-    VkCommandBuffer cmd_buf;
-    if (submit_one_time_command(ctx->device, ctx->cmd_pool, ctx->queue, &cmd_buf) != 0) {
-        vk_buffer_destroy(ctx->device, &staging);
+    VkResult res = vkWaitForFences(ctx->device, 1, &ctx->transfer_fence, VK_TRUE, UINT64_MAX);
+    if (res != VK_SUCCESS) {
+        LOG_ERROR("vkWaitForFences failed: %d", (int)res);
+        return -1;
+    }
+    res = vkResetFences(ctx->device, 1, &ctx->transfer_fence);
+    if (res != VK_SUCCESS) {
+        LOG_ERROR("vkResetFences failed: %d", (int)res);
+        return -1;
+    }
+    res = vkResetCommandBuffer(ctx->transfer_cmd, 0);
+    if (res != VK_SUCCESS) {
+        LOG_ERROR("vkResetCommandBuffer failed: %d", (int)res);
+        return -1;
+    }
+
+    VkCommandBufferBeginInfo begin_info = {0};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    res = vkBeginCommandBuffer(ctx->transfer_cmd, &begin_info);
+    if (res != VK_SUCCESS) {
+        LOG_ERROR("vkBeginCommandBuffer failed: %d", (int)res);
         return -1;
     }
 
@@ -293,25 +215,53 @@ int vk_buffer_download(
     copy_region.srcOffset = 0;
     copy_region.dstOffset = 0;
     copy_region.size = size;
-    vkCmdCopyBuffer(cmd_buf, device_buf->buffer, staging.buffer, 1, &copy_region);
+    vkCmdCopyBuffer(ctx->transfer_cmd,
+                    device_buf->buffer,
+                    ctx->download_staging_buffer,
+                    1,
+                    &copy_region);
 
-    if (end_one_time_command(ctx->device, ctx->cmd_pool, ctx->queue, cmd_buf) != 0) {
-        vk_buffer_destroy(ctx->device, &staging);
+    VkBufferMemoryBarrier copy_to_host = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = ctx->download_staging_buffer,
+        .offset = 0,
+        .size = size
+    };
+    vkCmdPipelineBarrier(ctx->transfer_cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        0,
+        0, NULL,
+        1, &copy_to_host,
+        0, NULL);
+
+    res = vkEndCommandBuffer(ctx->transfer_cmd);
+    if (res != VK_SUCCESS) {
+        LOG_ERROR("vkEndCommandBuffer failed: %d", (int)res);
         return -1;
     }
 
-    void *mapped = NULL;
-    rc = vk_buffer_map(ctx->device, &staging, 0, size, &mapped);
-    if (rc != 0) {
-        LOG_ERROR("vk_buffer_map failed in vk_buffer_download");
-        vk_buffer_destroy(ctx->device, &staging);
+    VkSubmitInfo submit_info = {0};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &ctx->transfer_cmd;
+    res = vkQueueSubmit(ctx->queue, 1, &submit_info, ctx->transfer_fence);
+    if (res != VK_SUCCESS) {
+        LOG_ERROR("vkQueueSubmit failed: %d", (int)res);
         return -1;
     }
 
-    memcpy(out_host_data, mapped, size);
-    vk_buffer_unmap(ctx->device, &staging);
+    res = vkWaitForFences(ctx->device, 1, &ctx->transfer_fence, VK_TRUE, UINT64_MAX);
+    if (res != VK_SUCCESS) {
+        LOG_ERROR("vkWaitForFences failed: %d", (int)res);
+        return -1;
+    }
 
-    vk_buffer_destroy(ctx->device, &staging);
+    memcpy(out_host_data, ctx->download_staging_mapped, size);
 
     LOG_DEBUG("Downloaded %zu bytes from device buffer", size);
     return 0;

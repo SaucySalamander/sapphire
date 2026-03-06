@@ -133,7 +133,8 @@ typedef struct {
 #define PIPELINE_GELU_BF16          13
 #define PIPELINE_VEC_ADD_F32        14
 #define PIPELINE_ARGMAX_F32         15
-#define NUM_PIPELINES               16
+#define PIPELINE_LMHEAD_DECODE_F32  16
+#define NUM_PIPELINES               17
 
 /**
  * Vulkan backend session data (P11-02 + P11-03 integration).
@@ -186,6 +187,7 @@ typedef struct {
     vk_buffer_t embedding_weight;       /* [vocab_size × hidden_size] - for lm_head projection */
     vk_buffer_t lm_head_logits;         /* [vocab_size] - output buffer for lm_head */
     vk_buffer_t selected_token_ids;     /* [max_batch] int32 selected ids from GPU argmax */
+    void *selected_token_ids_mapped;    /* Persistent map of selected_token_ids */
     
     vk_ring_buffer_t input_ring;        /* CPU→GPU token input ring */
     vk_ring_buffer_t output_ring;       /* GPU→CPU logits output ring */
@@ -200,6 +202,8 @@ typedef struct {
     VkCommandBuffer transfer_cmd;       /* Dedicated command buffer for embeddings upload */
     vk_buffer_t embedding_staging;      /* Persistent staging buffer (host-visible) */
     void *embedding_staging_mapped;     /* Optional persistent map of embedding_staging */
+    vk_buffer_t download_staging;       /* Persistent readback staging buffer (host-visible) */
+    void *download_staging_mapped;      /* Optional persistent map of download_staging */
     VkFence transfer_fence;             /* Fence for transfer synchronization */
     VkFence compute_fence;              /* Fence for forward-pass compute completion */
     VkSemaphore transfer_to_compute_sem;/* Binary semaphore: transfer -> compute dependency */

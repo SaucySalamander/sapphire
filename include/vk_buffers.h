@@ -38,6 +38,14 @@ typedef struct {
     VkPhysicalDevice phys_dev;
     VkCommandPool cmd_pool;
     VkQueue queue;
+    VkCommandBuffer transfer_cmd;
+    VkFence transfer_fence;
+    VkBuffer upload_staging_buffer;
+    size_t upload_staging_size;
+    void *upload_staging_mapped;
+    VkBuffer download_staging_buffer;
+    size_t download_staging_size;
+    void *download_staging_mapped;
 } vk_transfer_ctx_t;
 
 /** KV cache configuration for allocation */
@@ -289,6 +297,7 @@ void vk_kv_cache_destroy(VkDevice device, vk_kv_cache_t *cache);
  */
 typedef struct {
     vk_buffer_t *slots;                  /* Array of num_slots pre-allocated buffers */
+    void **mapped_slots;                 /* Persistent mapped pointers per slot */
     size_t num_slots;
     size_t slot_size;
     VkSemaphore *timeline_semaphore;    /* Per-slot timeline semaphore (pre-allocated) */
@@ -451,21 +460,34 @@ int vk_buffer_download(
 );
 
 /* ========================================================================
- * 5.7 Pipeline Barrier Helper (GPU Inter-Shader Synchronization)
+ * 5.7 Buffer Barrier Helpers (GPU Inter-Shader Synchronization)
  * ======================================================================== */
 
 /**
- * Synchronize compute shaders within a single forward pass command buffer.
+ * Insert a buffer-scoped memory dependency.
  *
- * Called between shader groups (e.g., after Q/K/V proj, before attention).
- * Ensures all writes from src shader complete before dst shader reads.
+ * Synchronizes accesses for one specific VkBuffer without introducing
+ * global memory barriers.
+ */
+void vk_buffer_barrier(
+    VkCommandBuffer cmd,
+    VkBuffer buf,
+    VkAccessFlags src,
+    VkAccessFlags dst,
+    VkPipelineStageFlags srcStage,
+    VkPipelineStageFlags dstStage
+);
+
+/**
+ * Insert buffer-scoped barriers for one or more buffers.
  *
- * Standard usage:
- *   vk_pipeline_barrier_compute(cmd_buf,
- *       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
- *       VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+ * Convenience wrapper over vkCmdPipelineBarrier that emits VkBufferMemoryBarrier
+ * entries for each buffer in `buffers[0..buffer_count)` with identical access and
+ * stage masks.
  *
  * @param cmd_buf     Command buffer
+ * @param buffers     Buffer array
+ * @param buffer_count Number of buffers in `buffers`
  * @param src_stage   Source pipeline stage
  * @param dst_stage   Destination pipeline stage
  * @param src_access  Source access mask
@@ -473,6 +495,8 @@ int vk_buffer_download(
  */
 void vk_pipeline_barrier_compute(
     VkCommandBuffer cmd_buf,
+    const VkBuffer *buffers,
+    uint32_t buffer_count,
     VkPipelineStageFlags src_stage,
     VkPipelineStageFlags dst_stage,
     VkAccessFlags src_access,

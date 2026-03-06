@@ -122,12 +122,19 @@ static void probe_buf(backend_vulkan_session_data_t *bd, vk_buffer_t *buf,
     }
     vk_transfer_ctx_t tctx = {
         .device = bd->device, .phys_dev = bd->phys_dev,
-        .cmd_pool = bd->cmd_pool, .queue = bd->compute_queue
+        .cmd_pool = bd->cmd_pool, .queue = bd->compute_queue,
+        .transfer_cmd = bd->transfer_cmd,
+        .transfer_fence = bd->transfer_fence,
+        .upload_staging_buffer = bd->embedding_staging.buffer,
+        .upload_staging_size = bd->embedding_staging.size,
+        .upload_staging_mapped = bd->embedding_staging_mapped,
+        .download_staging_buffer = bd->download_staging.buffer,
+        .download_staging_size = bd->download_staging.size,
+        .download_staging_mapped = bd->download_staging_mapped
     };
     float *tmp = malloc((size_t)count * sizeof(float));
     if (!tmp) { LOG_ERROR("[DBG] probe_buf: malloc failed"); return; }
 
-    vkQueueWaitIdle(bd->compute_queue);
     int rc = vk_buffer_download(&tctx, buf, (size_t)count * sizeof(float), tmp);
     if (rc != 0) { LOG_ERROR("[DBG] probe_buf: download failed for %s", tag); free(tmp); return; }
     vec_stats(tmp, count, tag);
@@ -175,7 +182,15 @@ static void debug_dump_buffer(backend_vulkan_session_data_t *bd, vk_buffer_t *bu
         .device = bd->device,
         .phys_dev = bd->phys_dev,
         .cmd_pool = bd->cmd_pool,
-        .queue = bd->compute_queue
+        .queue = bd->compute_queue,
+        .transfer_cmd = bd->transfer_cmd,
+        .transfer_fence = bd->transfer_fence,
+        .upload_staging_buffer = bd->embedding_staging.buffer,
+        .upload_staging_size = bd->embedding_staging.size,
+        .upload_staging_mapped = bd->embedding_staging_mapped,
+        .download_staging_buffer = bd->download_staging.buffer,
+        .download_staging_size = bd->download_staging.size,
+        .download_staging_mapped = bd->download_staging_mapped
     };
     
     float *host_data = malloc(count * sizeof(float));
@@ -183,8 +198,6 @@ static void debug_dump_buffer(backend_vulkan_session_data_t *bd, vk_buffer_t *bu
         LOG_ERROR("Failed to allocate debug buffer");
         return;
     }
-    
-    vkQueueWaitIdle(bd->compute_queue);  /* Force sync */
     
     int rc = vk_buffer_download(&tctx, buf, count * sizeof(float), host_data);
     if (rc != 0) {
@@ -536,6 +549,10 @@ static void destroy_backend_data(backend_vulkan_session_data_t *bd) {
         vkDestroyQueryPool(dev, bd->timing_query_pool, NULL);
     if (bd->embedding_staging_mapped)
         vk_buffer_unmap(dev, &bd->embedding_staging);
+    if (bd->download_staging_mapped)
+        vk_buffer_unmap(dev, &bd->download_staging);
+    if (bd->selected_token_ids_mapped)
+        vk_buffer_unmap(dev, &bd->selected_token_ids);
     if (bd->transfer_cmd)
         vkFreeCommandBuffers(dev, bd->cmd_pool, 1, &bd->transfer_cmd);
     if (bd->transfer_fence)   vkDestroyFence(dev, bd->transfer_fence, NULL);
@@ -543,6 +560,7 @@ static void destroy_backend_data(backend_vulkan_session_data_t *bd) {
     if (bd->transfer_to_compute_sem)
         vkDestroySemaphore(dev, bd->transfer_to_compute_sem, NULL);
     vk_buffer_destroy(dev, &bd->embedding_staging);
+    vk_buffer_destroy(dev, &bd->download_staging);
     if (bd->cmd_buffer)
         vkFreeCommandBuffers(dev, bd->cmd_pool, 1, &bd->cmd_buffer);
     if (bd->pipelines) {
@@ -607,11 +625,11 @@ static int init_vk_gpu_buffers(backend_vulkan_session_data_t *bd,
                          &bd->attn_scores) != 0) {
         LOG_ERROR("Failed to create attention scores buffer"); return -1;
     }
-    if (vk_ring_buffer_create(bd->device, bd->phys_dev, 3,
+    if (vk_ring_buffer_create(bd->device, bd->phys_dev, 1,
                               256 * sizeof(int), &bd->input_ring) != 0) {
         LOG_ERROR("Failed to create input ring buffer"); return -1;
     }
-    if (vk_ring_buffer_create(bd->device, bd->phys_dev, 3,
+    if (vk_ring_buffer_create(bd->device, bd->phys_dev, 1,
                               (size_t)cfg->vocab_size * sizeof(float),
                               &bd->output_ring) != 0) {
         LOG_ERROR("Failed to create output ring buffer"); return -1;
@@ -633,6 +651,7 @@ static int init_vk_gpu_buffers(backend_vulkan_session_data_t *bd,
 /* Allocate transfer cmd buffer, fences, semaphore, staging buffer, forward cmd buffer. */
 static int init_vk_transfer_resources(backend_vulkan_session_data_t *bd) {
     const size_t STAGING_SZ = 256 * 1024 * 1024;
+    const size_t DOWNLOAD_STAGING_SZ = 64 * 1024 * 1024;
     VkCommandBufferAllocateInfo xa = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = bd->cmd_pool,
@@ -664,6 +683,13 @@ static int init_vk_transfer_resources(backend_vulkan_session_data_t *bd) {
                          &bd->embedding_staging) != 0) {
         LOG_ERROR("Failed to create staging buffer (%zu MB)", STAGING_SZ >> 20); return -1;
     }
+    if (vk_buffer_create(bd->device, bd->phys_dev, DOWNLOAD_STAGING_SZ,
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         &bd->download_staging) != 0) {
+        LOG_ERROR("Failed to create download staging buffer (%zu MB)", DOWNLOAD_STAGING_SZ >> 20); return -1;
+    }
     VkCommandBufferAllocateInfo ca = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = bd->cmd_pool,
@@ -673,7 +699,8 @@ static int init_vk_transfer_resources(backend_vulkan_session_data_t *bd) {
     if (vkAllocateCommandBuffers(bd->device, &ca, &bd->cmd_buffer) != VK_SUCCESS) {
         LOG_ERROR("Failed to alloc forward pass cmd buffer"); return -1;
     }
-    LOG_DEBUG("Created transfer resources: staging=%zu MB", STAGING_SZ >> 20);
+    LOG_DEBUG("Created transfer resources: upload_staging=%zu MB download_staging=%zu MB",
+              STAGING_SZ >> 20, DOWNLOAD_STAGING_SZ >> 20);
     return 0;
 }
 
@@ -781,10 +808,10 @@ static int chunk_upload_to_device(backend_vulkan_session_data_t *bd,
         if (vkQueueSubmit(bd->compute_queue, 1, &sub, bd->transfer_fence) != VK_SUCCESS) {
             LOG_ERROR("Failed to submit upload chunk"); return -1;
         }
-        vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
         uploaded  += chunk;
         remaining -= chunk;
     }
+    vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
     return 0;
 }
 
@@ -862,9 +889,6 @@ static int upload_vk_layer_weights(backend_vulkan_session_data_t *bd,
             fail++;
     }
     if (fail > 0) { LOG_ERROR("%d weight upload(s) failed", fail); return -1; }
-    if (vkQueueWaitIdle(bd->compute_queue) != VK_SUCCESS) {
-        LOG_ERROR("vkQueueWaitIdle after weight uploads failed"); return -1;
-    }
     LOG_INFO("Uploaded %d packed weight buffers to GPU", VK_WEIGHTS_PER_LAYER);
     return 0;
 }
@@ -901,8 +925,8 @@ static int upload_rope_pair(backend_vulkan_session_data_t *bd,
         vkEndCommandBuffer(bd->transfer_cmd);
         vkResetFences(bd->device, 1, &bd->transfer_fence);
         vkQueueSubmit(bd->compute_queue, 1, &sub, bd->transfer_fence);
-        vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
     }
+    vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
     return 0;
 }
 
@@ -1024,6 +1048,7 @@ static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
         [PIPELINE_GELU_BF16]      = "src/kernels/backends/vulkan/shaders/gelu_bf16.comp.spv",
         [PIPELINE_VEC_ADD_F32]    = "src/kernels/backends/vulkan/shaders/vec_add_f32.comp.spv",
         [PIPELINE_ARGMAX_F32]     = "src/kernels/backends/vulkan/shaders/argmax_f32.comp.spv",
+        [PIPELINE_LMHEAD_DECODE_F32] = "src/kernels/backends/vulkan/shaders/lmhead_decode_f32.comp.spv",
     };
     static const vk_desc_layout_type_t lt[NUM_PIPELINES] = {
         [PIPELINE_RMSNORM_F32] = VK_DESC_LAYOUT_PROJECTION,
@@ -1042,6 +1067,7 @@ static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
         [PIPELINE_GELU_BF16] = VK_DESC_LAYOUT_WEIGHT_ONLY,
         [PIPELINE_VEC_ADD_F32] = VK_DESC_LAYOUT_PROJECTION,
         [PIPELINE_ARGMAX_F32] = VK_DESC_LAYOUT_CUSTOM,
+        [PIPELINE_LMHEAD_DECODE_F32] = VK_DESC_LAYOUT_PROJECTION,
     };
     static const uint32_t spl[NUM_PIPELINES] = {
         [PIPELINE_RMSNORM_F32] = 4, [PIPELINE_RMSNORM_BF16] = 4,
@@ -1052,6 +1078,7 @@ static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
         [PIPELINE_ATTENTION_F32] = 1, [PIPELINE_ATTENTION_BF16] = 1,
         [PIPELINE_GELU_F32] = 1,    [PIPELINE_GELU_BF16] = 1,
         [PIPELINE_VEC_ADD_F32] = 2, [PIPELINE_ARGMAX_F32] = 0,
+        [PIPELINE_LMHEAD_DECODE_F32] = 0,
     };
     static const vk_desc_binding_t argmax_b[] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
@@ -1070,6 +1097,7 @@ static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
         pc.num_desc_sets = spl[i] * (uint32_t)cfg->num_hidden_layers;
         if (i == PIPELINE_RMSNORM_F32 || i == PIPELINE_RMSNORM_BF16) pc.num_desc_sets++;
         if (i == PIPELINE_GEMV_F32    || i == PIPELINE_GEMV_BF16)    pc.num_desc_sets++;
+        if (i == PIPELINE_LMHEAD_DECODE_F32) pc.num_desc_sets++;
         if (i == PIPELINE_ARGMAX_F32) pc.num_desc_sets = 1;
         if (pc.num_desc_sets == 0)    pc.num_desc_sets = 1;
         if (vk_pipeline_create(bd->device, &pc, &bd->pipelines[i]) != 0) fail++;
@@ -1146,6 +1174,22 @@ static int setup_vk_timing_and_staging(backend_vulkan_session_data_t *bd,
         LOG_ERROR("Failed to create persistent staging mapping");
         return -1;
     }
+    if (vk_buffer_map(bd->device,
+                      &bd->download_staging,
+                      0,
+                      bd->download_staging.size,
+                      &bd->download_staging_mapped) != 0 || !bd->download_staging_mapped) {
+        LOG_ERROR("Failed to create persistent download staging mapping");
+        return -1;
+    }
+    if (vk_buffer_map(bd->device,
+                      &bd->selected_token_ids,
+                      0,
+                      bd->selected_token_ids.size,
+                      &bd->selected_token_ids_mapped) != 0 || !bd->selected_token_ids_mapped) {
+        LOG_ERROR("Failed to create persistent selected-token mapping");
+        return -1;
+    }
     bd->frame_counter = 0;
     return 0;
 }
@@ -1215,6 +1259,10 @@ static int vulkan_session_init(inference_session_t* session, const model_spec_t*
     if (upload_vk_layer_weights(bd, model, cfg, offset_alignment) != 0) goto fail;
     if (upload_vk_rope_caches(bd, cfg)                            != 0) goto fail;
     if (upload_vk_final_weights(bd, model, cfg)                   != 0) goto fail;
+    if (vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        LOG_ERROR("Failed waiting for transfer fence at end of init uploads");
+        goto fail;
+    }
     if (create_vk_compute_pipelines(bd, cfg)                      != 0) goto fail;
     if (alloc_vk_inference_bufs(bd, cfg, max_context_len)         != 0) goto fail;
     if (vulkan_prepopulate_descriptors(bd, cfg)                   != 0) goto fail;
@@ -1266,6 +1314,14 @@ static void vulkan_session_destroy(inference_session_t* session) {
         vk_buffer_unmap(backend_data->device, &backend_data->embedding_staging);
         backend_data->embedding_staging_mapped = NULL;
     }
+    if (backend_data->download_staging_mapped) {
+        vk_buffer_unmap(backend_data->device, &backend_data->download_staging);
+        backend_data->download_staging_mapped = NULL;
+    }
+    if (backend_data->selected_token_ids_mapped) {
+        vk_buffer_unmap(backend_data->device, &backend_data->selected_token_ids);
+        backend_data->selected_token_ids_mapped = NULL;
+    }
     if (backend_data->transfer_cmd) {
         vkFreeCommandBuffers(backend_data->device, backend_data->cmd_pool, 1, &backend_data->transfer_cmd);
     }
@@ -1279,6 +1335,7 @@ static void vulkan_session_destroy(inference_session_t* session) {
         vkDestroySemaphore(backend_data->device, backend_data->transfer_to_compute_sem, NULL);
     }
     vk_buffer_destroy(backend_data->device, &backend_data->embedding_staging);
+    vk_buffer_destroy(backend_data->device, &backend_data->download_staging);
 
     /* Free command buffer */
     if (backend_data->cmd_buffer) {
@@ -1474,6 +1531,7 @@ static void setup_attn_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd
     VkDeviceSize off_o       = layer_weight_offset(bd, VK_WGT_O_PROJ, L);
     VkBuffer   wgt_attn_post   = layer_weight_buffer(bd, VK_WGT_ATTN_NORM_POST)->buffer;
     VkDeviceSize off_attn_post = layer_weight_offset(bd, VK_WGT_ATTN_NORM_POST, L);
+    VkBuffer input_buf = sp->layer_hidden[L % 2].buffer;
     bool is_global_rope = ((L + 1) % 6 == 0);
     VkBuffer cos_buf = is_global_rope ? bd->rope_cos_cache.buffer : bd->rope_cos_cache_local.buffer;
     VkBuffer sin_buf = is_global_rope ? bd->rope_sin_cache.buffer : bd->rope_sin_cache_local.buffer;
@@ -1502,7 +1560,7 @@ static void setup_attn_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd
     S[SDT_SLOT_ATTN_RESIDUAL].pipeline_idx = PI_ADD;
     S[SDT_SLOT_ATTN_RESIDUAL].ds = sdt_alloc_ds(bd, PI_ADD);
     sdt_write_buf(dev, S[SDT_SLOT_ATTN_RESIDUAL].ds, 0, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_ATTN_RESIDUAL].ds, 1, sp->residual.buffer,    0, VK_WHOLE_SIZE);
+    sdt_write_buf(dev, S[SDT_SLOT_ATTN_RESIDUAL].ds, 1, input_buf,               0, VK_WHOLE_SIZE);
     sdt_write_buf(dev, S[SDT_SLOT_ATTN_RESIDUAL].ds, 2, sp->residual.buffer,    0, VK_WHOLE_SIZE);
 }
 
@@ -1686,29 +1744,25 @@ static inline void kts_maybe(VkCommandBuffer cmd_buf, backend_vulkan_session_dat
 static inline void barrier_buf(VkCommandBuffer cmd_buf,
     VkPipelineStageFlags src, VkPipelineStageFlags dst, VkBuffer buf)
 {
-    VkBufferMemoryBarrier bb = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = buf, .offset = 0, .size = VK_WHOLE_SIZE
-    };
-    vkCmdPipelineBarrier(cmd_buf, src, dst, 0, 0, NULL, 1, &bb, 0, NULL);
+    vk_buffer_barrier(cmd_buf,
+                      buf,
+                      VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT,
+                      src,
+                      dst);
 }
 
 static inline void barrier_bufs2(VkCommandBuffer cmd_buf,
     VkPipelineStageFlags src, VkPipelineStageFlags dst, VkBuffer b0, VkBuffer b1)
 {
-    VkBufferMemoryBarrier bb[2] = {
-        { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .buffer = b0, .offset = 0, .size = VK_WHOLE_SIZE },
-        { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .buffer = b1, .offset = 0, .size = VK_WHOLE_SIZE }
-    };
-    vkCmdPipelineBarrier(cmd_buf, src, dst, 0, 0, NULL, 2, bb, 0, NULL);
+        VkBuffer bufs[2] = { b0, b1 };
+        vk_pipeline_barrier_compute(cmd_buf,
+                                                                bufs,
+                                                                2,
+                                                                src,
+                                                                dst,
+                                                                VK_ACCESS_SHADER_WRITE_BIT,
+                                                                VK_ACCESS_SHADER_READ_BIT);
 }
 
 /** Packs proj_dispatch mode parameters (reduces param count below max). */
@@ -1742,7 +1796,7 @@ typedef struct {
 } record_layer_params_t;
 
 /*
- * record_qkv_attn_phase: save residual, pre-attn norm, Q/K/V proj, QK-norm
+ * record_qkv_attn_phase: pre-attn norm, Q/K/V proj, QK-norm
  * Part of record_transformer_layer (split for complexity compliance).
  */
 static void record_qkv_attn_phase(
@@ -1764,33 +1818,15 @@ static void record_qkv_attn_phase(
     bool use_gemm    = (batch_size > 1);
     int proj_pipeline = use_gemm ? PIPELINE_GEMM_F32 : PIPELINE_GEMV_F32;
     const proj_mode_t _pm = { proj_pipeline, (int)use_gemm, batch_size };
-    size_t hidden_bytes = (size_t)batch_size * d_model * sizeof(float);
-
-    VkBufferMemoryBarrier xfer_to_comp = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = sp->residual.buffer, .offset = 0, .size = VK_WHOLE_SIZE
-    };
 
     kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 0 start */
-
-    VkBuffer input_vkbuf = sp->layer_hidden[layer_idx % 2].buffer;
-    VkBufferCopy save_residual = { .srcOffset = 0, .dstOffset = 0, .size = hidden_bytes };
-    vkCmdCopyBuffer(cmd_buf, input_vkbuf, sp->residual.buffer, 1, &save_residual);
-    vkCmdPipelineBarrier(cmd_buf,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, NULL, 1, &xfer_to_comp, 0, NULL);
-    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 1 save residual */
 
     pc->stride_0 = d_model;
     sdt_bind(cmd_buf, &S[SDT_SLOT_PRE_ATTN_NORM], bd);
     vk_pipeline_dispatch(cmd_buf, &bd->pipelines[S[SDT_SLOT_PRE_ATTN_NORM].pipeline_idx],
                          pc, (uint32_t)batch_size, 1, 1);
     barrier_buf(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->norm_buf.buffer);
-    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 2 pre-attn norm */
+    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 1 pre-attn norm */
 
     pc->stride_0 = d_model; pc->stride_1 = use_gemm ? d_inner : 0;
     pc->num_heads = d_inner;
@@ -1800,14 +1836,14 @@ static void record_qkv_attn_phase(
     pc->num_heads = d_kv;
     proj_dispatch(cmd_buf, bd, &S[SDT_SLOT_V_PROJ], &_pm, d_kv, pc);
     barrier_bufs2(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->q_proj.buffer, sp->k_proj.buffer);
-    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 3 qkv projections */
+    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 2 qkv projections */
 
     pc->num_heads = num_q; pc->stride_0 = num_kv;
     sdt_bind(cmd_buf, &S[SDT_SLOT_QK_NORM], bd);
     vk_pipeline_dispatch(cmd_buf, &bd->pipelines[S[SDT_SLOT_QK_NORM].pipeline_idx],
                          pc, num_q + num_kv, (uint32_t)batch_size, 1);
     barrier_bufs2(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->q_proj.buffer, sp->k_proj.buffer);
-    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 4 qk norm */
+    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 3 qk norm */
 }
 
 /*
@@ -1991,7 +2027,7 @@ static int record_transformer_layer(
  *   2. 18 × record_transformer_layer() using SDT (ping-pong hidden state)
  *   3. LM-head: final RMSNorm + vocab projection (reads from correct buffer)
  *
- * Does NOT submit.  Caller calls vkQueueSubmit + vkQueueWaitIdle.
+ * Does NOT submit. Caller calls vkQueueSubmit and synchronizes via fence.
  *
  * @param bd         Backend session data
  * @param cfg        Model configuration
@@ -2025,16 +2061,12 @@ static void record_lmhead_block(
                             bd->timing_query_pool, (*query_idx)++);
 
     int num_layers = cfg->num_hidden_layers;
-    VkBufferMemoryBarrier last_layer_barrier = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = bd->scratchpad.layer_hidden[num_layers % 2].buffer,
-        .offset = 0, .size = VK_WHOLE_SIZE
-    };
-    vkCmdPipelineBarrier(bd->cmd_buffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, NULL, 1, &last_layer_barrier, 0, NULL);
+    vk_buffer_barrier(bd->cmd_buffer,
+                      bd->scratchpad.layer_hidden[num_layers % 2].buffer,
+                      VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     vk_kernel_push_constants_t pc = {0};
     pc.batch_size = 1;
@@ -2045,21 +2077,32 @@ static void record_lmhead_block(
     vk_pipeline_dispatch(bd->cmd_buffer,
                          &bd->pipelines[bd->sdt.lmhead_norm.pipeline_idx], &pc, 1, 1, 1);
 
-    VkBufferMemoryBarrier norm_barrier = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = bd->scratchpad.norm_buf.buffer, .offset = 0, .size = VK_WHOLE_SIZE
-    };
-    vkCmdPipelineBarrier(bd->cmd_buffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, NULL, 1, &norm_barrier, 0, NULL);
+    vk_buffer_barrier(bd->cmd_buffer,
+                      bd->scratchpad.norm_buf.buffer,
+                      VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-    /* Vocab Projection via tiled GEMM (GEMV would exceed maxComputeWorkGroupCount) */
+    /* Vocab Projection.
+     * Decode-select path (batch=1 + argmax) uses dedicated decode pipeline.
+     * Other paths retain tiled GEMM fallback. */
     pc.stride_0  = (uint32_t)cfg->hidden_size;
     pc.stride_1  = 0;
     pc.num_heads = (uint32_t)cfg->vocab_size;
-    {
+    if (opts->emit_argmax && opts->batch_size == 1) {
+        const vk_compute_pipeline_t *decode_pipe = &bd->pipelines[PIPELINE_LMHEAD_DECODE_F32];
+        const uint32_t max_groups_x = 65535u;
+        const uint32_t groups_x = (uint32_t)cfg->vocab_size < max_groups_x
+                                ? (uint32_t)cfg->vocab_size
+                                : max_groups_x;
+        const uint32_t groups_y = ceil_div((uint32_t)cfg->vocab_size, groups_x);
+        pc.reserved[0] = groups_x;
+        vkCmdBindPipeline(bd->cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, decode_pipe->pipeline);
+        vkCmdBindDescriptorSets(bd->cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                decode_pipe->pipeline_layout, 0, 1, &bd->sdt.lmhead_proj.ds, 0, NULL);
+        vk_pipeline_dispatch(bd->cmd_buffer, decode_pipe, &pc, groups_x, groups_y, 1);
+    } else {
         const vk_compute_pipeline_t *gemm_pipe = &bd->pipelines[PIPELINE_GEMM_F32];
         vkCmdBindPipeline(bd->cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, gemm_pipe->pipeline);
         vkCmdBindDescriptorSets(bd->cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -2070,42 +2113,55 @@ static void record_lmhead_block(
     }
 
     if (opts->emit_argmax) {
-        VkBufferMemoryBarrier proj_to_argmax = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = bd->lm_head_logits.buffer, .offset = 0, .size = VK_WHOLE_SIZE
-        };
-        vkCmdPipelineBarrier(bd->cmd_buffer,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 0, NULL, 1, &proj_to_argmax, 0, NULL);
+        vk_buffer_barrier(bd->cmd_buffer,
+                          bd->lm_head_logits.buffer,
+                          VK_ACCESS_SHADER_WRITE_BIT,
+                          VK_ACCESS_SHADER_READ_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
         pc.stride_0 = (uint32_t)cfg->vocab_size;
         pc.stride_1 = (uint32_t)cfg->vocab_size;
         sdt_bind(bd->cmd_buffer, &bd->sdt.lmhead_argmax, bd);
         vk_pipeline_dispatch(bd->cmd_buffer,
                             &bd->pipelines[bd->sdt.lmhead_argmax.pipeline_idx],
-                            &pc, ceil_div((uint32_t)opts->batch_size, 256), 1, 1);
+                            &pc, (uint32_t)opts->batch_size, 1, 1);
 
-        VkBufferMemoryBarrier argmax_to_host = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = bd->selected_token_ids.buffer, .offset = 0, .size = VK_WHOLE_SIZE
-        };
-        vkCmdPipelineBarrier(bd->cmd_buffer,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-            0, 0, NULL, 1, &argmax_to_host, 0, NULL);
+        vk_buffer_barrier(bd->cmd_buffer,
+                          bd->selected_token_ids.buffer,
+                          VK_ACCESS_SHADER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT);
     } else {
-        VkBufferMemoryBarrier proj_to_xfer = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = bd->lm_head_logits.buffer, .offset = 0, .size = VK_WHOLE_SIZE
-        };
-        vkCmdPipelineBarrier(bd->cmd_buffer,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, NULL, 1, &proj_to_xfer, 0, NULL);
+        vk_buffer_barrier(bd->cmd_buffer,
+                          bd->lm_head_logits.buffer,
+                          VK_ACCESS_SHADER_WRITE_BIT,
+                          VK_ACCESS_TRANSFER_READ_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        size_t logits_bytes = (size_t)cfg->vocab_size * sizeof(float);
+        if (bd->download_staging.buffer != VK_NULL_HANDLE &&
+            logits_bytes <= bd->download_staging.size) {
+            VkBufferCopy logits_copy = {
+                .srcOffset = 0,
+                .dstOffset = 0,
+                .size = logits_bytes
+            };
+            vkCmdCopyBuffer(bd->cmd_buffer,
+                            bd->lm_head_logits.buffer,
+                            bd->download_staging.buffer,
+                            1,
+                            &logits_copy);
+
+            vk_buffer_barrier(bd->cmd_buffer,
+                              bd->download_staging.buffer,
+                              VK_ACCESS_TRANSFER_WRITE_BIT,
+                              VK_ACCESS_HOST_READ_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_HOST_BIT);
+        }
     }
 
     if (timing_active && (*query_idx) < bd->timing_query_capacity)
@@ -2153,23 +2209,12 @@ static int vulkan_record_forward_pass(
                         1,
                         &copy_region);
 
-        VkBufferMemoryBarrier transfer_to_compute = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = bd->scratchpad.layer_hidden[0].buffer,
-            .offset = 0,
-            .size = VK_WHOLE_SIZE
-        };
-        vkCmdPipelineBarrier(bd->cmd_buffer,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0,
-                             0, NULL,
-                             1, &transfer_to_compute,
-                             0, NULL);
+        vk_buffer_barrier(bd->cmd_buffer,
+                          bd->scratchpad.layer_hidden[0].buffer,
+                          VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_SHADER_READ_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     }
 
     /* ----------------------------------------------------------------
@@ -2208,20 +2253,12 @@ static int vulkan_record_forward_pass(
 
         /* Layer boundary dependency: layer output hidden[(L+1)%2] is input of layer L+1. */
         if (L + 1 < num_layers) {
-            VkBufferMemoryBarrier layer_boundary = {
-                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .buffer = bd->scratchpad.layer_hidden[(L + 1) % 2].buffer,
-                .offset = 0,
-                .size = VK_WHOLE_SIZE
-            };
-            vkCmdPipelineBarrier(bd->cmd_buffer,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, NULL, 1, &layer_boundary, 0, NULL);
+            vk_buffer_barrier(bd->cmd_buffer,
+                              bd->scratchpad.layer_hidden[(L + 1) % 2].buffer,
+                              VK_ACCESS_SHADER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         }
 
         if (timing_active && query_idx < bd->timing_query_capacity) {
@@ -2284,32 +2321,14 @@ static void write_kv_to_cache(
     }
 
     /* FIX #1: Wait for RoPE compute to finish writing k_proj/v_proj before copy (prevents GPU hang) */
-    VkBufferMemoryBarrier rope_to_copy[2] = {
-        {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = sp->k_proj.buffer,
-            .offset = 0,
-            .size = VK_WHOLE_SIZE
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = sp->v_proj.buffer,
-            .offset = 0,
-            .size = VK_WHOLE_SIZE
-        }
-    };
-    vkCmdPipelineBarrier(ctx->cmd_buf,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  /* Wait for RoPE */
-        VK_PIPELINE_STAGE_TRANSFER_BIT,        /* Block Copy */
-        0, 0, NULL, 2, rope_to_copy, 0, NULL);
+    VkBuffer rope_copy_bufs[2] = { sp->k_proj.buffer, sp->v_proj.buffer };
+    vk_pipeline_barrier_compute(ctx->cmd_buf,
+                                rope_copy_bufs,
+                                2,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_ACCESS_TRANSFER_READ_BIT);
 
     VkBufferCopy k_region = {.srcOffset = 0, .dstOffset = k_dst, .size = copy_bytes};
     VkBufferCopy v_region = {.srcOffset = 0, .dstOffset = v_dst, .size = copy_bytes};
@@ -2319,18 +2338,12 @@ static void write_kv_to_cache(
                     ctx->bd->kv_cache.kv_data.buffer, 1, &v_region);
 
     /* Ensure copy completes before next compute shader reads KV cache */
-    VkBufferMemoryBarrier xfer = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = ctx->bd->kv_cache.kv_data.buffer,
-        .offset = 0,
-        .size = VK_WHOLE_SIZE
-    };
-    vkCmdPipelineBarrier(ctx->cmd_buf, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &xfer, 0, NULL);
+    vk_buffer_barrier(ctx->cmd_buf,
+                      ctx->bd->kv_cache.kv_data.buffer,
+                      VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 }
 
 /**
@@ -2353,18 +2366,27 @@ static void write_kv_to_cache(
 /* Helper: reset cmd buf, record copy embedding→hidden[0] with barrier, end+submit+wait */
 static void cp25_restore_embedding(backend_vulkan_session_data_t *bd,
     const VkCommandBufferBeginInfo *begin,
-    const VkBufferCopy *region, const VkMemoryBarrier *bmr)
+    const VkBufferCopy *region, VkBuffer barrier_buf_handle)
 {
     vkResetCommandBuffer(bd->cmd_buffer, 0);
     vkBeginCommandBuffer(bd->cmd_buffer, begin);
     vkCmdCopyBuffer(bd->cmd_buffer, bd->embedding_staging.buffer,
                     bd->scratchpad.layer_hidden[0].buffer, 1, region);
-    vkCmdPipelineBarrier(bd->cmd_buffer,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, bmr, 0, NULL, 0, NULL);
+    vk_buffer_barrier(bd->cmd_buffer,
+                      barrier_buf_handle,
+                      VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     vkEndCommandBuffer(bd->cmd_buffer);
-    vk_pipeline_submit_timeline(bd->compute_queue, bd->cmd_buffer, NULL, 0, NULL, 0);
-    vkQueueWaitIdle(bd->compute_queue);
+    vkResetFences(bd->device, 1, &bd->compute_fence);
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &bd->cmd_buffer
+    };
+    vkQueueSubmit(bd->compute_queue, 1, &submit, bd->compute_fence);
+    vkWaitForFences(bd->device, 1, &bd->compute_fence, VK_TRUE, UINT64_MAX);
 }
 
 static void run_debug_checkpoints(
@@ -2400,8 +2422,14 @@ static void run_debug_checkpoints(
         { record_layer_params_t _cp2p = {1,0,0,NULL,0};
           record_transformer_layer(bd->cmd_buffer, bd, cfg, 0, &_cp2p); }
         vkEndCommandBuffer(bd->cmd_buffer);
-        vk_pipeline_submit_timeline(bd->compute_queue, bd->cmd_buffer, NULL, 0, NULL, 0);
-        vkQueueWaitIdle(bd->compute_queue);
+                vkResetFences(bd->device, 1, &bd->compute_fence);
+                VkSubmitInfo submit = {
+                        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = 1,
+                        .pCommandBuffers = &bd->cmd_buffer
+                };
+                vkQueueSubmit(bd->compute_queue, 1, &submit, bd->compute_fence);
+                vkWaitForFences(bd->device, 1, &bd->compute_fence, VK_TRUE, UINT64_MAX);
         probe_buf(bd, &bd->scratchpad.norm_buf,        probe_n, "CP2_norm_buf");
         probe_buf(bd, &bd->scratchpad.q_proj,          probe_n, "CP2_q_proj");
         probe_buf(bd, &bd->scratchpad.attn_output,     cfg->hidden_size, "CP2_attn_output");
@@ -2414,8 +2442,8 @@ static void run_debug_checkpoints(
 
     /* CP2.5: Per-layer rolling probe */
     const char *dbg_layers_env = getenv("SAPPHIRE_DEBUG_LAYERS");
-    fprintf(stderr, "[CP2.5_DIAG] SAPPHIRE_DEBUG_LAYERS=%s\n",
-            dbg_layers_env ? dbg_layers_env : "NULL");
+    LOG_DEBUG("[CP2.5_DIAG] SAPPHIRE_DEBUG_LAYERS=%s",
+              dbg_layers_env ? dbg_layers_env : "NULL");
     if (!dbg_layers_env || dbg_layers_env[0] != '1') return;
 
     LOG_INFO("[DBG] CP2.5: per-layer rolling probe");
@@ -2425,26 +2453,28 @@ static void run_debug_checkpoints(
     };
     size_t emb_bytes = (size_t)cfg->hidden_size * sizeof(float);
     VkBufferCopy emb_region = { .srcOffset = 0, .dstOffset = 0, .size = emb_bytes };
-    VkMemoryBarrier emb_barrier = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-    };
+    VkBuffer emb_barrier_buf = bd->scratchpad.layer_hidden[0].buffer;
     for (int N = 1; N <= num_layers; N++) {
-        cp25_restore_embedding(bd, &lp_begin, &emb_region, &emb_barrier);
+        cp25_restore_embedding(bd, &lp_begin, &emb_region, emb_barrier_buf);
         for (int l = 0; l < N; l++) {
             record_layer_params_t _cp25p = {1,0,0,NULL,0};
             record_transformer_layer(bd->cmd_buffer, bd, cfg, l, &_cp25p);
         }
         vkEndCommandBuffer(bd->cmd_buffer);
-        vk_pipeline_submit_timeline(bd->compute_queue, bd->cmd_buffer, NULL, 0, NULL, 0);
-        vkQueueWaitIdle(bd->compute_queue);
+        vkResetFences(bd->device, 1, &bd->compute_fence);
+        VkSubmitInfo submit = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &bd->cmd_buffer
+        };
+        vkQueueSubmit(bd->compute_queue, 1, &submit, bd->compute_fence);
+        vkWaitForFences(bd->device, 1, &bd->compute_fence, VK_TRUE, UINT64_MAX);
         char tag[32];
         snprintf(tag, sizeof(tag), "CP25_L%02d_out", N - 1);
         probe_buf(bd, &bd->scratchpad.layer_hidden[N % 2], probe_n, tag);
     }
     /* Restore hidden[0] to original embedding */
-    cp25_restore_embedding(bd, &lp_begin, &emb_region, &emb_barrier);
+    cp25_restore_embedding(bd, &lp_begin, &emb_region, emb_barrier_buf);
     LOG_INFO("[DBG] CP2.5: done. hidden[0] restored.");
 }
 
@@ -2505,7 +2535,18 @@ static int submit_embedding_transfer(
     }
     sapphire_embed_lookup_batch(session, token_ids, batch_size, (float*)bd->embedding_staging_mapped);
 
-    VkResult vr = vkResetCommandBuffer(bd->transfer_cmd, 0);
+    VkResult vr = vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
+    if (vr != VK_SUCCESS) {
+        LOG_ERROR("Failed waiting for transfer fence: %d", (int)vr);
+        return -1;
+    }
+    vr = vkResetFences(bd->device, 1, &bd->transfer_fence);
+    if (vr != VK_SUCCESS) {
+        LOG_ERROR("Failed to reset transfer fence: %d", (int)vr);
+        return -1;
+    }
+
+    vr = vkResetCommandBuffer(bd->transfer_cmd, 0);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to reset transfer command buffer: %d", (int)vr);
         return -1;
@@ -2522,18 +2563,12 @@ static int submit_embedding_transfer(
     VkBufferCopy copy_region = { .srcOffset = 0, .dstOffset = 0, .size = embed_size };
     vkCmdCopyBuffer(bd->transfer_cmd, bd->embedding_staging.buffer,
                     bd->scratchpad.layer_hidden[0].buffer, 1, &copy_region);
-    VkBufferMemoryBarrier xfer_barrier = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = bd->scratchpad.layer_hidden[0].buffer,
-        .offset = 0, .size = VK_WHOLE_SIZE
-    };
-    vkCmdPipelineBarrier(bd->transfer_cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, NULL, 1, &xfer_barrier, 0, NULL);
+    vk_buffer_barrier(bd->transfer_cmd,
+                      bd->scratchpad.layer_hidden[0].buffer,
+                      VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     vr = vkEndCommandBuffer(bd->transfer_cmd);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to end transfer command buffer: %d", (int)vr);
@@ -2543,7 +2578,7 @@ static int submit_embedding_transfer(
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &bd->transfer_cmd
     };
-    vr = vkQueueSubmit(bd->compute_queue, 1, &submit_xfer, VK_NULL_HANDLE);
+    vr = vkQueueSubmit(bd->compute_queue, 1, &submit_xfer, bd->transfer_fence);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to submit transfer command: %d", (int)vr);
         return -1;
@@ -2596,17 +2631,12 @@ static int download_forward_logits(backend_vulkan_session_data_t *bd,
                                    double                        *out_download_ms)
 {
     double t0 = monotonic_ms();
-    vk_transfer_ctx_t ctx = {
-        .device   = bd->device,
-        .phys_dev = bd->phys_dev,
-        .cmd_pool = bd->cmd_pool,
-        .queue    = bd->compute_queue
-    };
     size_t logits_size = (size_t)cfg->vocab_size * sizeof(float);
-    if (vk_buffer_download(&ctx, &bd->lm_head_logits, logits_size, logits) != 0) {
-        LOG_ERROR("Failed to download logits from GPU");
+    if (!bd->download_staging_mapped || logits_size > bd->download_staging.size) {
+        LOG_ERROR("Persistent download staging is unavailable or too small");
         return -1;
     }
+    memcpy(logits, bd->download_staging_mapped, logits_size);
     *out_download_ms = monotonic_ms() - t0;
 
     LOG_DEBUG("GPU logits sample: [0]=%.6f, [1]=%.6f, [2]=%.6f, [100]=%.6f, [1000]=%.6f",
@@ -2704,7 +2734,7 @@ static int vulkan_forward_batch(inference_session_t* session, const int* token_i
 
     /* GPU Execution: Submit & wait via execute_gpu_forward().           */
     /* If logits==NULL we wait here; otherwise the download fence syncs. */
-    if (execute_gpu_forward(bd, (logits == NULL), &record_submit_ms,
+    if (execute_gpu_forward(bd, 1, &record_submit_ms,
                             &compute_wait_ms,
                             t_stage_ms + transfer_submit_ms) != 0)
         return -1;
@@ -2720,39 +2750,8 @@ static int vulkan_forward_batch(inference_session_t* session, const int* token_i
      * ======================================================================== */
 
     if (logits) {
-        double t_download_start_ms = monotonic_ms();
-        /* Download logits from GPU to CPU */
-        vk_transfer_ctx_t transfer_ctx = {
-            .device   = bd->device,
-            .phys_dev = bd->phys_dev,
-            .cmd_pool = bd->cmd_pool,
-            .queue    = bd->compute_queue
-        };
-
-        size_t logits_size = (size_t)cfg->vocab_size * sizeof(float);
-        int rc_download = vk_buffer_download(&transfer_ctx, &bd->lm_head_logits,
-                             logits_size, logits);
-        if (rc_download != 0) {
-            LOG_ERROR("Failed to download logits from GPU");
+        if (download_forward_logits(bd, cfg, logits, &download_ms) != 0) {
             return -1;
-        }
-        download_ms = monotonic_ms() - t_download_start_ms;
-
-        LOG_DEBUG("GPU logits sample: [0]=%.6f, [1]=%.6f, [2]=%.6f, [100]=%.6f, [1000]=%.6f",
-                  logits[0], logits[1], logits[2], logits[100], logits[1000]);
-
-        /* ================================================================
-         * DEBUG CP3 — Logit quality analysis.
-         * Checks:
-         *   span (max-min): healthy model has span > 10. Span < 1 → hidden
-         *     state is near-zero; span ≈ 0 → uniform garbage.
-         *   top-5 tokens: with a sensible prompt they should be coherent
-         *     English subwords, not random multilingual fragments.
-         * ================================================================ */
-        if (debug_gpu_enabled()) {
-            probe_logits(logits, cfg->vocab_size, "CP3_logits");
-            probe_buf(bd, &bd->scratchpad.norm_buf, 64, "CP3_lmhead_norm_out");
-            LOG_INFO("[DBG] CP3: span<1 → final hidden near-zero (residual collapse) | span>100 → activation explosion");
         }
     }
 
@@ -2799,7 +2798,7 @@ static void process_select_timing(
 
     if (bd->timing_kernel_query_count > 1 && qcount > 1) {
         static const char *knames[] = {
-            "save_residual", "pre_attn_norm", "qkv_projections", "qk_norm", "rope",
+            "pre_attn_norm", "qkv_projections", "qk_norm", "rope",
             "kv_write", "attention", "o_proj", "post_attn_norm", "attn_residual_add",
             "pre_ffn_norm", "gate_up_proj", "geglu", "down_proj", "post_ffn_norm", "ffn_residual_add"
         };
@@ -2892,47 +2891,25 @@ static int vulkan_forward_select_batch(inference_session_t* session, const int* 
         return -1;
     }
 
-    bd->frame_counter++;
-    vr = vkResetFences(bd->device, 1, &bd->compute_fence);
-    if (vr != VK_SUCCESS) {
-        LOG_ERROR("Failed to reset compute fence: %d", (int)vr);
+    if (execute_gpu_forward(bd,
+                            1,
+                            &record_submit_ms,
+                            &compute_wait_ms,
+                            t_start_ms + transfer_submit_ms) != 0) {
+        LOG_ERROR("Failed to execute GPU forward in select path");
         return -1;
     }
-
-    VkSubmitInfo submit_info = {0};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &bd->cmd_buffer;
-
-    vr = vkQueueSubmit(bd->compute_queue, 1, &submit_info, bd->compute_fence);
-    if (vr != VK_SUCCESS) {
-        LOG_ERROR("Failed to submit command buffer to GPU queue: %d", (int)vr);
-        return -1;
-    }
-    record_submit_ms = monotonic_ms() - t_start_ms - transfer_submit_ms;
-
-    double t_wait_start_ms = monotonic_ms();
-    vr = vkWaitForFences(bd->device, 1, &bd->compute_fence, VK_TRUE, UINT64_MAX);
-    if (vr != VK_SUCCESS) {
-        LOG_ERROR("Failed waiting for compute fence in select path: %d", (int)vr);
-        return -1;
-    }
-    compute_wait_ms = monotonic_ms() - t_wait_start_ms;
 
     process_select_timing(bd, cfg);
 
     double t_download_start_ms = monotonic_ms();
-    void *mapped_ids = NULL;
-    if (vk_buffer_map(bd->device,
-                      &bd->selected_token_ids,
-                      0,
-                      (size_t)batch_size * sizeof(int32_t),
-                      &mapped_ids) != 0 || !mapped_ids) {
-        LOG_ERROR("Failed to map selected token id buffer");
+    if (!bd->selected_token_ids_mapped) {
+        LOG_ERROR("Persistent selected-token mapping is NULL");
         return -1;
     }
-    memcpy(selected_ids, mapped_ids, (size_t)batch_size * sizeof(int32_t));
-    vk_buffer_unmap(bd->device, &bd->selected_token_ids);
+    memcpy(selected_ids,
+           bd->selected_token_ids_mapped,
+           (size_t)batch_size * sizeof(int32_t));
 
     download_ms = monotonic_ms() - t_download_start_ms;
 
