@@ -114,7 +114,7 @@ static void vec_stats(const float *v, int n, const char *tag) {
 }
 
 /** Download `count` floats from a GPU buffer and call vec_stats(). */
-static void probe_buf(backend_vulkan_session_data_t *bd, vk_buffer_t *buf,
+static void probe_buf(const backend_vulkan_session_data_t *bd, vk_buffer_t *buf,
                       int count, const char *tag) {
     if (!buf || !buf->buffer || count <= 0) {
         LOG_WARN("[DBG] %s: buffer is NULL", tag);
@@ -175,7 +175,7 @@ static void probe_logits(const float *logits, int vocab_size, const char *tag) {
 /**
  * Debug helper: Download and dump buffer contents for verification.
  */
-static void debug_dump_buffer(backend_vulkan_session_data_t *bd, vk_buffer_t *buf, const char *name, int count) {
+static void debug_dump_buffer(const backend_vulkan_session_data_t *bd, vk_buffer_t *buf, const char *name, int count) {
     if (!buf || !buf->buffer || count <= 0) return;
     
     vk_transfer_ctx_t tctx = {
@@ -1755,14 +1755,17 @@ static inline void barrier_buf(VkCommandBuffer cmd_buf,
 static inline void barrier_bufs2(VkCommandBuffer cmd_buf,
     VkPipelineStageFlags src, VkPipelineStageFlags dst, VkBuffer b0, VkBuffer b1)
 {
-        VkBuffer bufs[2] = { b0, b1 };
+        const VkBuffer bufs[2] = { b0, b1 };
+    const vk_barrier_cfg_t cfg = {
+        .src_stage = src,
+        .dst_stage = dst,
+        .src_access = VK_ACCESS_SHADER_WRITE_BIT,
+        .dst_access = VK_ACCESS_SHADER_READ_BIT
+    };
         vk_pipeline_barrier_compute(cmd_buf,
-                                                                bufs,
-                                                                2,
-                                                                src,
-                                                                dst,
-                                                                VK_ACCESS_SHADER_WRITE_BIT,
-                                                                VK_ACCESS_SHADER_READ_BIT);
+                                bufs,
+                                2,
+                                &cfg);
 }
 
 /** Packs proj_dispatch mode parameters (reduces param count below max). */
@@ -2321,14 +2324,17 @@ static void write_kv_to_cache(
     }
 
     /* FIX #1: Wait for RoPE compute to finish writing k_proj/v_proj before copy (prevents GPU hang) */
-    VkBuffer rope_copy_bufs[2] = { sp->k_proj.buffer, sp->v_proj.buffer };
+    const VkBuffer rope_copy_bufs[2] = { sp->k_proj.buffer, sp->v_proj.buffer };
+    const vk_barrier_cfg_t rope_copy_cfg = {
+        .src_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        .dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT,
+        .src_access = VK_ACCESS_SHADER_WRITE_BIT,
+        .dst_access = VK_ACCESS_TRANSFER_READ_BIT
+    };
     vk_pipeline_barrier_compute(ctx->cmd_buf,
                                 rope_copy_bufs,
                                 2,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                VK_ACCESS_SHADER_WRITE_BIT,
-                                VK_ACCESS_TRANSFER_READ_BIT);
+                                &rope_copy_cfg);
 
     VkBufferCopy k_region = {.srcOffset = 0, .dstOffset = k_dst, .size = copy_bytes};
     VkBufferCopy v_region = {.srcOffset = 0, .dstOffset = v_dst, .size = copy_bytes};

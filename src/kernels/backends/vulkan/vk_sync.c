@@ -56,22 +56,19 @@ void vk_pipeline_barrier_compute(
     VkCommandBuffer cmd_buf,
     const VkBuffer *buffers,
     uint32_t buffer_count,
-    VkPipelineStageFlags src_stage,
-    VkPipelineStageFlags dst_stage,
-    VkAccessFlags src_access,
-    VkAccessFlags dst_access
+    const vk_barrier_cfg_t *cfg
 ) {
-    if (!cmd_buf || !buffers || buffer_count == 0) {
+    if (!cmd_buf || !buffers || buffer_count == 0 || !cfg) {
         LOG_ERROR("vk_pipeline_barrier_compute: invalid arguments");
         return;
     }
 
-    VkBufferMemoryBarrier barriers[8] = {0};
     if (buffer_count <= 8u) {
+        VkBufferMemoryBarrier barriers[8] = {0};
         for (uint32_t i = 0; i < buffer_count; i++) {
             barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            barriers[i].srcAccessMask = src_access;
-            barriers[i].dstAccessMask = dst_access;
+            barriers[i].srcAccessMask = cfg->src_access;
+            barriers[i].dstAccessMask = cfg->dst_access;
             barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barriers[i].buffer = buffers[i];
@@ -80,8 +77,8 @@ void vk_pipeline_barrier_compute(
         }
 
         vkCmdPipelineBarrier(cmd_buf,
-                             src_stage,
-                             dst_stage,
+                             cfg->src_stage,
+                             cfg->dst_stage,
                              0,
                              0,
                              NULL,
@@ -95,9 +92,9 @@ void vk_pipeline_barrier_compute(
     for (uint32_t i = 0; i < buffer_count; i++) {
         vk_buffer_barrier(cmd_buf,
                           buffers[i],
-                          src_access,
-                          dst_access,
-                          src_stage,
-                          dst_stage);
+                          cfg->src_access,
+                          cfg->dst_access,
+                          cfg->src_stage,
+                          cfg->dst_stage);
     }
 }

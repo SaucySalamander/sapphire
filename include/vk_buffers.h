@@ -65,6 +65,14 @@ typedef struct {
     int head_dim;
 } vk_scratchpad_cfg_t;
 
+/** Multi-buffer pipeline barrier configuration. */
+typedef struct {
+    VkPipelineStageFlags src_stage;
+    VkPipelineStageFlags dst_stage;
+    VkAccessFlags src_access;
+    VkAccessFlags dst_access;
+} vk_barrier_cfg_t;
+
 /* ========================================================================
  * 5.1 Core Buffer Wrapper
  * ======================================================================== */
@@ -497,10 +505,7 @@ void vk_pipeline_barrier_compute(
     VkCommandBuffer cmd_buf,
     const VkBuffer *buffers,
     uint32_t buffer_count,
-    VkPipelineStageFlags src_stage,
-    VkPipelineStageFlags dst_stage,
-    VkAccessFlags src_access,
-    VkAccessFlags dst_access
+    const vk_barrier_cfg_t *cfg
 );
 
 #ifdef __cplusplus

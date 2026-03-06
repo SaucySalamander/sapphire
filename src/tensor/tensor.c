@@ -233,7 +233,7 @@ float tensor_get_f32(const tensor_t *t, size_t idx) {
 
     if (t->dtype == DTYPE_F32) {
         // Direct float access
-        float *fdata = (float *)t->data;
+        const float *fdata = (const float *)t->data;
         return fdata[idx];
     } else if (t->dtype == DTYPE_Q4_0 || t->dtype == DTYPE_Q8_0) {
         // Placeholder: quantized dequantization
