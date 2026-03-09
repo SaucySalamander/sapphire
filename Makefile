@@ -36,7 +36,7 @@ TARGETS = \
 	$(OUTDIR)/sapphire \
 
 
-.PHONY: all bench check-bench bench_f32 bench_bf16 test clean shaders
+.PHONY: all bench check-bench bench_f32 bench_bf16 kv-paging-matrix test clean shaders
 
 # ============================================================================
 # SPIR-V Shader Compilation (Phase 11-04)
@@ -360,6 +360,11 @@ $(OUTDIR)/bench_end_to_end: $(OUTDIR)/test/bench/bench_sapphire_end_to_end.o $(L
 
 bench_f32: $(OUTDIR)/bench_f32
 bench_bf16: $(OUTDIR)/bench_bf16
+
+KV_MATRIX_ARGS ?=
+
+kv-paging-matrix: $(OUTDIR)/sapphire
+	@python3 scripts/benchmark_vk_kv_paging_matrix.py $(KV_MATRIX_ARGS)
 
 $(OUTDIR)/bench_f32: $(OUTDIR)/test/bench/bench_f32.o $(LIB_OBJS)
 	$(CC) $(CFLAGS) $< $(LIB_OBJS) -o $@ $(LDFLAGS)

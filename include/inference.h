@@ -52,6 +52,42 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
 int perform_inference(inference_context_t* ctx, const char* prompt, char* output, int output_size);
 
 /**
+ * Save backend session state (KV cache and related sequence state) to disk.
+ *
+ * Currently implemented for CPU backend sessions.
+ *
+ * @param session Inference session.
+ * @param path    Output file path (e.g., .sapphire state file).
+ * @return 0 on success, -1 on error/unsupported backend.
+ */
+int inference_session_save_state(inference_session_t *session, const char *path);
+
+/**
+ * Load backend session state (KV cache and related sequence state) from disk.
+ *
+ * Currently implemented for CPU backend sessions.
+ *
+ * @param session Inference session.
+ * @param path    Input file path.
+ * @return 0 on success, -1 on error/unsupported backend.
+ */
+int inference_session_load_state(inference_session_t *session, const char *path);
+
+/**
+ * Save current context session state to disk.
+ *
+ * Convenience wrapper around inference_session_save_state(ctx->session, path).
+ */
+int inference_context_save_state(inference_context_t *ctx, const char *path);
+
+/**
+ * Load context session state from disk.
+ *
+ * Convenience wrapper around inference_session_load_state(ctx->session, path).
+ */
+int inference_context_load_state(inference_context_t *ctx, const char *path);
+
+/**
  * Destroy inference context and free owned resources.
  */
 void destroy_inference_context(inference_context_t* ctx);

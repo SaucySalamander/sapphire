@@ -22,10 +22,13 @@
 
 #include "vk_buffers.h"
 #include "vk_compute_pipeline.h"
+#include "vk_kv_paged.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct inference_session_t inference_session_t;
 
 /* ========================================================================
  * P11-04 Pipeline Enumeration
@@ -169,6 +172,12 @@ typedef struct {
     size_t *weight_layer_strides;       /* Byte stride per layer for each weight type [11] */
     
     vk_kv_cache_t kv_cache;             /* KV cache with position tracking */
+    vk_kv_pager_t *kv_pager;            /* Optional Vulkan KV paging metadata manager */
+    vk_buffer_t kv_pager_shadow;        /* Host-visible shadow storage for evicted KV pages */
+    size_t kv_pager_page_bytes;         /* Per-page bytes for K or V payload */
+    size_t kv_pager_shadow_stride;      /* Per-table-slot bytes in shadow buffer (K + V) */
+    vk_kv_transfer_op_t *kv_pager_ops;  /* Drained transfer ops staging array */
+    uint32_t kv_pager_ops_capacity;     /* Capacity of kv_pager_ops */
     vk_gpu_scratchpad_t scratchpad;     /* Ephemeral activation buffers */
     vk_buffer_t attn_scores;            /* [num_heads × max_seq_len] attention score scratch */
     
@@ -207,6 +216,9 @@ typedef struct {
     VkFence transfer_fence;             /* Fence for transfer synchronization */
     VkFence compute_fence;              /* Fence for forward-pass compute completion */
     VkSemaphore transfer_to_compute_sem;/* Binary semaphore: transfer -> compute dependency */
+    VkSemaphore kv_pager_timeline_sem;  /* Timeline semaphore for transfer->compute KV paging deps */
+    uint64_t kv_pager_timeline_value;   /* Last signaled transfer timeline value */
+    uint64_t kv_pager_wait_value;       /* Compute submit wait value (0 if no wait required) */
     
     /* Synchronization (timeline semaphores from ring buffers) */
     uint64_t frame_counter;             /* Current frame counter for timeline sync */
@@ -224,6 +236,9 @@ typedef struct {
     int timing_enabled;
     int timing_kernel_layer;
 } backend_vulkan_session_data_t;
+
+int backend_vulkan_save_state(inference_session_t *session, const char *path);
+int backend_vulkan_load_state(inference_session_t *session, const char *path);
 
 #ifdef __cplusplus
 }

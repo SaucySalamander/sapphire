@@ -25,6 +25,8 @@
 #include "../../include/backend_vulkan.h"
 #include "../../include/vk_buffers.h"
 #include "../../include/vk_compute_pipeline.h"
+#include "../../include/vk_kv_paged.h"
+#include "../../include/kv_cache_state.h"
 #include "../../include/model_spec.h"
 #include "../../include/gemma3_270m_config.h"
 #include "../../include/llm_model.h"
@@ -38,6 +40,9 @@
 #include <stdint.h>
 #include "../../include/log.h"
 #include "vk_mem_alloc.h"
+
+#define VK_STATE_MAGIC_LOCAL "SPKVv1\0"
+#define VK_STATE_VERSION_LOCAL 1u
 
 /* Alignment helper macro */
 #define ALIGN_UP(value, alignment) (((value) + (alignment) - 1) & ~((alignment) - 1))
@@ -581,6 +586,14 @@ static void destroy_backend_data(backend_vulkan_session_data_t *bd) {
     vk_buffer_destroy(dev, &bd->selected_token_ids);
     vk_buffer_destroy(dev, &bd->lm_head_logits);
     vk_kv_cache_destroy(dev, &bd->kv_cache);
+    vk_buffer_destroy(dev, &bd->kv_pager_shadow);
+    if (bd->kv_pager_timeline_sem)
+        vkDestroySemaphore(dev, bd->kv_pager_timeline_sem, NULL);
+    free(bd->kv_pager_ops);
+    if (bd->kv_pager) {
+        vk_kv_pager_destroy(bd->kv_pager);
+        bd->kv_pager = NULL;
+    }
     if (bd->weight_buffers) {
         for (size_t i = 0; i < bd->num_weight_buffers; i++)
             vk_buffer_destroy(dev, &bd->weight_buffers[i]);
@@ -608,6 +621,17 @@ static int init_vk_gpu_buffers(backend_vulkan_session_data_t *bd,
     if (vk_kv_cache_create(bd->device, bd->phys_dev, &kv_cfg, &bd->kv_cache) != 0) {
         LOG_ERROR("Failed to create KV cache"); return -1;
     }
+
+    {
+        vk_kv_pager_config_t pager_cfg;
+        if (vk_kv_pager_config_from_env(&pager_cfg, cfg->num_hidden_layers, max_context_len) == 0 && pager_cfg.enabled) {
+            bd->kv_pager = vk_kv_pager_create(&pager_cfg, cfg->num_hidden_layers, max_context_len);
+            if (!bd->kv_pager) {
+                LOG_WARN("Vulkan KV pager requested but initialization failed; continuing without pager");
+            }
+        }
+    }
+
     vk_scratchpad_cfg_t sc = {
         .max_batch_size = max_context_len,
         .d_model        = cfg->hidden_size,
@@ -645,6 +669,61 @@ static int init_vk_gpu_buffers(backend_vulkan_session_data_t *bd,
         bd->weight_layer_strides = NULL;
         return -1;
     }
+    return 0;
+}
+
+static int init_vk_kv_pager_resources(backend_vulkan_session_data_t *bd,
+                                      const gemma3_270m_config_t *cfg) {
+    if (!bd || !cfg || !bd->kv_pager) return 0;
+
+    uint32_t table_slots = vk_kv_pager_table_slots(bd->kv_pager);
+    uint32_t page_tokens = vk_kv_pager_page_tokens(bd->kv_pager);
+    if (table_slots == 0u || page_tokens == 0u) return 0;
+
+    size_t kv_page_elems = (size_t)cfg->num_key_value_heads * (size_t)page_tokens * (size_t)cfg->head_dim;
+    bd->kv_pager_page_bytes = kv_page_elems * sizeof(float);
+    bd->kv_pager_shadow_stride = bd->kv_pager_page_bytes * 2u;
+    size_t shadow_bytes = (size_t)table_slots * bd->kv_pager_shadow_stride;
+
+    if (vk_buffer_create(bd->device,
+                         bd->phys_dev,
+                         shadow_bytes,
+                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         &bd->kv_pager_shadow) != 0) {
+        LOG_ERROR("Failed to create Vulkan KV pager shadow buffer (%zu bytes)", shadow_bytes);
+        return -1;
+    }
+
+    bd->kv_pager_ops = (vk_kv_transfer_op_t *)calloc((size_t)table_slots * 2u, sizeof(vk_kv_transfer_op_t));
+    if (!bd->kv_pager_ops) {
+        LOG_ERROR("Failed to allocate Vulkan KV pager transfer ops array");
+        return -1;
+    }
+    bd->kv_pager_ops_capacity = table_slots * 2u;
+
+    VkSemaphoreTypeCreateInfo timeline_type = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        .initialValue = 0u
+    };
+    VkSemaphoreCreateInfo sem_info = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        .pNext = &timeline_type
+    };
+    if (vkCreateSemaphore(bd->device, &sem_info, NULL, &bd->kv_pager_timeline_sem) != VK_SUCCESS) {
+        LOG_ERROR("Failed to create Vulkan KV pager timeline semaphore");
+        return -1;
+    }
+    bd->kv_pager_timeline_value = 0u;
+    bd->kv_pager_wait_value = 0u;
+
+    LOG_INFO("Vulkan KV pager resources initialized: shadow=%zu MB slots=%u page_tokens=%u",
+             shadow_bytes >> 20,
+             table_slots,
+             page_tokens);
     return 0;
 }
 
@@ -1265,6 +1344,7 @@ static int vulkan_session_init(inference_session_t* session, const model_spec_t*
     }
     if (create_vk_compute_pipelines(bd, cfg)                      != 0) goto fail;
     if (alloc_vk_inference_bufs(bd, cfg, max_context_len)         != 0) goto fail;
+    if (init_vk_kv_pager_resources(bd, cfg)                        != 0) goto fail;
     if (vulkan_prepopulate_descriptors(bd, cfg)                   != 0) goto fail;
     if (setup_vk_timing_and_staging(bd, cfg)                      != 0) goto fail;
 
@@ -1374,6 +1454,32 @@ static void vulkan_session_destroy(inference_session_t* session) {
 
     /* Destroy KV cache */
     vk_kv_cache_destroy(backend_data->device, &backend_data->kv_cache);
+    vk_buffer_destroy(backend_data->device, &backend_data->kv_pager_shadow);
+    if (backend_data->kv_pager_timeline_sem) {
+        vkDestroySemaphore(backend_data->device, backend_data->kv_pager_timeline_sem, NULL);
+    }
+    if (backend_data->kv_pager_ops) {
+        free(backend_data->kv_pager_ops);
+    }
+    if (backend_data->kv_pager) {
+        vk_kv_pager_stats_t pager_stats;
+        if (vk_kv_pager_get_stats(backend_data->kv_pager, &pager_stats) == 0) {
+            uint64_t accesses = pager_stats.page_hits + pager_stats.page_misses;
+            double hit_rate = (accesses > 0u)
+                ? (100.0 * (double)pager_stats.page_hits / (double)accesses)
+                : 100.0;
+            LOG_INFO("VK KV pager stats: hits=%llu misses=%llu hit_rate=%.2f%% binds=%llu evictions=%llu read_touches=%llu write_touches=%llu",
+                     (unsigned long long)pager_stats.page_hits,
+                     (unsigned long long)pager_stats.page_misses,
+                     hit_rate,
+                     (unsigned long long)pager_stats.page_binds,
+                     (unsigned long long)pager_stats.page_evictions,
+                     (unsigned long long)pager_stats.read_touches,
+                     (unsigned long long)pager_stats.write_touches);
+        }
+        vk_kv_pager_destroy(backend_data->kv_pager);
+        backend_data->kv_pager = NULL;
+    }
 
     /* Destroy weight buffers */
     if (backend_data->weight_buffers) {
@@ -1849,6 +1955,32 @@ static void record_qkv_attn_phase(
     kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 3 qk norm */
 }
 
+static void vk_kv_pager_touch_layer_window(backend_vulkan_session_data_t *bd,
+                                           const gemma3_270m_config_t *cfg,
+                                           int layer_idx,
+                                           int start_pos,
+                                           int batch_size) {
+    if (!bd || !cfg || !bd->kv_pager) return;
+
+    int is_global = 0;
+    if (cfg->layer_types_mask) {
+        is_global = (((cfg->layer_types_mask >> (unsigned long long)layer_idx) & 1ULL) != 0ULL) ? 1 : 0;
+    } else {
+        is_global = (((layer_idx + 1) % 6) == 0) ? 1 : 0;
+    }
+
+    int window_end = start_pos + batch_size;
+    int window_start = 0;
+    if (!is_global) {
+        int swa_window = (cfg->sliding_window > 0) ? cfg->sliding_window : 1024;
+        if (window_end > swa_window) {
+            window_start = window_end - swa_window;
+        }
+    }
+
+    (void)vk_kv_pager_touch_read_range(bd->kv_pager, layer_idx, window_start, window_end - 1);
+}
+
 /*
  * record_rope_attn_phase: RoPE, KV-cache write, attention, O-proj,
  * post-attn norm, and attention residual add.
@@ -1873,6 +2005,8 @@ static void record_rope_attn_phase(
     bool use_gemm     = (batch_size > 1);
     int proj_pipeline = use_gemm ? PIPELINE_GEMM_F32 : PIPELINE_GEMV_F32;
     const proj_mode_t _pm = { proj_pipeline, (int)use_gemm, batch_size };
+
+    vk_kv_pager_touch_layer_window(bd, cfg, layer_idx, start_pos, batch_size);
 
     pc->num_heads = num_q; pc->stride_0 = num_kv;
     sdt_bind(cmd_buf, &S[SDT_SLOT_ROPE], bd);
@@ -2350,6 +2484,12 @@ static void write_kv_to_cache(
                       VK_ACCESS_SHADER_READ_BIT,
                       VK_PIPELINE_STAGE_TRANSFER_BIT,
                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    if (ctx->bd->kv_pager) {
+        int end_pos = ctx->seq_pos;
+        int start_pos = ctx->seq_pos - ctx->batch_size + 1;
+        (void)vk_kv_pager_touch_write_range(ctx->bd->kv_pager, ctx->layer, start_pos, end_pos);
+    }
 }
 
 /**
@@ -2522,6 +2662,101 @@ static void process_forward_timing(backend_vulkan_session_data_t *bd, int num_la
     LOG_DEBUG("VK GPU timing summary: total=%.3f ms (layers=%d)", total_ms, num_layers);
 }
 
+static void vk_kv_pager_prefetch_batch(backend_vulkan_session_data_t *bd,
+                                       const gemma3_270m_config_t *cfg,
+                                       int start_pos,
+                                       int batch_size) {
+    if (!bd || !cfg || !bd->kv_pager) return;
+    int write_start = start_pos;
+    int write_end = start_pos + batch_size - 1;
+
+    for (int layer = 0; layer < cfg->num_hidden_layers; ++layer) {
+        int is_global = 0;
+        if (cfg->layer_types_mask) {
+            is_global = (((cfg->layer_types_mask >> (unsigned long long)layer) & 1ULL) != 0ULL) ? 1 : 0;
+        } else {
+            is_global = (((layer + 1) % 6) == 0) ? 1 : 0;
+        }
+
+        int read_end = write_end;
+        int read_start = 0;
+        if (!is_global) {
+            int swa_window = (cfg->sliding_window > 0) ? cfg->sliding_window : 1024;
+            if ((read_end + 1) > swa_window) {
+                read_start = (read_end + 1) - swa_window;
+            }
+        }
+
+        (void)vk_kv_pager_touch_read_range(bd->kv_pager, layer, read_start, read_end);
+        (void)vk_kv_pager_touch_write_range(bd->kv_pager, layer, write_start, write_end);
+    }
+}
+
+static uint32_t record_vk_kv_pager_transfer_ops(backend_vulkan_session_data_t *bd,
+                                                 const gemma3_270m_config_t *cfg) {
+    if (!bd || !cfg || !bd->kv_pager || !bd->kv_pager_ops || bd->kv_pager_ops_capacity == 0u) return 0u;
+
+    uint32_t op_count = vk_kv_pager_drain_transfer_ops(bd->kv_pager,
+                                                       bd->kv_pager_ops,
+                                                       bd->kv_pager_ops_capacity);
+    if (op_count == 0u) return 0u;
+
+    size_t max_pos = (size_t)bd->kv_cache.max_seq_len;
+    size_t kv_head_elems = (size_t)cfg->num_key_value_heads * (size_t)cfg->head_dim;
+    size_t layer_stride = max_pos * kv_head_elems * 2u;
+
+    int emitted_promote = 0;
+    int emitted_evict = 0;
+
+    for (uint32_t i = 0; i < op_count; ++i) {
+        const vk_kv_transfer_op_t *op = &bd->kv_pager_ops[i];
+        size_t token_start = (size_t)op->token_start;
+        size_t token_count = (size_t)op->token_count;
+        size_t copy_bytes = token_count * kv_head_elems * sizeof(float);
+        size_t layer_base = (size_t)op->layer * layer_stride;
+
+        size_t k_kv_offset = (layer_base + token_start * kv_head_elems) * sizeof(float);
+        size_t v_kv_offset = (layer_base + max_pos * kv_head_elems + token_start * kv_head_elems) * sizeof(float);
+
+        size_t shadow_base = (size_t)op->table_slot * bd->kv_pager_shadow_stride;
+        size_t k_shadow_offset = shadow_base;
+        size_t v_shadow_offset = shadow_base + bd->kv_pager_page_bytes;
+
+        if (op->type == VK_KV_TRANSFER_OP_PROMOTE) {
+            VkBufferCopy k_region = {.srcOffset = k_shadow_offset, .dstOffset = k_kv_offset, .size = copy_bytes};
+            VkBufferCopy v_region = {.srcOffset = v_shadow_offset, .dstOffset = v_kv_offset, .size = copy_bytes};
+            vkCmdCopyBuffer(bd->transfer_cmd, bd->kv_pager_shadow.buffer, bd->kv_cache.kv_data.buffer, 1, &k_region);
+            vkCmdCopyBuffer(bd->transfer_cmd, bd->kv_pager_shadow.buffer, bd->kv_cache.kv_data.buffer, 1, &v_region);
+            emitted_promote = 1;
+        } else if (op->type == VK_KV_TRANSFER_OP_EVICT) {
+            VkBufferCopy k_region = {.srcOffset = k_kv_offset, .dstOffset = k_shadow_offset, .size = copy_bytes};
+            VkBufferCopy v_region = {.srcOffset = v_kv_offset, .dstOffset = v_shadow_offset, .size = copy_bytes};
+            vkCmdCopyBuffer(bd->transfer_cmd, bd->kv_cache.kv_data.buffer, bd->kv_pager_shadow.buffer, 1, &k_region);
+            vkCmdCopyBuffer(bd->transfer_cmd, bd->kv_cache.kv_data.buffer, bd->kv_pager_shadow.buffer, 1, &v_region);
+            emitted_evict = 1;
+        }
+    }
+
+    if (emitted_evict) {
+        vk_buffer_barrier(bd->transfer_cmd,
+                          bd->kv_pager_shadow.buffer,
+                          VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT);
+    }
+    if (emitted_promote) {
+        vk_buffer_barrier(bd->transfer_cmd,
+                          bd->kv_cache.kv_data.buffer,
+                          VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_SHADER_READ_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+
+    return op_count;
+}
+
 /**
  * Compute embeddings for the current batch and submit a GPU transfer to
  * hidden[0]. Returns 0 on success, -1 on any Vulkan failure.
@@ -2575,19 +2810,46 @@ static int submit_embedding_transfer(
                       VK_ACCESS_SHADER_READ_BIT,
                       VK_PIPELINE_STAGE_TRANSFER_BIT,
                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    uint32_t pager_ops = record_vk_kv_pager_transfer_ops(bd, cfg);
+
     vr = vkEndCommandBuffer(bd->transfer_cmd);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to end transfer command buffer: %d", (int)vr);
         return -1;
     }
+
+    VkTimelineSemaphoreSubmitInfo timeline_info = {0};
+    uint32_t signal_count = 0u;
+    VkSemaphore signal_sem = VK_NULL_HANDLE;
+
+    if (bd->kv_pager_timeline_sem != VK_NULL_HANDLE) {
+        bd->kv_pager_wait_value = ++bd->kv_pager_timeline_value;
+        signal_sem = bd->kv_pager_timeline_sem;
+        timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline_info.signalSemaphoreValueCount = 1;
+        timeline_info.pSignalSemaphoreValues = &bd->kv_pager_wait_value;
+        signal_count = 1u;
+    } else {
+        bd->kv_pager_wait_value = 0u;
+    }
+
     VkSubmitInfo submit_xfer = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1, .pCommandBuffers = &bd->transfer_cmd
+        .pNext = (signal_count > 0u) ? &timeline_info : NULL,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &bd->transfer_cmd,
+        .signalSemaphoreCount = signal_count,
+        .pSignalSemaphores = (signal_count > 0u) ? &signal_sem : NULL
     };
     vr = vkQueueSubmit(bd->compute_queue, 1, &submit_xfer, bd->transfer_fence);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to submit transfer command: %d", (int)vr);
         return -1;
+    }
+
+    if (pager_ops > 0u) {
+        LOG_DEBUG("Vulkan KV pager transfer ops submitted: %u", pager_ops);
     }
     return 0;
 }
@@ -2606,16 +2868,29 @@ static int execute_gpu_forward(backend_vulkan_session_data_t *bd,
         return -1;
     }
 
+    VkTimelineSemaphoreSubmitInfo timeline_info = {0};
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     VkSubmitInfo si = {0};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &bd->cmd_buffer;
+
+    if (bd->kv_pager_timeline_sem != VK_NULL_HANDLE && bd->kv_pager_wait_value > 0u) {
+        timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline_info.waitSemaphoreValueCount = 1;
+        timeline_info.pWaitSemaphoreValues = &bd->kv_pager_wait_value;
+        si.pNext = &timeline_info;
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &bd->kv_pager_timeline_sem;
+        si.pWaitDstStageMask = &wait_stage;
+    }
 
     VkResult vr_submit = vkQueueSubmit(bd->compute_queue, 1, &si, bd->compute_fence);
     if (vr_submit != VK_SUCCESS) {
         LOG_ERROR("Failed to submit command buffer to GPU queue: %d", (int)vr_submit);
         return -1;
     }
+    bd->kv_pager_wait_value = 0u;
     *out_record_ms = monotonic_ms() - t_stage_ms;
 
     if (wait_for_fence) {
@@ -2696,6 +2971,8 @@ static int vulkan_forward_batch(inference_session_t* session, const int* token_i
     /* ========================================================================
      * Optimized Embedding Upload (Zero Allocations - Reuse Persistent Resources)
      * ======================================================================== */
+
+    vk_kv_pager_prefetch_batch(bd, cfg, start_pos, batch_size);
 
     if (submit_embedding_transfer(bd, session, cfg, token_ids, batch_size) != 0)
         return -1;
@@ -2947,11 +3224,332 @@ static void vulkan_reset(inference_session_t* session) {
 
     /* Reset KV cache position for new sequence */
     vk_kv_cache_reset(&backend_data->kv_cache);
+    if (backend_data->kv_pager) {
+        vk_kv_pager_reset(backend_data->kv_pager);
+    }
 
     /* Reset frame counter for timeline semaphore sync */
     backend_data->frame_counter = 0;
 
     LOG_DEBUG("Vulkan backend reset for new sequence");
+}
+
+static int transfer_region_device_to_host(backend_vulkan_session_data_t *bd,
+                                          VkBuffer src,
+                                          VkDeviceSize src_offset,
+                                          void *dst_host,
+                                          size_t size) {
+    if (!bd || !src || !dst_host || size == 0u) return -1;
+    if (!bd->download_staging_mapped || size > bd->download_staging.size) return -1;
+
+    VkResult vr = vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkResetFences(bd->device, 1, &bd->transfer_fence);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkResetCommandBuffer(bd->transfer_cmd, 0);
+    if (vr != VK_SUCCESS) return -1;
+
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    vr = vkBeginCommandBuffer(bd->transfer_cmd, &begin);
+    if (vr != VK_SUCCESS) return -1;
+
+    VkBufferCopy copy = {
+        .srcOffset = src_offset,
+        .dstOffset = 0,
+        .size = size
+    };
+    vkCmdCopyBuffer(bd->transfer_cmd, src, bd->download_staging.buffer, 1, &copy);
+
+    vk_buffer_barrier(bd->transfer_cmd,
+                      bd->download_staging.buffer,
+                      VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_HOST_READ_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_HOST_BIT);
+
+    vr = vkEndCommandBuffer(bd->transfer_cmd);
+    if (vr != VK_SUCCESS) return -1;
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &bd->transfer_cmd
+    };
+    vr = vkQueueSubmit(bd->compute_queue, 1, &submit, bd->transfer_fence);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
+    if (vr != VK_SUCCESS) return -1;
+
+    memcpy(dst_host, bd->download_staging_mapped, size);
+    return 0;
+}
+
+static int transfer_region_host_to_device(backend_vulkan_session_data_t *bd,
+                                          const void *src_host,
+                                          VkBuffer dst,
+                                          VkDeviceSize dst_offset,
+                                          size_t size) {
+    if (!bd || !src_host || !dst || size == 0u) return -1;
+    if (!bd->embedding_staging_mapped || size > bd->embedding_staging.size) return -1;
+
+    memcpy(bd->embedding_staging_mapped, src_host, size);
+
+    VkResult vr = vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkResetFences(bd->device, 1, &bd->transfer_fence);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkResetCommandBuffer(bd->transfer_cmd, 0);
+    if (vr != VK_SUCCESS) return -1;
+
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    vr = vkBeginCommandBuffer(bd->transfer_cmd, &begin);
+    if (vr != VK_SUCCESS) return -1;
+
+    VkBufferCopy copy = {
+        .srcOffset = 0,
+        .dstOffset = dst_offset,
+        .size = size
+    };
+    vkCmdCopyBuffer(bd->transfer_cmd, bd->embedding_staging.buffer, dst, 1, &copy);
+
+    vk_buffer_barrier(bd->transfer_cmd,
+                      dst,
+                      VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    vr = vkEndCommandBuffer(bd->transfer_cmd);
+    if (vr != VK_SUCCESS) return -1;
+
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &bd->transfer_cmd
+    };
+    vr = vkQueueSubmit(bd->compute_queue, 1, &submit, bd->transfer_fence);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
+    if (vr != VK_SUCCESS) return -1;
+
+    return 0;
+}
+
+typedef struct {
+    backend_vulkan_session_data_t *bd;
+    kv_state_writer_t *writer;
+    uint32_t page_tokens;
+    uint32_t max_seq_len;
+    size_t page_float_count;
+    size_t max_pos;
+    size_t kv_head_elems;
+    size_t layer_stride;
+} vk_state_save_ctx_t;
+
+static int backend_vulkan_save_one_page(const vk_state_save_ctx_t *ctx,
+                                        uint32_t layer,
+                                        uint32_t page_idx,
+                                        float *k_page,
+                                        float *v_page) {
+    uint32_t token_start = page_idx * ctx->page_tokens;
+    uint32_t token_count = ctx->page_tokens;
+    if (token_start + token_count > ctx->max_seq_len) {
+        token_count = ctx->max_seq_len - token_start;
+    }
+
+    size_t copy_floats = (size_t)token_count * ctx->kv_head_elems;
+    size_t copy_bytes = copy_floats * sizeof(float);
+    memset(k_page, 0, ctx->page_float_count * sizeof(float));
+    memset(v_page, 0, ctx->page_float_count * sizeof(float));
+
+    size_t layer_base = (size_t)layer * ctx->layer_stride;
+    size_t k_offset = (layer_base + (size_t)token_start * ctx->kv_head_elems) * sizeof(float);
+    size_t v_offset = (layer_base + ctx->max_pos * ctx->kv_head_elems + (size_t)token_start * ctx->kv_head_elems) * sizeof(float);
+
+    if (transfer_region_device_to_host(ctx->bd, ctx->bd->kv_cache.kv_data.buffer, k_offset, k_page, copy_bytes) != 0 ||
+        transfer_region_device_to_host(ctx->bd, ctx->bd->kv_cache.kv_data.buffer, v_offset, v_page, copy_bytes) != 0) {
+        return -1;
+    }
+
+    kv_state_page_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.layer = layer;
+    rec.page_idx = page_idx;
+    rec.token_start = token_start;
+    rec.token_count = token_count;
+    rec.tier = (uint32_t)KV_PAGE_TIER_VRAM;
+    rec.flags = 0u;
+    return kv_state_writer_write_page(ctx->writer, &rec, k_page, v_page, ctx->page_float_count);
+}
+
+int backend_vulkan_save_state(inference_session_t *session, const char *path) {
+    if (!session || !session->backend_data || !path) return -1;
+    backend_vulkan_session_data_t *bd = (backend_vulkan_session_data_t *)session->backend_data;
+    const gemma3_270m_config_t *cfg = (const gemma3_270m_config_t *)session->model_spec->variant_config;
+    if (!cfg) return -1;
+
+    kv_pager_config_t pager_cfg;
+    if (kv_pager_config_from_env(&pager_cfg) != 0) return -1;
+    uint32_t page_tokens = pager_cfg.page_tokens;
+    if (page_tokens == 0u) return -1;
+
+    uint32_t current_seq_len = (uint32_t)vk_kv_cache_get_seq_pos(&bd->kv_cache);
+    uint64_t pages_per_layer = (current_seq_len > 0u)
+        ? (uint64_t)((current_seq_len + page_tokens - 1u) / page_tokens)
+        : 0u;
+    uint64_t page_count = pages_per_layer * (uint64_t)cfg->num_hidden_layers;
+
+    size_t page_float_count = (size_t)cfg->num_key_value_heads * (size_t)page_tokens * (size_t)cfg->head_dim;
+    kv_state_file_header_t header;
+    memset(&header, 0, sizeof(header));
+    memcpy(header.magic, VK_STATE_MAGIC_LOCAL, sizeof(header.magic));
+    header.version = VK_STATE_VERSION_LOCAL;
+    header.header_size = (uint32_t)sizeof(header);
+    header.num_layers = (uint32_t)cfg->num_hidden_layers;
+    header.num_kv_heads = (uint32_t)cfg->num_key_value_heads;
+    header.max_seq_len = (uint32_t)bd->kv_cache.max_seq_len;
+    header.head_dim = (uint32_t)cfg->head_dim;
+    header.current_seq_len = current_seq_len;
+    header.page_tokens = page_tokens;
+    header.page_float_count = (uint32_t)page_float_count;
+    header.page_count = page_count;
+
+    kv_state_writer_t *writer = NULL;
+    if (kv_state_writer_open(path, &header, &writer) != 0) return -1;
+
+    float *k_page = (float *)malloc(page_float_count * sizeof(float));
+    float *v_page = (float *)malloc(page_float_count * sizeof(float));
+    if (!k_page || !v_page) {
+        if (k_page) free(k_page);
+        if (v_page) free(v_page);
+        kv_state_writer_close(writer);
+        return -1;
+    }
+
+    size_t max_pos = (size_t)bd->kv_cache.max_seq_len;
+    size_t kv_head_elems = (size_t)cfg->num_key_value_heads * (size_t)cfg->head_dim;
+    size_t layer_stride = max_pos * kv_head_elems * 2u;
+    vk_state_save_ctx_t save_ctx = {
+        .bd = bd,
+        .writer = writer,
+        .page_tokens = page_tokens,
+        .max_seq_len = (uint32_t)bd->kv_cache.max_seq_len,
+        .page_float_count = page_float_count,
+        .max_pos = max_pos,
+        .kv_head_elems = kv_head_elems,
+        .layer_stride = layer_stride
+    };
+
+    for (int layer = 0; layer < cfg->num_hidden_layers; ++layer) {
+        for (uint32_t page_idx = 0; page_idx < (uint32_t)pages_per_layer; ++page_idx) {
+            if (backend_vulkan_save_one_page(&save_ctx,
+                                             (uint32_t)layer,
+                                             page_idx,
+                                             k_page,
+                                             v_page) != 0) {
+                free(k_page);
+                free(v_page);
+                kv_state_writer_close(writer);
+                return -1;
+            }
+        }
+    }
+
+    free(k_page);
+    free(v_page);
+    if (kv_state_writer_close(writer) != 0) return -1;
+    LOG_INFO("Vulkan KV snapshot saved: %s (seq_len=%u pages=%llu)",
+             path,
+             current_seq_len,
+             (unsigned long long)page_count);
+    return 0;
+}
+
+int backend_vulkan_load_state(inference_session_t *session, const char *path) {
+    if (!session || !session->backend_data || !path) return -1;
+    backend_vulkan_session_data_t *bd = (backend_vulkan_session_data_t *)session->backend_data;
+    const gemma3_270m_config_t *cfg = (const gemma3_270m_config_t *)session->model_spec->variant_config;
+    if (!cfg) return -1;
+
+    kv_state_file_header_t header;
+    kv_state_reader_t *reader = NULL;
+    if (kv_state_reader_open(path, &header, &reader) != 0) return -1;
+
+    if ((int)header.num_layers != cfg->num_hidden_layers ||
+        (int)header.num_kv_heads != cfg->num_key_value_heads ||
+        (int)header.max_seq_len != (int)bd->kv_cache.max_seq_len ||
+        (int)header.head_dim != cfg->head_dim) {
+        kv_state_reader_close(reader);
+        LOG_ERROR("Vulkan KV snapshot incompatible with current session");
+        return -1;
+    }
+
+    size_t page_float_count = (size_t)header.page_float_count;
+    float *k_page = (float *)malloc(page_float_count * sizeof(float));
+    float *v_page = (float *)malloc(page_float_count * sizeof(float));
+    if (!k_page || !v_page) {
+        if (k_page) free(k_page);
+        if (v_page) free(v_page);
+        kv_state_reader_close(reader);
+        return -1;
+    }
+
+    size_t max_pos = (size_t)bd->kv_cache.max_seq_len;
+    size_t kv_head_elems = (size_t)cfg->num_key_value_heads * (size_t)cfg->head_dim;
+    size_t layer_stride = max_pos * kv_head_elems * 2u;
+
+    vk_kv_cache_reset(&bd->kv_cache);
+    if (bd->kv_pager) vk_kv_pager_reset(bd->kv_pager);
+
+    for (uint64_t i = 0; i < header.page_count; ++i) {
+        kv_state_page_record_t rec;
+        int rc = kv_state_reader_read_page(reader,
+                                           &rec,
+                                           k_page,
+                                           v_page,
+                                           page_float_count);
+        if (rc <= 0) {
+            free(k_page);
+            free(v_page);
+            kv_state_reader_close(reader);
+            return -1;
+        }
+
+        size_t copy_floats = (size_t)rec.token_count * kv_head_elems;
+        size_t copy_bytes = copy_floats * sizeof(float);
+        size_t layer_base = (size_t)rec.layer * layer_stride;
+        size_t k_offset = (layer_base + (size_t)rec.token_start * kv_head_elems) * sizeof(float);
+        size_t v_offset = (layer_base + max_pos * kv_head_elems + (size_t)rec.token_start * kv_head_elems) * sizeof(float);
+
+        if (transfer_region_host_to_device(bd, k_page, bd->kv_cache.kv_data.buffer, k_offset, copy_bytes) != 0 ||
+            transfer_region_host_to_device(bd, v_page, bd->kv_cache.kv_data.buffer, v_offset, copy_bytes) != 0) {
+            free(k_page);
+            free(v_page);
+            kv_state_reader_close(reader);
+            return -1;
+        }
+    }
+
+    free(k_page);
+    free(v_page);
+    kv_state_reader_close(reader);
+
+    if (vk_kv_cache_set_seq_pos(&bd->kv_cache, (int)header.current_seq_len) != 0) {
+        LOG_ERROR("Vulkan KV snapshot load failed: invalid seq pos %u", header.current_seq_len);
+        return -1;
+    }
+
+    LOG_INFO("Vulkan KV snapshot loaded: %s (seq_len=%u pages=%llu)",
+             path,
+             header.current_seq_len,
+             (unsigned long long)header.page_count);
+    return 0;
 }
 
 /**

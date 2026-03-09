@@ -17,9 +17,11 @@
 #include "../include/gemma3_270m_config.h"
 #include "../include/ggml_model.h"
 #include "../include/kv_cache.h"
+#include "../include/kv_cache_state.h"
 #include "../include/layer_config_loader.h"
 #include "../include/log.h"
 #include "../include/model_reader.h"
+#include "../include/backend_vulkan.h"
 #include "../include/rope.h"
 #include "../include/tensor.h"
 #include "../include/kernels.h"
@@ -540,6 +542,82 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
              (session && session->backend) ? session->backend->name : "unknown");
 
     LOG_DEBUG("Generated %d tokens", st.generated_count);
+
+    return 0;
+}
+
+int inference_session_save_state(inference_session_t *session, const char *path) {
+    if (!session || !path) return -1;
+
+    if (session->backend && session->backend->type == SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        return backend_vulkan_save_state(session, path);
+    }
+
+    if (!session->kv_cache) {
+        LOG_ERROR("Session save failed: KV cache is unavailable");
+        return -1;
+    }
+
+    return kv_cache_save_state(session->kv_cache, path);
+}
+
+int inference_session_load_state(inference_session_t *session, const char *path) {
+    if (!session || !path) return -1;
+
+    if (session->backend && session->backend->type == SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        return backend_vulkan_load_state(session, path);
+    }
+
+    if (!session->kv_cache) {
+        LOG_ERROR("Session load failed: KV cache is unavailable");
+        return -1;
+    }
+
+    return kv_cache_load_state(session->kv_cache, path);
+}
+
+int inference_context_save_state(inference_context_t *ctx, const char *path) {
+    if (!ctx || !ctx->session || !path) return -1;
+    if (inference_session_save_state(ctx->session, path) != 0) {
+        return -1;
+    }
+
+    if (ctx->conversation_len < 0 || ctx->conversation_len > ctx->context_len) {
+        LOG_ERROR("Context save failed: invalid conversation length %d (capacity=%d)",
+                  ctx->conversation_len,
+                  ctx->context_len);
+        return -1;
+    }
+
+    if (kv_state_append_transcript(path,
+                                   ctx->conversation_tokens,
+                                   (uint32_t)ctx->conversation_len) != 0) {
+        LOG_ERROR("Context save failed: transcript append failed (%s)", path);
+        return -1;
+    }
+
+    return 0;
+}
+
+int inference_context_load_state(inference_context_t *ctx, const char *path) {
+    if (!ctx || !ctx->session || !path) return -1;
+    int rc = inference_session_load_state(ctx->session, path);
+    if (rc != 0) return rc;
+
+    uint32_t loaded_tokens = 0u;
+    rc = kv_state_read_transcript(path,
+                                  ctx->conversation_tokens,
+                                  (uint32_t)ctx->context_len,
+                                  &loaded_tokens);
+    if (rc == 0) {
+        ctx->conversation_len = (int)loaded_tokens;
+    } else if (rc == 1) {
+        ctx->conversation_len = 0;
+        LOG_WARN("Loaded legacy KV state without transcript section: %s", path);
+    } else {
+        LOG_ERROR("Context load failed: transcript read failed (%s)", path);
+        return -1;
+    }
 
     return 0;
 }

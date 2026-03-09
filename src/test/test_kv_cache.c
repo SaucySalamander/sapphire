@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <assert.h>
+#include <string.h>
 #include "kv_cache.h"
 #include "tensor.h"
 #include "test_utils.h"
@@ -194,6 +195,109 @@ static void test_cache_reset(void) {
     tests_passed++;
 }
 
+static void test_touch_range_and_reset_reuse(void) {
+    printf("TEST: kv_cache_touch_range + reset reuse\n");
+
+    int num_layers = 3;
+    int num_kv_heads = 1;
+    int max_seq_len = 192;
+    int head_dim = 16;
+
+    kv_cache_t *cache = kv_cache_create(num_layers, num_kv_heads, max_seq_len, head_dim);
+    assert(cache != NULL);
+
+    size_t token_size = (size_t)num_kv_heads * (size_t)head_dim;
+    float *k_token = (float *)malloc(token_size * sizeof(float));
+    float *v_token = (float *)malloc(token_size * sizeof(float));
+    assert(k_token != NULL && v_token != NULL);
+
+    for (size_t i = 0; i < token_size; i++) {
+        k_token[i] = 0.25f + (float)i * 0.001f;
+        v_token[i] = -0.5f + (float)i * 0.001f;
+    }
+
+    for (int pos = 0; pos < 96; ++pos) {
+        int rc = kv_cache_append_token(cache, k_token, v_token);
+        assert(rc == 0);
+    }
+    assert(kv_cache_get_seq_len(cache) == 96);
+
+    int touch_rc = kv_cache_touch_range(cache, 1, 0, 95);
+    assert(touch_rc == 0);
+
+    kv_cache_reset(cache);
+    assert(kv_cache_get_seq_len(cache) == 0);
+
+    for (int pos = 0; pos < 32; ++pos) {
+        int rc = kv_cache_append_token(cache, k_token, v_token);
+        assert(rc == 0);
+    }
+    assert(kv_cache_get_seq_len(cache) == 32);
+
+    touch_rc = kv_cache_touch_range(cache, 2, 0, 31);
+    assert(touch_rc == 0);
+
+    free(k_token);
+    free(v_token);
+    kv_cache_release(cache);
+
+    printf("  ✓ Touch-range and reset reuse successful\n");
+    tests_passed++;
+}
+
+static void test_save_load_state(void) {
+    printf("TEST: kv_cache_save_state + kv_cache_load_state\n");
+
+    const char *state_path = "/tmp/sapphire_kv_test_state.sapphire";
+    int num_layers = 4;
+    int num_kv_heads = 1;
+    int max_seq_len = 160;
+    int head_dim = 16;
+
+    kv_cache_t *src = kv_cache_create(num_layers, num_kv_heads, max_seq_len, head_dim);
+    kv_cache_t *dst = kv_cache_create(num_layers, num_kv_heads, max_seq_len, head_dim);
+    assert(src != NULL && dst != NULL);
+
+    size_t token_size = (size_t)num_kv_heads * (size_t)head_dim;
+    float *k_token = (float *)malloc(token_size * sizeof(float));
+    float *v_token = (float *)malloc(token_size * sizeof(float));
+    assert(k_token != NULL && v_token != NULL);
+
+    for (int pos = 0; pos < 96; ++pos) {
+        for (size_t i = 0; i < token_size; ++i) {
+            k_token[i] = (float)pos + (float)i * 0.01f;
+            v_token[i] = (float)(-pos) - (float)i * 0.02f;
+        }
+        int rc = kv_cache_append_token(src, k_token, v_token);
+        assert(rc == 0);
+    }
+
+    assert(kv_cache_get_seq_len(src) == 96);
+    assert(kv_cache_save_state(src, state_path) == 0);
+    assert(kv_cache_load_state(dst, state_path) == 0);
+    assert(kv_cache_get_seq_len(dst) == 96);
+
+    const float *src_k = (const float *)tensor_data(kv_cache_get_keys(src, 0));
+    const float *dst_k = (const float *)tensor_data(kv_cache_get_keys(dst, 0));
+    const float *src_v = (const float *)tensor_data(kv_cache_get_values(src, num_layers - 1));
+    const float *dst_v = (const float *)tensor_data(kv_cache_get_values(dst, num_layers - 1));
+
+    size_t tensor_elems = (size_t)num_kv_heads * (size_t)max_seq_len * (size_t)head_dim;
+    int cmp_k = memcmp(src_k, dst_k, tensor_elems * sizeof(float));
+    int cmp_v = memcmp(src_v, dst_v, tensor_elems * sizeof(float));
+    assert(cmp_k == 0);
+    assert(cmp_v == 0);
+
+    remove(state_path);
+    free(k_token);
+    free(v_token);
+    kv_cache_release(src);
+    kv_cache_release(dst);
+
+    printf("  ✓ Save/load state successful\n");
+    tests_passed++;
+}
+
 // ============================================================================
 // Test: Per-layer attention configuration
 // ============================================================================
@@ -333,6 +437,8 @@ int main(void) {
     test_append_token();
     test_cache_full();
     test_cache_reset();
+    test_touch_range_and_reset_reuse();
+    test_save_load_state();
     test_layer_config();
     test_accessors();
     test_gemma3_config();
