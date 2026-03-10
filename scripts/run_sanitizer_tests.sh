@@ -30,7 +30,7 @@ export UBSAN_OPTIONS="verbosity=1:halt_on_error=0"
 # Run the binary with a simple one-shot inference test
 # This exercises model loading, tokenizer, inference, and memory management
 echo "Running binary with one-shot inference test..."
-"$BINARY" -m gemma3-270m-it -p "write a poem about the sun" 2>&1 || true
+"$BINARY" -m gemma-3-270m-it -p "write a poem about the sun" -n 8 2>&1 || true
 
 # Check if sanitizer detected any violations
 if [ -f "$REPORT_FILE" ] && [ -s "$REPORT_FILE" ]; then

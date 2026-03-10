@@ -126,6 +126,8 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
         attn_len = swa_window;
     }
 
+    (void)kv_cache_touch_range(session->kv_cache, layer_idx, window_start, seq_len - 1);
+
     float head_scalar = (config->query_pre_attn_scalar > 0.0f) ? (1.0f / sqrtf(config->query_pre_attn_scalar)) : (1.0f / sqrtf((float)head_dim));
 
     int group_size = config->num_attention_heads / config->num_key_value_heads;

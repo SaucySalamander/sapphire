@@ -1,0 +1,84 @@
+/**
+ * @file gemm_bf16.comp
+ * @brief Batched matrix multiplication shader (BF16 precision).
+ *
+ * Computes Y[batch, d_out] = X[batch, d_in] @ W[d_out, d_in]^T
+ * Input/weights/output are BF16 packed in uint[]. Computation in FP32.
+ *
+ * Parallelization: 2D grid (batch_size, d_out).
+ */
+#version 450 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict readonly buffer InputBuffer {
+    uint data[];
+} inputBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer WeightBuffer {
+    uint data[];
+} weightBuffer;
+
+layout(std430, binding = 2) restrict buffer OutputBuffer {
+    uint data[];
+} outputBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+float bf16_unpack(uint bf16_val) {
+    return uintBitsToFloat(bf16_val << 16);
+}
+
+uint bf16_pack(float fp32_val) {
+    uint bits = floatBitsToUint(fp32_val);
+    return (bits + 0x7FFFu) >> 16;
+}
+
+void main() {
+    uint batch_idx = gl_GlobalInvocationID.x;
+    uint out_idx = gl_GlobalInvocationID.y;
+
+    uint d_in = pc.d_model;
+    uint d_out = pc.num_heads;
+    uint in_stride = (pc.stride_0 > 0u) ? pc.stride_0 : d_in;
+    uint out_stride = (pc.stride_1 > 0u) ? pc.stride_1 : d_out;
+    uint weight_stride = d_in;
+
+    if (batch_idx >= pc.batch_size || out_idx >= d_out) return;
+
+    float acc = 0.0;
+    for (uint i = 0u; i < d_in; i++) {
+        uint x_idx = batch_idx * in_stride + i;
+        uint x_word = inputBuffer.data[x_idx >> 1];
+        float x_val = bf16_unpack(((x_idx & 1u) == 0u) ? (x_word & 0xFFFFu) : (x_word >> 16));
+
+        uint w_idx = out_idx * weight_stride + i;
+        uint w_word = weightBuffer.data[w_idx >> 1];
+        float w_val = bf16_unpack(((w_idx & 1u) == 0u) ? (w_word & 0xFFFFu) : (w_word >> 16));
+
+        acc += x_val * w_val;
+    }
+
+    uint linear_idx = batch_idx * out_stride + out_idx;
+    uint word_idx = linear_idx >> 1;
+    uint packed = bf16_pack(acc);
+    uint existing = outputBuffer.data[word_idx];
+    if ((linear_idx & 1u) == 0u) {
+        outputBuffer.data[word_idx] = (existing & 0xFFFF0000u) | (packed & 0xFFFFu);
+    } else {
+        outputBuffer.data[word_idx] = (existing & 0x0000FFFFu) | (packed << 16);
+    }
+}

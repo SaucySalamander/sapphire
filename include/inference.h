@@ -10,6 +10,7 @@
 #include "kv_cache.h"
 #include "kernels.h"      /* For kernel_context_t in GEMV operations */
 #include "layer_dispatch.h" /* For sapphire_layer_config_t */
+#include "backend.h"      /* For backend abstraction */
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,9 +25,13 @@ typedef struct {
     inference_session_t *session;
     sapphire_tokenizer_t *tokenizer;
     float *logits;          // Buffer for logits
+    int *conversation_tokens; // Persistent token history for interactive chat
+    int conversation_len;     // Number of valid tokens in conversation_tokens
     int max_tokens;
     float temperature;
     int context_len;
+    /* Wall-clock elapsed seconds for the most recent perform_inference() call. */
+    double last_inference_time;
 } inference_context_t;
 
 /**
@@ -47,43 +52,85 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
 int perform_inference(inference_context_t* ctx, const char* prompt, char* output, int output_size);
 
 /**
+ * Save backend session state (KV cache and related sequence state) to disk.
+ *
+ * Currently implemented for CPU backend sessions.
+ *
+ * @param session Inference session.
+ * @param path    Output file path (e.g., .sapphire state file).
+ * @return 0 on success, -1 on error/unsupported backend.
+ */
+int inference_session_save_state(inference_session_t *session, const char *path);
+
+/**
+ * Load backend session state (KV cache and related sequence state) from disk.
+ *
+ * Currently implemented for CPU backend sessions.
+ *
+ * @param session Inference session.
+ * @param path    Input file path.
+ * @return 0 on success, -1 on error/unsupported backend.
+ */
+int inference_session_load_state(inference_session_t *session, const char *path);
+
+/**
+ * Save current context session state to disk.
+ *
+ * Convenience wrapper around inference_session_save_state(ctx->session, path).
+ */
+int inference_context_save_state(inference_context_t *ctx, const char *path);
+
+/**
+ * Load context session state from disk.
+ *
+ * Convenience wrapper around inference_session_load_state(ctx->session, path).
+ */
+int inference_context_load_state(inference_context_t *ctx, const char *path);
+
+/**
  * Destroy inference context and free owned resources.
  */
 void destroy_inference_context(inference_context_t* ctx);
 
 /**
- * Inference session (manages KV caches and intermediate buffers).
+ * Inference session (manages compute backend and intermediate state).
+ *
+ * This structure is backend-agnostic: it delegates all hardware-specific
+ * operations (memory allocation, kernel execution, synchronization) to
+ * the selected backend implementation via the backend interface.
+ *
+ * For performance, the CPU backend exposes key pointers directly here
+ * (kv_cache, gemv_ctx, etc.) to avoid function call overhead in hot paths.
+ * Vulkan backend leaves these NULL.
  */
 typedef struct inference_session_t {
+    /* Public model and configuration */
     model_spec_t *model_spec;
-    kv_cache_t *kv_cache;          /**< Global multi-layer KV cache for all layers. */
-    
-    float *scratch_buffer;          /**< Reusable buffer for temporary tensors. */
-    size_t scratch_size;
 
-    /* Padded dimensions (multiples of 8 floats / 32 bytes) to ensure SIMD kernels can
-     * safely load 256-bit vectors without overrunning the allocation. Calculated from
-     * model->config.d_model, d_inner (query dimension), d_kv (key/value dimension),
-     * and the FFN hidden size. */
-    int padded_d_model;
-    int padded_d_inner;   /**< Padded query projection dimension */
-    int padded_d_kv;      /**< Padded key/value projection dimension (may differ in GQA) */
-    int padded_d_ff;
+    /* Backend abstraction */
+    sapphire_backend_t *backend;      /**< Pointer to selected hardware backend (CPU, Vulkan, etc.). */
+    void *backend_data;               /**< Opaque backend-specific session state. Allocated and owned by backend. */
 
-    float *attn_scores;            /**< Softmax-normalized attention weights (size = max_context_len) */
-    float *attn_scores_raw;        /**< Optional raw QK diagnostics buffer (size = max_context_len) */
-    
-    /* Precomputed RoPE frequencies for both global and local attention layers (Gemma 3) */
-    float *rope_freqs_cos_global;  /**< Global base (e.g. 1M) for RoPE. */
-    float *rope_freqs_sin_global;
-    float *rope_freqs_cos_local;   /**< Local base (e.g. 10k) for RoPE. */
-    float *rope_freqs_sin_local;
-    
-    kernel_context_t *gemv_ctx;     /**< GEMV context for matrix-vector operations. */
-    
-    /* Layer dispatch configuration */
+    /* Shared metadata (used by all backends) */
     sapphire_layer_config_t *layer_configs;  /**< Per-layer type and settings [num_layers]. */
-    int num_layers;                  /**< Number of transformer layers. */
+    int num_layers;                           /**< Number of transformer layers. */
+
+    /* CPU backend field pointers (set by CPU backend, NULL for others) */
+    /* These are exposed here for performance (avoid function call overhead) */
+    kv_cache_t *kv_cache;                    /**< [CPU only] Global multi-layer KV cache for all layers. */
+    float *scratch_buffer;                   /**< [CPU only] Reusable buffer for temporary tensors. */
+    size_t scratch_size;                     /**< [CPU only] Size of scratch buffer in bytes. */
+    float *attn_scores;                      /**< [CPU only] Softmax-normalized attention weights. */
+    float *attn_scores_raw;                  /**< [CPU only] Optional raw QK diagnostics buffer. */
+    float *rope_freqs_cos_global;            /**< [CPU only] Global RoPE base (e.g., 1M) cosines. */
+    float *rope_freqs_sin_global;            /**< [CPU only] Global RoPE sines. */
+    float *rope_freqs_cos_local;             /**< [CPU only] Local RoPE base (e.g., 10k) cosines. */
+    float *rope_freqs_sin_local;             /**< [CPU only] Local RoPE sines. */
+    struct sapphire_context *gemv_ctx;       /**< [CPU only] GEMV context for matrix-vector operations. */
+    int padded_d_model;                      /**< [CPU only] Padded hidden size. */
+    int padded_d_inner;                      /**< [CPU only] Padded query projection dimension. */
+    int padded_d_kv;                         /**< [CPU only] Padded key/value projection dimension. */
+    int padded_d_ff;                         /**< [CPU only] Padded feed-forward dimension. */
 } inference_session_t;
 
 /**

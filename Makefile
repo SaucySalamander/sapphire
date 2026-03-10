@@ -1,19 +1,25 @@
 CC = gcc
+CXX = g++
 SRCDIR = src
 INCDIR = include
 OUTDIR = out
 ASAN_OUTDIR = out/asan
 
+# Vulkan SDK detection (find vulkan headers and libraries)
+VK_INCLUDE_PATHS = $(shell for p in /usr/include /usr/local/include /opt/vulkan/include; do [ -f $$p/vulkan/vulkan.h ] && { echo -I$$p; break; }; done)
+VK_LIB_PATHS = $(shell for p in /usr/lib /usr/lib64 /usr/local/lib /opt/vulkan/lib; do [ -f $$p/libvulkan.so ] && { echo -L$$p; break; }; done)
+VMA_INCLUDE_PATHS = $(shell for p in $(INCDIR) $(INCDIR)/third_party/vma /usr/include /usr/local/include; do [ -f $$p/vk_mem_alloc.h ] && { echo -I$$p; break; }; done)
+
 # Compilation flags
-CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma
-LDFLAGS = -lm -pthread
+CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS)
+LDFLAGS = -lm -pthread -lvulkan -lstdc++ $(VK_LIB_PATHS)
 
 # AddressSanitizer + UndefinedBehaviorSanitizer flags
 # Use -g for debug info (better error messages), -O1 for reasonable speed
 # Include paths (-I. -I$(INCDIR)) must be present for sanitizer builds
 # IMPORTANT: must include -mavx2 -mfma for AVX/FMA intrinsics in kernel code
-SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer
-SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined
+SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS)
+SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined -lvulkan -lstdc++ $(VK_LIB_PATHS)
 
 # HIP configuration (optional ROCm support)
 HIPCC = hipcc
@@ -30,9 +36,26 @@ TARGETS = \
 	$(OUTDIR)/sapphire \
 
 
-.PHONY: all bench check-bench bench_f32 bench_bf16 test clean
+.PHONY: all bench check-bench bench_f32 bench_bf16 kv-paging-matrix test clean shaders
 
-all: $(TARGETS)
+# ============================================================================
+# SPIR-V Shader Compilation (Phase 11-04)
+# ============================================================================
+
+GLSLANG ?= glslangValidator
+SHADER_DIR = src/kernels/backends/vulkan/shaders
+SHADER_SRCS := $(wildcard $(SHADER_DIR)/*.comp)
+SHADER_SPVS := $(patsubst %.comp,%.comp.spv,$(SHADER_SRCS))
+
+# Rule for GLSL -> SPIR-V compilation
+$(SHADER_DIR)/%.comp.spv: $(SHADER_DIR)/%.comp
+	$(GLSLANG) -V $< -o $@
+
+# Compile all shaders
+shaders: $(SHADER_SPVS)
+	@echo "Compiled $(words $(SHADER_SPVS)) shaders to SPIR-V"
+
+all: $(TARGETS) $(SHADER_SPVS)
 
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
@@ -53,6 +76,10 @@ $(OUTDIR)/%.o: $(SRCDIR)/io/%.c | $(OUTDIR)
 $(OUTDIR)/%.o: $(SRCDIR)/kernels/%.c | $(OUTDIR)
 	mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OUTDIR)/kernels/backends/vulkan/%.o: $(SRCDIR)/kernels/backends/vulkan/%.cpp | $(OUTDIR)
+	mkdir -p $(@D)
+	$(CXX) $(CFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/loader/%.c | $(OUTDIR)
 	mkdir -p $(@D)
@@ -83,6 +110,7 @@ $(OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(OUTDIR)
 /* Discover non-test sources: exclude src/test/ directory and common test filename patterns */
 NON_TEST_SRCS := $(shell find $(SRCDIR) -type f -name '*.c' ! -path '$(SRCDIR)/test/*' ! -name 'test_*.c' ! -name '*_test.c' -print)
 NON_TEST_OBJS := $(patsubst $(SRCDIR)/%.c,$(OUTDIR)/%.o,$(NON_TEST_SRCS))
+NON_TEST_OBJS += $(OUTDIR)/kernels/backends/vulkan/vma_impl.o
 
 # Library objects (non-test objects excluding main.o)
 LIB_OBJS := $(filter-out $(OUTDIR)/main.o, $(NON_TEST_OBJS))
@@ -166,6 +194,10 @@ $(ASAN_OUTDIR)/%.o: $(SRCDIR)/kernels/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
 	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
 
+$(ASAN_OUTDIR)/kernels/backends/vulkan/%.o: $(SRCDIR)/kernels/backends/vulkan/%.cpp | $(ASAN_OUTDIR)
+	mkdir -p $(@D)
+	$(CXX) $(SANITIZER_FLAGS) -c $< -o $@
+
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/loader/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
 	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
@@ -192,6 +224,7 @@ $(ASAN_OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(ASAN_OUTDIR)
 
 # Reuse NON_TEST_SRCS and NON_TEST_OBJS but map to asan directory
 ASAN_TEST_OBJS := $(patsubst $(SRCDIR)/%.c,$(ASAN_OUTDIR)/%.o,$(NON_TEST_SRCS))
+ASAN_TEST_OBJS += $(ASAN_OUTDIR)/kernels/backends/vulkan/vma_impl.o
 
 $(ASAN_OUTDIR)/sapphire: $(ASAN_TEST_OBJS)
 	$(CC) $(SANITIZER_FLAGS) $^ -o $@ $(SANITIZER_LDFLAGS)
@@ -259,6 +292,7 @@ check-cppcheck: compile_commands $(REPORTS_DIR)
 .PHONY: check-complexity
 check-complexity: $(REPORTS_DIR)
 	@echo "Running Lizard (strict mode - CC: $(LIZARD_THRESHOLD_CC), NLOC: $(LIZARD_THRESHOLD_NLOC), Params: $(LIZARD_THRESHOLD_PARAM), Tokens: $(LIZARD_THRESHOLD_TOKEN))..."
+	@command -v $(LIZARD) >/dev/null 2>&1 || { echo "❌ Lizard not found: $(LIZARD)"; exit 1; }
 	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_NLOC) -a $(LIZARD_THRESHOLD_PARAM) -T token_count=$(LIZARD_THRESHOLD_TOKEN) -x '*/test/*' src 2>&1 | tee $(REPORTS_DIR)/lizard-strict.txt || true
 	@if grep -q "!!!!.*Warnings" $(REPORTS_DIR)/lizard-strict.txt 2>/dev/null; then \
 	  echo "❌ Complexity checks failed. See $(REPORTS_DIR)/lizard-strict.txt"; \
@@ -280,6 +314,7 @@ check-all:
 
 clean:
 	rm -rf $(OUTDIR) $(ASAN_OUTDIR) $(REPORTS_DIR) compile_commands.json
+	rm -f $(SHADER_DIR)/*.comp.spv
 
 # ============================================================================
 # Complexity Analysis with Lizard (Phase 2 Quality Metrics)
@@ -326,6 +361,11 @@ $(OUTDIR)/bench_end_to_end: $(OUTDIR)/test/bench/bench_sapphire_end_to_end.o $(L
 
 bench_f32: $(OUTDIR)/bench_f32
 bench_bf16: $(OUTDIR)/bench_bf16
+
+KV_MATRIX_ARGS ?=
+
+kv-paging-matrix: $(OUTDIR)/sapphire
+	@python3 scripts/benchmark_vk_kv_paging_matrix.py $(KV_MATRIX_ARGS)
 
 $(OUTDIR)/bench_f32: $(OUTDIR)/test/bench/bench_f32.o $(LIB_OBJS)
 	$(CC) $(CFLAGS) $< $(LIB_OBJS) -o $@ $(LDFLAGS)

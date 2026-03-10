@@ -38,6 +38,8 @@ static void print_help(const char* program_name) {
     printf("  -t, --temp <value>        Temperature for sampling (default: 1.0)\n");
     printf("  -n, --max-tokens <num>    Maximum tokens to generate (default: 100)\n");
     printf("  -p, --prompt <string>     Run a single prompt non-interactively and exit (echoes prompt)\n");
+    printf("  --save-state <path>       Save session state to .sapphire file before exit\n");
+    printf("  --load-state <path>       Load session state from .sapphire file at startup\n");
     printf("  -h, --help                Show this help message\n");
     printf("\nModel Directory Structure (required files):\n");
     printf("  model.safetensors (or model.gguf / model.bin)\n");
@@ -47,11 +49,176 @@ static void print_help(const char* program_name) {
     printf("\nInteractive Commands:\n");
     printf("  /exit                     Exit the program\n");
     printf("  /clear                    Clear conversation history\n");
+    printf("  /save <path>              Save session state to file\n");
+    printf("  /load <path>              Load session state from file\n");
+    printf("  /state                    Show session state visibility\n");
     printf("  /info                     Show model information\n");
     printf("  /help                     Show command help\n");
     printf("\nExample:\n");
     printf("  %s -m gemma3-270m-it -c 4096 -t 0.7 -n 200\n", program_name);
     printf("\n");
+}
+
+typedef struct {
+    const char* model_name;
+    int context_len;
+    float temperature;
+    int max_tokens;
+    const char* prompt_arg;
+    const char* save_state_path;
+    const char* load_state_path;
+} cli_args_t;
+
+static void cli_args_init(cli_args_t *args) {
+    if (!args) return;
+    args->model_name = NULL;
+    args->context_len = CONTEXT_LEN;
+    args->temperature = TEMPERATURE;
+    args->max_tokens = MAX_TOKENS_GENERATE;
+    args->prompt_arg = NULL;
+    args->save_state_path = NULL;
+    args->load_state_path = NULL;
+}
+
+static void print_session_state(const inference_context_t *ctx,
+                                const char *last_state_op,
+                                const char *last_state_path) {
+    const char *backend_name = (ctx->session && ctx->session->backend && ctx->session->backend->name)
+        ? ctx->session->backend->name
+        : "unknown";
+    int persistence_supported = (ctx->session && ctx->session->backend &&
+        (ctx->session->backend->type == SAPPHIRE_BACKEND_TYPE_CPU ||
+         ctx->session->backend->type == SAPPHIRE_BACKEND_TYPE_VULKAN));
+    int kv_seq_len = -1;
+    if (ctx->session && ctx->session->kv_cache) {
+        kv_seq_len = kv_cache_get_seq_len(ctx->session->kv_cache);
+    }
+
+    printf("\nSession State:\n");
+    printf("  Backend: %s\n", backend_name);
+    printf("  Persistence: %s\n", persistence_supported ? "supported" : "not supported for current backend");
+    printf("  Conversation tokens: %d\n", ctx->conversation_len);
+    if (kv_seq_len >= 0) {
+        printf("  KV sequence length: %d\n", kv_seq_len);
+    } else {
+        printf("  KV sequence length: unavailable\n");
+    }
+    if (last_state_op && last_state_path[0] != '\0') {
+        printf("  Last state file (%s): %s\n", last_state_op, last_state_path);
+    } else {
+        printf("  Last state file: none in this session\n");
+    }
+}
+
+static const char *skip_ws(const char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    return s;
+}
+
+static int handle_slash_command(inference_context_t *ctx,
+                                const char *prompt,
+                                char *last_state_path,
+                                size_t last_state_path_size,
+                                const char **last_state_op,
+                                int *should_exit) {
+    if (!ctx || !prompt || prompt[0] != '/') return 0;
+
+    if (strcmp(prompt, "/exit") == 0 || strcmp(prompt, "/quit") == 0) {
+        printf("Exiting Sapphire inference engine. Goodbye!\n");
+        *should_exit = 1;
+        return 1;
+    }
+
+    if (strcmp(prompt, "/clear") == 0) {
+        printf("Conversation history cleared\n");
+        if (ctx->session) {
+            destroy_inference_session(ctx->session);
+            ctx->session = inference_session_create(ctx->spec, ctx->context_len);
+        }
+        ctx->conversation_len = 0;
+        return 1;
+    }
+
+    if (strncmp(prompt, "/save", 5) == 0) {
+        const char *path = skip_ws(prompt + 5);
+        if (*path == '\0') {
+            printf("Usage: /save <path>\n");
+        } else if (inference_context_save_state(ctx, path) == 0) {
+            printf("Session state saved to: %s\n", path);
+            snprintf(last_state_path, last_state_path_size, "%s", path);
+            *last_state_op = "saved";
+        } else {
+            printf("Failed to save session state to: %s\n", path);
+        }
+        return 1;
+    }
+
+    if (strncmp(prompt, "/load", 5) == 0) {
+        const char *path = skip_ws(prompt + 5);
+        if (*path == '\0') {
+            printf("Usage: /load <path>\n");
+        } else if (inference_context_load_state(ctx, path) == 0) {
+            printf("Session state loaded from: %s\n", path);
+            snprintf(last_state_path, last_state_path_size, "%s", path);
+            *last_state_op = "loaded";
+        } else {
+            printf("Failed to load session state from: %s\n", path);
+        }
+        return 1;
+    }
+
+    if (strcmp(prompt, "/state") == 0) {
+        print_session_state(ctx, *last_state_op, last_state_path);
+        return 1;
+    }
+
+    if (strcmp(prompt, "/info") == 0) {
+        printf("\nModel Information:\n");
+        printf("\nInference Settings:\n");
+        printf("  Temperature: %.2f\n", ctx->temperature);
+        printf("  Max tokens: %d\n", ctx->max_tokens);
+        printf("  Context length: %d\n", ctx->context_len);
+        return 1;
+    }
+
+    if (strcmp(prompt, "/help") == 0) {
+        printf("\nAvailable Commands:\n");
+        printf("  /exit          - Exit the program\n");
+        printf("  /clear         - Clear conversation history\n");
+        printf("  /save <path>   - Save session state\n");
+        printf("  /load <path>   - Load session state\n");
+        printf("  /state         - Show session state visibility\n");
+        printf("  /info          - Show model configuration\n");
+        printf("  /help          - Show this help message\n");
+        printf("\nJust type your prompt to generate responses.\n");
+        return 1;
+    }
+
+    printf("Unknown command: %s\n", prompt);
+    printf("Type '/help' for available commands.\n");
+    return 1;
+}
+
+static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args) {
+    if (!args) return -1;
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
+            args->model_name = argv[++i];
+        } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--context") == 0) && i + 1 < argc) {
+            args->context_len = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0) && i + 1 < argc) {
+            args->temperature = atof(argv[++i]);
+        } else if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) && i + 1 < argc) {
+            args->max_tokens = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
+            args->prompt_arg = argv[++i];
+        } else if (strcmp(argv[i], "--save-state") == 0 && i + 1 < argc) {
+            args->save_state_path = argv[++i];
+        } else if (strcmp(argv[i], "--load-state") == 0 && i + 1 < argc) {
+            args->load_state_path = argv[++i];
+        }
+    }
+    return 0;
 }
 
 /**
@@ -69,6 +236,9 @@ static int interactive_loop(inference_context_t* ctx) {
 
     char prompt[MAX_PROMPT_LENGTH];
     char output[BUFFER_SIZE];
+    char last_state_path[BUFFER_SIZE];
+    const char* last_state_op = NULL;
+    last_state_path[0] = '\0';
 
     printf("\n");
     printf("================================================================================\n");
@@ -100,47 +270,26 @@ static int interactive_loop(inference_context_t* ctx) {
             continue;
         }
 
-        // Handle commands
         if (prompt[0] == '/') {
-            if (strcmp(prompt, "/exit") == 0 || strcmp(prompt, "/quit") == 0) {
-                printf("Exiting Sapphire inference engine. Goodbye!\n");
-                break;
-            } else if (strcmp(prompt, "/clear") == 0) {
-                printf("Conversation history cleared\n");
-                // Reset session
-                if (ctx->session) {
-                    destroy_inference_session(ctx->session);
-                    ctx->session = inference_session_create(ctx->spec, ctx->context_len);
-                }
-            } else if (strcmp(prompt, "/info") == 0) {
-                printf("\nModel Information:\n");
-                printf("\nInference Settings:\n");
-                printf("  Temperature: %.2f\n", ctx->temperature);
-                printf("  Max tokens: %d\n", ctx->max_tokens);
-                printf("  Context length: %d\n", ctx->context_len);
-            } else if (strcmp(prompt, "/help") == 0) {
-                printf("\nAvailable Commands:\n");
-                printf("  /exit          - Exit the program\n");
-                printf("  /clear         - Clear conversation history\n");
-                printf("  /info          - Show model configuration\n");
-                printf("  /help          - Show this help message\n");
-                printf("\nJust type your prompt to generate responses.\n");
-            } else {
-                printf("Unknown command: %s\n", prompt);
-                printf("Type '/help' for available commands.\n");
-            }
+            int should_exit = 0;
+            (void)handle_slash_command(ctx,
+                                       prompt,
+                                       last_state_path,
+                                       sizeof(last_state_path),
+                                       &last_state_op,
+                                       &should_exit);
+            if (should_exit) break;
         } else {
             // Perform inference
             printf("\n[Generating response...]\n");
 
-            clock_t start = clock();
             int result = perform_inference(ctx, prompt, output, sizeof(output));
-            clock_t end = clock();
 
             if (result == 0) {
-                double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
+                double elapsed = ctx->last_inference_time;
+                const char *backend_name = (ctx->session && ctx->session->backend) ? ctx->session->backend->name : "unknown";
                 printf("\n[Response]\n%s\n", output);
-                printf("\n[Generation time: %.3f seconds]\n", elapsed);
+                printf("\n[Generation time: %.3f seconds] (backend=%s)\n", elapsed, backend_name);
             } else {
                 printf("Inference failed\n");
             }
@@ -194,9 +343,16 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
 
     LOG_INFO("Running prompt (non-interactive): '%s'", prompt);
 
+    if (ctx->session) {
+        inference_session_reset(ctx->session);
+    }
+    ctx->conversation_len = 0;
+
     int rc = perform_inference(ctx, prompt, output, output_size);
     if (rc == 0) {
         LOG_INFO("\n[Response]\n%s\n", output);
+        LOG_INFO("[Inference time: %.3f seconds] (backend=%s)", ctx->last_inference_time,
+                 (ctx->session && ctx->session->backend) ? ctx->session->backend->name : "unknown");
     } else {
         LOG_ERROR("One-shot inference failed");
     }
@@ -224,29 +380,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Parse arguments
-    const char* model_name = NULL;
-    int context_len = CONTEXT_LEN;
-    float temperature = TEMPERATURE;
-    int max_tokens = MAX_TOKENS_GENERATE;
-    const char* prompt_arg = NULL;  // Non-interactive prompt (via -p)
-
-    for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
-            model_name = argv[++i];
-        } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--context") == 0) && i + 1 < argc) {
-            context_len = atoi(argv[++i]);
-        } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0) && i + 1 < argc) {
-            temperature = atof(argv[++i]);
-        } else if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) && i + 1 < argc) {
-            max_tokens = atoi(argv[++i]);
-        } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
-            prompt_arg = argv[++i];
-        }
-    }
+    cli_args_t args;
+    cli_args_init(&args);
+    if (parse_cli_args(argc, (const char * const *)argv, &args) != 0) return 1;
 
     // Validate that model name was provided
-    if (!model_name) {
+    if (!args.model_name) {
         LOG_ERROR("ERROR: Model name required. Use -m or --model flag.\n");
         print_help(argv[0]);
         return 1;
@@ -259,19 +398,35 @@ int main(int argc, char* argv[]) {
     printf("================================================================================\n");
 
     // Create inference context with tokenizer
-    inference_context_t* ctx = create_inference_context(temperature, max_tokens, context_len, model_name);
+    inference_context_t* ctx = create_inference_context(args.temperature, args.max_tokens, args.context_len, args.model_name);
     if (!ctx) {
         LOG_ERROR("Failed to create inference context. Exiting.");
         return 1;
     }
 
+    if (args.load_state_path) {
+        if (inference_context_load_state(ctx, args.load_state_path) != 0) {
+            LOG_WARN("Failed to load session state from %s", args.load_state_path);
+        } else {
+            LOG_INFO("Loaded session state from %s", args.load_state_path);
+        }
+    }
+
     int result = 0;
     // If prompt_arg provided, run a single non-interactive inference and exit
-    if (prompt_arg) {
-        result = one_shot_inference(ctx, prompt_arg, BUFFER_SIZE);
+    if (args.prompt_arg) {
+        result = one_shot_inference(ctx, args.prompt_arg, BUFFER_SIZE);
     } else {
         // Enter interactive loop
         result = interactive_loop(ctx);
+    }
+
+    if (args.save_state_path) {
+        if (inference_context_save_state(ctx, args.save_state_path) != 0) {
+            LOG_WARN("Failed to save session state to %s", args.save_state_path);
+        } else {
+            LOG_INFO("Saved session state to %s", args.save_state_path);
+        }
     }
 
     // Cleanup

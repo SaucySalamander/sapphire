@@ -1,0 +1,115 @@
+/**
+ * @file gemv_bf16.comp
+ * @brief Matrix-Vector multiplication shader (BF16 precision).
+ *
+ * Computes y[d_out] = W[d_out, d_in] @ x[d_in]
+ * Input/weights are BF16 packed pairs in uint[]. Output stored as BF16.
+ *
+ * Parallelization: One workgroup per output row.
+ *   All 256 threads collaboratively compute one dot product per WG.
+ *   Dispatch: (d_out, 1, 1) workgroups.
+ *
+ * Key BF16 optimization: each weight uint32 holds 2 BF16 values. We process
+ * pairs together with a single uint32 load, halving weight memory traffic.
+ * Input vector is also read in pairs (even d_in is common for model dims).
+ */
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict readonly buffer InputBuffer {
+    uint data[];
+} inputBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer WeightBuffer {
+    uint data[];
+} weightBuffer;
+
+layout(std430, binding = 2) restrict buffer OutputBuffer {
+    uint data[];
+} outputBuffer;
+
+/* gemv_bf16 push constants below */
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+float bf16_unpack_lo(uint word) { return uintBitsToFloat((word & 0xFFFFu) << 16); }
+float bf16_unpack_hi(uint word) { return uintBitsToFloat( word & 0xFFFF0000u);     }
+
+uint bf16_pack(float fp32_val) {
+    uint bits = floatBitsToUint(fp32_val);
+    return (bits + 0x7FFFu) >> 16;
+}
+
+shared float sh_partial[256];
+
+void main() {
+    uint out_row  = gl_WorkGroupID.x;  /* one workgroup per output row */
+    uint local_id = gl_LocalInvocationID.x;
+
+    uint d_in          = pc.d_model;
+    uint d_out         = pc.num_heads;
+    uint weight_stride = (pc.stride_0 > 0u) ? pc.stride_0 : d_in;
+
+    if (out_row >= d_out) return;
+
+    /* ── Phase 1: Partial dot product (process 2 BF16 elements per loop) ── */
+    float acc = 0.0;
+    uint row_base = out_row * weight_stride;
+
+    /* Process pairs of BF16 values: one uint32 holds two consecutive elements. */
+    /* Stride by 256*2 = 512 BF16 elements per loop iteration.                  */
+    uint i = local_id * 2u;
+    for (; i + 1u < d_in; i += 256u * 2u) {
+        /* Weight: two BF16 values packed in one uint32 word.  */
+        uint w_word = weightBuffer.data[(row_base + i) >> 1u];
+        /* Input: same packing.                                */
+        uint x_word = inputBuffer.data[i >> 1u];
+
+        acc += bf16_unpack_lo(w_word) * bf16_unpack_lo(x_word);
+        acc += bf16_unpack_hi(w_word) * bf16_unpack_hi(x_word);
+    }
+    /* Handle odd remainder (when d_in is odd). */
+    if (i < d_in) {
+        uint w_word = weightBuffer.data[(row_base + i) >> 1u];
+        uint x_word = inputBuffer.data[i >> 1u];
+        float w_val = ((i & 1u) == 0u) ? bf16_unpack_lo(w_word) : bf16_unpack_hi(w_word);
+        float x_val = ((i & 1u) == 0u) ? bf16_unpack_lo(x_word) : bf16_unpack_hi(x_word);
+        acc += w_val * x_val;
+    }
+
+    sh_partial[local_id] = acc;
+    barrier();
+
+    /* ── Phase 2: Parallel tree reduction in shared memory ──────────────── */
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (local_id < s) {
+            sh_partial[local_id] += sh_partial[local_id + s];
+        }
+        barrier();
+    }
+
+    /* ── Phase 3: Write BF16 result (thread 0 only) ─────────────────────── */
+    if (local_id == 0u) {
+        uint packed  = bf16_pack(sh_partial[0u]);
+        uint word_idx = out_row >> 1u;
+        uint existing = outputBuffer.data[word_idx];
+        if ((out_row & 1u) == 0u) {
+            outputBuffer.data[word_idx] = (existing & 0xFFFF0000u) | (packed & 0xFFFFu);
+        } else {
+            outputBuffer.data[word_idx] = (existing & 0x0000FFFFu) | (packed << 16u);
+        }
+    }
+}

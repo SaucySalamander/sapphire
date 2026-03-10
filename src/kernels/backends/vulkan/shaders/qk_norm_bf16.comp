@@ -1,0 +1,138 @@
+/**
+ * @file qk_norm_bf16.comp
+ * @brief QK-Normalization shader (BF16 precision).
+ *
+ * Normalizes Q and K projections per-head using RMSNorm with per-head scale.
+ * Q/K/scale buffers are BF16 packed in uint[]. Computation in FP32.
+ *
+ * Parallelization: One workgroup per head. Workgroups [0, num_heads_q) normalize Q,
+ * workgroups [num_heads_q, num_heads_q + num_heads_k) normalize K.
+ */
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict buffer QBuffer {
+    uint data[];
+} qBuffer;
+
+layout(std430, binding = 1) restrict buffer KBuffer {
+    uint data[];
+} kBuffer;
+
+layout(std430, binding = 2) restrict readonly buffer QNormScale {
+    uint data[];
+} qNormScale;
+
+layout(std430, binding = 3) restrict readonly buffer KNormScale {
+    uint data[];
+} kNormScale;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;     // num_heads_q
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;      // num_heads_k
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+float bf16_unpack(uint bf16_val) {
+    return uintBitsToFloat(bf16_val << 16);
+}
+
+uint bf16_pack(float fp32_val) {
+    uint bits = floatBitsToUint(fp32_val);
+    return (bits + 0x7FFFu) >> 16;
+}
+
+shared float shared_sum[256];
+
+void main() {
+    uint wg_idx    = gl_WorkGroupID.x;  /* head index */
+    uint token_idx = gl_WorkGroupID.y;  /* batch token index */
+    uint local_id  = gl_LocalInvocationID.x;
+    uint head_dim_val = pc.head_dim;
+    uint num_heads_q = pc.num_heads;
+    uint num_heads_k = pc.stride_0;
+
+    if (token_idx >= pc.batch_size) return;
+
+    bool is_q_head = (wg_idx < num_heads_q);
+    uint head_idx = is_q_head ? wg_idx : (wg_idx - num_heads_q);
+
+    if (!is_q_head && head_idx >= num_heads_k) return;
+
+    /* Per-token base offset */
+    uint q_token_base = token_idx * num_heads_q * head_dim_val;
+    uint k_token_base = token_idx * num_heads_k * head_dim_val;
+    uint base = is_q_head ? (q_token_base + head_idx * head_dim_val)
+                           : (k_token_base + head_idx * head_dim_val);
+
+    // Phase 1: sum of squares
+    float local_sum = 0.0;
+    for (uint d = local_id; d < head_dim_val; d += 256u) {
+        uint idx = base + d;
+        uint word;
+        if (is_q_head) {
+            word = qBuffer.data[idx >> 1];
+        } else {
+            word = kBuffer.data[idx >> 1];
+        }
+        float val = bf16_unpack(((idx & 1u) == 0u) ? (word & 0xFFFFu) : (word >> 16));
+        local_sum += val * val;
+    }
+    shared_sum[local_id] = local_sum;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (local_id < s) {
+            shared_sum[local_id] += shared_sum[local_id + s];
+        }
+        barrier();
+    }
+
+    float rms = sqrt(shared_sum[0] / float(head_dim_val) + 1e-5);  /* Gemma3: rms_norm_eps=1e-5 */
+
+    // Phase 2: normalize and write BF16 pairs (scale weights are per-head, not per-token)
+    uint scale_base = head_idx * head_dim_val;
+    for (uint d = local_id * 2u; d < head_dim_val; d += 512u) {
+        uint idx0 = base + d;
+        uint idx1 = base + d + 1u;
+        uint s_idx0 = scale_base + d;
+
+        uint data_word, scale_word;
+        if (is_q_head) {
+            data_word = qBuffer.data[idx0 >> 1];
+            scale_word = qNormScale.data[s_idx0 >> 1];
+        } else {
+            data_word = kBuffer.data[idx0 >> 1];
+            scale_word = kNormScale.data[s_idx0 >> 1];
+        }
+
+        float val0 = bf16_unpack(data_word & 0xFFFFu);
+        float scale0 = bf16_unpack(scale_word & 0xFFFFu);
+        float result0 = (val0 / rms) * scale0;
+
+        float result1 = 0.0;
+        if (d + 1u < head_dim_val) {
+            float val1 = bf16_unpack(data_word >> 16);
+            float scale1 = bf16_unpack(scale_word >> 16);
+            result1 = (val1 / rms) * scale1;
+        }
+
+        uint out_word = (bf16_pack(result1) << 16) | (bf16_pack(result0) & 0xFFFFu);
+        if (is_q_head) {
+            qBuffer.data[idx0 >> 1] = out_word;
+        } else {
+            kBuffer.data[idx0 >> 1] = out_word;
+        }
+    }
+}
+

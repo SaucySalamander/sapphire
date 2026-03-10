@@ -1,0 +1,72 @@
+#version 450 core
+
+/* Decode-specialized lm_head projection (batch_size == 1).
+ * Computes logits[v] = dot(hidden[d_model], embedding[v][d_model])
+ * using one workgroup per vocab row with intra-WG reduction.
+ */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict readonly buffer InputBuffer {
+    float data[];
+} inputBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer WeightBuffer {
+    float data[];
+} weightBuffer;
+
+layout(std430, binding = 2) restrict writeonly buffer OutputBuffer {
+    float data[];
+} outputBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+shared float sh_partial[256];
+
+void main() {
+    uint groups_x = pc.reserved[0];
+    uint out_row = gl_WorkGroupID.x + gl_WorkGroupID.y * groups_x;
+    uint lane = gl_LocalInvocationID.x;
+
+    uint d_in = pc.d_model;
+    uint d_out = pc.num_heads;
+    uint weight_stride = (pc.stride_0 > 0u) ? pc.stride_0 : d_in;
+
+    if (out_row >= d_out) {
+        return;
+    }
+
+    uint row_base = out_row * weight_stride;
+    float acc = 0.0;
+
+    for (uint i = lane; i < d_in; i += 256u) {
+        acc += weightBuffer.data[row_base + i] * inputBuffer.data[i];
+    }
+
+    sh_partial[lane] = acc;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            sh_partial[lane] += sh_partial[lane + s];
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        outputBuffer.data[out_row] = sh_partial[0u];
+    }
+}

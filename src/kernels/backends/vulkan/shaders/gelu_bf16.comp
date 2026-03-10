@@ -1,0 +1,83 @@
+/**
+ * @file gelu_bf16.comp
+ * @brief GeGLU activation shader (BF16 precision).
+ *
+ * Computes: gate[i] = GELU(gate[i]) * value[i]  (element-wise)
+ * Gate/value buffers are BF16 packed in uint[]. Computation in FP32.
+ *
+ * Parallelization: One thread per uint word (2 BF16 elements).
+ */
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict buffer GateBuffer {
+    uint data[];
+} gateBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer ValueBuffer {
+    uint data[];
+} valueBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+float bf16_unpack(uint bf16_val) {
+    return uintBitsToFloat(bf16_val << 16);
+}
+
+uint bf16_pack(float fp32_val) {
+    uint bits = floatBitsToUint(fp32_val);
+    return (bits + 0x7FFFu) >> 16;
+}
+
+const float SQRT_2_OVER_PI = 0.7978845608028654;
+const float GELU_COEFF = 0.044715;
+
+float gelu_approx(float x) {
+    float cube = x * x * x;
+    float inner = SQRT_2_OVER_PI * (x + GELU_COEFF * cube);
+    return 0.5 * x * (1.0 + tanh(inner));
+}
+
+void main() {
+    uint word_idx = gl_GlobalInvocationID.x;
+
+    uint d_ff = pc.d_ff;
+    uint total_elements = pc.batch_size * d_ff;
+    uint total_words = (total_elements + 1u) / 2u;
+
+    if (word_idx >= total_words) return;
+
+    // Load gate and value words (each contains 2 BF16 values)
+    uint gate_word = gateBuffer.data[word_idx];
+    uint val_word = valueBuffer.data[word_idx];
+
+    // First element (low half)
+    float gate0 = bf16_unpack(gate_word & 0xFFFFu);
+    float val0 = bf16_unpack(val_word & 0xFFFFu);
+    float result0 = gelu_approx(gate0) * val0;
+
+    // Second element (high half)
+    float result1 = 0.0;
+    if (word_idx * 2u + 1u < total_elements) {
+        float gate1 = bf16_unpack(gate_word >> 16);
+        float val1 = bf16_unpack(val_word >> 16);
+        result1 = gelu_approx(gate1) * val1;
+    }
+
+    // Store pair
+    gateBuffer.data[word_idx] = (bf16_pack(result1) << 16) | (bf16_pack(result0) & 0xFFFFu);
+}

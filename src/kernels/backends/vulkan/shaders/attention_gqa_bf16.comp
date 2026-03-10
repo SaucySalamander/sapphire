@@ -1,0 +1,186 @@
+/**
+ * @file attention_gqa_bf16.comp
+ * @brief Multi-Head Attention with GQA shader (BF16 precision).
+ *
+ * Computes: attn_output = softmax(Q @ K^T / sqrt(head_dim)) @ V
+ * Q/KV-cache/output are BF16 packed in uint[]. Computation in FP32.
+ *
+ * Parallelization: (num_heads, batch_size, 1) workgroups.
+ *   gl_WorkGroupID.x = head index
+ *   gl_WorkGroupID.y = batch/token index within the prefill batch
+ *
+ * Causal masking: token i can only attend to positions [0, start_pos + i].
+ */
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict readonly buffer QBuffer {
+    uint data[];
+} qBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer KVCache {
+    uint data[];
+} kvCache;
+
+layout(std430, binding = 2) restrict buffer AttnOutput {
+    uint data[];
+} attnOutput;
+
+layout(std430, binding = 3) restrict buffer ScoresBuffer {
+    float data[];
+} scoresBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;       // last absolute pos (start_pos + batch_size - 1)
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;      // num_kv_heads
+    uint stride_1;      // sliding_window
+    uint start_pos;     // first absolute pos of this batch
+    uint reserved[5];   // reserved[0] = layer_type_mask
+} pc;
+
+float bf16_unpack(uint bf16_val) {
+    return uintBitsToFloat(bf16_val << 16);
+}
+
+uint bf16_pack(float fp32_val) {
+    uint bits = floatBitsToUint(fp32_val);
+    return (bits + 0x7FFFu) >> 16;
+}
+
+shared float shared_max;
+shared float shared_sum;
+shared float shared_scores[8192];  /* Supports up to 8192 context positions */
+
+void main() {
+    uint head_q    = gl_WorkGroupID.x;
+    uint batch_idx = gl_WorkGroupID.y;  /* token index within this batch */
+    uint local_id  = gl_LocalInvocationID.x;
+
+    if (head_q >= pc.num_heads) return;
+    if (batch_idx >= pc.batch_size) return;
+
+    uint num_kv_heads = pc.stride_0;
+    uint sliding_window = pc.stride_1;
+    uint head_dim_val = pc.head_dim;
+    uint layer_type_mask = pc.reserved[0];
+
+    // GQA mapping
+    uint group_size = pc.num_heads / num_kv_heads;
+    uint head_kv = head_q / group_size;
+
+    // Sliding window vs global
+    bool is_global = false;
+    if (layer_type_mask != 0u) {
+        is_global = ((layer_type_mask >> pc.layer_idx) & 1u) != 0u;
+    } else {
+        is_global = (((pc.layer_idx + 1u) % 6u) == 0u);
+    }
+
+    /* Causal mask: token batch_idx can see positions [window_start, start_pos + batch_idx] */
+    uint window_end = pc.start_pos + batch_idx + 1u;
+    uint window_start = 0u;
+    if (!is_global && sliding_window > 0u) {
+        window_start = (window_end > sliding_window) ? (window_end - sliding_window) : 0u;
+    }
+
+    uint window_len = window_end - window_start;
+    if (window_len == 0u) return;
+
+    float inv_sqrt_dim = 1.0 / sqrt(float(head_dim_val));
+
+    // KV cache layout
+    uint layer_stride = pc.max_seq_len * num_kv_heads * head_dim_val * 2u;
+    uint k_base = pc.layer_idx * layer_stride;
+    uint v_base = k_base + pc.max_seq_len * num_kv_heads * head_dim_val;
+
+    // Q buffer offset for this batch token
+    uint q_token_base = batch_idx * pc.num_heads * head_dim_val;
+
+    // Phase 1: Q·K^T scores
+    for (uint t = window_start + local_id; t < window_end; t += 256u) {
+        float score = 0.0;
+        uint k_offset = k_base + t * num_kv_heads * head_dim_val + head_kv * head_dim_val;
+        uint q_offset = q_token_base + head_q * head_dim_val;
+
+        for (uint d = 0u; d < head_dim_val; d++) {
+            uint q_idx = q_offset + d;
+            uint q_word = qBuffer.data[q_idx >> 1];
+            float q_val = bf16_unpack(((q_idx & 1u) == 0u) ? (q_word & 0xFFFFu) : (q_word >> 16));
+
+            uint k_idx = k_offset + d;
+            uint k_word = kvCache.data[k_idx >> 1];
+            float k_val = bf16_unpack(((k_idx & 1u) == 0u) ? (k_word & 0xFFFFu) : (k_word >> 16));
+
+            score += q_val * k_val;
+        }
+        shared_scores[t - window_start] = score * inv_sqrt_dim;
+    }
+    barrier();
+
+    // Phase 2: Find max
+    if (local_id == 0u) {
+        float global_max = -1e30;
+        for (uint t = 0u; t < window_len; t++) {
+            global_max = max(global_max, shared_scores[t]);
+        }
+        shared_max = global_max;
+    }
+    barrier();
+
+    float max_score = shared_max;
+
+    // Phase 3: exp and sum
+    for (uint t = local_id; t < window_len; t += 256u) {
+        shared_scores[t] = exp(shared_scores[t] - max_score);
+    }
+    barrier();
+
+    if (local_id == 0u) {
+        float sum_exp = 0.0;
+        for (uint t = 0u; t < window_len; t++) {
+            sum_exp += shared_scores[t];
+        }
+        shared_sum = sum_exp;
+    }
+    barrier();
+
+    float sum_val = shared_sum;
+
+    // Phase 4: Normalize (softmax)
+    for (uint t = local_id; t < window_len; t += 256u) {
+        shared_scores[t] /= sum_val;
+    }
+    barrier();
+
+    // Phase 5: Accumulate V, store as BF16 pairs
+    uint out_base = batch_idx * pc.num_heads * head_dim_val;
+    uint out_offset = out_base + head_q * head_dim_val;
+    for (uint d = local_id * 2u; d < head_dim_val; d += 512u) {
+        float acc0 = 0.0;
+        float acc1 = 0.0;
+        for (uint t = 0u; t < window_len; t++) {
+            uint v_offset = v_base + (window_start + t) * num_kv_heads * head_dim_val + head_kv * head_dim_val;
+
+            uint v_idx0 = v_offset + d;
+            uint v_word0 = kvCache.data[v_idx0 >> 1];
+            acc0 += shared_scores[t] * bf16_unpack(((v_idx0 & 1u) == 0u) ? (v_word0 & 0xFFFFu) : (v_word0 >> 16));
+
+            if (d + 1u < head_dim_val) {
+                uint v_idx1 = v_offset + d + 1u;
+                uint v_word1 = kvCache.data[v_idx1 >> 1];
+                acc1 += shared_scores[t] * bf16_unpack(((v_idx1 & 1u) == 0u) ? (v_word1 & 0xFFFFu) : (v_word1 >> 16));
+            }
+        }
+
+        uint out_word_idx = (out_offset + d) >> 1;
+        attnOutput.data[out_word_idx] = (bf16_pack(acc1) << 16) | (bf16_pack(acc0) & 0xFFFFu);
+    }
+}

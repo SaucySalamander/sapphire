@@ -109,3 +109,27 @@ Interactive REPL commands:
 - `/help`            : Show command help
 
 If you want help for the runtime itself, run `./out/sapphire -h`.
+
+### Vulkan KV paging perf matrix
+
+To measure the Phase 11 KV paging perf matrix (VRAM hit-rate plus p50/p95/p99 token latency):
+
+```bash
+make kv-paging-matrix
+```
+
+Outputs:
+
+- `reports/vk_kv_paging_matrix.csv`
+- `reports/vk_kv_paging_matrix.md`
+
+You can customize matrix dimensions and run count directly:
+
+```bash
+python3 scripts/benchmark_vk_kv_paging_matrix.py \
+  --model gemma-3-270m-it \
+  --runs 9 \
+  --page-tokens 64,128 \
+  --vram-budgets 2048,1024,512 \
+  --max-tokens 32
+```

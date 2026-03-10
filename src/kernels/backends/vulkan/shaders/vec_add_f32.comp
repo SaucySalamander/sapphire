@@ -1,0 +1,39 @@
+#version 450
+
+/* Element-wise vector addition: out = a + b
+ * Used for residual connections in transformer layers.
+ * 
+ * Workgroup size: 256 threads
+ * Dispatch: ceil(num_elements / 256) workgroups
+ */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer InputA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer InputB { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float out_data[]; };
+
+/* Layout MUST match vk_kernel_push_constants_t in vk_compute_pipeline.h exactly. */
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;     // 0
+    uint batch_size;    // 1
+    uint seq_pos;       // 2
+    uint max_seq_len;   // 3
+    uint d_model;       // 4
+    uint num_heads;     // 5  (unused)
+    uint head_dim;      // 6  (unused)
+    uint d_ff;          // 7  (unused)
+    uint stride_0;      // 8  = num_elements (total floats to add)
+    uint stride_1;      // 9  (unused)
+    uint start_pos;     // 10 (unused here)
+    uint reserved[5];   // 11-15
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint num_elements = pc.stride_0;
+    
+    if (gid >= num_elements) return;
+    
+    out_data[gid] = a[gid] + b[gid];
+}

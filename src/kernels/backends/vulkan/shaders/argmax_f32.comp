@@ -1,0 +1,80 @@
+#version 450
+
+/* Argmax over logits for each batch sample.
+ * One workgroup processes one sample; threads stride over vocab and then
+ * reduce in shared memory.
+ */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict readonly buffer LogitsBuffer {
+    float data[];
+} logitsBuffer;
+
+layout(std430, binding = 1) restrict writeonly buffer IdsBuffer {
+    int data[];
+} idsBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;      // vocab_size
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+shared float sh_best_val[256];
+shared uint  sh_best_idx[256];
+
+bool better_candidate(float va, uint ia, float vb, uint ib) {
+    return (va > vb) || (va == vb && ia < ib);
+}
+
+void main() {
+    uint sample_idx = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (sample_idx >= pc.batch_size) return;
+
+    uint vocab_size = pc.stride_0;
+    uint base = sample_idx * vocab_size;
+
+    float best_val = -3.402823e38;
+    uint best_idx = 0u;
+
+    for (uint i = lane; i < vocab_size; i += 256u) {
+        float v = logitsBuffer.data[base + i];
+        if (better_candidate(v, i, best_val, best_idx)) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+
+    sh_best_val[lane] = best_val;
+    sh_best_idx[lane] = best_idx;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            float rv = sh_best_val[lane + s];
+            uint ri = sh_best_idx[lane + s];
+            float lv = sh_best_val[lane];
+            uint li = sh_best_idx[lane];
+            if (better_candidate(rv, ri, lv, li)) {
+                sh_best_val[lane] = rv;
+                sh_best_idx[lane] = ri;
+            }
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        idsBuffer.data[sample_idx] = int(sh_best_idx[0]);
+    }
+}

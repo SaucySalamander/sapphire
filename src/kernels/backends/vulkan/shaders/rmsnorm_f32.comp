@@ -1,0 +1,84 @@
+/**
+ * @file rmsnorm_f32.comp
+ * @brief RMSNorm compute shader (F32 precision).
+ *
+ * Performs RMSNorm: output = (input / RMS(input)) * scale
+ * Used for pre-attention and pre-FFN normalization.
+ *
+ * Parallelization: One workgroup per batch sample.
+ * Each workgroup uses shared memory reduction to compute RMS.
+ */
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Descriptor bindings (F32: buffers are float[])
+layout(std430, binding = 0) restrict readonly buffer InputBuffer {
+    float data[];
+} inputBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer ScaleBuffer {
+    float data[];
+} scaleBuffer;
+
+layout(std430, binding = 2) restrict writeonly buffer OutputBuffer {
+    float data[];
+} outputBuffer;
+
+// Push constants (matches vk_kernel_push_constants_t layout)
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;
+    uint stride_1;
+    uint start_pos;     // first absolute pos of this batch
+    uint reserved[5];
+} pc;
+
+// Shared memory for parallel reduction
+shared float shared_sum[256];
+
+void main() {
+    uint local_id = gl_LocalInvocationID.x;
+    uint sample_idx = gl_WorkGroupID.x;
+
+    if (sample_idx >= pc.batch_size) return;
+
+    uint d_model = pc.d_model;
+    uint stride = (pc.stride_0 > 0) ? pc.stride_0 : d_model;
+    uint base_offset = sample_idx * stride;
+
+    // Phase 1: Compute sum of squares (parallel reduction)
+    float local_sum = 0.0;
+    for (uint d = local_id; d < d_model; d += 256) {
+        float val = inputBuffer.data[base_offset + d];
+        local_sum += val * val;
+    }
+    shared_sum[local_id] = local_sum;
+    barrier();
+
+    // Reduction in shared memory
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (local_id < s) {
+            shared_sum[local_id] += shared_sum[local_id + s];
+        }
+        barrier();
+    }
+
+    // Phase 2: Compute RMS and normalize
+    // Gemma3 uses rmsnorm_delta: output = (input / rms) * (1.0 + weight)
+    // Weight stores the delta from 1.0, matching rmsnorm_delta_apply_avx2 in normalization.c
+    float rms = sqrt(shared_sum[0] / float(d_model) + 1e-6);  /* Gemma3: rms_norm_eps=1e-6 */
+
+    for (uint d = local_id; d < d_model; d += 256) {
+        float val = inputBuffer.data[base_offset + d];
+        float scale = 1.0 + scaleBuffer.data[d];  /* rmsnorm_delta: (1 + weight) */
+        outputBuffer.data[base_offset + d] = (val / rms) * scale;
+    }
+}

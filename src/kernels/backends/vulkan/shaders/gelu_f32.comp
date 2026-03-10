@@ -1,0 +1,73 @@
+/**
+ * @file gelu_f32.comp
+ * @brief GeGLU activation shader (F32 precision).
+ *
+ * Computes: gate[i] = GELU(gate[i]) * value[i]  (element-wise)
+ * GELU uses the tanh approximation:
+ *   gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+ *
+ * Used as part of the FFN block (GeGLU activation).
+ *
+ * Parallelization: One thread per (batch, element) pair.
+ */
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Descriptor bindings
+layout(std430, binding = 0) restrict buffer GateBuffer {
+    float data[];
+} gateBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer ValueBuffer {
+    float data[];
+} valueBuffer;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;      // gate_stride
+    uint stride_1;      // value_stride
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+const float SQRT_2_OVER_PI = 0.7978845608028654;  // sqrt(2/pi)
+const float GELU_COEFF = 0.044715;
+
+float gelu_approx(float x) {
+    float cube = x * x * x;
+    float inner = SQRT_2_OVER_PI * (x + GELU_COEFF * cube);
+    return 0.5 * x * (1.0 + tanh(inner));
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    uint d_ff = pc.d_ff;
+    uint total = pc.batch_size * d_ff;
+    uint gate_stride = (pc.stride_0 > 0) ? pc.stride_0 : d_ff;
+    uint value_stride = (pc.stride_1 > 0) ? pc.stride_1 : d_ff;
+
+    if (idx >= total) return;
+
+    uint batch_idx = idx / d_ff;
+    uint elem_idx = idx % d_ff;
+
+    uint gate_offset = batch_idx * gate_stride + elem_idx;
+    uint value_offset = batch_idx * value_stride + elem_idx;
+
+    float gate_val = gateBuffer.data[gate_offset];
+    float value_val = valueBuffer.data[value_offset];
+
+    // GeGLU: GELU(gate) * value
+    float result = gelu_approx(gate_val) * value_val;
+    gateBuffer.data[gate_offset] = result;
+}

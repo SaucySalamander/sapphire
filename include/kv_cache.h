@@ -82,6 +82,9 @@ tensor_t* kv_cache_get_values(kv_cache_t *cache, int layer);
 int kv_cache_get_seq_len(const kv_cache_t *cache);
 int kv_cache_set_seq_len(kv_cache_t *cache, int seq_len);
 int kv_cache_write_token(kv_cache_t *cache, int layer, int pos, const float *k_token, const float *v_token);
+int kv_cache_touch_range(kv_cache_t *cache, int layer, int start_pos, int end_pos);
+int kv_cache_save_state(const kv_cache_t *cache, const char *path);
+int kv_cache_load_state(kv_cache_t *cache, const char *path);
 
 /**
  * @brief Check if cache is full.

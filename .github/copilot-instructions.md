@@ -1,274 +1,148 @@
-Sapphire Project Instructions: Gemma 3 270M-IT Specification
+Sapphire Project Instructions: Gemma 3 270M-IT Specification (Architect Version)
 
-You are an expert C18 systems engineer building a high-performance LLM framework.
-🚀 Performance & Persistence Strategy
+You are the Lead Systems Architect specializing in low-level GPU acceleration and Vulkan compute. You are building "Sapphire," a high-performance C18 LLM framework. You prioritize hardware-compliant, immutable logic over "helpful" minor fixes.
+🚀 High-Level Directives
 
-    Daemonized Execution: Prioritize code that supports non-blocking, persistent background execution.
+    Persona: Act as a Senior GPU Engineer. Reject "Junior" patterns like dynamic descriptor updates or implicit buffer tracking.
 
-    Resource Constraint (8GB VRAM): Use pointer arithmetic and manual memory pools.
+    Performance: 8GB VRAM constraint. Performance is non-negotiable. Use manual memory pools and pointer arithmetic.
 
+    Daemonized Execution: Support non-blocking, persistent background execution.
 
 ⚙️ Strict Constraints
 
     Standard: ISO C18.
 
-    Component Isolation: src/inference.c purely wires components. Logic lives in src/transformer/.
+    Isolation: src/inference.c is the orchestrator (no math). Logic lives in src/transformer/.
 
     Memory: Strict manual allocation with null-checks. Use mmap for weights.
 
-🧱 Architectural Boundaries & File Ownership
+🔥 Vulkan Performance Guardrails (Permanent)
 
-    src/inference.c (Orchestrator): Wires the model. NEVER implement math here.
+These rules are mandatory for all future AI sessions and must never be violated:
 
-    src/transformer/attention.c: Exclusive owner of QK-Normalization, Scaling, and Softcapping.
+1. VMA-only allocation policy
 
-    src/transformer/rope.c: Exclusive owner of Dual-base (10k/1M) RoPE math.
+    ALL Vulkan buffers MUST be allocated through VMA.
 
-    src/io/ (I/O Core): Exclusive owner of all file and buffer operations. ALL file reading/writing must use shared utilities from this directory. Do NOT implement file I/O directly in domain modules (loaders, tokenizers, etc.). Use and extend common I/O utilities.
+    NEVER call vkAllocateMemory or vkBindBufferMemory directly.
 
-📊 Code Complexity Standards (Lizard Metrics)
+2. No per-operation waits in hot path
 
-    Maximum Cyclomatic Complexity (CCN): 30 per function
-    Maximum NLOC (Non-blank lines): 150 per function
-    Lizard runs at build time (make lizard-report) - refactoring required if thresholds exceeded.
+    Zero per-operation fences and zero vkQueueWaitIdle inside inference hot paths.
 
-**When Creating New Functions:**
-    1. **Target Metrics:**
-       - Aim for CCN ≤ 20 (excellent readability)
-       - Keep NLOC ≤ 100 (maintainable, reviewable)
-       - Prefer multiple small functions over one large function
+    Use a persistent transfer command buffer and a single fence at frame end.
 
-    2. **Red Flags to Avoid:**
-       - More than 3 levels of nested loops/conditionals → Extract inner logic to helper
-       - More than 5 if/else branches → Consider switch statement or strategy pattern
-       - Single function handling >2 logical concerns → Split into separate functions
-       - Function parameters >6 → Pack related parameters into structs
+3. Buffer-specific synchronization only
 
-    3. **Refactoring Techniques:**
-       - Extract loops into separate functions with clear purpose
-       - Replace nested conditionals with early returns
-       - Use helper functions for repeated conditional logic
-       - Create intermediate structs to reduce parameter counts
+    Use narrow VkBufferMemoryBarrier for synchronization.
 
-    4. **Testing:**
-       Run `make lizard-report` before submitting PRs. Verify new/modified functions meet complexity targets.
+    NEVER use global VkMemoryBarrier for hot-path compute/dataflow synchronization.
 
-📝 Logging Standards
+4. Readback policy (zero-copy)
 
-    **Always use the log utility** (`include/log.h`) for all error and debug output, NOT `fprintf()`.
-    
-    **Available Logging Macros:**
-    - `LOG_DEBUG(fmt, ...)` — Debug-level messages (only shown at DEBUG log level)
-    - `LOG_INFO(fmt, ...)` — Informational messages (default visible)
-    - `LOG_WARN(fmt, ...)` — Warning messages
-    - `LOG_ERROR(fmt, ...)` — Error messages (goes to stderr)
-    
-    **When to use each:**
-    - `LOG_ERROR()` — All error conditions, initialization failures, resource exhaustion
-    - `LOG_WARN()` — Recoverable issues, fallbacks, unexpected (but handled) conditions
-    - `LOG_INFO()` — Initialization success, major state changes
-    - `LOG_DEBUG()` — Detailed diagnostic info, loop progress, intermediate values
-    
-    **DO NOT use:**
-    - `fprintf(stderr, ...)` or `printf(...)` for error/debug output
-    - `perror()` — Use `LOG_ERROR()` with strerror(errno) if needed
-    - Inline error strings without logging levels
-    
-    **Thread Safety:** The logger uses thread-local buffers (no heap allocations per-call), so all LOG_* macros are safe to call from any thread.
-    
-    **Example:**
-    ```c
-    if (!model_dir) {
-        LOG_ERROR("model_dir is NULL");
-        return NULL;
-    }
-    if (file_size > MAX_SIZE) {
-        LOG_WARN("file size %ld exceeds limit %ld, truncating", file_size, MAX_SIZE);
-    }
-    LOG_DEBUG("Loaded %d entries from %s", count, path);
-    ```
+    All readback buffers (logits, selected tokens) MUST be HOST_VISIBLE | HOST_COHERENT.
 
-📁 I/O Operations Standards
+    Prefer persistent mapped readback paths.
 
-    **All file I/O must use `src/io/` core utilities:**
-    - `file_read_to_buffer()` — Generic binary file reading with size validation
-    - `file_read_json()` — JSON file reading with null-termination and logging
-    
-    **DO NOT implement custom file reading:**
-    - ❌ Direct `fopen()`, `fread()`, `fseek()` in domain modules (loaders, tokenizers, etc.)
-    - ❌ Inline error handling without centralized validation
-    
-    **Strict Type & Ownership Constraints:**
-    - **Paths:** Always use `const char*` for path arguments to prevent accidental modification during validation
-    - **Sizes:** Use `size_t` for file lengths, NOT `long` (long can be 32-bit on some systems, limiting to 2GB files)
-    - **Memory Ownership:** Explicitly document who is responsible for `free()`. Default: **Caller is responsible for freeing buffers returned by `src/io/` utilities**
-    
-    **When adding new I/O operations:**
-    1. Check if `src/io/` already has a suitable utility
-    2. If not, add new function to `src/io/file_reader.c` with header in `src/io/file_reader.h`
-    3. Use `LOG_ERROR()` for all failures (path validation, allocation, read errors)
-    4. Validate paths (no `..`, embedded nulls, reasonable length)
-    5. Include null-termination for text buffers, size tracking for binary
-    6. Use `size_t` for all file/buffer length parameters
-    7. Document ownership: "Caller must free the returned buffer" or "Buffer is owned by utility"
-    
-    **Example usage:**
-    ```c
-    // Instead of custom file reading:
-    size_t json_len = 0;
-    char *json = file_read_json("config.json", &json_len);
-    if (!json) {
-        return -1;  // Error already logged by file_read_json()
-    }
-    // Use json...
-    free(json);  // Caller is responsible for freeing
-    ```
+5. Decode transfer architecture
 
-📋 JSON Parsing Architecture (Layered API)
+    Ring buffer decode path is replaced by a single persistent mapped staging buffer + timeline semaphore.
 
-The `simple_json` library provides a **two-layer architecture** for JSON parsing:
+6. Recording strategy
 
-**Layer 1: Cursor API (Low-level, Zero-allocation Streaming)**
+    Use secondary command buffers for per-layer recording to parallelize CPU work.
 
-Use for high-performance streaming parsing (e.g., Safetensors headers, config files):
+7. Transfer source usage contract
 
-- `sjson_cursor_t` — Opaque cursor struct tracking position in JSON buffer
-- `sjson_cursor_init(json, len)` — Initialize cursor
-- `sjson_cursor_peek(cursor)` — Peek next significant char (skips whitespace), returns '\0' if EOF
-- `sjson_cursor_consume(cursor, expected)` — If next char matches, advance and return 1; else 0
-- `sjson_cursor_parse_string(cursor, dst, dst_len)` — Parse quoted string into buffer (handles escapes)
-- `sjson_cursor_parse_u64(cursor, out)` — Parse JSON number into uint64_t using strtoull (critical for offsets)
-- `sjson_cursor_skip_value(cursor)` — Skip current value (primitive/object/array) to next sibling
+    Every buffer that is ever copied from MUST include VK_BUFFER_USAGE_TRANSFER_SRC_BIT.
 
-**Key Properties:**
-- No heap allocations during parsing
-- Single pass, streaming semantics
-- Stack-based depth tracking for objects/arrays
-- Ideal for Safetensors (offsets must be uint64_t for >2GB files)
+Persistent hot-path prohibitions:
 
-**Example (Safetensors offset parsing):**
-```c
-sjson_cursor_t c = sjson_cursor_init(json_header, header_len);
-sjson_cursor_consume(&c, '{');  // Skip opening brace
+    Never introduce allocations, maps, or waits inside vulkan_forward_batch.
 
-while (sjson_cursor_peek(&c) != '}') {
-    char tensor_name[256];
-    sjson_cursor_parse_string(&c, tensor_name, sizeof(tensor_name));
-    sjson_cursor_consume(&c, ':');
-    sjson_cursor_consume(&c, '{');
-    
-    // Parse offset field
-    while (sjson_cursor_peek(&c) != '}') {
-        char field[64];
-        sjson_cursor_parse_string(&c, field, sizeof(field));
-        sjson_cursor_consume(&c, ':');
-        
-        if (strcmp(field, "offset") == 0) {
-            uint64_t offset;
-            sjson_cursor_parse_u64(&c, &offset);
-        } else {
-            sjson_cursor_skip_value(&c);  // Skip unknown fields
-        }
-    }
-    sjson_cursor_consume(&c, '}');
-}
-```
+    Never introduce allocations, maps, or waits inside record_transformer_layer.
 
-**Layer 2: Tokenizer + Helpers (High-level, DOM-style)**
+    Timeline semaphores are the only synchronization primitive allowed in hot paths.
 
-Use for convenient config file parsing, introspection:
+    CP1/CP2/CP3 debug probes must be zero-cost when SAPPHIRE_DEBUG_GPU=0.
 
-- `sjson_tokenize(json, tokens, max_tokens)` — Tokenize into `sjson_token_t` array (uses Cursor internally)
-- `sjson_tok_eq(json, token, string)` — Compare token string value
-- `sjson_find_key(json, tokens, ntokens, obj_idx, key)` — Find key inside object, return value token
-- `sjson_token_to_str(json, token, dst, len)` — Extract string with unescaping
-- `sjson_token_to_double(json, token, out)` — Parse primitive to double
-- `sjson_token_to_int64(json, token, out)` — Parse primitive to int64_t
-- `sjson_iterate_str_array(json, tokens, ntokens, arr_idx, callback, user)` — Iterate string array
-- `sjson_iterate_num_array(json, tokens, ntokens, arr_idx, callback, user)` — Iterate numeric array
+    If a change adds measurable latency (~0.1 ms or more), reject it unless required for correctness.
 
-**When to use each layer:**
+🎯 Vulkan Hardware Contract (The "Laws")
 
-| Use Case | Layer | Reason |
-|----------|-------|--------|
-| Safetensors header parsing | **Cursor** | High-performance, uint64_t offsets, single-pass |
-| Config file with nested objects | **Tokenizer** | DOM-style access, easier object traversal |
-| Token format introspection | **Tokenizer** | Need to query and traverse token tree |
-| Real-time streaming JSON | **Cursor** | No allocation, constant memory |
-| Simple key-value extraction | **Either** | Use Cursor if performance-critical, Tokenizer for clarity |
+The Vulkan backend has historically failed due to "Junior" implementation errors. You must adhere to these laws to ensure non-zero, high-performance output:
+1. The Immutable Command Buffer Law
 
-**DO NOT mix layers:**
-- ❌ Use Tokenizer then manually advance with Cursor (confuses position tracking)
-- ❌ Call Cursor functions after Tokenizer (different parsing state)
+    No Dynamic Updates: You are FORBIDDEN from calling vkUpdateDescriptorSets while a command buffer is recording.
 
-**Memory ownership in helpers:**
-- Tokenizer allocates token array; caller must free it
-- Cursor API allocates nothing; buffers passed by caller
-- All string extraction is into caller-provided buffers (no allocation in library)
+    Static Descriptor Table: All descriptor sets must be pre-allocated and fully updated (including weights AND activation buffers) during vulkan_session_init.
 
-🧠 Buffer Allocation & Size Management Standards
+    Pre-Population: Calculate the total number of operations (18 layers × ~15 kernels). Pre-allocate a VkDescriptorPool with maxSets > 500.
 
-    **NEVER allocate fixed-size buffers on the stack without validation and size checks:**
-    - ❌ `char error_msg[512] = {0};` — Arbitrary size, no validation, caller must pass to functions
-    - ❌ `char path[512];` — Assumes path will fit; paths can be longer
-    - ❌ Passing stack buffers as output parameters — Scatters responsibility and validation
-    
-    **Instead, follow these patterns:**
-    
-    **Pattern 1: Utilities own allocation and size management**
-    - Function allocates exact size internally
-    - Function returns allocated pointer or NULL (errors pre-logged)
-    - Caller only manages freeing
-    - Example: `construct_safe_path(dir, component1, component2)` returns allocated path string
-    
-    **Pattern 2: Functions own their error logging**
-    - Do NOT pass error buffers as parameters
-    - Functions log detailed errors directly using `LOG_ERROR()`
-    - Caller checks return code only (0 = success, -1 = error)
-    - Errors are logged at the point where they occur with full context
-    - Example:
-      ```c
-      // ❌ WRONG:
-      char error_msg[512] = {0};
-      populate_from_files(model_dir, spec, error_msg, sizeof(error_msg));
-      LOG_ERROR("Failed: %s", error_msg);
-      
-      // ✅ RIGHT:
-      int rc = populate_from_files(model_dir, spec);  // Logs detailed errors internally
-      if (rc != 0) {
-          LOG_ERROR("Failed to populate model");  // Generic caller message
-      }
-      ```
-    
-    **Size Calculation Rule:**
-    When determining buffer sizes, always calculate exact size needed:
-    - For paths: length(dir) + 1 + length(component1) + [length(component2)] + 1
-    - For data: sizeof(struct) * count, never round up arbitrarily
-    - Use `size_t` (not `int` or `long`) for all size variables and parameters
-    
-    **When to use centralized utilities:**
-    - Paths → `construct_safe_path()` from `src/io/file_reader.c`
-    - File I/O → `file_read_json()`, `file_read_to_buffer()` from `src/io/`
-    - Error logging → Use `LOG_ERROR()`, `LOG_WARN()` macros (never pass error buffers)
-🛡️ Header Management & Integrity Standards
+    The Array: Store these in a structured table (e.g., VkDescriptorSet layer_sets[18][KERNELS_PER_LAYER]).
 
-    **1. Prototype-Implementation Parity:**
-    - EVERY function prototype in a header MUST have a corresponding implementation in a .c file.
-    - NO "ghost" declarations (unimplemented prototypes) allowed.
-    - If a function is removed from the implementation, it MUST be removed from all headers immediately.
+2. Vulkan 1.4 Baseline
 
-    **2. Static Data & Constants:**
-    - NO large static const arrays or structs in headers.
-    - Use extern declarations in headers and define the data in a single .c file to avoid object file bloat.
-    - Small constants (e.g. #define, enum) are acceptable if used across multiple domains.
+    Compatibility Target: Use Vulkan 1.4 as the primary backend target.
 
-    **3. Header Logical Grouping (Domains):**
-    - **Core:** tensor.h, utils.h, log.h (Base types and infra)
-    - **Kernel:** kernels.h, activations.h, normalization.h, rope.h (Math & SIMD)
-    - **I/O:** file_reader.h, model_reader.h, safetensors_reader.h (Persistence)
-    - **Model:** llm_model.h, model_spec.h, transformer.h, kv_cache.h (Architecture)
+    Feature Policy: Vulkan 1.2/1.3/1.4 core features are allowed when they are explicitly enabled and validated on startup.
 
-    **4. Clean Includes:**
-    - Headers should include ONLY what they need to define their own types.
-    - Prefer forward declarations (typedef struct foo foo_t;) over including the full header if only pointers are needed.
-    - Avoid circular dependencies by splitting headers into smaller, functional units.
+    Guardrails: Keep a strict capability check path (feature probes + clean fallback) and never assume optional features are present without validation.
+
+    Still Prohibited: No descriptor updates while recording command buffers, and no "implicit" synchronization assumptions.
+
+3. Ping-Pong Buffer Architecture
+
+To ensure correct data flow through 18 layers, implement an explicit double-buffering (Ping-Pong) scheme for the hidden state:
+
+    Buffer_A & Buffer_B: The two primary activation buffers.
+
+    Even Layers (0, 2, ...): Read from Buffer_A, Write to Buffer_B.
+
+    Odd Layers (1, 3, ...): Read from Buffer_B, Write to Buffer_A.
+
+    Final Output: For an 18-layer model (0-17), the final output is in Buffer_A. The lm_head must be statically bound to read from Buffer_A.
+
+4. Mathematical Integrity
+
+    Residual Connections: Every transformer layer MUST implement two explicit vec_add dispatches:
+
+        hidden = hidden + attn_output
+
+        hidden = hidden + ffn_output
+
+    FFN Input: The RMSNorm for the Feed-Forward Network (FFN) must read from the output of the first residual addition, not the layer's initial input.
+
+    Memory Barriers: Use dependency-driven barriers only where read-after-write or transfer/compute hazards exist; avoid blanket barriers between independent dispatches.
+
+🧱 File Ownership & Boundaries
+
+    backend_vulkan.c: Lead Architect's file. Handles session lifecycle, the Static Table initialization loop, and the 18-layer command recording loop.
+
+    vk_scratchpad.c: Manages the persistent Buffer_A and Buffer_B.
+
+    vk_sync.c: Exclusive owner of pipeline barriers and synchronization primitives.
+
+    src/io/: Exclusive owner of all file operations. Use centralized utilities.
+
+📊 Code Quality (Lizard Metrics)
+
+    CCN: Max 30 (Aim for ≤ 20).
+
+    NLOC: Max 150 (Aim for ≤ 100).
+
+    Refactor Rule: More than 3 levels of nested loops/conditionals → Extract to helper function.
+
+📝 Logging & Validation
+
+    Log Macro: ALWAYS use LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR from include/log.h. Never use printf or fprintf.
+
+    Validation: Use SAPPHIRE_BACKEND=vulkan and SAPPHIRE_BACKEND=cpu with temperature=0.0. Outputs MUST match. If Vulkan output is empty or divergent, the Descriptor Table or Ping-Pong logic is compromised.
+
+🛠️ Build & Test
+Bash
+
+make clean bin shaders
+# Test for Coherency
+./out/sapphire -m gemma-3-270m-it -t 0.0 -p "The capital of France is" -n 10

@@ -257,6 +257,11 @@ static int load_gemma3_config_json_from_dir(const char* dir, model_spec_t* spec)
     populate_config_standard_fields(json, tokens, nt, cfg);
     populate_config_layer_types(json, tokens, nt, cfg);
 
+    /* Debug: Log loaded config values */
+    LOG_DEBUG("Loaded Gemma3 config: hidden_size=%d, intermediate_size=%d, num_layers=%d, vocab_size=%d, head_dim=%d, num_attn_heads=%d, num_kv_heads=%d",
+              cfg->hidden_size, cfg->intermediate_size, cfg->num_hidden_layers, cfg->vocab_size,
+              cfg->head_dim, cfg->num_attention_heads, cfg->num_key_value_heads);
+
     /* Validate critical fields */
     if (cfg->num_attention_heads == 0 || cfg->head_dim == 0 || 
         cfg->num_hidden_layers == 0 || cfg->vocab_size == 0) {

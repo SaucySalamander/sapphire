@@ -1,0 +1,101 @@
+/**
+ * @file qk_norm_f32.comp
+ * @brief QK-Normalization shader (F32 precision).
+ *
+ * Normalizes Q and K projections per-head using RMSNorm with per-head scale.
+ * Applied after projections and before RoPE (Gemma 3 feature).
+ *
+ * Parallelization: One workgroup per head. Workgroups [0, num_heads_q) normalize Q,
+ * workgroups [num_heads_q, num_heads_q + num_heads_k) normalize K.
+ */
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict buffer QBuffer {
+    float data[];
+} qBuffer;
+
+layout(std430, binding = 1) restrict buffer KBuffer {
+    float data[];
+} kBuffer;
+
+layout(std430, binding = 2) restrict readonly buffer QNormScale {
+    float data[];
+} qNormScale;
+
+layout(std430, binding = 3) restrict readonly buffer KNormScale {
+    float data[];
+} kNormScale;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;     // num_heads_q
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;      // num_heads_k
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+shared float shared_sum[256];
+
+void main() {
+    uint wg_idx    = gl_WorkGroupID.x;  /* head index */
+    uint token_idx = gl_WorkGroupID.y;  /* batch token index */
+    uint local_id  = gl_LocalInvocationID.x;
+    uint head_dim_val = pc.head_dim;
+    uint num_heads_q = pc.num_heads;
+    uint num_heads_k = pc.stride_0;
+
+    if (token_idx >= pc.batch_size) return;
+
+    bool is_q_head = (wg_idx < num_heads_q);
+    uint head_idx = is_q_head ? wg_idx : (wg_idx - num_heads_q);
+
+    if (!is_q_head && head_idx >= num_heads_k) return;
+
+    /* Per-token batch offset into Q or K buffer */
+    uint q_token_base = token_idx * num_heads_q * head_dim_val;
+    uint k_token_base = token_idx * num_heads_k * head_dim_val;
+    uint base = is_q_head ? (q_token_base + head_idx * head_dim_val)
+                           : (k_token_base + head_idx * head_dim_val);
+
+    // Phase 1: sum of squares
+    float local_sum = 0.0;
+    for (uint d = local_id; d < head_dim_val; d += 256u) {
+        float val = is_q_head ? qBuffer.data[base + d] : kBuffer.data[base + d];
+        local_sum += val * val;
+    }
+    shared_sum[local_id] = local_sum;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (local_id < s) {
+            shared_sum[local_id] += shared_sum[local_id + s];
+        }
+        barrier();
+    }
+
+    // Gemma3 rmsnorm_delta: output = (input / rms) * (1.0 + weight)
+    float rms = sqrt(shared_sum[0] / float(head_dim_val) + 1e-6);  /* Gemma3: rms_norm_eps=1e-6 */
+
+    // Phase 2: normalize (scale weights are per-head, not per-token)
+    uint scale_base = head_idx * head_dim_val;
+    for (uint d = local_id; d < head_dim_val; d += 256u) {
+        if (is_q_head) {
+            float val = qBuffer.data[base + d];
+            float scale = 1.0 + qNormScale.data[scale_base + d];  /* rmsnorm_delta */
+            qBuffer.data[base + d] = (val / rms) * scale;
+        } else {
+            float val = kBuffer.data[base + d];
+            float scale = 1.0 + kNormScale.data[scale_base + d];  /* rmsnorm_delta */
+            kBuffer.data[base + d] = (val / rms) * scale;
+        }
+    }
+}
