@@ -428,7 +428,6 @@ static int upload_tensor_to_gpu(
 typedef struct {
     VkCommandBuffer cmd_buf;
     backend_vulkan_session_data_t *bd;
-    const gemma3_270m_config_t *cfg;
     int layer;
     int batch_size;
     int seq_pos;
@@ -2019,7 +2018,7 @@ static void record_rope_attn_phase(
 
     {
         layer_dispatch_ctx_t ctx = {
-            .cmd_buf    = cmd_buf, .bd = bd, .cfg = cfg,
+            .cmd_buf    = cmd_buf, .bd = bd,
             .layer      = layer_idx, .batch_size = batch_size,
             .seq_pos    = start_pos + batch_size - 1
         };
