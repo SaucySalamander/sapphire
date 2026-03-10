@@ -19,19 +19,20 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install cppcheck
+      - name: Install cppcheck and Vulkan headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y cppcheck
+          sudo apt-get install -y cppcheck libvulkan-dev
 
       - name: Install Lizard
         run: |
-          pip install lizard
+          python -m venv .venv
+          .venv/bin/pip install lizard
 
       - name: Verify tools
         run: |
           cppcheck --version
-          lizard --version
+          .venv/bin/lizard --version
           gcc --version
 
       - name: Generate compile_commands.json

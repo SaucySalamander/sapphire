@@ -19,7 +19,7 @@ LDFLAGS = -lm -pthread -lvulkan -lstdc++ $(VK_LIB_PATHS)
 # Include paths (-I. -I$(INCDIR)) must be present for sanitizer builds
 # IMPORTANT: must include -mavx2 -mfma for AVX/FMA intrinsics in kernel code
 SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS)
-SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined -lstdc++ $(VK_LIB_PATHS)
+SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined -lvulkan -lstdc++ $(VK_LIB_PATHS)
 
 # HIP configuration (optional ROCm support)
 HIPCC = hipcc
@@ -292,6 +292,7 @@ check-cppcheck: compile_commands $(REPORTS_DIR)
 .PHONY: check-complexity
 check-complexity: $(REPORTS_DIR)
 	@echo "Running Lizard (strict mode - CC: $(LIZARD_THRESHOLD_CC), NLOC: $(LIZARD_THRESHOLD_NLOC), Params: $(LIZARD_THRESHOLD_PARAM), Tokens: $(LIZARD_THRESHOLD_TOKEN))..."
+	@command -v $(LIZARD) >/dev/null 2>&1 || { echo "❌ Lizard not found: $(LIZARD)"; exit 1; }
 	@$(LIZARD) -l c -m -C $(LIZARD_THRESHOLD_CC) -L $(LIZARD_THRESHOLD_NLOC) -a $(LIZARD_THRESHOLD_PARAM) -T token_count=$(LIZARD_THRESHOLD_TOKEN) -x '*/test/*' src 2>&1 | tee $(REPORTS_DIR)/lizard-strict.txt || true
 	@if grep -q "!!!!.*Warnings" $(REPORTS_DIR)/lizard-strict.txt 2>/dev/null; then \
 	  echo "❌ Complexity checks failed. See $(REPORTS_DIR)/lizard-strict.txt"; \
