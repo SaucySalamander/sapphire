@@ -55,6 +55,7 @@ static safetensors_dtype_t safetensors_dtype_from_string(const char *s) {
     if (strcmp(s, "F16") == 0 || strcmp(s, "float16") == 0) return SAFETENSORS_F16;
     if (strcmp(s, "I32") == 0 || strcmp(s, "int32") == 0) return SAFETENSORS_I32;
     if (strcmp(s, "I64") == 0 || strcmp(s, "int64") == 0) return SAFETENSORS_I64;
+    if (strcmp(s, "U8") == 0 || strcmp(s, "uint8") == 0) return SAFETENSORS_U8;
     
     return SAFETENSORS_UNKNOWN;
 }
@@ -458,6 +459,24 @@ tensor_t* safetensors_load_tensor_copy(const safetensors_file_t *st,
     
     tensor_t *t = safetensors_create_tensor_ref((safetensors_file_t*)st, meta);
     return t;
+}
+
+const void* safetensors_data_ptr(const safetensors_file_t *st,
+                                 const safetensors_tensor_meta_t *meta) {
+    uint64_t data_section_start = 0;
+
+    if (!st || !meta) {
+        LOG_ERROR("safetensors_data_ptr: invalid arguments");
+        return NULL;
+    }
+
+    data_section_start = 8 + st->header_size;
+    if (data_section_start + meta->offset + meta->size_bytes > st->mmap_size) {
+        LOG_ERROR("safetensors_data_ptr: tensor '%s' extends beyond file", meta->name);
+        return NULL;
+    }
+
+    return (const char*)st->mmap_ptr + data_section_start + meta->offset;
 }
 
 /**

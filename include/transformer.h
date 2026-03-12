@@ -10,6 +10,7 @@
 #include "gemma3_270m_config.h"
 
 struct inference_session_t;
+struct sapphire_tokenizer_t;
 
 typedef struct {
     const float* cos;
@@ -64,6 +65,18 @@ void sapphire_embed_lookup_batch(struct inference_session_t* session, const int*
  * @brief Performs LM Head calculation and softcapping.
  */
 void lm_head(struct inference_session_t* session, const float* hidden, float* logits);
+
+typedef struct {
+    const model_spec_t* spec;
+    const char* text;
+    const char* tensor_name;
+    float* out_vector;
+    uint32_t out_dim;
+} transformer_activation_capture_request_t;
+
+int sapphire_collect_tensor_activation(struct inference_session_t* session,
+                                       struct sapphire_tokenizer_t* tokenizer,
+                                       const transformer_activation_capture_request_t* request);
 
 typedef struct layer_buffers {
     int pm, pi, pk, pf;

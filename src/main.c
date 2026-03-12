@@ -7,6 +7,7 @@
 
 #include "ggml_model.h"
 #include "inference.h"
+#include "ternary_conversion.h"
 #include "tokenizer.h"
 #include "utils.h"
 #include "log.h"
@@ -38,6 +39,15 @@ static void print_help(const char* program_name) {
     printf("  -t, --temp <value>        Temperature for sampling (default: 1.0)\n");
     printf("  -n, --max-tokens <num>    Maximum tokens to generate (default: 100)\n");
     printf("  -p, --prompt <string>     Run a single prompt non-interactively and exit (echoes prompt)\n");
+    printf("  --convert-ternary         Run ternary conversion mode instead of inference\n");
+    printf("  --output <path>           Output file (single-layer) or output directory (full-model)\n");
+    printf("  --layer <name>            Optional single-layer conversion filter\n");
+    printf("  --calibration-corpus <p>  Optional text corpus file for tokenized STE calibration\n");
+    printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
+    printf("  --validation-corpus <p>   Optional held-out text corpus file for conversion checkpoints\n");
+    printf("  --validation-samples <n>  Held-out prompt count for checkpoint evaluation\n");
+    printf("  --validate-every <n>      Run checkpoint validation every N converted tensors\n");
+    printf("  --kl-weight <value>       Optional KL distillation weight (default: 0.05)\n");
     printf("  --save-state <path>       Save session state to .sapphire file before exit\n");
     printf("  --load-state <path>       Load session state from .sapphire file at startup\n");
     printf("  -h, --help                Show this help message\n");
@@ -56,6 +66,8 @@ static void print_help(const char* program_name) {
     printf("  /help                     Show command help\n");
     printf("\nExample:\n");
     printf("  %s -m gemma3-270m-it -c 4096 -t 0.7 -n 200\n", program_name);
+    printf("  %s -m gemma-3-27b-it --convert-ternary --output ./out/model-ternary\n", program_name);
+    printf("  %s -m gemma-3-270m-it --convert-ternary --layer model.layers.0.self_attn.q_proj.weight --output ./out/layer0-qproj.safetensors\n", program_name);
     printf("\n");
 }
 
@@ -65,6 +77,15 @@ typedef struct {
     float temperature;
     int max_tokens;
     const char* prompt_arg;
+    int convert_ternary;
+    const char* output_path;
+    const char* layer_name;
+    const char* calibration_corpus_path;
+    int calibration_sample_limit;
+    const char* validation_corpus_path;
+    int validation_sample_limit;
+    int validate_every_n;
+    float kl_weight;
     const char* save_state_path;
     const char* load_state_path;
 } cli_args_t;
@@ -76,8 +97,84 @@ static void cli_args_init(cli_args_t *args) {
     args->temperature = TEMPERATURE;
     args->max_tokens = MAX_TOKENS_GENERATE;
     args->prompt_arg = NULL;
+    args->convert_ternary = 0;
+    args->output_path = NULL;
+    args->layer_name = NULL;
+    args->calibration_corpus_path = NULL;
+    args->calibration_sample_limit = 4;
+    args->validation_corpus_path = NULL;
+    args->validation_sample_limit = 4;
+    args->validate_every_n = 0;
+    args->kl_weight = 0.05f;
     args->save_state_path = NULL;
     args->load_state_path = NULL;
+}
+
+static int validate_cli_args(const cli_args_t *args) {
+    if (!args) return -1;
+
+    if (!args->model_name) {
+        LOG_ERROR("ERROR: Model name required. Use -m or --model flag.");
+        return -1;
+    }
+
+    if (args->convert_ternary) {
+        if (!args->output_path) {
+            LOG_ERROR("ERROR: --output is required with --convert-ternary.");
+            return -1;
+        }
+        if (args->prompt_arg) {
+            LOG_ERROR("ERROR: --prompt cannot be combined with --convert-ternary.");
+            return -1;
+        }
+        if (args->save_state_path || args->load_state_path) {
+            LOG_ERROR("ERROR: session state flags are not valid in --convert-ternary mode.");
+            return -1;
+        }
+        if (args->calibration_sample_limit <= 0) {
+            LOG_ERROR("ERROR: --calibration-samples must be > 0.");
+            return -1;
+        }
+        if (args->kl_weight < 0.0f) {
+            LOG_ERROR("ERROR: --kl-weight must be >= 0.");
+            return -1;
+        }
+        if (args->validation_sample_limit < 0) {
+            LOG_ERROR("ERROR: --validation-samples must be >= 0.");
+            return -1;
+        }
+        if (args->validate_every_n < 0) {
+            LOG_ERROR("ERROR: --validate-every must be >= 0.");
+            return -1;
+        }
+        if (args->layer_name && args->validate_every_n > 0) {
+            LOG_ERROR("ERROR: --validate-every is only supported for full-model ternary conversion.");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int run_ternary_conversion_mode(const cli_args_t *args) {
+    ternary_conversion_config_t config;
+
+    if (!args) {
+        LOG_ERROR("ternary conversion mode: args is NULL");
+        return -1;
+    }
+
+    config.model_name = args->model_name;
+    config.output_path = args->output_path;
+    config.layer_name = args->layer_name;
+    config.calibration_corpus_path = args->calibration_corpus_path;
+    config.validation_corpus_path = args->validation_corpus_path;
+    config.context_len = args->context_len;
+    config.calibration_sample_limit = args->calibration_sample_limit;
+    config.validation_sample_limit = args->validation_sample_limit;
+    config.validate_every_n = args->validate_every_n;
+    config.kl_weight = args->kl_weight;
+    return transformer_run_ternary_conversion(&config);
 }
 
 static void print_session_state(const inference_context_t *ctx,
@@ -200,24 +297,78 @@ static int handle_slash_command(inference_context_t *ctx,
 }
 
 static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args) {
+    typedef enum {
+        CLI_OPT_UNKNOWN = 0,
+        CLI_OPT_MODEL,
+        CLI_OPT_CONTEXT,
+        CLI_OPT_TEMP,
+        CLI_OPT_MAX_TOKENS,
+        CLI_OPT_PROMPT,
+        CLI_OPT_CONVERT_TERNARY,
+        CLI_OPT_OUTPUT,
+        CLI_OPT_LAYER,
+        CLI_OPT_CALIBRATION_CORPUS,
+        CLI_OPT_CALIBRATION_SAMPLES,
+        CLI_OPT_VALIDATION_CORPUS,
+        CLI_OPT_VALIDATION_SAMPLES,
+        CLI_OPT_VALIDATE_EVERY,
+        CLI_OPT_KL_WEIGHT,
+        CLI_OPT_SAVE_STATE,
+        CLI_OPT_LOAD_STATE
+    } cli_option_t;
+
     if (!args) return -1;
+
     for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
-            args->model_name = argv[++i];
-        } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--context") == 0) && i + 1 < argc) {
-            args->context_len = atoi(argv[++i]);
-        } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0) && i + 1 < argc) {
-            args->temperature = atof(argv[++i]);
-        } else if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) && i + 1 < argc) {
-            args->max_tokens = atoi(argv[++i]);
-        } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
-            args->prompt_arg = argv[++i];
-        } else if (strcmp(argv[i], "--save-state") == 0 && i + 1 < argc) {
-            args->save_state_path = argv[++i];
-        } else if (strcmp(argv[i], "--load-state") == 0 && i + 1 < argc) {
-            args->load_state_path = argv[++i];
+        const char *value = NULL;
+        cli_option_t option = CLI_OPT_UNKNOWN;
+
+        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) option = CLI_OPT_MODEL;
+        else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--context") == 0) option = CLI_OPT_CONTEXT;
+        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0) option = CLI_OPT_TEMP;
+        else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) option = CLI_OPT_MAX_TOKENS;
+        else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) option = CLI_OPT_PROMPT;
+        else if (strcmp(argv[i], "--convert-ternary") == 0) option = CLI_OPT_CONVERT_TERNARY;
+        else if (strcmp(argv[i], "--output") == 0) option = CLI_OPT_OUTPUT;
+        else if (strcmp(argv[i], "--layer") == 0) option = CLI_OPT_LAYER;
+        else if (strcmp(argv[i], "--calibration-corpus") == 0) option = CLI_OPT_CALIBRATION_CORPUS;
+        else if (strcmp(argv[i], "--calibration-samples") == 0) option = CLI_OPT_CALIBRATION_SAMPLES;
+        else if (strcmp(argv[i], "--validation-corpus") == 0) option = CLI_OPT_VALIDATION_CORPUS;
+        else if (strcmp(argv[i], "--validation-samples") == 0) option = CLI_OPT_VALIDATION_SAMPLES;
+        else if (strcmp(argv[i], "--validate-every") == 0) option = CLI_OPT_VALIDATE_EVERY;
+        else if (strcmp(argv[i], "--kl-weight") == 0) option = CLI_OPT_KL_WEIGHT;
+        else if (strcmp(argv[i], "--save-state") == 0) option = CLI_OPT_SAVE_STATE;
+        else if (strcmp(argv[i], "--load-state") == 0) option = CLI_OPT_LOAD_STATE;
+
+        if (option == CLI_OPT_CONVERT_TERNARY) {
+            args->convert_ternary = 1;
+            continue;
+        }
+        if (option == CLI_OPT_UNKNOWN || i + 1 >= argc) {
+            continue;
+        }
+
+        value = argv[++i];
+        switch (option) {
+            case CLI_OPT_MODEL: args->model_name = value; break;
+            case CLI_OPT_CONTEXT: args->context_len = atoi(value); break;
+            case CLI_OPT_TEMP: args->temperature = atof(value); break;
+            case CLI_OPT_MAX_TOKENS: args->max_tokens = atoi(value); break;
+            case CLI_OPT_PROMPT: args->prompt_arg = value; break;
+            case CLI_OPT_OUTPUT: args->output_path = value; break;
+            case CLI_OPT_LAYER: args->layer_name = value; break;
+            case CLI_OPT_CALIBRATION_CORPUS: args->calibration_corpus_path = value; break;
+            case CLI_OPT_CALIBRATION_SAMPLES: args->calibration_sample_limit = atoi(value); break;
+            case CLI_OPT_VALIDATION_CORPUS: args->validation_corpus_path = value; break;
+            case CLI_OPT_VALIDATION_SAMPLES: args->validation_sample_limit = atoi(value); break;
+            case CLI_OPT_VALIDATE_EVERY: args->validate_every_n = atoi(value); break;
+            case CLI_OPT_KL_WEIGHT: args->kl_weight = (float)atof(value); break;
+            case CLI_OPT_SAVE_STATE: args->save_state_path = value; break;
+            case CLI_OPT_LOAD_STATE: args->load_state_path = value; break;
+            default: break;
         }
     }
+
     return 0;
 }
 
@@ -384,9 +535,7 @@ int main(int argc, char* argv[]) {
     cli_args_init(&args);
     if (parse_cli_args(argc, (const char * const *)argv, &args) != 0) return 1;
 
-    // Validate that model name was provided
-    if (!args.model_name) {
-        LOG_ERROR("ERROR: Model name required. Use -m or --model flag.\n");
+    if (validate_cli_args(&args) != 0) {
         print_help(argv[0]);
         return 1;
     }
@@ -396,6 +545,14 @@ int main(int argc, char* argv[]) {
     printf("================================================================================\n");
     printf("                      SAPPHIRE INFERENCE ENGINE (v1.0)\n");
     printf("================================================================================\n");
+
+    if (args.convert_ternary) {
+        int rc = run_ternary_conversion_mode(&args);
+        printf("\n================================================================================\n");
+        printf("                    Sapphire Inference Engine Closed\n");
+        printf("================================================================================\n");
+        return rc;
+    }
 
     // Create inference context with tokenizer
     inference_context_t* ctx = create_inference_context(args.temperature, args.max_tokens, args.context_len, args.model_name);

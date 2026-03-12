@@ -12,6 +12,7 @@
 #include "log.h"
 #include "rope.h"
 #include "tensor.h"
+#include "tokenizer.h"
 #include "utils.h"
 
 
@@ -73,6 +74,208 @@ layer_buffers_t init_layer_buffers(const struct inference_session_t* session,
         buf.weight_scratch = buf.q_proj;
     }
     return buf;
+}
+
+typedef enum {
+    CAPTURE_TARGET_UNKNOWN = 0,
+    CAPTURE_TARGET_QKV_INPUT,
+    CAPTURE_TARGET_OUT_INPUT,
+    CAPTURE_TARGET_FFN_INPUT,
+    CAPTURE_TARGET_DOWN_INPUT,
+} capture_target_t;
+
+static int parse_capture_target(const char* tensor_name,
+                                int* out_layer_idx,
+                                capture_target_t* out_target) {
+    const char* prefix = "model.layers.";
+    const char* cursor = NULL;
+    char* endptr = NULL;
+    long parsed_layer = 0;
+
+    if (!tensor_name || !out_layer_idx || !out_target) {
+        return -1;
+    }
+    if (strncmp(tensor_name, prefix, strlen(prefix)) != 0) {
+        return -1;
+    }
+
+    cursor = tensor_name + strlen(prefix);
+    parsed_layer = strtol(cursor, &endptr, 10);
+    if (endptr == cursor || parsed_layer < 0 || strncmp(endptr, ".", 1) != 0) {
+        return -1;
+    }
+
+    if (strstr(tensor_name, ".self_attn.q_proj.weight") ||
+        strstr(tensor_name, ".self_attn.k_proj.weight") ||
+        strstr(tensor_name, ".self_attn.v_proj.weight")) {
+        *out_target = CAPTURE_TARGET_QKV_INPUT;
+    } else if (strstr(tensor_name, ".self_attn.o_proj.weight")) {
+        *out_target = CAPTURE_TARGET_OUT_INPUT;
+    } else if (strstr(tensor_name, ".mlp.gate_proj.weight") ||
+               strstr(tensor_name, ".mlp.up_proj.weight")) {
+        *out_target = CAPTURE_TARGET_FFN_INPUT;
+    } else if (strstr(tensor_name, ".mlp.down_proj.weight")) {
+        *out_target = CAPTURE_TARGET_DOWN_INPUT;
+    } else {
+        *out_target = CAPTURE_TARGET_UNKNOWN;
+        return -1;
+    }
+
+    *out_layer_idx = (int)parsed_layer;
+    return 0;
+}
+
+static transformer_rope_t select_layer_rope(const struct inference_session_t* session,
+                                            int layer_idx) {
+    const sapphire_layer_config_t* layer_cfg = &session->layer_configs[layer_idx];
+    int is_global = layer_cfg->config.attention.is_global;
+    transformer_rope_t rope;
+
+    rope.cos = is_global ? session->rope_freqs_cos_global : session->rope_freqs_cos_local;
+    rope.sin = is_global ? session->rope_freqs_sin_global : session->rope_freqs_sin_local;
+    return rope;
+}
+
+static int capture_target_vector(float* dst, uint32_t out_dim, const float* src, int src_dim) {
+    if (!dst || !src || src_dim <= 0 || out_dim != (uint32_t)src_dim) {
+        return -1;
+    }
+    vec_copy(dst, src, src_dim);
+    return 0;
+}
+
+typedef struct {
+    int layer_idx;
+    int token_pos;
+    float* hidden;
+    transformer_rope_t rope;
+    capture_target_t target;
+    float* out_vector;
+    uint32_t out_dim;
+} capture_layer_input_request_t;
+
+static int capture_layer_tensor_input(struct inference_session_t* session,
+                                      const capture_layer_input_request_t* request) {
+    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
+    model_layer_weights_t* layer = &model->layers[request->layer_idx];
+    gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
+    int d_model = config->hidden_size;
+    int head_dim = config->head_dim > 0 ? config->head_dim : (d_model / config->num_attention_heads);
+    int d_inner = config->num_attention_heads * head_dim;
+    int d_ff = config->intermediate_size;
+    layer_buffers_t buf = init_layer_buffers(session, config, d_model, head_dim, 1);
+    transformer_layer_ctx_t ctx = {
+        .session = session,
+        .layer = layer,
+        .config = config,
+        .layer_idx = request->layer_idx,
+        .token_pos = request->token_pos,
+        .batch_size = 1,
+        .d_model = d_model,
+        .head_dim = head_dim
+    };
+
+    if (request->target == CAPTURE_TARGET_QKV_INPUT) {
+        const float* norm_attn_data = get_norm_weights(ctx.layer->norm_attn_weight, buf.weight_scratch, d_model);
+        vec_copy(buf.residual, request->hidden, d_model);
+        rmsnorm_delta(buf.norm_buf, request->hidden, norm_attn_data, 1e-6f, d_model);
+        return capture_target_vector(request->out_vector, request->out_dim, buf.norm_buf, d_model);
+    }
+
+    compute_attention_stage(buf, &ctx, request->hidden, request->rope.cos, request->rope.sin);
+    if (request->target == CAPTURE_TARGET_OUT_INPUT) {
+        return capture_target_vector(request->out_vector, request->out_dim, buf.attn_out, d_inner);
+    }
+
+    compute_ffn_stage(buf, &ctx, request->hidden);
+    if (request->target == CAPTURE_TARGET_FFN_INPUT) {
+        return capture_target_vector(request->out_vector, request->out_dim, buf.norm_buf, d_model);
+    }
+    if (request->target == CAPTURE_TARGET_DOWN_INPUT) {
+        return capture_target_vector(request->out_vector, request->out_dim, buf.ffn_gate_buf, d_ff);
+    }
+
+    return -1;
+}
+
+int sapphire_collect_tensor_activation(struct inference_session_t* session,
+                                       struct sapphire_tokenizer_t* tokenizer,
+                                       const transformer_activation_capture_request_t* request) {
+    const gemma3_270m_config_t* config = NULL;
+    capture_target_t target = CAPTURE_TARGET_UNKNOWN;
+    capture_layer_input_request_t capture_request;
+    int layer_idx = 0;
+    int* tokens = NULL;
+    float* hidden = NULL;
+    int token_count = 0;
+    const int max_tokens = 1024;
+    int rc = -1;
+
+    if (!session || !tokenizer || !request || !request->spec || !request->text ||
+        !request->tensor_name || !request->out_vector) {
+        return -1;
+    }
+    if (!session->backend || session->backend->type != SAPPHIRE_BACKEND_TYPE_CPU) {
+        LOG_WARN("Activation replay requires CPU backend; falling back for %s", request->tensor_name);
+        return -1;
+    }
+    if (parse_capture_target(request->tensor_name, &layer_idx, &target) != 0) {
+        return -1;
+    }
+
+    config = (gemma3_270m_config_t*)request->spec->variant_config;
+    if (!config || layer_idx < 0 || layer_idx >= config->num_hidden_layers) {
+        return -1;
+    }
+
+    tokens = (int*)malloc((size_t)max_tokens * sizeof(int));
+    hidden = (float*)malloc((size_t)config->hidden_size * sizeof(float));
+    if (!tokens || !hidden) {
+        LOG_ERROR("sapphire_collect_tensor_activation: allocation failed");
+        goto cleanup;
+    }
+
+    token_count = build_gemma3_prompt(request->spec, request->text, tokens, max_tokens);
+    if (token_count <= 0) {
+        token_count = tokenize(tokenizer, request->text, tokens, max_tokens);
+    }
+    if (token_count <= 0) {
+        LOG_WARN("sapphire_collect_tensor_activation: tokenization failed for tensor %s", request->tensor_name);
+        goto cleanup;
+    }
+
+    memset(&capture_request, 0, sizeof(capture_request));
+    capture_request.layer_idx = layer_idx;
+    capture_request.target = target;
+    capture_request.out_vector = request->out_vector;
+    capture_request.out_dim = request->out_dim;
+
+    inference_session_reset(session);
+    for (int pos = 0; pos < token_count; ++pos) {
+        sapphire_embed_lookup(session, tokens[pos], hidden);
+
+        for (int l = 0; l < layer_idx; ++l) {
+            transformer_rope_t rope = select_layer_rope(session, l);
+            sapphire_transformer_layer(session, l, pos, hidden, rope);
+        }
+
+        if (pos < token_count - 1) {
+            transformer_rope_t rope = select_layer_rope(session, layer_idx);
+            sapphire_transformer_layer(session, layer_idx, pos, hidden, rope);
+            continue;
+        }
+
+        capture_request.token_pos = pos;
+        capture_request.hidden = hidden;
+        capture_request.rope = select_layer_rope(session, layer_idx);
+        rc = capture_layer_tensor_input(session, &capture_request);
+        break;
+    }
+
+cleanup:
+    free(tokens);
+    free(hidden);
+    return rc;
 }
 
 typedef struct {

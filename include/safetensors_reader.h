@@ -41,6 +41,7 @@ typedef enum {
     SAFETENSORS_F16 = 2,     // float16
     SAFETENSORS_I32 = 3,     // int32
     SAFETENSORS_I64 = 4,     // int64
+    SAFETENSORS_U8 = 5,      // uint8
     SAFETENSORS_UNKNOWN = -1
 } safetensors_dtype_t;
 
@@ -157,6 +158,22 @@ tensor_t* safetensors_create_tensor_ref(safetensors_file_t *st,
  */
 tensor_t* safetensors_load_tensor_copy(const safetensors_file_t *st,
                                        const safetensors_tensor_meta_t *meta);
+
+/**
+ * @brief Return a raw pointer to tensor bytes inside the mmapped file.
+ *
+ * This is intended for low-level I/O modules that need direct byte access for
+ * custom packed formats without forcing a tensor_t wrapper.
+ *
+ * @param st Safetensors file handle.
+ * @param meta Tensor metadata.
+ *
+ * @return Pointer into the mmapped file on success, NULL on validation failure.
+ *
+ * @note The returned pointer becomes invalid after safetensors_close().
+ */
+const void* safetensors_data_ptr(const safetensors_file_t *st,
+                                 const safetensors_tensor_meta_t *meta);
 
 /**
  * @brief Close a Safetensors file and free all resources.
