@@ -18,6 +18,50 @@ typedef struct {
 } transformer_rope_t;
 
 /**
+ * @brief Target activation point within a transformer layer.
+ *
+ * Enumerated in order of computation: the pre-attention RMSNorm output is
+ * captured first, then the raw attention output, then the pre-FFN RMSNorm
+ * output, then the GeGLU intermediate.
+ */
+typedef enum {
+    CAPTURE_TARGET_UNKNOWN    = 0,
+    CAPTURE_TARGET_QKV_INPUT  = 1, /**< Pre-attn RMSNorm output (input to Q/K/V projections). */
+    CAPTURE_TARGET_OUT_INPUT  = 2, /**< Raw attention output before o_proj. */
+    CAPTURE_TARGET_FFN_INPUT  = 3, /**< Pre-FFN RMSNorm output (input to gate/up projections). */
+    CAPTURE_TARGET_DOWN_INPUT = 4  /**< GeGLU output (input to down projection). */
+} capture_target_t;
+
+/**
+ * @brief Single activation capture slot for sapphire_record_pass().
+ *
+ * One slot per (layer_idx, target) pair. The caller pre-allocates out_vector
+ * for each sample and resets captured=0 before each pass.
+ */
+typedef struct {
+    int              layer_idx;  /**< Layer to capture from (0-based). */
+    capture_target_t target;     /**< Which activation point to capture. */
+    float           *out_vector; /**< Caller-allocated output buffer. */
+    uint32_t         out_dim;    /**< Expected vector dimension. */
+    int              captured;   /**< Set to 1 by sapphire_record_pass() on success. */
+} activation_record_slot_t;
+
+/**
+ * @brief Single-pass activation recorder.
+ *
+ * Runs one complete forward pass over 'text' and fills every slot whose
+ * (layer_idx, target) is pending (captured == 0). Capture happens at
+ * the final token position, before the layer advances hidden state.
+ *
+ * Requires CPU backend. Returns 0 on success, -1 on error.
+ */
+int sapphire_record_pass(struct inference_session_t  *session,
+                         struct sapphire_tokenizer_t *tokenizer,
+                         const struct model_spec     *spec,
+                         const char                  *text,
+                         activation_record_slot_t    *slots,
+                         int                          slot_count);
+/**
  * @brief Forward pass for a single transformer layer.
  * 
  * Orchestrates:

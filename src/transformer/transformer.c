@@ -76,14 +76,6 @@ layer_buffers_t init_layer_buffers(const struct inference_session_t* session,
     return buf;
 }
 
-typedef enum {
-    CAPTURE_TARGET_UNKNOWN = 0,
-    CAPTURE_TARGET_QKV_INPUT,
-    CAPTURE_TARGET_OUT_INPUT,
-    CAPTURE_TARGET_FFN_INPUT,
-    CAPTURE_TARGET_DOWN_INPUT,
-} capture_target_t;
-
 static int parse_capture_target(const char* tensor_name,
                                 int* out_layer_idx,
                                 capture_target_t* out_target) {
@@ -661,4 +653,75 @@ void compute_ssm_stage(layer_buffers_t buf,
     LOG_WARN("compute_ssm_stage called for layer %d (not yet implemented)", ctx->layer_idx);
     /* TODO: Implement Mamba-style SSM forward pass */
     (void)buf;
+}
+
+int sapphire_record_pass(struct inference_session_t  *session,
+                         struct sapphire_tokenizer_t *tokenizer,
+                         const struct model_spec     *spec,
+                         const char                  *text,
+                         activation_record_slot_t    *slots,
+                         int                          slot_count)
+{
+    const gemma3_270m_config_t *config = NULL;
+    const model_spec_t         *mspec  = (const model_spec_t *)spec;
+    sapphire_tokenizer_t       *tok    = (sapphire_tokenizer_t *)tokenizer;
+    int    *tokens      = NULL;
+    float  *hidden      = NULL;
+    int     token_count = 0;
+    int     rc          = -1;
+    const int max_tokens = 1024;
+
+    if (!session || !tokenizer || !spec || !text || !slots || slot_count <= 0) return -1;
+    if (!session->backend || session->backend->type != SAPPHIRE_BACKEND_TYPE_CPU) {
+        LOG_WARN("sapphire_record_pass: CPU backend required");
+        return -1;
+    }
+    config = (const gemma3_270m_config_t *)mspec->variant_config;
+    if (!config || config->num_hidden_layers <= 0 || config->hidden_size <= 0) return -1;
+
+    tokens = (int *)malloc((size_t)max_tokens * sizeof(int));
+    hidden = (float *)malloc((size_t)config->hidden_size * sizeof(float));
+    if (!tokens || !hidden) {
+        LOG_ERROR("sapphire_record_pass: allocation failed");
+        goto cleanup;
+    }
+
+    token_count = build_gemma3_prompt(mspec, text, tokens, max_tokens);
+    if (token_count <= 0) token_count = tokenize(tok, text, tokens, max_tokens);
+    if (token_count <= 0) {
+        LOG_WARN("sapphire_record_pass: tokenization failed");
+        goto cleanup;
+    }
+
+    inference_session_reset(session);
+    for (int pos = 0; pos < token_count; ++pos) {
+        int is_final = (pos == token_count - 1);
+        sapphire_embed_lookup(session, tokens[pos], hidden);
+        for (int l = 0; l < config->num_hidden_layers; ++l) {
+            transformer_rope_t rope = select_layer_rope(session, l);
+            if (is_final) {
+                capture_layer_input_request_t req;
+                req.token_pos  = pos;
+                req.hidden     = hidden;
+                req.rope       = rope;
+                for (int si = 0; si < slot_count; ++si) {
+                    if (slots[si].layer_idx != l || slots[si].captured) continue;
+                    req.layer_idx  = l;
+                    req.target     = slots[si].target;
+                    req.out_vector = slots[si].out_vector;
+                    req.out_dim    = slots[si].out_dim;
+                    if (capture_layer_tensor_input(session, &req) == 0) {
+                        slots[si].captured = 1;
+                    }
+                }
+            }
+            sapphire_transformer_layer(session, l, pos, hidden, rope);
+        }
+    }
+    rc = 0;
+
+cleanup:
+    free(tokens);
+    free(hidden);
+    return rc;
 }
