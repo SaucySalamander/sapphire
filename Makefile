@@ -10,16 +10,23 @@ VK_INCLUDE_PATHS = $(shell for p in /usr/include /usr/local/include /opt/vulkan/
 VK_LIB_PATHS = $(shell for p in /usr/lib /usr/lib64 /usr/local/lib /opt/vulkan/lib; do [ -f $$p/libvulkan.so ] && { echo -L$$p; break; }; done)
 VMA_INCLUDE_PATHS = $(shell for p in $(INCDIR) $(INCDIR)/third_party/vma /usr/include /usr/local/include; do [ -f $$p/vk_mem_alloc.h ] && { echo -I$$p; break; }; done)
 
+# Optional libcurl detection for remote calibration/validation corpus ingestion
+CURL_PKG_CFLAGS = $(shell pkg-config --cflags libcurl 2>/dev/null)
+CURL_PKG_LIBS = $(shell pkg-config --libs libcurl 2>/dev/null)
+CURL_INCLUDE_PATHS = $(shell if [ -z "$(CURL_PKG_CFLAGS)$(CURL_PKG_LIBS)" ]; then for p in /usr/include /usr/local/include; do [ -f $$p/curl/curl.h ] && { echo -I$$p; break; }; done; fi)
+CURL_LIB_PATHS = $(shell if [ -z "$(CURL_PKG_CFLAGS)$(CURL_PKG_LIBS)" ]; then for p in /usr/lib /usr/lib64 /usr/local/lib; do [ -f $$p/libcurl.so ] && { echo -L$$p -lcurl; break; }; done; fi)
+CURL_DEFS = $(if $(strip $(CURL_PKG_LIBS)$(CURL_LIB_PATHS)),-DSAPPHIRE_HAVE_LIBCURL=1,)
+
 # Compilation flags
-CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS)
-LDFLAGS = -lm -pthread -lvulkan -lstdc++ $(VK_LIB_PATHS)
+CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS) $(CURL_PKG_CFLAGS) $(CURL_INCLUDE_PATHS) $(CURL_DEFS)
+LDFLAGS = -lm -pthread -lvulkan -lstdc++ $(VK_LIB_PATHS) $(CURL_PKG_LIBS) $(CURL_LIB_PATHS)
 
 # AddressSanitizer + UndefinedBehaviorSanitizer flags
 # Use -g for debug info (better error messages), -O1 for reasonable speed
 # Include paths (-I. -I$(INCDIR)) must be present for sanitizer builds
 # IMPORTANT: must include -mavx2 -mfma for AVX/FMA intrinsics in kernel code
-SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS)
-SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined -lvulkan -lstdc++ $(VK_LIB_PATHS)
+SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS) $(CURL_PKG_CFLAGS) $(CURL_INCLUDE_PATHS) $(CURL_DEFS)
+SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined -lvulkan -lstdc++ $(VK_LIB_PATHS) $(CURL_PKG_LIBS) $(CURL_LIB_PATHS)
 
 # HIP configuration (optional ROCm support)
 HIPCC = hipcc

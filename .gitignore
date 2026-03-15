@@ -94,6 +94,18 @@ Thumbs.db
 *.log
 .cache/
 
+# Generated ternary conversion corpora
+corpora/*
+!corpora/README.md
+!corpora/calibration/
+!corpora/calibration/.gitkeep
+!corpora/validation/
+!corpora/validation/.gitkeep
+corpora/calibration/*
+!corpora/calibration/.gitkeep
+corpora/validation/*
+!corpora/validation/.gitkeep
+
 # Archives
 *.tgz
 *.tar.gz

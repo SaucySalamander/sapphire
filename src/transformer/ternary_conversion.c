@@ -29,6 +29,22 @@ typedef struct {
     ternary_validation_state_t validation_state;
 } conversion_runtime_t;
 
+static int load_runtime_corpus(const char *manifest_path,
+                               const char *source_path,
+                               int sample_limit,
+                               calibration_corpus_t *storage) {
+    if (!storage) {
+        return -1;
+    }
+    if (manifest_path && manifest_path[0] != '\0') {
+        return calibration_corpus_load_manifest(manifest_path, sample_limit, storage);
+    }
+    if (source_path && source_path[0] != '\0') {
+        return calibration_corpus_load(source_path, sample_limit, storage);
+    }
+    return 0;
+}
+
 static transformer_ste_config_t default_runtime_ste_config(const ternary_conversion_config_t *config) {
     transformer_ste_config_t ste_config;
 
@@ -67,6 +83,7 @@ static void destroy_conversion_runtime(conversion_runtime_t *runtime) {
 static void init_conversion_validation(const ternary_conversion_config_t *config,
                                        conversion_runtime_t *runtime) {
     ternary_validation_config_t validation_config;
+    const char *validation_manifest = NULL;
     const char *validation_source = NULL;
     int validation_samples = 0;
 
@@ -78,20 +95,31 @@ static void init_conversion_validation(const ternary_conversion_config_t *config
     }
 
     validation_source = config->validation_corpus_path;
-    if (!validation_source || validation_source[0] == '\0') {
+    if (config->validation_corpus_manifest_path && config->validation_corpus_manifest_path[0] != '\0') {
+        validation_manifest = config->validation_corpus_manifest_path;
+    }
+    if ((!validation_manifest || validation_manifest[0] == '\0') &&
+        (!validation_source || validation_source[0] == '\0') &&
+        config->calibration_corpus_manifest_path && config->calibration_corpus_manifest_path[0] != '\0') {
+        validation_manifest = config->calibration_corpus_manifest_path;
+    }
+    if ((!validation_manifest || validation_manifest[0] == '\0') &&
+        (!validation_source || validation_source[0] == '\0')) {
         validation_source = config->calibration_corpus_path;
     }
     validation_samples = (config->validation_sample_limit > 0)
         ? config->validation_sample_limit
         : ((config->calibration_sample_limit > 0) ? config->calibration_sample_limit : 4);
 
-    if (!validation_source || validation_source[0] == '\0') {
+    if ((!validation_manifest || validation_manifest[0] == '\0') &&
+        (!validation_source || validation_source[0] == '\0')) {
         LOG_WARN("ternary validation: disabled because no validation corpus was provided");
         return;
     }
-    if (calibration_corpus_load(validation_source,
-                                validation_samples,
-                                &runtime->validation_corpus_storage) != 0) {
+    if (load_runtime_corpus(validation_manifest,
+                            validation_source,
+                            validation_samples,
+                            &runtime->validation_corpus_storage) != 0) {
         LOG_WARN("ternary validation: failed to load held-out corpus; disabling checkpoints");
         memset(&runtime->validation_corpus_storage, 0, sizeof(runtime->validation_corpus_storage));
         return;
@@ -143,10 +171,12 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
     }
 
     if (out_runtime->activation_ctx) {
-        if (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0') {
-            if (calibration_corpus_load(config->calibration_corpus_path,
-                                        config->calibration_sample_limit,
-                                        &out_runtime->corpus_storage) != 0) {
+        if ((config->calibration_corpus_manifest_path && config->calibration_corpus_manifest_path[0] != '\0') ||
+            (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0')) {
+            if (load_runtime_corpus(config->calibration_corpus_manifest_path,
+                                    config->calibration_corpus_path,
+                                    config->calibration_sample_limit,
+                                    &out_runtime->corpus_storage) != 0) {
                 destroy_conversion_runtime(out_runtime);
                 return -1;
             }
@@ -172,10 +202,12 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
     out_runtime->calibration_corpus.model_spec = spec;
     out_runtime->calibration_corpus.session = NULL;
 
-    if (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0') {
-        if (calibration_corpus_load(config->calibration_corpus_path,
-                                    config->calibration_sample_limit,
-                                    &out_runtime->corpus_storage) != 0) {
+    if ((config->calibration_corpus_manifest_path && config->calibration_corpus_manifest_path[0] != '\0') ||
+        (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0')) {
+        if (load_runtime_corpus(config->calibration_corpus_manifest_path,
+                                config->calibration_corpus_path,
+                                config->calibration_sample_limit,
+                                &out_runtime->corpus_storage) != 0) {
             destroy_conversion_runtime(out_runtime);
             return -1;
         }
@@ -463,8 +495,14 @@ int transformer_run_ternary_conversion(const ternary_conversion_config_t *config
     } else {
         LOG_INFO("  calibration_corpus: <built-in fallback>");
     }
+    if (config->calibration_corpus_manifest_path && config->calibration_corpus_manifest_path[0] != '\0') {
+        LOG_INFO("  calibration_manifest: %s", config->calibration_corpus_manifest_path);
+    }
     if (config->validation_corpus_path && config->validation_corpus_path[0] != '\0') {
         LOG_INFO("  validation_corpus: %s", config->validation_corpus_path);
+    }
+    if (config->validation_corpus_manifest_path && config->validation_corpus_manifest_path[0] != '\0') {
+        LOG_INFO("  validation_manifest: %s", config->validation_corpus_manifest_path);
     }
 
     model_dir = construct_safe_path("./models", config->model_name, NULL);

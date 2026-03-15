@@ -1,0 +1,4 @@
+source,weight,quota
+corpora/calibration/fineweb_edu.txt,2.0,500
+corpora/calibration/the_stack_c_cpp.txt,1.0,250
+corpora/calibration/proof_pile2_science.txt,1.0,250

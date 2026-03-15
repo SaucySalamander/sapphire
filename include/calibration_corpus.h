@@ -1,6 +1,6 @@
 /**
  * @file calibration_corpus.h
- * @brief Local calibration corpus loading helpers for ternary conversion.
+ * @brief Local and remote calibration corpus loading helpers for ternary conversion.
  */
 
 #ifndef CALIBRATION_CORPUS_H
@@ -19,6 +19,10 @@ typedef struct {
 int calibration_corpus_load(const char *path,
                             int max_samples,
                             calibration_corpus_t *out_corpus);
+
+int calibration_corpus_load_manifest(const char *path,
+                                     int max_samples,
+                                     calibration_corpus_t *out_corpus);
 
 void calibration_corpus_free(calibration_corpus_t *corpus);
 

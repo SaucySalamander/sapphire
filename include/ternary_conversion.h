@@ -15,7 +15,9 @@ typedef struct {
     const char *output_path;
     const char *layer_name;
     const char *calibration_corpus_path;
+    const char *calibration_corpus_manifest_path;
     const char *validation_corpus_path;
+    const char *validation_corpus_manifest_path;
     int context_len;
     int calibration_sample_limit;
     int validation_sample_limit;

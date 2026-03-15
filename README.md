@@ -9,6 +9,7 @@ primitives (RoPE, ALiBi, activations, normalization) together with benchmark
 tools.
 
 ## Highlights
+
 - Quantized GEMV kernels with Q4_0 and Q8_0 block formats in `src/kernels/`.
 - A compact tensor implementation with float and quantized types in `src/tensor/`.
 - Transformer primitives in `src/transformer/` (RoPE, ALiBi, activations,
@@ -20,6 +21,7 @@ tools.
 - Note: current kernels are CPU-only; GPU support is not available yet.
 
 ## Repository layout
+
 - `include/` - Public headers for tensors, transformer, KV cache, kernels, and
   model/loader interfaces.
 - `src/kernels/` - Quantized GEMV kernels and architecture-specific implementations.
@@ -36,6 +38,7 @@ tools.
 - `out/` - Build artifacts (created automatically).
 
 ## Building and running
+
 Prerequisites: `make` and a compiler with AVX2/FMA support (the Makefile uses
 `-mavx2 -mfma`). Optional HIP targets require `hipcc` and ROCm headers.
 
@@ -52,6 +55,7 @@ make clean
 All build artifacts are produced in `out/`.
 
 ## Usage notes
+
 - Public APIs are declared under `include/`; link against built objects in `out/`
   or build in-tree via the Makefile.
 - The repository serves as a test bed for the Gemma-3 family; components are
@@ -64,7 +68,7 @@ All build artifacts are produced in `out/`.
 
 Required files (typical):
 
-```
+```text
 models/<model-name>/
   model.safetensors    # or model.gguf / model.bin
   tokenizer.json
@@ -109,6 +113,73 @@ Interactive REPL commands:
 - `/help`            : Show command help
 
 If you want help for the runtime itself, run `./out/sapphire -h`.
+
+### Ternary conversion corpora
+
+The ternary conversion path accepts either a single text corpus source or a local
+manifest file via `--calib-manifest` and `--validation-manifest`.
+
+- The manifest file itself must be local.
+- Each manifest entry points at a plain-text source that Sapphire can read.
+- Hugging Face dataset pages are not directly usable as manifest entries unless
+  they resolve to raw text; most dataset repos expose Parquet/JSON shards instead.
+
+This repository includes a 27B-oriented “high-signal” corpus preset:
+
+- [configs/corpus/27b_high_signal_calib_manifest.csv](configs/corpus/27b_high_signal_calib_manifest.csv)
+- [configs/corpus/27b_high_signal_validation_manifest.csv](configs/corpus/27b_high_signal_validation_manifest.csv)
+- [configs/corpus/README.md](configs/corpus/README.md)
+- [scripts/prepare_ternary_corpus.py](scripts/prepare_ternary_corpus.py)
+
+Prepare the local text shards first:
+
+```bash
+./.venv/bin/python -m pip install -U -r scripts/requirements-ternary-corpus.txt
+./.venv/bin/python scripts/prepare_ternary_corpus.py
+```
+
+That command writes plain-text corpora under `./corpora/` matching the checked-in
+manifest files.
+
+Note: `bigcode/the-stack-v2` is gated on Hugging Face. Accept the dataset terms and
+authenticate the environment (for example with `huggingface-cli login` or `HF_TOKEN`)
+before running the corpus export helper.
+
+Also note: `HF_TOKEN` only unlocks The Stack v2 metadata on Hugging Face. The helper
+now tries public unsigned Software Heritage object access first and falls back to
+the public HTTPS content endpoint. Explicit AWS credentials are optional.
+
+To avoid rescanning The Stack metadata stream on every export, you can build a local
+metadata cache once and sample from that cache on subsequent runs:
+
+```bash
+./.venv/bin/python scripts/prepare_ternary_corpus.py --stack-cache-only
+./.venv/bin/python scripts/prepare_ternary_corpus.py
+```
+
+Example full-model conversion run:
+
+```bash
+./out/sapphire \
+  -m gemma-3-27b-it \
+  --convert-ternary \
+  --output ./out/gemma-3-27b-it-ternary \
+  --calib-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv \
+  --validation-manifest ./configs/corpus/27b_high_signal_validation_manifest.csv \
+  --calibration-samples 8 \
+  --validation-samples 64 \
+  --validate-every 32 \
+  --kl-weight 0.05
+```
+
+Recommended 27B mix rationale:
+
+- 50% FineWeb-Edu prose to preserve language coherence.
+- 25% C/C++/Python code to preserve systems reasoning.
+- 25% Proof-Pile-2 scientific/math text to preserve technical intuition.
+
+For validation, the preset uses GSM8K and HumanEval prompts so checkpoint KL/NLL
+stays anchored to math and coding behavior rather than the same replay corpus.
 
 ### Vulkan KV paging perf matrix
 

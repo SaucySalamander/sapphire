@@ -42,9 +42,11 @@ static void print_help(const char* program_name) {
     printf("  --convert-ternary         Run ternary conversion mode instead of inference\n");
     printf("  --output <path>           Output file (single-layer) or output directory (full-model)\n");
     printf("  --layer <name>            Optional single-layer conversion filter\n");
-    printf("  --calibration-corpus <p>  Optional text corpus file for tokenized STE calibration\n");
+    printf("  --calibration-corpus <p>  Optional text corpus file or URL for tokenized STE calibration\n");
+    printf("  --calib-manifest <p>      Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
     printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
-    printf("  --validation-corpus <p>   Optional held-out text corpus file for conversion checkpoints\n");
+    printf("  --validation-corpus <p>   Optional held-out text corpus file or URL for checkpoints\n");
+    printf("  --validation-manifest <p> Optional local held-out corpus manifest file\n");
     printf("  --validation-samples <n>  Held-out prompt count for checkpoint evaluation\n");
     printf("  --validate-every <n>      Run checkpoint validation every N converted tensors\n");
     printf("  --kl-weight <value>       Optional KL distillation weight (default: 0.05)\n");
@@ -81,8 +83,10 @@ typedef struct {
     const char* output_path;
     const char* layer_name;
     const char* calibration_corpus_path;
+    const char* calibration_corpus_manifest_path;
     int calibration_sample_limit;
     const char* validation_corpus_path;
+    const char* validation_corpus_manifest_path;
     int validation_sample_limit;
     int validate_every_n;
     float kl_weight;
@@ -101,8 +105,10 @@ static void cli_args_init(cli_args_t *args) {
     args->output_path = NULL;
     args->layer_name = NULL;
     args->calibration_corpus_path = NULL;
+    args->calibration_corpus_manifest_path = NULL;
     args->calibration_sample_limit = 4;
     args->validation_corpus_path = NULL;
+    args->validation_corpus_manifest_path = NULL;
     args->validation_sample_limit = 4;
     args->validate_every_n = 0;
     args->kl_weight = 0.05f;
@@ -133,6 +139,14 @@ static int validate_cli_args(const cli_args_t *args) {
         }
         if (args->calibration_sample_limit <= 0) {
             LOG_ERROR("ERROR: --calibration-samples must be > 0.");
+            return -1;
+        }
+        if (args->calibration_corpus_path && args->calibration_corpus_manifest_path) {
+            LOG_ERROR("ERROR: use either --calibration-corpus or --calib-manifest, not both.");
+            return -1;
+        }
+        if (args->validation_corpus_path && args->validation_corpus_manifest_path) {
+            LOG_ERROR("ERROR: use either --validation-corpus or --validation-manifest, not both.");
             return -1;
         }
         if (args->kl_weight < 0.0f) {
@@ -168,7 +182,9 @@ static int run_ternary_conversion_mode(const cli_args_t *args) {
     config.output_path = args->output_path;
     config.layer_name = args->layer_name;
     config.calibration_corpus_path = args->calibration_corpus_path;
+    config.calibration_corpus_manifest_path = args->calibration_corpus_manifest_path;
     config.validation_corpus_path = args->validation_corpus_path;
+    config.validation_corpus_manifest_path = args->validation_corpus_manifest_path;
     config.context_len = args->context_len;
     config.calibration_sample_limit = args->calibration_sample_limit;
     config.validation_sample_limit = args->validation_sample_limit;
@@ -308,8 +324,10 @@ static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
         CLI_OPT_OUTPUT,
         CLI_OPT_LAYER,
         CLI_OPT_CALIBRATION_CORPUS,
+        CLI_OPT_CALIBRATION_MANIFEST,
         CLI_OPT_CALIBRATION_SAMPLES,
         CLI_OPT_VALIDATION_CORPUS,
+        CLI_OPT_VALIDATION_MANIFEST,
         CLI_OPT_VALIDATION_SAMPLES,
         CLI_OPT_VALIDATE_EVERY,
         CLI_OPT_KL_WEIGHT,
@@ -332,8 +350,10 @@ static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
         else if (strcmp(argv[i], "--output") == 0) option = CLI_OPT_OUTPUT;
         else if (strcmp(argv[i], "--layer") == 0) option = CLI_OPT_LAYER;
         else if (strcmp(argv[i], "--calibration-corpus") == 0) option = CLI_OPT_CALIBRATION_CORPUS;
+        else if (strcmp(argv[i], "--calib-manifest") == 0) option = CLI_OPT_CALIBRATION_MANIFEST;
         else if (strcmp(argv[i], "--calibration-samples") == 0) option = CLI_OPT_CALIBRATION_SAMPLES;
         else if (strcmp(argv[i], "--validation-corpus") == 0) option = CLI_OPT_VALIDATION_CORPUS;
+        else if (strcmp(argv[i], "--validation-manifest") == 0) option = CLI_OPT_VALIDATION_MANIFEST;
         else if (strcmp(argv[i], "--validation-samples") == 0) option = CLI_OPT_VALIDATION_SAMPLES;
         else if (strcmp(argv[i], "--validate-every") == 0) option = CLI_OPT_VALIDATE_EVERY;
         else if (strcmp(argv[i], "--kl-weight") == 0) option = CLI_OPT_KL_WEIGHT;
@@ -358,8 +378,10 @@ static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
             case CLI_OPT_OUTPUT: args->output_path = value; break;
             case CLI_OPT_LAYER: args->layer_name = value; break;
             case CLI_OPT_CALIBRATION_CORPUS: args->calibration_corpus_path = value; break;
+            case CLI_OPT_CALIBRATION_MANIFEST: args->calibration_corpus_manifest_path = value; break;
             case CLI_OPT_CALIBRATION_SAMPLES: args->calibration_sample_limit = atoi(value); break;
             case CLI_OPT_VALIDATION_CORPUS: args->validation_corpus_path = value; break;
+            case CLI_OPT_VALIDATION_MANIFEST: args->validation_corpus_manifest_path = value; break;
             case CLI_OPT_VALIDATION_SAMPLES: args->validation_sample_limit = atoi(value); break;
             case CLI_OPT_VALIDATE_EVERY: args->validate_every_n = atoi(value); break;
             case CLI_OPT_KL_WEIGHT: args->kl_weight = (float)atof(value); break;
