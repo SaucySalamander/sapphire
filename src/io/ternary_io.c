@@ -12,6 +12,7 @@
 
 #include "file_reader.h"
 #include "log.h"
+#include "simple_json.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -573,5 +574,143 @@ int io_write_layer_ternary_into_dir(const char *output_dir,
     }
 
     free(output_path);
+    return rc;
+}
+
+/* -------------------------------------------------------------------------
+ * Sharded safetensors helpers for multi-file models (e.g. Gemma 3 27B).
+ * model.safetensors.index.json format:
+ *   { "metadata": {...}, "weight_map": { "<tensor>": "<shard>.safetensors", ... } }
+ * -------------------------------------------------------------------------*/
+
+#define SHARD_INDEX_FILENAME "model.safetensors.index.json"
+#define SHARD_FILENAME_MAX   128u
+#define SHARD_KEY_MAX        320
+
+/**
+ * Walk model.safetensors.index.json (already loaded into `json`) and copy the
+ * shard filename for `tensor_name` into out_shard.  Returns 0 on success.
+ */
+static int resolve_shard_filename(const char *json,
+                                  size_t json_len,
+                                  const char *tensor_name,
+                                  char *out_shard,
+                                  size_t out_shard_size)
+{
+    sjson_cursor_t c = sjson_cursor_init(json, json_len);
+    char key[SHARD_KEY_MAX];
+    char wkey[SHARD_KEY_MAX];
+
+    if (!sjson_cursor_consume(&c, '{')) {
+        LOG_ERROR("shard resolver: expected '{' at start of index.json");
+        return -1;
+    }
+
+    while (sjson_cursor_peek(&c) != '}' && sjson_cursor_peek(&c) != '\0') {
+        if (sjson_cursor_parse_string(&c, key, (int)sizeof(key)) != 0) {
+            LOG_ERROR("shard resolver: failed to parse top-level key");
+            return -1;
+        }
+        if (!sjson_cursor_consume(&c, ':')) {
+            LOG_ERROR("shard resolver: expected ':' after key %s", key);
+            return -1;
+        }
+
+        if (strcmp(key, "weight_map") == 0) {
+            if (!sjson_cursor_consume(&c, '{')) {
+                LOG_ERROR("shard resolver: expected '{' opening weight_map");
+                return -1;
+            }
+            while (sjson_cursor_peek(&c) != '}' && sjson_cursor_peek(&c) != '\0') {
+                if (sjson_cursor_parse_string(&c, wkey, (int)sizeof(wkey)) != 0) {
+                    LOG_ERROR("shard resolver: failed to parse weight_map key");
+                    return -1;
+                }
+                if (!sjson_cursor_consume(&c, ':')) {
+                    LOG_ERROR("shard resolver: expected ':' in weight_map entry");
+                    return -1;
+                }
+                if (strcmp(wkey, tensor_name) == 0) {
+                    return sjson_cursor_parse_string(&c, out_shard, (int)out_shard_size);
+                }
+                if (sjson_cursor_skip_value(&c) != 0) {
+                    LOG_ERROR("shard resolver: skip_value failed in weight_map");
+                    return -1;
+                }
+                sjson_cursor_consume(&c, ',');
+            }
+            LOG_ERROR("shard resolver: tensor '%s' not found in weight_map", tensor_name);
+            return -1;
+        }
+
+        if (sjson_cursor_skip_value(&c) != 0) {
+            LOG_ERROR("shard resolver: skip_value failed for key %s", key);
+            return -1;
+        }
+        sjson_cursor_consume(&c, ',');
+    }
+
+    LOG_ERROR("shard resolver: weight_map not found in index.json");
+    return -1;
+}
+
+char *io_resolve_shard_path(const char *model_dir, const char *tensor_name)
+{
+    char *index_path = NULL;
+    char *json = NULL;
+    size_t json_len = 0;
+    char shard_filename[SHARD_FILENAME_MAX];
+    char *result = NULL;
+
+    if (!model_dir || !tensor_name) {
+        LOG_ERROR("io_resolve_shard_path: invalid arguments");
+        return NULL;
+    }
+
+    index_path = construct_safe_path(model_dir, SHARD_INDEX_FILENAME, NULL);
+    if (!index_path) {
+        return NULL;
+    }
+
+    if (file_read_json(index_path, &json, &json_len) != 0) {
+        free(index_path);
+        return NULL;
+    }
+    free(index_path);
+
+    shard_filename[0] = '\0';
+    if (resolve_shard_filename(json, json_len, tensor_name,
+                               shard_filename, sizeof(shard_filename)) != 0) {
+        free(json);
+        return NULL;
+    }
+    free(json);
+
+    result = construct_safe_path(model_dir, shard_filename, NULL);
+    if (!result) {
+        LOG_ERROR("io_resolve_shard_path: failed to construct path for shard '%s'", shard_filename);
+    }
+    return result;
+}
+
+int io_mmap_layer_bf16_sharded(const char *model_dir,
+                                const char *tensor_name,
+                                ternary_bf16_layer_map_t *out_map)
+{
+    char *shard_path = NULL;
+    int rc = -1;
+
+    if (!model_dir || !out_map || ternary_validate_tensor_name(tensor_name) != 0) {
+        LOG_ERROR("io_mmap_layer_bf16_sharded: invalid arguments");
+        return -1;
+    }
+
+    shard_path = io_resolve_shard_path(model_dir, tensor_name);
+    if (!shard_path) {
+        return -1;
+    }
+
+    rc = io_mmap_layer_bf16(shard_path, tensor_name, out_map);
+    free(shard_path);
     return rc;
 }

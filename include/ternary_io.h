@@ -76,6 +76,33 @@ int io_mmap_layer_bf16(const char *safetensors_path,
 void io_unmap_layer_bf16(ternary_bf16_layer_map_t *map);
 
 /**
+ * @brief Resolve the shard safetensors path for a named tensor in a sharded model.
+ *
+ * Reads model.safetensors.index.json from model_dir and walks weight_map to find
+ * which shard file contains tensor_name.
+ *
+ * @param model_dir  Directory containing the sharded safetensors files and index.
+ * @param tensor_name Fully-qualified tensor name (e.g. "language_model.model.layers.0.self_attn.q_proj.weight").
+ * @return malloc'd path string (caller must free()), or NULL on error.
+ */
+char *io_resolve_shard_path(const char *model_dir, const char *tensor_name);
+
+/**
+ * @brief mmap a BF16 layer tensor from a sharded safetensors model.
+ *
+ * Automatically locates the correct shard via model.safetensors.index.json,
+ * then delegates to io_mmap_layer_bf16().
+ *
+ * @param model_dir  Directory containing shard files and model.safetensors.index.json.
+ * @param tensor_name Fully-qualified tensor name.
+ * @param out_map    Receives the mapped layer view.
+ * @return 0 on success, -1 on error.
+ */
+int io_mmap_layer_bf16_sharded(const char *model_dir,
+                                const char *tensor_name,
+                                ternary_bf16_layer_map_t *out_map);
+
+/**
  * @brief Incremental CRC32 helper for non-ECC staging validation.
  *
  * Pass `0` as the initial CRC for a fresh computation.

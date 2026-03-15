@@ -87,7 +87,11 @@ typedef enum {
 static int parse_capture_target(const char* tensor_name,
                                 int* out_layer_idx,
                                 capture_target_t* out_target) {
-    const char* prefix = "model.layers.";
+    static const char *CAPTURE_PREFIXES[] = {
+        "model.layers.",
+        "language_model.model.layers.",
+        NULL
+    };
     const char* cursor = NULL;
     char* endptr = NULL;
     long parsed_layer = 0;
@@ -95,11 +99,18 @@ static int parse_capture_target(const char* tensor_name,
     if (!tensor_name || !out_layer_idx || !out_target) {
         return -1;
     }
-    if (strncmp(tensor_name, prefix, strlen(prefix)) != 0) {
+
+    for (int pi = 0; CAPTURE_PREFIXES[pi] != NULL; ++pi) {
+        size_t plen = strlen(CAPTURE_PREFIXES[pi]);
+        if (strncmp(tensor_name, CAPTURE_PREFIXES[pi], plen) == 0) {
+            cursor = tensor_name + plen;
+            break;
+        }
+    }
+    if (!cursor) {
         return -1;
     }
 
-    cursor = tensor_name + strlen(prefix);
     parsed_layer = strtol(cursor, &endptr, 10);
     if (endptr == cursor || parsed_layer < 0 || strncmp(endptr, ".", 1) != 0) {
         return -1;
