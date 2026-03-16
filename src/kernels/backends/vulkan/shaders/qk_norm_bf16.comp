@@ -98,7 +98,7 @@ void main() {
         barrier();
     }
 
-    float rms = sqrt(shared_sum[0] / float(head_dim_val) + 1e-5);  /* Gemma3: rms_norm_eps=1e-5 */
+    float rms = sqrt(shared_sum[0] / float(head_dim_val) + uintBitsToFloat(pc.reserved[1]));  /* rms_norm_eps from push constants */
 
     // Phase 2: normalize and write BF16 pairs (scale weights are per-head, not per-token)
     uint scale_base = head_idx * head_dim_val;
@@ -118,13 +118,13 @@ void main() {
 
         float val0 = bf16_unpack(data_word & 0xFFFFu);
         float scale0 = bf16_unpack(scale_word & 0xFFFFu);
-        float result0 = (val0 / rms) * scale0;
+        float result0 = (val0 / rms) * (1.0 + scale0);  /* rmsnorm_delta */
 
         float result1 = 0.0;
         if (d + 1u < head_dim_val) {
             float val1 = bf16_unpack(data_word >> 16);
             float scale1 = bf16_unpack(scale_word >> 16);
-            result1 = (val1 / rms) * scale1;
+            result1 = (val1 / rms) * (1.0 + scale1);  /* rmsnorm_delta */
         }
 
         uint out_word = (bf16_pack(result1) << 16) | (bf16_pack(result0) & 0xFFFFu);

@@ -9,6 +9,7 @@
 #include "model_spec.h"
 #include "gemma3_270m_spec.h"
 #include "gemma3_27b_spec.h"
+#include "gemma3_4b_spec.h"
 #include "log.h"
 
 /**
@@ -32,6 +33,8 @@ model_spec_t* get_model_spec(const char *model_name) {
         return &GEMMA3_270M_SPEC;
     } else if (strcmp(model_name, "gemma-3-27b-it") == 0) {
         return &GEMMA3_27B_IT_SPEC;
+    } else if (strcmp(model_name, "gemma-3-4b-it") == 0) {
+        return &GEMMA3_4B_IT_SPEC;
     }
 
     LOG_ERROR("Unknown model: %s", model_name);

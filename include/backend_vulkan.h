@@ -100,8 +100,9 @@ typedef struct inference_session_t inference_session_t;
 #define SDT_SLOT_FFN_RESIDUAL    16
 #define SDT_KERNELS_PER_LAYER    17
 
-/* Maximum layers supported by the static table. */
-#define SDT_MAX_LAYERS           18
+/* Maximum layers supported by the static table.
+ * Must match or exceed SAPPHIRE_MAX_LAYERS (llm_model.h). */
+#define SDT_MAX_LAYERS           256
 
 /**
  * Per-kernel descriptor set entry: the pipeline that owns the set and

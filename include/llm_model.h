@@ -61,7 +61,10 @@ typedef struct {
     tensor_t *norm_final_weight;             /**< Final layer norm: [d_model]. */
     tensor_t *lm_head_weight;                /**< Logit projection: [vocab_size, d_model]. */
     model_layer_weights_t *layers;           /**< Array of [num_layers]. */
-    void *safetensors_handle;                /**< Opaque handle to safetensors_file_t for cleanup. */
+    int    num_layers;                       /**< Actual number of entries in layers[]. */
+    void  *safetensors_handle;               /**< Single-shard handle (NULL when using shard array). */
+    void **safetensors_shard_handles;        /**< Array of per-shard handles (multi-part safetensors). */
+    int    safetensors_shard_count;          /**< Number of entries in safetensors_shard_handles. */
 } llm_model_t;
 
 /**

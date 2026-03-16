@@ -302,19 +302,15 @@ static int gemma3_populate_from_files(const char* model_dir, model_spec_t* spec)
     }
 
     llm_model_t* model = (llm_model_t*)spec->llm_model;
-    /* Copy loaded model data into the provided model structure */
-    model->embedding_weight = loaded_model->embedding_weight;
-    model->norm_final_weight = loaded_model->norm_final_weight;
-    model->lm_head_weight = loaded_model->lm_head_weight;
-    model->layers = loaded_model->layers;
-    model->safetensors_handle = loaded_model->safetensors_handle;
-
-    /* Compute derived fields on the Gemma runtime config */
-    const gemma3_270m_config_t* cfg = (const gemma3_270m_config_t*)spec->variant_config;
+    /* Copy ALL fields from loaded shell into the spec-owned model struct,
+     * including num_layers, safetensors_shard_handles, safetensors_shard_count.
+     * Partial copies caused double-free and shard handle leaks. */
+    memcpy(model, loaded_model, sizeof(*loaded_model));
 
     /* Free the shell structure (loaded_model) but keep its contents */
     free(loaded_model);
 
+    const gemma3_270m_config_t* cfg = (const gemma3_270m_config_t*)spec->variant_config;
     if (!cfg) return 0;
 
     sapphire_tokenizer_t *tokenizer = tokenizer_load(model_dir);

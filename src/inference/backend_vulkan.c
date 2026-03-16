@@ -520,6 +520,9 @@ static vk_kernel_push_constants_t build_push_constants(
     pc.num_heads   = (uint32_t)cfg->num_attention_heads;
     pc.head_dim    = (uint32_t)cfg->head_dim;
     pc.d_ff        = (uint32_t)cfg->intermediate_size;
+    /* Route rms_norm_eps through reserved[1] so shaders read it from push
+     * constants rather than using a hard-coded literal (model-agnostic). */
+    memcpy(&pc.reserved[1], &cfg->rms_norm_eps, sizeof(float));
     return pc;
 }
 
@@ -827,10 +830,19 @@ static void pack_weight_layer_data(float *layer_dst, const tensor_t *t,
     }
     size_t payload_bytes;
     if (comp == VK_WGT_QK_NORM_Q && num_src == (size_t)cfg->head_dim) {
+        /* Single-head q_norm weight [head_dim] → tile across num_attention_heads */
         for (int h = 0; h < cfg->num_attention_heads; h++)
             memcpy(layer_dst + h * cfg->head_dim, src_f32,
                    (size_t)cfg->head_dim * sizeof(float));
         payload_bytes = (size_t)cfg->num_attention_heads * cfg->head_dim * sizeof(float);
+    } else if (comp == VK_WGT_QK_NORM_K && num_src == (size_t)cfg->head_dim) {
+        /* Single-head k_norm weight [head_dim] → tile across num_key_value_heads.
+         * Mirrors the CPU path in load_key_vector (attention.c). Without this,
+         * KV heads 1..N-1 read zero scale → zero K vectors → corrupted attention. */
+        for (int h = 0; h < cfg->num_key_value_heads; h++)
+            memcpy(layer_dst + h * cfg->head_dim, src_f32,
+                   (size_t)cfg->head_dim * sizeof(float));
+        payload_bytes = (size_t)cfg->num_key_value_heads * cfg->head_dim * sizeof(float);
     } else {
         if (src_f32 != layer_dst) memcpy(layer_dst, src_f32, num_src * sizeof(float));
         payload_bytes = num_src * sizeof(float);
@@ -912,6 +924,9 @@ static int upload_one_weight_type(backend_vulkan_session_data_t *bd,
             : tensor_nbytes(t) / sizeof(uint16_t);
         if (comp == VK_WGT_QK_NORM_Q && ne == (size_t)cfg->head_dim)
             ne = (size_t)cfg->num_attention_heads * cfg->head_dim;
+        /* k_norm is also stored per-head [head_dim]; expand to all KV heads */
+        if (comp == VK_WGT_QK_NORM_K && ne == (size_t)cfg->head_dim)
+            ne = (size_t)cfg->num_key_value_heads * cfg->head_dim;
         layer_stride = ALIGN_UP(ne * sizeof(float), offset_alignment);
         break;
     }
@@ -1625,7 +1640,7 @@ static void setup_qkv_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
 
 /* Setup SDT slots: ROPE, ATTENTION, O_PROJ, POST_ATTN_NORM, ATTN_RESIDUAL */
 static void setup_attn_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
-    vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
+    const gemma3_270m_config_t *cfg, vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
 {
     const int PI_GEMV  = PIPELINE_GEMV_F32;
     const int PI_ROPE  = PIPELINE_ROPE_F32;
@@ -1637,7 +1652,9 @@ static void setup_attn_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd
     VkBuffer   wgt_attn_post   = layer_weight_buffer(bd, VK_WGT_ATTN_NORM_POST)->buffer;
     VkDeviceSize off_attn_post = layer_weight_offset(bd, VK_WGT_ATTN_NORM_POST, L);
     VkBuffer input_buf = sp->layer_hidden[L % 2].buffer;
-    bool is_global_rope = ((L + 1) % 6 == 0);
+    /* Use layer_types_mask bit to select the correct RoPE cache (global=1M theta, local=10k theta).
+     * This is authoritative and model-agnostic — supports any global/local attention pattern. */
+    bool is_global_rope = (bool)((cfg->layer_types_mask >> (unsigned)L) & 1ULL);
     VkBuffer cos_buf = is_global_rope ? bd->rope_cos_cache.buffer : bd->rope_cos_cache_local.buffer;
     VkBuffer sin_buf = is_global_rope ? bd->rope_sin_cache.buffer : bd->rope_sin_cache_local.buffer;
     S[SDT_SLOT_ROPE].pipeline_idx = PI_ROPE;
@@ -1740,9 +1757,8 @@ static void populate_layer_descriptor_slots(
     sdt_entry_t *S)
 {
     VkDevice dev = bd->device;
-    (void)cfg;
     setup_qkv_sdt_slots    (dev, bd, sp, L, S);
-    setup_attn_sdt_slots   (dev, bd, sp, L, S);
+    setup_attn_sdt_slots   (dev, bd, cfg, sp, L, S);
     setup_ffn_in_sdt_slots (dev, bd, sp, L, S);
     setup_ffn_out_sdt_slots(dev, bd, sp, L, S);
 }
@@ -1770,7 +1786,7 @@ static int vulkan_prepopulate_descriptors(backend_vulkan_session_data_t *bd,
     }
 
     /* -- LM-Head: Final RMSNorm + Vocabulary Projection ------------------- */
-    /* After 18 layers, final output is in hidden[(18)%2] = hidden[0] */
+    /* Final output is in hidden[num_layers % 2] (ping-pong result) */
     VkBuffer final_hidden = sp->layer_hidden[num_layers % 2].buffer;
 
     bd->sdt.lmhead_norm.pipeline_idx = PI_NORM;
@@ -2028,7 +2044,10 @@ static void record_rope_attn_phase(
 
     pc->num_heads = num_q; pc->stride_0 = num_kv;
     pc->stride_1  = (uint32_t)cfg->sliding_window;
-    pc->reserved[0] = (uint32_t)(cfg->layer_types_mask & 0xFFFFFFFF);
+    /* Pass the single precomputed bit for this layer (0=local, 1=global).
+     * Avoids the SPIR-V UB of shifting a 32-bit uint by >= 32 for layer_idx >= 32
+     * (affects 4B layers 32-33 and any model with > 31 layers). */
+    pc->reserved[0] = (uint32_t)((cfg->layer_types_mask >> (unsigned)layer_idx) & 1ULL);
     sdt_bind(cmd_buf, &S[SDT_SLOT_ATTENTION], bd);
     vk_pipeline_dispatch(cmd_buf, &bd->pipelines[S[SDT_SLOT_ATTENTION].pipeline_idx],
                          pc, num_q, (uint32_t)batch_size, 1);
@@ -2208,6 +2227,7 @@ static void record_lmhead_block(
     pc.batch_size = 1;
     pc.d_model    = (uint32_t)cfg->hidden_size;
     pc.stride_0   = (uint32_t)cfg->hidden_size;
+    memcpy(&pc.reserved[1], &cfg->rms_norm_eps, sizeof(float));
 
     sdt_bind(bd->cmd_buffer, &bd->sdt.lmhead_norm, bd);
     vk_pipeline_dispatch(bd->cmd_buffer,
@@ -2406,8 +2426,8 @@ static int vulkan_record_forward_pass(
     /* ----------------------------------------------------------------
      * LM-Head: Final RMSNorm + Vocabulary Projection
      *
-     * After 18 layers the final hidden state lives in:
-     *   hidden[num_layers % 2]  (= hidden[0] for 18 layers)
+     * After num_layers the final hidden state lives in:
+     *   hidden[num_layers % 2]  (ping-pong result)
      * This buffer handle was baked into sdt.lmhead_norm at init time.
      * ---------------------------------------------------------------- */
     if (emit_lmhead) {

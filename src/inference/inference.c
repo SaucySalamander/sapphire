@@ -137,8 +137,25 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
     ctx->temperature = temperature;
 
     // Allocate logits buffer
+    // NOTE: embedding_weight shape[0] may exceed config->vocab_size (e.g. alignment
+    // padding row in sharded safetensors).  We must allocate enough for all rows that
+    // the lm_head gemv will write, otherwise the kernel pool overflows into adjacent
+    // heap memory (heap-buffer-overflow, manifests as "double free or corruption").
     const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)spec->variant_config;
-    ctx->logits = (float*)malloc(config->vocab_size * sizeof(float));
+    int logits_rows = config->vocab_size;
+    {
+        const llm_model_t *lm = (const llm_model_t *)spec->llm_model;
+        if (lm && lm->embedding_weight && tensor_ndim(lm->embedding_weight) == 2) {
+            const int *emb_shape = tensor_shape(lm->embedding_weight);
+            if (emb_shape && emb_shape[0] > logits_rows) {
+                LOG_DEBUG("logits alloc: emb rows %d > vocab_size %d, "
+                          "using emb rows to prevent OOB write",
+                          emb_shape[0], logits_rows);
+                logits_rows = emb_shape[0];
+            }
+        }
+    }
+    ctx->logits = (float*)malloc((size_t)logits_rows * sizeof(float));
     if (!ctx->logits) {
         LOG_ERROR("Failed to allocate logits buffer");
         free(ctx);
