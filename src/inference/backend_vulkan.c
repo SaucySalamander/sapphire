@@ -866,7 +866,7 @@ static void pack_weight_layer_data(float *layer_dst, const tensor_t *t,
  * Reuses bd->embedding_staging, bd->transfer_cmd, bd->transfer_fence.
  */
 static int chunk_upload_to_device(backend_vulkan_session_data_t *bd,
-                                  const float *packed_data,
+                                  const void *packed_data,
                                   size_t total_size, vk_buffer_t *dst_buf) {
     const size_t STAGINGSZ = bd->embedding_staging.size;
     size_t remaining = total_size, uploaded = 0;
@@ -887,7 +887,7 @@ static int chunk_upload_to_device(backend_vulkan_session_data_t *bd,
                           0, chunk, &mapped) != 0) {
             LOG_ERROR("Failed to map staging buffer for chunk upload"); return -1;
         }
-        memcpy(mapped, (const void *)(packed_data + uploaded / sizeof(float)), chunk);
+        memcpy(mapped, (const uint8_t *)packed_data + uploaded, chunk);
         vk_buffer_unmap(bd->device, &bd->embedding_staging);
         vkResetCommandBuffer(bd->transfer_cmd, 0);
         vkBeginCommandBuffer(bd->transfer_cmd, &beg);
@@ -955,34 +955,107 @@ static int upload_one_weight_type(backend_vulkan_session_data_t *bd,
     return 0;
 }
 
-/* Upload all 13 per-layer weight types to the GPU. */
+/*
+ * Upload one projection weight type as raw BF16 (uint16 packed pairs).
+ * Skips the BF16→F32 conversion done by upload_one_weight_type, halving
+ * VRAM usage for projection matrices (critical for 4B+ models on 8 GB GPUs).
+ * Returns -1 if the source tensor is not BF16; caller falls back to F32 path.
+ */
+static int upload_one_weight_type_bf16(backend_vulkan_session_data_t *bd,
+                                       const llm_model_t *model,
+                                       const gemma3_270m_config_t *cfg,
+                                       int comp, const char *name,
+                                       size_t offset_alignment) {
+    int nl = cfg->num_hidden_layers;
+    const tensor_t *first = NULL;
+    size_t layer_ne = 0;
+    for (int l = 0; l < nl; l++) {
+        const tensor_t *t = get_layer_weight_tensor(&model->layers[l], comp);
+        if (!t || tensor_dtype(t) != DTYPE_BF16) return -1;
+        if (!first) { first = t; layer_ne = tensor_nbytes(t) / sizeof(uint16_t); }
+    }
+    if (!first || layer_ne == 0) return -1;
+
+    size_t layer_stride = ALIGN_UP(layer_ne * sizeof(uint16_t), offset_alignment);
+    size_t total        = layer_stride * (size_t)nl;
+
+    if (vk_buffer_create(bd->device, bd->phys_dev, total,
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                         &bd->weight_buffers[comp]) != 0) {
+        LOG_ERROR("Failed to create BF16 device buffer for %s (%zu B)", name, total);
+        return -1;
+    }
+
+    uint8_t *packed = (uint8_t *)malloc(total);
+    if (!packed) { LOG_ERROR("OOM for BF16 pack buffer %s", name); return -1; }
+    memset(packed, 0, total);
+    for (int l = 0; l < nl; l++) {
+        const tensor_t *t = get_layer_weight_tensor(&model->layers[l], comp);
+        if (!t) continue;
+        memcpy(packed + (size_t)l * layer_stride,
+               tensor_data(t),
+               tensor_nbytes(t) / sizeof(uint16_t) * sizeof(uint16_t));
+    }
+
+    int rc = chunk_upload_to_device(bd, packed, total,
+                                    &bd->weight_buffers[comp]);
+    free(packed);
+    if (rc != 0) { LOG_ERROR("Failed to upload BF16 %s", name); return -1; }
+    bd->weight_layer_strides[comp] = layer_stride;
+    LOG_DEBUG("Uploaded BF16 %s: %d layers × %zu B = %zu total", name, nl, layer_stride, total);
+    return 0;
+}
+
+/* Upload all 13 per-layer weight types to the GPU.
+ * Projection weights (Q/K/V/O/Gate/Up/Down) are uploaded as raw BF16 when
+ * the source tensors are BF16, halving their VRAM footprint and keeping them
+ * resident on GPU instead of spilling over PCIe on 8 GB cards.
+ * Norm weights are always F32 (tiny; used by F32-only norm pipelines). */
 static int upload_vk_layer_weights(backend_vulkan_session_data_t *bd,
                                    const llm_model_t *model,
                                    const gemma3_270m_config_t *cfg,
                                    size_t offset_alignment) {
-    static const struct { int comp; const char *name; } wt[] = {
+    static const struct { int comp; const char *name; } norm_wt[] = {
         {VK_WGT_ATTN_NORM,      "attn_norm"},
-        {VK_WGT_Q_PROJ,         "q_proj"},
-        {VK_WGT_K_PROJ,         "k_proj"},
-        {VK_WGT_V_PROJ,         "v_proj"},
         {VK_WGT_QK_NORM_Q,      "q_norm"},
         {VK_WGT_QK_NORM_K,      "k_norm"},
-        {VK_WGT_O_PROJ,         "o_proj"},
         {VK_WGT_ATTN_NORM_POST, "attn_norm_post"},
         {VK_WGT_FFN_NORM,       "ffn_norm"},
-        {VK_WGT_GATE_PROJ,      "gate_proj"},
-        {VK_WGT_UP_PROJ,        "up_proj"},
-        {VK_WGT_DOWN_PROJ,      "down_proj"},
         {VK_WGT_FFN_NORM_POST,  "ffn_norm_post"},
     };
+    static const struct { int comp; const char *name; } proj_wt[] = {
+        {VK_WGT_Q_PROJ,    "q_proj"},
+        {VK_WGT_K_PROJ,    "k_proj"},
+        {VK_WGT_V_PROJ,    "v_proj"},
+        {VK_WGT_O_PROJ,    "o_proj"},
+        {VK_WGT_GATE_PROJ, "gate_proj"},
+        {VK_WGT_UP_PROJ,   "up_proj"},
+        {VK_WGT_DOWN_PROJ, "down_proj"},
+    };
     int fail = 0;
-    for (size_t w = 0; w < sizeof(wt)/sizeof(wt[0]); w++) {
-        if (upload_one_weight_type(bd, model, cfg, wt[w].comp, wt[w].name,
-                                   offset_alignment) != 0)
+    for (size_t w = 0; w < sizeof(norm_wt)/sizeof(norm_wt[0]); w++) {
+        if (upload_one_weight_type(bd, model, cfg, norm_wt[w].comp,
+                                   norm_wt[w].name, offset_alignment) != 0)
             fail++;
     }
+    int bf16_ok = 0;
+    int total_proj = (int)(sizeof(proj_wt)/sizeof(proj_wt[0]));
+    for (int w = 0; w < total_proj; w++) {
+        if (upload_one_weight_type_bf16(bd, model, cfg, proj_wt[w].comp,
+                                        proj_wt[w].name, offset_alignment) == 0) {
+            bf16_ok++;
+        } else {
+            if (upload_one_weight_type(bd, model, cfg, proj_wt[w].comp,
+                                       proj_wt[w].name, offset_alignment) != 0)
+                fail++;
+        }
+    }
     if (fail > 0) { LOG_ERROR("%d weight upload(s) failed", fail); return -1; }
-    LOG_INFO("Uploaded %d packed weight buffers to GPU", VK_WEIGHTS_PER_LAYER);
+    bd->proj_weights_bf16 = (bf16_ok == total_proj) ? 1 : 0;
+    LOG_INFO("Uploaded %d packed weight buffers to GPU (proj_bf16=%d)",
+             VK_WEIGHTS_PER_LAYER, bd->proj_weights_bf16);
     return 0;
 }
 
@@ -1142,6 +1215,8 @@ static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
         [PIPELINE_VEC_ADD_F32]    = "src/kernels/backends/vulkan/shaders/vec_add_f32.comp.spv",
         [PIPELINE_ARGMAX_F32]     = "src/kernels/backends/vulkan/shaders/argmax_f32.comp.spv",
         [PIPELINE_LMHEAD_DECODE_F32] = "src/kernels/backends/vulkan/shaders/lmhead_decode_f32.comp.spv",
+        [PIPELINE_GEMV_W16A32]    = "src/kernels/backends/vulkan/shaders/gemv_w16a32.comp.spv",
+        [PIPELINE_GEMM_W16A32]    = "src/kernels/backends/vulkan/shaders/gemm_w16a32.comp.spv",
     };
     static const vk_desc_layout_type_t lt[NUM_PIPELINES] = {
         [PIPELINE_RMSNORM_F32] = VK_DESC_LAYOUT_PROJECTION,
@@ -1161,6 +1236,8 @@ static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
         [PIPELINE_VEC_ADD_F32] = VK_DESC_LAYOUT_PROJECTION,
         [PIPELINE_ARGMAX_F32] = VK_DESC_LAYOUT_CUSTOM,
         [PIPELINE_LMHEAD_DECODE_F32] = VK_DESC_LAYOUT_PROJECTION,
+        [PIPELINE_GEMV_W16A32] = VK_DESC_LAYOUT_PROJECTION,
+        [PIPELINE_GEMM_W16A32] = VK_DESC_LAYOUT_PROJECTION,
     };
     static const uint32_t spl[NUM_PIPELINES] = {
         [PIPELINE_RMSNORM_F32] = 4, [PIPELINE_RMSNORM_BF16] = 4,
@@ -1172,6 +1249,8 @@ static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
         [PIPELINE_GELU_F32] = 1,    [PIPELINE_GELU_BF16] = 1,
         [PIPELINE_VEC_ADD_F32] = 2, [PIPELINE_ARGMAX_F32] = 0,
         [PIPELINE_LMHEAD_DECODE_F32] = 0,
+        [PIPELINE_GEMV_W16A32] = 7,
+        [PIPELINE_GEMM_W16A32] = 0,
     };
     static const vk_desc_binding_t argmax_b[] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
@@ -1190,6 +1269,8 @@ static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
         pc.num_desc_sets = spl[i] * (uint32_t)cfg->num_hidden_layers;
         if (i == PIPELINE_RMSNORM_F32 || i == PIPELINE_RMSNORM_BF16) pc.num_desc_sets++;
         if (i == PIPELINE_GEMV_F32    || i == PIPELINE_GEMV_BF16)    pc.num_desc_sets++;
+        if (i == PIPELINE_GEMV_W16A32)                                pc.num_desc_sets++;
+        if (i == PIPELINE_GEMM_W16A32) pc.num_desc_sets = 1;
         if (i == PIPELINE_LMHEAD_DECODE_F32) pc.num_desc_sets++;
         if (i == PIPELINE_ARGMAX_F32) pc.num_desc_sets = 1;
         if (pc.num_desc_sets == 0)    pc.num_desc_sets = 1;
@@ -1595,7 +1676,7 @@ static void setup_qkv_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
     vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
 {
     const int PI_NORM  = PIPELINE_RMSNORM_F32;
-    const int PI_GEMV  = PIPELINE_GEMV_F32;
+    const int PI_GEMV  = bd->proj_weights_bf16 ? PIPELINE_GEMV_W16A32 : PIPELINE_GEMV_F32;
     const int PI_QKNRM = PIPELINE_QK_NORM_F32;
     VkBuffer   wgt_attn_norm   = layer_weight_buffer(bd, VK_WGT_ATTN_NORM)->buffer;
     VkDeviceSize off_attn_norm = layer_weight_offset(bd, VK_WGT_ATTN_NORM, L);
@@ -1642,7 +1723,7 @@ static void setup_qkv_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
 static void setup_attn_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
     const gemma3_270m_config_t *cfg, vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
 {
-    const int PI_GEMV  = PIPELINE_GEMV_F32;
+    const int PI_GEMV  = bd->proj_weights_bf16 ? PIPELINE_GEMV_W16A32 : PIPELINE_GEMV_F32;
     const int PI_ROPE  = PIPELINE_ROPE_F32;
     const int PI_ATTN  = PIPELINE_ATTENTION_F32;
     const int PI_NORM  = PIPELINE_RMSNORM_F32;
@@ -1690,7 +1771,7 @@ static void setup_attn_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd
 static void setup_ffn_in_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
     vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
 {
-    const int PI_GEMV  = PIPELINE_GEMV_F32;
+    const int PI_GEMV  = bd->proj_weights_bf16 ? PIPELINE_GEMV_W16A32 : PIPELINE_GEMV_F32;
     const int PI_NORM  = PIPELINE_RMSNORM_F32;
     const int PI_GELU  = PIPELINE_GELU_F32;
     VkBuffer   wgt_ffn_norm  = layer_weight_buffer(bd, VK_WGT_FFN_NORM)->buffer;
@@ -1724,7 +1805,7 @@ static void setup_ffn_in_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *
 static void setup_ffn_out_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
     vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
 {
-    const int PI_GEMV  = PIPELINE_GEMV_F32;
+    const int PI_GEMV  = bd->proj_weights_bf16 ? PIPELINE_GEMV_W16A32 : PIPELINE_GEMV_F32;
     const int PI_NORM  = PIPELINE_RMSNORM_F32;
     const int PI_ADD   = PIPELINE_VEC_ADD_F32;
     VkBuffer   wgt_down     = layer_weight_buffer(bd, VK_WGT_DOWN_PROJ)->buffer;
@@ -1896,7 +1977,15 @@ static inline void proj_dispatch(VkCommandBuffer cmd_buf, backend_vulkan_session
     const sdt_entry_t *e, const proj_mode_t *mode,
     uint32_t out_elems, const vk_kernel_push_constants_t *pc)
 {
+    /* When projection weights are BF16 on GPU, route through W16A32 shaders
+     * instead of the F32 GEMV/GEMM pipelines which would read BF16 as garbage. */
     int proj_pipeline = mode->proj_pipeline;
+    if (bd->proj_weights_bf16) {
+        if (!mode->use_gemm && proj_pipeline == PIPELINE_GEMV_F32)
+            proj_pipeline = PIPELINE_GEMV_W16A32;
+        else if (mode->use_gemm && proj_pipeline == PIPELINE_GEMM_F32)
+            proj_pipeline = PIPELINE_GEMM_W16A32;
+    }
     int use_gemm      = mode->use_gemm;
     int batch_size    = mode->batch_size;
     const vk_compute_pipeline_t *pipe = &bd->pipelines[proj_pipeline];

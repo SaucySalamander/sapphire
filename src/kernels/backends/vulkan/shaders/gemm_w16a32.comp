@@ -1,0 +1,103 @@
+/**
+ * @file gemm_w16a32.comp
+ * @brief Mixed-precision tiled GEMM: F32 activations × BF16 weights → F32 output.
+ *
+ * Prefill counterpart to gemv_w16a32.comp (batch_size > 1).
+ * Computes Y[batch, d_out] = X[batch, d_in] @ W[d_out, d_in]^T
+ *
+ * Weight buffer is raw BF16 (uint32[] with two uint16 values per word):
+ *   element index e → word weightBuffer.data[e >> 1]
+ *   even e  → bits [15:0]   → uintBitsToFloat(word_lo << 16)
+ *   odd  e  → bits [31:16]  → uintBitsToFloat(word & 0xFFFF0000)
+ *
+ * Uses 16×16 shared-memory tiling identical to gemm_f32.comp.  The only
+ * difference is the weight load path: each thread unpacks one BF16 element
+ * from the packed uint buffer into the F32 shared-memory tile.  The input
+ * tile and accumulator remain F32 throughout.
+ *
+ * Dispatch: (ceil(d_out/16), ceil(batch_size/16), 1) workgroups.
+ */
+#version 450 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict readonly buffer InputBuffer {
+    float data[];
+} inputBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer WeightBuffer {
+    uint data[];  /* BF16 packed: two uint16 per uint32 word */
+} weightBuffer;
+
+layout(std430, binding = 2) restrict writeonly buffer OutputBuffer {
+    float data[];
+} outputBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;       /* d_in  (K) */
+    uint num_heads;     /* d_out (N) */
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;      /* in_stride  (elements) */
+    uint stride_1;      /* out_stride (elements) */
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+float bf16_lo(uint packed) { return uintBitsToFloat((packed & 0xFFFFu) << 16u); }
+float bf16_hi(uint packed) { return uintBitsToFloat( packed & 0xFFFF0000u);      }
+
+shared float sh_x[16][16];
+shared float sh_w[16][16];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;   /* → output column (out_idx)  */
+    uint ty = gl_LocalInvocationID.y;   /* → batch row    (batch_idx) */
+
+    uint tile_out   = gl_WorkGroupID.x * 16u;
+    uint tile_batch = gl_WorkGroupID.y * 16u;
+
+    uint out_idx   = tile_out   + tx;
+    uint batch_idx = tile_batch + ty;
+
+    uint d_in       = pc.d_model;
+    uint d_out      = pc.num_heads;
+    uint in_stride  = (pc.stride_0 > 0u) ? pc.stride_0 : d_in;
+    uint out_stride = (pc.stride_1 > 0u) ? pc.stride_1 : d_out;
+
+    float acc = 0.0;
+
+    uint num_tiles = (d_in + 15u) >> 4u;
+    for (uint tile = 0u; tile < num_tiles; tile++) {
+        uint k_base = tile * 16u;
+
+        /* Load input tile (F32) */
+        uint k_x = k_base + tx;
+        sh_x[ty][tx] = (batch_idx < pc.batch_size && k_x < d_in)
+                       ? inputBuffer.data[batch_idx * in_stride + k_x]
+                       : 0.0;
+
+        /* Load weight tile from BF16 packed buffer */
+        uint k_w      = k_base + ty;
+        uint elem_idx = out_idx * d_in + k_w;
+        uint word     = weightBuffer.data[elem_idx >> 1u];
+        float w_val   = ((elem_idx & 1u) == 0u) ? bf16_lo(word) : bf16_hi(word);
+        sh_w[tx][ty]  = (out_idx < d_out && k_w < d_in) ? w_val : 0.0;
+
+        barrier();
+
+        for (uint k = 0u; k < 16u; k++) {
+            acc += sh_x[ty][k] * sh_w[tx][k];
+        }
+
+        barrier();
+    }
+
+    if (batch_idx < pc.batch_size && out_idx < d_out) {
+        outputBuffer.data[batch_idx * out_stride + out_idx] = acc;
+    }
+}

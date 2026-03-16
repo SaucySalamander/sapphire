@@ -138,7 +138,14 @@ typedef struct {
 #define PIPELINE_VEC_ADD_F32        14
 #define PIPELINE_ARGMAX_F32         15
 #define PIPELINE_LMHEAD_DECODE_F32  16
-#define NUM_PIPELINES               17
+/* Mixed-precision GEMV: F32 activations × BF16 weights → F32 output.
+ * Used for projection layers when model weights are stored as BF16, cutting
+ * VRAM usage in half vs F32 conversion (critical for 4B+ models on 8 GB GPUs). */
+#define PIPELINE_GEMV_W16A32        17
+/* Mixed-precision tiled GEMM: F32 activations × BF16 weights → F32 output.
+ * Prefill (batch>1) counterpart to PIPELINE_GEMV_W16A32. */
+#define PIPELINE_GEMM_W16A32        18
+#define NUM_PIPELINES               19
 
 /**
  * Vulkan backend session data (P11-02 + P11-03 integration).
@@ -226,6 +233,11 @@ typedef struct {
 
     /* Static Descriptor Table (Vulkan 1.0 – no update-after-bind) */
     VulkanStaticDescriptors sdt;        /* Pre-populated descriptor sets for all kernels */
+
+    /* Non-zero when projection weights are stored as BF16 on GPU (set during weight upload).
+     * Enables the PIPELINE_GEMV_W16A32 path which halves VRAM for projection matrices
+     * and eliminates PCIe spill on GPUs with < 12 GB VRAM (e.g. RX 5700 XT). */
+    int proj_weights_bf16;
 
     /* Optional GPU timestamp profiling (SAPPHIRE_VK_PROFILE=1) */
     VkQueryPool timing_query_pool;
