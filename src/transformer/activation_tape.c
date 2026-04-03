@@ -405,6 +405,28 @@ static const tape_manifest_entry_t *tape_find_entry(const activation_tape_t *tap
     return NULL;
 }
 
+int activation_tape_entry_index(const activation_tape_t *tape,
+                                const char              *tensor_name)
+{
+    const tape_manifest_entry_t *entry = NULL;
+
+    if (!tape || !tensor_name) {
+        return -1;
+    }
+
+    entry = tape_find_entry(tape, tensor_name);
+    if (!entry) {
+        return -1;
+    }
+    if (entry->alias_of_entry != TAPE_NO_ALIAS) {
+        if (entry->alias_of_entry >= tape->entry_count) {
+            return -1;
+        }
+        return (int)entry->alias_of_entry;
+    }
+    return (int)(entry - tape->manifest);
+}
+
 activation_tape_t *activation_tape_open(const char *tape_path)
 {
     if (!tape_path) return NULL;

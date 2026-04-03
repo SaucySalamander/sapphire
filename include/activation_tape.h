@@ -127,6 +127,10 @@ int activation_tape_get_vector(const activation_tape_t *tape,
                                int                      sample_idx,
                                float                   *out_vector);
 
+/** @return primary manifest entry index for tensor_name, or -1 if not found. */
+int activation_tape_entry_index(const activation_tape_t *tape,
+                                const char              *tensor_name);
+
 /** @return number of samples in the tape, or -1 if tape is NULL. */
 int activation_tape_sample_count(const activation_tape_t *tape);
 

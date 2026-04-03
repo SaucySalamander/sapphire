@@ -6,6 +6,7 @@
 #include "ternary_calibration.h"
 
 #include "log.h"
+#include "activation_tape.h"
 #include "llm_model.h"
 #include "inference.h"
 #include "model_spec.h"
@@ -228,14 +229,100 @@ static float* build_fallback_vectors(uint32_t cols, int sample_count) {
     return vectors;
 }
 
+static float *build_tape_calibration_vectors(const ternary_activation_tape_context_t *tape_context,
+                                             uint32_t cols,
+                                             int requested_sample_count,
+                                             int *out_sample_count) {
+    const activation_tape_t *tape = NULL;
+    const char *tensor_name = NULL;
+    uint32_t tape_cols = 0u;
+    int tape_samples = 0;
+    int sample_count = requested_sample_count;
+    float *vectors = NULL;
+
+    if (!tape_context || !tape_context->tape || !tape_context->tensor_name || requested_sample_count <= 0) {
+        return NULL;
+    }
+
+    tape = tape_context->tape;
+    tensor_name = tape_context->tensor_name;
+    tape_cols = activation_tape_vector_dim(tape, tensor_name);
+    if (tape_cols == 0u) {
+        LOG_ERROR("build_calibration_vectors: activation tape does not contain tensor %s", tensor_name);
+        return NULL;
+    }
+    if (tape_cols != cols) {
+        LOG_ERROR("build_calibration_vectors: tape dimension mismatch for %s (tape=%u expected=%u)",
+                  tensor_name,
+                  tape_cols,
+                  cols);
+        return NULL;
+    }
+
+    tape_samples = activation_tape_sample_count(tape);
+    if (tape_samples <= 0) {
+        LOG_ERROR("build_calibration_vectors: activation tape has no samples for %s", tensor_name);
+        return NULL;
+    }
+    if (sample_count > tape_samples) {
+        LOG_WARN("build_calibration_vectors: clamping sample count for %s from %d to %d",
+                 tensor_name,
+                 sample_count,
+                 tape_samples);
+        sample_count = tape_samples;
+    }
+
+    vectors = (float *)calloc((size_t)sample_count * cols, sizeof(float));
+    if (!vectors) {
+        LOG_ERROR("build_calibration_vectors: tape-backed allocation failed for %s", tensor_name);
+        return NULL;
+    }
+
+    for (int s = 0; s < sample_count; ++s) {
+        if (activation_tape_get_vector(tape,
+                                       tensor_name,
+                                       s,
+                                       vectors + (size_t)s * cols) != 0) {
+            LOG_ERROR("build_calibration_vectors: failed to read %s sample %d from activation tape",
+                      tensor_name,
+                      s);
+            free(vectors);
+            return NULL;
+        }
+    }
+
+    if (out_sample_count) {
+        *out_sample_count = sample_count;
+    }
+
+    LOG_INFO("Built tape-backed calibration vectors: tensor=%s samples=%d",
+             tensor_name,
+             sample_count);
+    return vectors;
+}
+
 static float* build_calibration_vectors(uint32_t cols,
                                         int sample_count,
-                                        const ternary_calibration_corpus_t *corpus) {
+                                        const ternary_calibration_corpus_t *corpus,
+                                        const ternary_activation_tape_context_t *tape_context,
+                                        int *out_sample_count) {
     float *vectors = NULL;
     int used_activation_replay = 0;
 
     if (cols == 0 || sample_count <= 0) {
         return NULL;
+    }
+
+    if (tape_context && tape_context->tape) {
+        vectors = build_tape_calibration_vectors(tape_context, cols, sample_count, out_sample_count);
+        if (vectors) {
+            return vectors;
+        }
+        return NULL;
+    }
+
+    if (out_sample_count) {
+        *out_sample_count = sample_count;
     }
 
     if (!corpus || !corpus->sample_texts || corpus->sample_count <= 0 ||
@@ -283,6 +370,9 @@ static float* build_calibration_vectors(uint32_t cols,
     } else {
         LOG_INFO("Built tokenized calibration vectors: requested=%d available_samples=%d",
                  sample_count, corpus->sample_count);
+    }
+    if (out_sample_count) {
+        *out_sample_count = sample_count;
     }
     return vectors;
 }
@@ -826,18 +916,21 @@ void transformer_free_ternary_calibration_result(ternary_calibration_result_t *r
     memset(result, 0, sizeof(*result));
 }
 
-int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
-                                    uint32_t rows,
-                                    uint32_t cols,
-                                    const transformer_ste_config_t *config,
-                                    const ternary_calibration_corpus_t *corpus,
-                                    ternary_calibration_result_t *out_result) {
+int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
+                                              uint32_t rows,
+                                              uint32_t cols,
+                                              const transformer_ste_config_t *config,
+                                              const ternary_calibration_source_t *source,
+                                              ternary_calibration_result_t *out_result) {
     transformer_ste_config_t effective_config;
     ste_calibration_context_t calibration_context;
     float *velocity = NULL;
     float *calibration_vectors = NULL;
     size_t weight_count = 0;
     size_t packed_bytes = 0;
+    int actual_sample_count = 0;
+    const ternary_calibration_corpus_t *corpus = source ? source->corpus : NULL;
+    const ternary_activation_tape_context_t *tape_context = source ? source->tape_context : NULL;
 
     if (!bf16_weights || !out_result || rows == 0 || cols == 0) {
         LOG_ERROR("transformer_calibrate_layer_ste: invalid arguments");
@@ -862,9 +955,12 @@ int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
         return -1;
     }
     velocity = (float *)calloc(weight_count, sizeof(float));
+    actual_sample_count = effective_config.calibration_samples;
     calibration_vectors = build_calibration_vectors(cols,
                                                     effective_config.calibration_samples,
-                                                    corpus);
+                                                    corpus,
+                                                    tape_context,
+                                                    &actual_sample_count);
     if (!velocity || !calibration_vectors) {
         LOG_ERROR("transformer_calibrate_layer_ste: calibration buffer allocation failed");
         free(velocity);
@@ -872,6 +968,8 @@ int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
         transformer_free_ternary_calibration_result(out_result);
         return -1;
     }
+
+    effective_config.calibration_samples = actual_sample_count;
 
     for (size_t i = 0; i < weight_count; ++i) {
         out_result->latent_weights[i] = bf16_to_f32_scalar(bf16_weights[i]);
@@ -933,4 +1031,18 @@ int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
              (double)effective_config.zero_occupancy_floor,
              packed_bytes);
     return 0;
+}
+
+int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
+                                    uint32_t rows,
+                                    uint32_t cols,
+                                    const transformer_ste_config_t *config,
+                                    const ternary_calibration_corpus_t *corpus,
+                                    ternary_calibration_result_t *out_result) {
+    return transformer_calibrate_layer_ste_with_tape(bf16_weights,
+                                                     rows,
+                                                     cols,
+                                                     config,
+                                                     NULL,
+                                                     out_result);
 }

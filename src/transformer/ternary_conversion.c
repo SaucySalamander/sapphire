@@ -6,6 +6,7 @@
 #include "ternary_conversion.h"
 
 #include "calibration_corpus.h"
+#include "activation_tape.h"
 #include "file_reader.h"
 #include "inference.h"
 #include "log.h"
@@ -23,6 +24,7 @@ typedef struct {
     calibration_corpus_t validation_corpus_storage;
     ternary_calibration_corpus_t calibration_corpus;
     inference_context_t *activation_ctx;
+    activation_tape_t *activation_tape;
     sapphire_tokenizer_t *tokenizer;
     model_spec_t *model_spec;
     sapphire_tokenizer_t *previous_tokenizer_handle;
@@ -63,11 +65,55 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
     return ste_config;
 }
 
+static int tensor_name_is_layer_tensor(const char *tensor_name)
+{
+    return tensor_name && strstr(tensor_name, ".layers.") != NULL;
+}
+
+static void prefetch_activation_tape_lookahead(const conversion_runtime_t *runtime,
+                                               const model_spec_t *spec,
+                                               int start_idx,
+                                               int lookahead_count,
+                                               int *last_prefetched_entry_idx)
+{
+    int prefetched = 0;
+
+    if (!runtime || !runtime->activation_tape || !spec || lookahead_count <= 0) {
+        return;
+    }
+
+    for (int i = start_idx; i < spec->tensor_map_size && prefetched < lookahead_count; ++i) {
+        const char *tensor_name = spec->tensor_map[i].hf_name;
+        int entry_idx = -1;
+
+        if (!tensor_name || !tensor_name_is_layer_tensor(tensor_name)) {
+            continue;
+        }
+
+        entry_idx = activation_tape_entry_index(runtime->activation_tape, tensor_name);
+        if (entry_idx < 0) {
+            continue;
+        }
+        if (last_prefetched_entry_idx && *last_prefetched_entry_idx == entry_idx) {
+            continue;
+        }
+
+        activation_tape_prefetch_entry(runtime->activation_tape, (uint32_t)entry_idx);
+        if (last_prefetched_entry_idx) {
+            *last_prefetched_entry_idx = entry_idx;
+        }
+        prefetched++;
+    }
+}
+
 static void destroy_conversion_runtime(conversion_runtime_t *runtime) {
     if (!runtime) {
         return;
     }
 
+    if (runtime->activation_tape) {
+        activation_tape_close(runtime->activation_tape);
+    }
     if (runtime->activation_ctx) {
         ternary_validation_destroy(&runtime->validation_state);
         destroy_inference_context(runtime->activation_ctx);
@@ -156,6 +202,15 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
     if (!spec) {
         LOG_ERROR("ternary conversion: failed to resolve model spec for %s", config->model_name);
         return -1;
+    }
+
+    if (config->activation_tape_path && config->activation_tape_path[0] != '\0') {
+        out_runtime->activation_tape = activation_tape_open(config->activation_tape_path);
+        if (!out_runtime->activation_tape) {
+            LOG_ERROR("ternary conversion: failed to open activation tape %s", config->activation_tape_path);
+            destroy_conversion_runtime(out_runtime);
+            return -1;
+        }
     }
 
     out_runtime->activation_ctx = create_inference_context(0.0f,
@@ -250,19 +305,27 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
 
     ste_config = default_runtime_ste_config(config);
 
-    if (transformer_calibrate_layer_ste(map.bf16_weights,
-                                        map.rows,
-                                        map.cols,
-                                        &ste_config,
-                                        runtime ? &(ternary_calibration_corpus_t){
-                                            .sample_texts = runtime->calibration_corpus.sample_texts,
-                                            .sample_count = runtime->calibration_corpus.sample_count,
-                                            .tokenizer = runtime->calibration_corpus.tokenizer,
-                                            .model_spec = runtime->calibration_corpus.model_spec,
-                                            .session = runtime->calibration_corpus.session,
-                                            .tensor_name = config->layer_name
-                                        } : NULL,
-                                        &result) != 0) {
+    if (transformer_calibrate_layer_ste_with_tape(map.bf16_weights,
+                                                  map.rows,
+                                                  map.cols,
+                                                  &ste_config,
+                                                  runtime ? &(ternary_calibration_source_t){
+                                                      .corpus = &(ternary_calibration_corpus_t){
+                                                          .sample_texts = runtime->calibration_corpus.sample_texts,
+                                                          .sample_count = runtime->calibration_corpus.sample_count,
+                                                          .tokenizer = runtime->calibration_corpus.tokenizer,
+                                                          .model_spec = runtime->calibration_corpus.model_spec,
+                                                          .session = runtime->calibration_corpus.session,
+                                                          .tensor_name = config->layer_name
+                                                      },
+                                                      .tape_context = (runtime->activation_tape && tensor_name_is_layer_tensor(config->layer_name))
+                                                          ? &(ternary_activation_tape_context_t){
+                                                                .tape = runtime->activation_tape,
+                                                                .tensor_name = config->layer_name
+                                                            }
+                                                          : NULL
+                                                  } : NULL,
+                                                  &result) != 0) {
         io_unmap_layer_bf16(&map);
         return -1;
     }
@@ -291,6 +354,7 @@ typedef struct {
     const char *model_path;
     const char *output_dir;
     const char *tensor_name;
+    const activation_tape_t *activation_tape;
     const transformer_ste_config_t *ste_config;
     const ternary_calibration_corpus_t *calibration_corpus;
     ternary_calibration_result_t *out_result;
@@ -337,12 +401,38 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
         return 0;
     }
 
-    if (transformer_calibrate_layer_ste(map.bf16_weights,
-                                        map.rows,
-                                        map.cols,
-                                        job->ste_config,
-                                        job->calibration_corpus,
-                                        &result) != 0) {
+    if (tensor_name_is_layer_tensor(job->tensor_name) && job->activation_tape) {
+        int tape_entry_idx = activation_tape_entry_index(job->activation_tape, job->tensor_name);
+        ternary_calibration_source_t calibration_source;
+
+        if (tape_entry_idx < 0) {
+            LOG_ERROR("Activation tape does not contain tensor %s", job->tensor_name);
+            io_unmap_layer_bf16(&map);
+            return -1;
+        }
+
+        memset(&calibration_source, 0, sizeof(calibration_source));
+        calibration_source.corpus = job->calibration_corpus;
+        calibration_source.tape_context = &(ternary_activation_tape_context_t){
+            .tape = job->activation_tape,
+            .tensor_name = job->tensor_name
+        };
+
+        if (transformer_calibrate_layer_ste_with_tape(map.bf16_weights,
+                                                      map.rows,
+                                                      map.cols,
+                                                      job->ste_config,
+                                                      &calibration_source,
+                                                      &result) != 0) {
+            io_unmap_layer_bf16(&map);
+            return -1;
+        }
+    } else if (transformer_calibrate_layer_ste(map.bf16_weights,
+                                               map.rows,
+                                               map.cols,
+                                               job->ste_config,
+                                               job->calibration_corpus,
+                                               &result) != 0) {
         io_unmap_layer_bf16(&map);
         return -1;
     }
@@ -393,6 +483,8 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
         return -1;
     }
 
+    int last_prefetched_entry_idx = -1;
+
     for (int i = 0; i < spec->tensor_map_size; ++i) {
         const char *tensor_name = spec->tensor_map[i].hf_name;
         convert_tensor_job_t job;
@@ -416,6 +508,14 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
             continue;
         }
 
+        if (runtime && runtime->activation_tape) {
+            prefetch_activation_tape_lookahead(runtime,
+                                               spec,
+                                               i,
+                                               2,
+                                               &last_prefetched_entry_idx);
+        }
+
         memset(&active_corpus, 0, sizeof(active_corpus));
         if (runtime) {
             active_corpus = runtime->calibration_corpus;
@@ -426,6 +526,7 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
         job.model_path = model_path;
         job.output_dir = config->output_path;
         job.tensor_name = tensor_name;
+        job.activation_tape = runtime ? runtime->activation_tape : NULL;
         job.ste_config = &ste_config;
         job.calibration_corpus = runtime ? &active_corpus : NULL;
         job.out_result = &result;
@@ -491,6 +592,9 @@ int transformer_run_ternary_conversion(const ternary_conversion_config_t *config
         LOG_INFO("  layer filter: %s", config->layer_name);
     } else {
         LOG_INFO("  layer filter: <all layers>");
+    }
+    if (config->activation_tape_path && config->activation_tape_path[0] != '\0') {
+        LOG_INFO("  activation_tape: %s", config->activation_tape_path);
     }
     if (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0') {
         LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);

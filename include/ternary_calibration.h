@@ -12,6 +12,7 @@
 typedef struct sapphire_tokenizer_t sapphire_tokenizer_t;
 typedef struct model_spec model_spec_t;
 typedef struct inference_session_t inference_session_t;
+typedef struct activation_tape_t activation_tape_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,6 +41,16 @@ typedef struct {
 } ternary_calibration_corpus_t;
 
 typedef struct {
+    const activation_tape_t *tape;
+    const char *tensor_name;
+} ternary_activation_tape_context_t;
+
+typedef struct {
+    const ternary_calibration_corpus_t *corpus;
+    const ternary_activation_tape_context_t *tape_context;
+} ternary_calibration_source_t;
+
+typedef struct {
     float *latent_weights;
     int8_t *ternary_weights;
     uint8_t *packed_weights;
@@ -49,6 +60,13 @@ typedef struct {
     uint32_t rows;
     uint32_t cols;
 } ternary_calibration_result_t;
+
+int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
+                                              uint32_t rows,
+                                              uint32_t cols,
+                                              const transformer_ste_config_t *config,
+                                              const ternary_calibration_source_t *source,
+                                              ternary_calibration_result_t *out_result);
 
 int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
                                     uint32_t rows,

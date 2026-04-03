@@ -43,6 +43,7 @@ static void print_help(const char* program_name) {
     printf("  --output <path>           Output file (single-layer) or output directory (full-model)\n");
     printf("  --layer <name>            Optional single-layer conversion filter\n");
     printf("  --calibration-corpus <p>  Optional text corpus file or URL for tokenized STE calibration\n");
+    printf("  --activation-tape <path>  Optional activation tape for tape-backed calibration\n");
     printf("  --calib-manifest <p>      Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
     printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
     printf("  --validation-corpus <p>   Optional held-out text corpus file or URL for checkpoints\n");
@@ -75,28 +76,33 @@ static void print_help(const char* program_name) {
 }
 
 typedef struct {
-    const char* model_name;
+    const char *model_name;
     int context_len;
     float temperature;
     int max_tokens;
-    const char* prompt_arg;
+    const char *prompt_arg;
     int convert_ternary;
-    const char* output_path;
-    const char* layer_name;
-    const char* calibration_corpus_path;
-    const char* calibration_corpus_manifest_path;
+    const char *output_path;
+    const char *layer_name;
+    const char *activation_tape_path;
+    const char *calibration_corpus_path;
+    const char *calibration_corpus_manifest_path;
     int calibration_sample_limit;
-    const char* validation_corpus_path;
-    const char* validation_corpus_manifest_path;
+    const char *validation_corpus_path;
+    const char *validation_corpus_manifest_path;
     int validation_sample_limit;
     int validate_every_n;
     float kl_weight;
-    const char* save_state_path;
-    const char* load_state_path;
+    const char *save_state_path;
+    const char *load_state_path;
 } cli_args_t;
 
-static void cli_args_init(cli_args_t *args) {
-    if (!args) return;
+static void cli_args_init(cli_args_t *args)
+{
+    if (!args) {
+        return;
+    }
+
     args->model_name = NULL;
     args->context_len = CONTEXT_LEN;
     args->temperature = TEMPERATURE;
@@ -105,6 +111,7 @@ static void cli_args_init(cli_args_t *args) {
     args->convert_ternary = 0;
     args->output_path = NULL;
     args->layer_name = NULL;
+    args->activation_tape_path = NULL;
     args->calibration_corpus_path = NULL;
     args->calibration_corpus_manifest_path = NULL;
     args->calibration_sample_limit = 4;
@@ -117,8 +124,11 @@ static void cli_args_init(cli_args_t *args) {
     args->load_state_path = NULL;
 }
 
-static int validate_cli_args(const cli_args_t *args) {
-    if (!args) return -1;
+static int validate_cli_args(const cli_args_t *args)
+{
+    if (!args) {
+        return -1;
+    }
 
     if (!args->model_name) {
         LOG_ERROR("ERROR: Model name required. Use -m or --model flag.");
@@ -140,6 +150,10 @@ static int validate_cli_args(const cli_args_t *args) {
         }
         if (args->calibration_sample_limit <= 0) {
             LOG_ERROR("ERROR: --calibration-samples must be > 0.");
+            return -1;
+        }
+        if (args->activation_tape_path && args->activation_tape_path[0] == '\0') {
+            LOG_ERROR("ERROR: --activation-tape must not be empty.");
             return -1;
         }
         if (args->calibration_corpus_path && args->calibration_corpus_manifest_path) {
@@ -171,7 +185,8 @@ static int validate_cli_args(const cli_args_t *args) {
     return 0;
 }
 
-static int run_ternary_conversion_mode(const cli_args_t *args) {
+static int run_ternary_conversion_mode(const cli_args_t *args)
+{
     ternary_conversion_config_t config;
 
     if (!args) {
@@ -182,6 +197,7 @@ static int run_ternary_conversion_mode(const cli_args_t *args) {
     config.model_name = args->model_name;
     config.output_path = args->output_path;
     config.layer_name = args->layer_name;
+    config.activation_tape_path = args->activation_tape_path;
     config.calibration_corpus_path = args->calibration_corpus_path;
     config.calibration_corpus_manifest_path = args->calibration_corpus_manifest_path;
     config.validation_corpus_path = args->validation_corpus_path;
@@ -196,7 +212,8 @@ static int run_ternary_conversion_mode(const cli_args_t *args) {
 
 static void print_session_state(const inference_context_t *ctx,
                                 const char *last_state_op,
-                                const char *last_state_path) {
+                                const char *last_state_path)
+{
     const char *backend_name = (ctx->session && ctx->session->backend && ctx->session->backend->name)
         ? ctx->session->backend->name
         : "unknown";
@@ -204,6 +221,7 @@ static void print_session_state(const inference_context_t *ctx,
         (ctx->session->backend->type == SAPPHIRE_BACKEND_TYPE_CPU ||
          ctx->session->backend->type == SAPPHIRE_BACKEND_TYPE_VULKAN));
     int kv_seq_len = -1;
+
     if (ctx->session && ctx->session->kv_cache) {
         kv_seq_len = kv_cache_get_seq_len(ctx->session->kv_cache);
     }
@@ -313,53 +331,89 @@ static int handle_slash_command(inference_context_t *ctx,
     return 1;
 }
 
-static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args) {
-    typedef enum {
-        CLI_OPT_UNKNOWN = 0,
-        CLI_OPT_MODEL,
-        CLI_OPT_CONTEXT,
-        CLI_OPT_TEMP,
-        CLI_OPT_MAX_TOKENS,
-        CLI_OPT_PROMPT,
-        CLI_OPT_CONVERT_TERNARY,
-        CLI_OPT_OUTPUT,
-        CLI_OPT_LAYER,
-        CLI_OPT_CALIBRATION_CORPUS,
-        CLI_OPT_CALIBRATION_MANIFEST,
-        CLI_OPT_CALIBRATION_SAMPLES,
-        CLI_OPT_VALIDATION_CORPUS,
-        CLI_OPT_VALIDATION_MANIFEST,
-        CLI_OPT_VALIDATION_SAMPLES,
-        CLI_OPT_VALIDATE_EVERY,
-        CLI_OPT_KL_WEIGHT,
-        CLI_OPT_SAVE_STATE,
-        CLI_OPT_LOAD_STATE
-    } cli_option_t;
+typedef enum {
+    CLI_OPT_UNKNOWN = 0,
+    CLI_OPT_MODEL,
+    CLI_OPT_CONTEXT,
+    CLI_OPT_TEMP,
+    CLI_OPT_MAX_TOKENS,
+    CLI_OPT_PROMPT,
+    CLI_OPT_CONVERT_TERNARY,
+    CLI_OPT_OUTPUT,
+    CLI_OPT_LAYER,
+    CLI_OPT_ACTIVATION_TAPE,
+    CLI_OPT_CALIBRATION_CORPUS,
+    CLI_OPT_CALIBRATION_MANIFEST,
+    CLI_OPT_CALIBRATION_SAMPLES,
+    CLI_OPT_VALIDATION_CORPUS,
+    CLI_OPT_VALIDATION_MANIFEST,
+    CLI_OPT_VALIDATION_SAMPLES,
+    CLI_OPT_VALIDATE_EVERY,
+    CLI_OPT_KL_WEIGHT,
+    CLI_OPT_SAVE_STATE,
+    CLI_OPT_LOAD_STATE
+} cli_option_t;
 
-    if (!args) return -1;
+static cli_option_t parse_cli_option(const char *arg)
+{
+    if (!arg) {
+        return CLI_OPT_UNKNOWN;
+    }
+    if (strcmp(arg, "-m") == 0 || strcmp(arg, "--model") == 0) return CLI_OPT_MODEL;
+    if (strcmp(arg, "-c") == 0 || strcmp(arg, "--context") == 0) return CLI_OPT_CONTEXT;
+    if (strcmp(arg, "-t") == 0 || strcmp(arg, "--temp") == 0) return CLI_OPT_TEMP;
+    if (strcmp(arg, "-n") == 0 || strcmp(arg, "--max-tokens") == 0) return CLI_OPT_MAX_TOKENS;
+    if (strcmp(arg, "-p") == 0 || strcmp(arg, "--prompt") == 0) return CLI_OPT_PROMPT;
+    if (strcmp(arg, "--convert-ternary") == 0) return CLI_OPT_CONVERT_TERNARY;
+    if (strcmp(arg, "--output") == 0) return CLI_OPT_OUTPUT;
+    if (strcmp(arg, "--layer") == 0) return CLI_OPT_LAYER;
+    if (strcmp(arg, "--activation-tape") == 0) return CLI_OPT_ACTIVATION_TAPE;
+    if (strcmp(arg, "--calibration-corpus") == 0) return CLI_OPT_CALIBRATION_CORPUS;
+    if (strcmp(arg, "--calib-manifest") == 0) return CLI_OPT_CALIBRATION_MANIFEST;
+    if (strcmp(arg, "--calibration-samples") == 0) return CLI_OPT_CALIBRATION_SAMPLES;
+    if (strcmp(arg, "--validation-corpus") == 0) return CLI_OPT_VALIDATION_CORPUS;
+    if (strcmp(arg, "--validation-manifest") == 0) return CLI_OPT_VALIDATION_MANIFEST;
+    if (strcmp(arg, "--validation-samples") == 0) return CLI_OPT_VALIDATION_SAMPLES;
+    if (strcmp(arg, "--validate-every") == 0) return CLI_OPT_VALIDATE_EVERY;
+    if (strcmp(arg, "--kl-weight") == 0) return CLI_OPT_KL_WEIGHT;
+    if (strcmp(arg, "--save-state") == 0) return CLI_OPT_SAVE_STATE;
+    if (strcmp(arg, "--load-state") == 0) return CLI_OPT_LOAD_STATE;
+    return CLI_OPT_UNKNOWN;
+}
 
-    for (int i = 1; i < argc; i++) {
-        const char *value = NULL;
-        cli_option_t option = CLI_OPT_UNKNOWN;
+static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *value)
+{
+    switch (option) {
+        case CLI_OPT_MODEL: args->model_name = value; break;
+        case CLI_OPT_CONTEXT: args->context_len = atoi(value); break;
+        case CLI_OPT_TEMP: args->temperature = atof(value); break;
+        case CLI_OPT_MAX_TOKENS: args->max_tokens = atoi(value); break;
+        case CLI_OPT_PROMPT: args->prompt_arg = value; break;
+        case CLI_OPT_OUTPUT: args->output_path = value; break;
+        case CLI_OPT_LAYER: args->layer_name = value; break;
+        case CLI_OPT_ACTIVATION_TAPE: args->activation_tape_path = value; break;
+        case CLI_OPT_CALIBRATION_CORPUS: args->calibration_corpus_path = value; break;
+        case CLI_OPT_CALIBRATION_MANIFEST: args->calibration_corpus_manifest_path = value; break;
+        case CLI_OPT_CALIBRATION_SAMPLES: args->calibration_sample_limit = atoi(value); break;
+        case CLI_OPT_VALIDATION_CORPUS: args->validation_corpus_path = value; break;
+        case CLI_OPT_VALIDATION_MANIFEST: args->validation_corpus_manifest_path = value; break;
+        case CLI_OPT_VALIDATION_SAMPLES: args->validation_sample_limit = atoi(value); break;
+        case CLI_OPT_VALIDATE_EVERY: args->validate_every_n = atoi(value); break;
+        case CLI_OPT_KL_WEIGHT: args->kl_weight = (float)atof(value); break;
+        case CLI_OPT_SAVE_STATE: args->save_state_path = value; break;
+        case CLI_OPT_LOAD_STATE: args->load_state_path = value; break;
+        default: break;
+    }
+}
 
-        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) option = CLI_OPT_MODEL;
-        else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--context") == 0) option = CLI_OPT_CONTEXT;
-        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0) option = CLI_OPT_TEMP;
-        else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) option = CLI_OPT_MAX_TOKENS;
-        else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) option = CLI_OPT_PROMPT;
-        else if (strcmp(argv[i], "--convert-ternary") == 0) option = CLI_OPT_CONVERT_TERNARY;
-        else if (strcmp(argv[i], "--output") == 0) option = CLI_OPT_OUTPUT;
-        else if (strcmp(argv[i], "--layer") == 0) option = CLI_OPT_LAYER;
-        else if (strcmp(argv[i], "--calibration-corpus") == 0) option = CLI_OPT_CALIBRATION_CORPUS;
-        else if (strcmp(argv[i], "--calib-manifest") == 0) option = CLI_OPT_CALIBRATION_MANIFEST;
-        else if (strcmp(argv[i], "--calibration-samples") == 0) option = CLI_OPT_CALIBRATION_SAMPLES;
-        else if (strcmp(argv[i], "--validation-corpus") == 0) option = CLI_OPT_VALIDATION_CORPUS;
-        else if (strcmp(argv[i], "--validation-manifest") == 0) option = CLI_OPT_VALIDATION_MANIFEST;
-        else if (strcmp(argv[i], "--validation-samples") == 0) option = CLI_OPT_VALIDATION_SAMPLES;
-        else if (strcmp(argv[i], "--validate-every") == 0) option = CLI_OPT_VALIDATE_EVERY;
-        else if (strcmp(argv[i], "--kl-weight") == 0) option = CLI_OPT_KL_WEIGHT;
-        else if (strcmp(argv[i], "--save-state") == 0) option = CLI_OPT_SAVE_STATE;
-        else if (strcmp(argv[i], "--load-state") == 0) option = CLI_OPT_LOAD_STATE;
+static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
+{
+    if (!args) {
+        return -1;
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        cli_option_t option = parse_cli_option(argv[i]);
 
         if (option == CLI_OPT_CONVERT_TERNARY) {
             args->convert_ternary = 1;
@@ -369,27 +423,7 @@ static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
             continue;
         }
 
-        value = argv[++i];
-        switch (option) {
-            case CLI_OPT_MODEL: args->model_name = value; break;
-            case CLI_OPT_CONTEXT: args->context_len = atoi(value); break;
-            case CLI_OPT_TEMP: args->temperature = atof(value); break;
-            case CLI_OPT_MAX_TOKENS: args->max_tokens = atoi(value); break;
-            case CLI_OPT_PROMPT: args->prompt_arg = value; break;
-            case CLI_OPT_OUTPUT: args->output_path = value; break;
-            case CLI_OPT_LAYER: args->layer_name = value; break;
-            case CLI_OPT_CALIBRATION_CORPUS: args->calibration_corpus_path = value; break;
-            case CLI_OPT_CALIBRATION_MANIFEST: args->calibration_corpus_manifest_path = value; break;
-            case CLI_OPT_CALIBRATION_SAMPLES: args->calibration_sample_limit = atoi(value); break;
-            case CLI_OPT_VALIDATION_CORPUS: args->validation_corpus_path = value; break;
-            case CLI_OPT_VALIDATION_MANIFEST: args->validation_corpus_manifest_path = value; break;
-            case CLI_OPT_VALIDATION_SAMPLES: args->validation_sample_limit = atoi(value); break;
-            case CLI_OPT_VALIDATE_EVERY: args->validate_every_n = atoi(value); break;
-            case CLI_OPT_KL_WEIGHT: args->kl_weight = (float)atof(value); break;
-            case CLI_OPT_SAVE_STATE: args->save_state_path = value; break;
-            case CLI_OPT_LOAD_STATE: args->load_state_path = value; break;
-            default: break;
-        }
+        apply_cli_option(args, option, argv[++i]);
     }
 
     return 0;
