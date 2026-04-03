@@ -6,6 +6,7 @@
 #include "ternary_conversion.h"
 
 #include "calibration_corpus.h"
+#include "activation_alignment.h"
 #include "activation_tape.h"
 #include "file_reader.h"
 #include "inference.h"
@@ -30,6 +31,78 @@ typedef struct {
     sapphire_tokenizer_t *previous_tokenizer_handle;
     ternary_validation_state_t validation_state;
 } conversion_runtime_t;
+
+static int prepare_teacher_student_alignment(const ternary_conversion_config_t *config,
+                                             conversion_runtime_t *runtime)
+{
+    activation_alignment_request_t request;
+    char *aligned_tape_path = NULL;
+    char *aligned_manifest_path = NULL;
+    activation_tape_t *aligned_tape = NULL;
+    const model_spec_t *teacher_spec = NULL;
+    const activation_tape_t *teacher_tape = NULL;
+    int rc = -1;
+
+    if (!config || !runtime) {
+        return -1;
+    }
+
+    if (!config->teacher_model_name || config->teacher_model_name[0] == '\0') {
+        return 0;
+    }
+
+    if (config->layer_name && config->layer_name[0] != '\0') {
+        LOG_ERROR("ternary alignment: --teacher-model requires full-model conversion");
+        return -1;
+    }
+    if (!runtime->activation_tape) {
+        LOG_ERROR("ternary alignment: --teacher-model requires --activation-tape");
+        return -1;
+    }
+
+    teacher_tape = runtime->activation_tape;
+    teacher_spec = get_model_spec(config->teacher_model_name);
+    if (!teacher_spec) {
+        LOG_ERROR("ternary alignment: failed to resolve teacher spec for %s", config->teacher_model_name);
+        return -1;
+    }
+
+    memset(&request, 0, sizeof(request));
+    request.teacher_spec = teacher_spec;
+    request.student_spec = runtime->model_spec;
+    request.teacher_tape = teacher_tape;
+    request.depth_strategy = ACTIVATION_ALIGNMENT_DEPTH_BUCKET;
+    request.width_strategy = ACTIVATION_ALIGNMENT_WIDTH_AUTO;
+
+    if (activation_alignment_prepare_artifacts(&request,
+                                              config->output_path,
+                                              &aligned_tape_path,
+                                              &aligned_manifest_path) != 0) {
+        return -1;
+    }
+
+    aligned_tape = activation_tape_open(aligned_tape_path);
+    if (!aligned_tape) {
+        LOG_ERROR("ternary alignment: failed to open aligned tape %s", aligned_tape_path);
+        goto alignment_cleanup;
+    }
+
+    LOG_INFO("ternary alignment: manifest=%s", aligned_manifest_path);
+    LOG_INFO("ternary alignment: tape=%s", aligned_tape_path);
+
+    activation_tape_close(runtime->activation_tape);
+    runtime->activation_tape = aligned_tape;
+    aligned_tape = NULL;
+    rc = 0;
+
+alignment_cleanup:
+    free(aligned_tape_path);
+    free(aligned_manifest_path);
+    if (aligned_tape) {
+        activation_tape_close(aligned_tape);
+    }
+    return rc;
+}
 
 static int load_runtime_corpus(const char *manifest_path,
                                const char *source_path,
@@ -241,6 +314,10 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
                 (const char *const *)out_runtime->corpus_storage.samples;
             out_runtime->calibration_corpus.sample_count = out_runtime->corpus_storage.sample_count;
         }
+        if (prepare_teacher_student_alignment(config, out_runtime) != 0) {
+            destroy_conversion_runtime(out_runtime);
+            return -1;
+        }
         init_conversion_validation(config, out_runtime);
         return 0;
     }
@@ -273,6 +350,11 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
         out_runtime->calibration_corpus.sample_count = out_runtime->corpus_storage.sample_count;
     } else {
         LOG_WARN("ternary conversion: no calibration corpus provided; using built-in fallback prompts");
+    }
+
+    if (prepare_teacher_student_alignment(config, out_runtime) != 0) {
+        destroy_conversion_runtime(out_runtime);
+        return -1;
     }
 
     return 0;
@@ -595,6 +677,9 @@ int transformer_run_ternary_conversion(const ternary_conversion_config_t *config
     }
     if (config->activation_tape_path && config->activation_tape_path[0] != '\0') {
         LOG_INFO("  activation_tape: %s", config->activation_tape_path);
+    }
+    if (config->teacher_model_name && config->teacher_model_name[0] != '\0') {
+        LOG_INFO("  teacher_model: %s", config->teacher_model_name);
     }
     if (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0') {
         LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);

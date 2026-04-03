@@ -42,6 +42,7 @@ static void print_help(const char* program_name) {
     printf("  --convert-ternary         Run ternary conversion mode instead of inference\n");
     printf("  --output <path>           Output file (single-layer) or output directory (full-model)\n");
     printf("  --layer <name>            Optional single-layer conversion filter\n");
+    printf("  --teacher-model <name>    Optional teacher model for cross-architecture alignment\n");
     printf("  --calibration-corpus <p>  Optional text corpus file or URL for tokenized STE calibration\n");
     printf("  --activation-tape <path>  Optional activation tape for tape-backed calibration\n");
     printf("  --calib-manifest <p>      Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
@@ -85,6 +86,7 @@ typedef struct {
     const char *output_path;
     const char *layer_name;
     const char *activation_tape_path;
+    const char *teacher_model_name;
     const char *calibration_corpus_path;
     const char *calibration_corpus_manifest_path;
     int calibration_sample_limit;
@@ -112,6 +114,7 @@ static void cli_args_init(cli_args_t *args)
     args->output_path = NULL;
     args->layer_name = NULL;
     args->activation_tape_path = NULL;
+    args->teacher_model_name = NULL;
     args->calibration_corpus_path = NULL;
     args->calibration_corpus_manifest_path = NULL;
     args->calibration_sample_limit = 4;
@@ -156,6 +159,18 @@ static int validate_cli_args(const cli_args_t *args)
             LOG_ERROR("ERROR: --activation-tape must not be empty.");
             return -1;
         }
+        if (args->teacher_model_name && args->teacher_model_name[0] == '\0') {
+            LOG_ERROR("ERROR: --teacher-model must not be empty.");
+            return -1;
+        }
+        if (args->teacher_model_name && !args->activation_tape_path) {
+            LOG_ERROR("ERROR: --teacher-model requires --activation-tape.");
+            return -1;
+        }
+        if (args->teacher_model_name && args->layer_name) {
+            LOG_ERROR("ERROR: --teacher-model is only supported for full-model ternary conversion.");
+            return -1;
+        }
         if (args->calibration_corpus_path && args->calibration_corpus_manifest_path) {
             LOG_ERROR("ERROR: use either --calibration-corpus or --calib-manifest, not both.");
             return -1;
@@ -198,6 +213,7 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.output_path = args->output_path;
     config.layer_name = args->layer_name;
     config.activation_tape_path = args->activation_tape_path;
+    config.teacher_model_name = args->teacher_model_name;
     config.calibration_corpus_path = args->calibration_corpus_path;
     config.calibration_corpus_manifest_path = args->calibration_corpus_manifest_path;
     config.validation_corpus_path = args->validation_corpus_path;
@@ -342,6 +358,7 @@ typedef enum {
     CLI_OPT_OUTPUT,
     CLI_OPT_LAYER,
     CLI_OPT_ACTIVATION_TAPE,
+    CLI_OPT_TEACHER_MODEL,
     CLI_OPT_CALIBRATION_CORPUS,
     CLI_OPT_CALIBRATION_MANIFEST,
     CLI_OPT_CALIBRATION_SAMPLES,
@@ -368,6 +385,7 @@ static cli_option_t parse_cli_option(const char *arg)
     if (strcmp(arg, "--output") == 0) return CLI_OPT_OUTPUT;
     if (strcmp(arg, "--layer") == 0) return CLI_OPT_LAYER;
     if (strcmp(arg, "--activation-tape") == 0) return CLI_OPT_ACTIVATION_TAPE;
+    if (strcmp(arg, "--teacher-model") == 0) return CLI_OPT_TEACHER_MODEL;
     if (strcmp(arg, "--calibration-corpus") == 0) return CLI_OPT_CALIBRATION_CORPUS;
     if (strcmp(arg, "--calib-manifest") == 0) return CLI_OPT_CALIBRATION_MANIFEST;
     if (strcmp(arg, "--calibration-samples") == 0) return CLI_OPT_CALIBRATION_SAMPLES;
@@ -392,6 +410,7 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_OUTPUT: args->output_path = value; break;
         case CLI_OPT_LAYER: args->layer_name = value; break;
         case CLI_OPT_ACTIVATION_TAPE: args->activation_tape_path = value; break;
+        case CLI_OPT_TEACHER_MODEL: args->teacher_model_name = value; break;
         case CLI_OPT_CALIBRATION_CORPUS: args->calibration_corpus_path = value; break;
         case CLI_OPT_CALIBRATION_MANIFEST: args->calibration_corpus_manifest_path = value; break;
         case CLI_OPT_CALIBRATION_SAMPLES: args->calibration_sample_limit = atoi(value); break;

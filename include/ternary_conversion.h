@@ -15,6 +15,7 @@ typedef struct {
     const char *output_path;
     const char *layer_name;
     const char *activation_tape_path;
+    const char *teacher_model_name;
     const char *calibration_corpus_path;
     const char *calibration_corpus_manifest_path;
     const char *validation_corpus_path;
