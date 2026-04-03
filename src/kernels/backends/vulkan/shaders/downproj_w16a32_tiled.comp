@@ -1,0 +1,103 @@
+#version 450 core
+
+/* Decode-specialized tiled down projection.
+ *
+ * Computes y[d_model] = W[d_model, d_ff] * x[d_ff] for batch_size == 1 with
+ * BF16 weights and F32 activations. Unlike the generic GEMV path, one
+ * workgroup computes 4 output rows and cooperatively stages 256 input floats
+ * into shared memory per tile, so the large FFN activation vector is read once
+ * for 4 rows instead of once per row.
+ *
+ * Layout matches VK_DESC_LAYOUT_PROJECTION:
+ *   binding 0: input  (F32)  [d_ff]
+ *   binding 1: weight (BF16 packed uint[])
+ *   binding 2: output (F32)  [d_model]
+ *
+ * Dispatch: (ceil(d_model / 4), 1, 1) workgroups.
+ */
+
+layout(local_size_x = 64, local_size_y = 4, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict readonly buffer InputBuffer {
+    float data[];
+} inputBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer WeightBuffer {
+    uint data[];
+} weightBuffer;
+
+layout(std430, binding = 2) restrict writeonly buffer OutputBuffer {
+    float data[];
+} outputBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+float bf16_lo(uint packed) {
+    return uintBitsToFloat((packed & 0xFFFFu) << 16u);
+}
+
+float bf16_hi(uint packed) {
+    return uintBitsToFloat(packed & 0xFFFF0000u);
+}
+
+shared float sh_input[256];
+shared float sh_partial[4][64];
+
+void main() {
+    uint lane_x = gl_LocalInvocationID.x;
+    uint lane_y = gl_LocalInvocationID.y;
+    uint linear_lane = lane_y * 64u + lane_x;
+    uint row = gl_WorkGroupID.x * 4u + lane_y;
+
+    uint d_in = pc.d_model;
+    uint d_out = pc.num_heads;
+    uint weight_stride = (pc.stride_0 > 0u) ? pc.stride_0 : d_in;
+
+    float acc = 0.0;
+
+    for (uint tile_base = 0u; tile_base < d_in; tile_base += 256u) {
+        uint input_idx = tile_base + linear_lane;
+        sh_input[linear_lane] = (input_idx < d_in) ? inputBuffer.data[input_idx] : 0.0;
+        barrier();
+
+        if (row < d_out) {
+            uint row_base = row * weight_stride;
+            uint tile_limit = min(256u, d_in - tile_base);
+            for (uint k = lane_x; k < tile_limit; k += 64u) {
+                uint elem_idx = row_base + tile_base + k;
+                uint packed = weightBuffer.data[elem_idx >> 1u];
+                float w = ((elem_idx & 1u) == 0u) ? bf16_lo(packed) : bf16_hi(packed);
+                acc += w * sh_input[k];
+            }
+        }
+
+        barrier();
+    }
+
+    sh_partial[lane_y][lane_x] = acc;
+    barrier();
+
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (lane_x < s) {
+            sh_partial[lane_y][lane_x] += sh_partial[lane_y][lane_x + s];
+        }
+        barrier();
+    }
+
+    if (lane_x == 0u && row < d_out) {
+        outputBuffer.data[row] = sh_partial[lane_y][0u];
+    }
+}

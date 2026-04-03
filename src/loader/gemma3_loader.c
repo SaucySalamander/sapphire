@@ -105,6 +105,29 @@ static void parse_numeric_field(const char* json, const sjson_token_t* tokens, i
     }
 }
 
+/* Parse a numeric field with an alternate JSON key name. */
+static void parse_numeric_field_alt(const char* json, const sjson_token_t* tokens, int nt,
+                                    gemma3_270m_config_t* cfg,
+                                    const gemma3_field_spec_t* spec,
+                                    const char* alt_json_key) {
+    int v_idx = sjson_find_key(json, tokens, nt, 0, spec->json_key);
+    if (v_idx < 0 && alt_json_key) {
+        v_idx = sjson_find_key(json, tokens, nt, 0, alt_json_key);
+    }
+    if (v_idx < 0) return;
+
+    double dv = 0.0;
+    if (sjson_token_to_double(json, &tokens[v_idx], &dv) != 0) return;
+
+    if (spec->type == FIELD_INT) {
+        int* field_ptr = (int*)(void*)((char*)cfg + spec->cfg_offset);
+        *field_ptr = (int)(dv + 0.5);
+    } else if (spec->type == FIELD_FLOAT) {
+        float* field_ptr = (float*)(void*)((char*)cfg + spec->cfg_offset);
+        *field_ptr = (float)dv;
+    }
+}
+
 /* Parse a nullable softcap field (checks for "null" literal) */
 static void parse_nullable_softcap(const char* json, const sjson_token_t* tokens, int nt,
                                     float* target, const char* key_primary, 
@@ -166,11 +189,15 @@ static void populate_config_standard_fields(const char* json, const sjson_token_
         {"num_key_value_heads", offsetof(gemma3_270m_config_t, num_key_value_heads), FIELD_INT},
         {"vocab_size", offsetof(gemma3_270m_config_t, vocab_size), FIELD_INT},
         {"sliding_window", offsetof(gemma3_270m_config_t, sliding_window), FIELD_INT},
-        {"_sliding_window_pattern", offsetof(gemma3_270m_config_t, sliding_window_pattern), FIELD_INT},
         {"query_pre_attn_scalar", offsetof(gemma3_270m_config_t, query_pre_attn_scalar), FIELD_FLOAT},
         {"attention_dropout", offsetof(gemma3_270m_config_t, attention_dropout), FIELD_FLOAT},
         {"max_position_embeddings", offsetof(gemma3_270m_config_t, max_position_embeddings), FIELD_INT},
         {"head_dim", offsetof(gemma3_270m_config_t, head_dim), FIELD_INT},
+        {"rms_norm_eps", offsetof(gemma3_270m_config_t, rms_norm_eps), FIELD_FLOAT},
+    };
+
+    static const gemma3_field_spec_t SLIDING_WINDOW_PATTERN_FIELD = {
+        "_sliding_window_pattern", offsetof(gemma3_270m_config_t, sliding_window_pattern), FIELD_INT
     };
 
     /* Table-driven parsing for string fields */
@@ -191,6 +218,8 @@ static void populate_config_standard_fields(const char* json, const sjson_token_
     for (size_t i = 0; i < sizeof(NUMERIC_FIELDS) / sizeof(NUMERIC_FIELDS[0]); ++i) {
         parse_numeric_field(json, tokens, nt, cfg, &NUMERIC_FIELDS[i]);
     }
+    parse_numeric_field_alt(json, tokens, nt, cfg, &SLIDING_WINDOW_PATTERN_FIELD,
+                            "sliding_window_pattern");
     for (size_t i = 0; i < sizeof(STRING_FIELDS) / sizeof(STRING_FIELDS[0]); ++i) {
         parse_string_field(json, tokens, nt, cfg, &STRING_FIELDS[i]);
     }
@@ -201,6 +230,24 @@ static void populate_config_standard_fields(const char* json, const sjson_token_
     /* Handle nullable softcaps separately */
     parse_nullable_softcap(json, tokens, nt, &cfg->final_logit_softcapping, "final_logit_softcap", "final_logit_softcapping");
     parse_nullable_softcap(json, tokens, nt, &cfg->attn_logit_softcapping, "attn_logit_softcap", "attn_logit_softcapping");
+}
+
+static void populate_config_layer_types_from_pattern(gemma3_270m_config_t* cfg) {
+    if (!cfg || cfg->layer_types_mask != 0 || cfg->num_hidden_layers <= 0) {
+        return;
+    }
+
+    int pattern = cfg->sliding_window_pattern > 0 ? cfg->sliding_window_pattern : 6;
+    unsigned long long mask = 0ULL;
+
+    for (int i = 0; i < cfg->num_hidden_layers && i < 64; ++i) {
+        if (pattern > 1 && ((i + 1) % pattern) == 0) {
+            mask |= (1ULL << i);
+        }
+    }
+
+    cfg->layer_types_mask = mask;
+    cfg->layer_types_count = cfg->num_hidden_layers;
 }
 
 static void populate_config_layer_types(const char* json, const sjson_token_t* tokens, int nt,
@@ -249,6 +296,11 @@ static int load_gemma3_config_json_from_dir(const char* dir, model_spec_t* spec)
     if (!cfg) goto cleanup;
 
     /* Initialize nullable floats to NAN */
+    cfg->bos_token_id = 2;
+    cfg->eos_token_id = 1;
+    cfg->pad_token_id = 0;
+    cfg->rms_norm_eps = 1e-6f;
+    cfg->sliding_window_pattern = 6;
     cfg->attn_logit_softcapping = NAN;
     cfg->final_logit_softcapping = NAN;
     cfg->rope_scaling = NAN;
@@ -256,6 +308,7 @@ static int load_gemma3_config_json_from_dir(const char* dir, model_spec_t* spec)
     /* Populate fields using helpers */
     populate_config_standard_fields(json, tokens, nt, cfg);
     populate_config_layer_types(json, tokens, nt, cfg);
+    populate_config_layer_types_from_pattern(cfg);
 
     /* Debug: Log loaded config values */
     LOG_DEBUG("Loaded Gemma3 config: hidden_size=%d, intermediate_size=%d, num_layers=%d, vocab_size=%d, head_dim=%d, num_attn_heads=%d, num_kv_heads=%d",

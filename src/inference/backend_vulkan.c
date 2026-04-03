@@ -627,7 +627,11 @@ static int init_vk_gpu_buffers(backend_vulkan_session_data_t *bd,
     {
         vk_kv_pager_config_t pager_cfg;
         if (vk_kv_pager_config_from_env(&pager_cfg, cfg->num_hidden_layers, max_context_len) == 0 && pager_cfg.enabled) {
-            bd->kv_pager = vk_kv_pager_create(&pager_cfg, cfg->num_hidden_layers, max_context_len);
+            bd->kv_pager = vk_kv_pager_create(&pager_cfg,
+                                              cfg->num_hidden_layers,
+                                              max_context_len,
+                                              cfg->layer_types_mask,
+                                              cfg->sliding_window);
             if (!bd->kv_pager) {
                 LOG_WARN("Vulkan KV pager requested but initialization failed; continuing without pager");
             }
@@ -1172,7 +1176,36 @@ static int upload_single_weight_f32(backend_vulkan_session_data_t *bd,
     return rc;
 }
 
-/* Upload final_norm_weight and embedding_weight to the GPU. */
+/**
+ * Upload embedding table as raw BF16 bytes (no conversion) when the source
+ * tensor is already BF16.  Halves VRAM: 1.34 GB for 4B, 2.68 GB for 27B.
+ * Returns 0 on success, -1 when source is not BF16 or allocation fails.
+ */
+static int upload_embedding_bf16(backend_vulkan_session_data_t *bd,
+                                  const tensor_t *tensor,
+                                  vk_buffer_t *dst_buf) {
+    if (!tensor || tensor_dtype(tensor) != DTYPE_BF16) return -1;
+    size_t bf16_bytes = tensor_nbytes(tensor);
+    if (bf16_bytes == 0) return -1;
+    if (vk_buffer_create(bd->device, bd->phys_dev, bf16_bytes,
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, dst_buf) != 0) {
+        LOG_ERROR("Failed to create BF16 embedding buffer (%zu B)", bf16_bytes);
+        return -1;
+    }
+    int rc = chunk_upload_to_device(bd, tensor_data(tensor), bf16_bytes, dst_buf);
+    if (rc != 0) {
+        LOG_ERROR("Failed to upload BF16 embedding");
+        vk_buffer_destroy(bd->device, dst_buf);
+        return -1;
+    }
+    return 0;
+}
+
+/* Upload final_norm_weight and embedding_weight to the GPU.
+ * Attempts BF16 embedding upload first (halves VRAM for 4B/27B models);
+ * falls back to F32 when source tensor is not BF16. */
 static int upload_vk_final_weights(backend_vulkan_session_data_t *bd,
                                    const llm_model_t *model,
                                    const gemma3_270m_config_t *cfg) {
@@ -1181,14 +1214,110 @@ static int upload_vk_final_weights(backend_vulkan_session_data_t *bd,
                                  norm_sz, &bd->final_norm_weight) != 0) {
         LOG_ERROR("Failed to upload final_norm_weight"); return -1;
     }
-    size_t emb_sz = (size_t)cfg->vocab_size * (size_t)cfg->hidden_size * sizeof(float);
-    if (upload_single_weight_f32(bd, model->embedding_weight,
-                                 emb_sz, &bd->embedding_weight) != 0) {
-        LOG_ERROR("Failed to upload embedding_weight"); return -1;
+    if (upload_embedding_bf16(bd, model->embedding_weight,
+                              &bd->embedding_weight) == 0) {
+        bd->emb_weights_bf16 = 1;
+        LOG_INFO("Uploaded embedding as BF16: %zu B (saved %zu B vs F32)",
+                 tensor_nbytes(model->embedding_weight),
+                 tensor_nbytes(model->embedding_weight));
+    } else {
+        size_t emb_sz = (size_t)cfg->vocab_size *
+                        (size_t)cfg->hidden_size * sizeof(float);
+        if (upload_single_weight_f32(bd, model->embedding_weight,
+                                     emb_sz, &bd->embedding_weight) != 0) {
+            LOG_ERROR("Failed to upload embedding_weight"); return -1;
+        }
+        bd->emb_weights_bf16 = 0;
+        LOG_INFO("Uploaded embedding as F32: %zu B", emb_sz);
     }
-    LOG_INFO("Uploaded final weights: norm=%zu B, embedding=%zu B", norm_sz, emb_sz);
+    LOG_INFO("Uploaded final weights: norm=%zu B, emb_bf16=%d",
+             norm_sz, bd->emb_weights_bf16);
     return 0;
 }
+
+static const char *const VK_PIPELINE_SPV_PATHS[NUM_PIPELINES] = {
+    [PIPELINE_RMSNORM_F32]       = "src/kernels/backends/vulkan/shaders/rmsnorm_f32.comp.spv",
+    [PIPELINE_RMSNORM_BF16]      = "src/kernels/backends/vulkan/shaders/rmsnorm_bf16.comp.spv",
+    [PIPELINE_GEMV_F32]          = "src/kernels/backends/vulkan/shaders/gemv_f32.comp.spv",
+    [PIPELINE_GEMV_BF16]         = "src/kernels/backends/vulkan/shaders/gemv_bf16.comp.spv",
+    [PIPELINE_GEMM_F32]          = "src/kernels/backends/vulkan/shaders/gemm_f32.comp.spv",
+    [PIPELINE_GEMM_BF16]         = "src/kernels/backends/vulkan/shaders/gemm_bf16.comp.spv",
+    [PIPELINE_ROPE_F32]          = "src/kernels/backends/vulkan/shaders/rope_apply_f32.comp.spv",
+    [PIPELINE_ROPE_BF16]         = "src/kernels/backends/vulkan/shaders/rope_apply_bf16.comp.spv",
+    [PIPELINE_QK_NORM_F32]       = "src/kernels/backends/vulkan/shaders/qk_norm_f32.comp.spv",
+    [PIPELINE_QK_NORM_BF16]      = "src/kernels/backends/vulkan/shaders/qk_norm_bf16.comp.spv",
+    [PIPELINE_ATTENTION_F32]     = "src/kernels/backends/vulkan/shaders/attention_gqa_f32.comp.spv",
+    [PIPELINE_ATTENTION_BF16]    = "src/kernels/backends/vulkan/shaders/attention_gqa_bf16.comp.spv",
+    [PIPELINE_GELU_F32]          = "src/kernels/backends/vulkan/shaders/gelu_f32.comp.spv",
+    [PIPELINE_GELU_BF16]         = "src/kernels/backends/vulkan/shaders/gelu_bf16.comp.spv",
+    [PIPELINE_VEC_ADD_F32]       = "src/kernels/backends/vulkan/shaders/vec_add_f32.comp.spv",
+    [PIPELINE_ARGMAX_F32]        = "src/kernels/backends/vulkan/shaders/argmax_f32.comp.spv",
+    [PIPELINE_LMHEAD_DECODE_F32] = "src/kernels/backends/vulkan/shaders/lmhead_decode_f32.comp.spv",
+    [PIPELINE_GEMV_W16A32]       = "src/kernels/backends/vulkan/shaders/gemv_w16a32.comp.spv",
+    [PIPELINE_GEMM_W16A32]       = "src/kernels/backends/vulkan/shaders/gemm_w16a32.comp.spv",
+    [PIPELINE_LMHEAD_DECODE_W16A32] = "src/kernels/backends/vulkan/shaders/lmhead_decode_w16a32.comp.spv",
+    [PIPELINE_FFN_GEGLU_W16A32]     = "src/kernels/backends/vulkan/shaders/ffn_geglu_fused_w16a32.comp.spv",
+};
+
+static const vk_desc_layout_type_t VK_PIPELINE_LAYOUT_TYPES[NUM_PIPELINES] = {
+    [PIPELINE_RMSNORM_F32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_RMSNORM_BF16] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMV_F32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMV_BF16] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMM_F32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMM_BF16] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_ROPE_F32] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_ROPE_BF16] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_QK_NORM_F32] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_QK_NORM_BF16] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_ATTENTION_F32] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_ATTENTION_BF16] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_GELU_F32] = VK_DESC_LAYOUT_WEIGHT_ONLY,
+    [PIPELINE_GELU_BF16] = VK_DESC_LAYOUT_WEIGHT_ONLY,
+    [PIPELINE_VEC_ADD_F32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_ARGMAX_F32] = VK_DESC_LAYOUT_CUSTOM,
+    [PIPELINE_LMHEAD_DECODE_F32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMV_W16A32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMM_W16A32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_LMHEAD_DECODE_W16A32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_FFN_GEGLU_W16A32] = VK_DESC_LAYOUT_CUSTOM,
+};
+
+static const uint32_t VK_PIPELINE_DESC_SETS_PER_LAYER[NUM_PIPELINES] = {
+    [PIPELINE_RMSNORM_F32] = 4,
+    [PIPELINE_RMSNORM_BF16] = 4,
+    [PIPELINE_GEMV_F32] = 7,
+    [PIPELINE_GEMV_BF16] = 7,
+    [PIPELINE_GEMM_F32] = 0,
+    [PIPELINE_GEMM_BF16] = 0,
+    [PIPELINE_ROPE_F32] = 1,
+    [PIPELINE_ROPE_BF16] = 1,
+    [PIPELINE_QK_NORM_F32] = 1,
+    [PIPELINE_QK_NORM_BF16] = 1,
+    [PIPELINE_ATTENTION_F32] = 1,
+    [PIPELINE_ATTENTION_BF16] = 1,
+    [PIPELINE_GELU_F32] = 1,
+    [PIPELINE_GELU_BF16] = 1,
+    [PIPELINE_VEC_ADD_F32] = 2,
+    [PIPELINE_ARGMAX_F32] = 0,
+    [PIPELINE_LMHEAD_DECODE_F32] = 0,
+    [PIPELINE_GEMV_W16A32] = 7,
+    [PIPELINE_GEMM_W16A32] = 0,
+    [PIPELINE_LMHEAD_DECODE_W16A32] = 0,
+    [PIPELINE_FFN_GEGLU_W16A32] = 1,
+};
+
+static const vk_desc_binding_t VK_ARGMAX_BINDINGS[] = {
+    {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+    {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+};
+
+static const vk_desc_binding_t VK_FFN_GEGLU_BINDINGS[] = {
+    {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+    {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+    {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+    {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+};
 
 /* Create all shader pipelines with pre-allocated descriptor sets (SDT). */
 static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
@@ -1196,82 +1325,27 @@ static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
     bd->pipelines = calloc(NUM_PIPELINES, sizeof(vk_compute_pipeline_t));
     if (!bd->pipelines) { LOG_ERROR("Failed to alloc pipeline array"); return -1; }
     bd->num_pipelines = NUM_PIPELINES;
-
-    static const char *spv[NUM_PIPELINES] = {
-        [PIPELINE_RMSNORM_F32]    = "src/kernels/backends/vulkan/shaders/rmsnorm_f32.comp.spv",
-        [PIPELINE_RMSNORM_BF16]   = "src/kernels/backends/vulkan/shaders/rmsnorm_bf16.comp.spv",
-        [PIPELINE_GEMV_F32]       = "src/kernels/backends/vulkan/shaders/gemv_f32.comp.spv",
-        [PIPELINE_GEMV_BF16]      = "src/kernels/backends/vulkan/shaders/gemv_bf16.comp.spv",
-        [PIPELINE_GEMM_F32]       = "src/kernels/backends/vulkan/shaders/gemm_f32.comp.spv",
-        [PIPELINE_GEMM_BF16]      = "src/kernels/backends/vulkan/shaders/gemm_bf16.comp.spv",
-        [PIPELINE_ROPE_F32]       = "src/kernels/backends/vulkan/shaders/rope_apply_f32.comp.spv",
-        [PIPELINE_ROPE_BF16]      = "src/kernels/backends/vulkan/shaders/rope_apply_bf16.comp.spv",
-        [PIPELINE_QK_NORM_F32]    = "src/kernels/backends/vulkan/shaders/qk_norm_f32.comp.spv",
-        [PIPELINE_QK_NORM_BF16]   = "src/kernels/backends/vulkan/shaders/qk_norm_bf16.comp.spv",
-        [PIPELINE_ATTENTION_F32]  = "src/kernels/backends/vulkan/shaders/attention_gqa_f32.comp.spv",
-        [PIPELINE_ATTENTION_BF16] = "src/kernels/backends/vulkan/shaders/attention_gqa_bf16.comp.spv",
-        [PIPELINE_GELU_F32]       = "src/kernels/backends/vulkan/shaders/gelu_f32.comp.spv",
-        [PIPELINE_GELU_BF16]      = "src/kernels/backends/vulkan/shaders/gelu_bf16.comp.spv",
-        [PIPELINE_VEC_ADD_F32]    = "src/kernels/backends/vulkan/shaders/vec_add_f32.comp.spv",
-        [PIPELINE_ARGMAX_F32]     = "src/kernels/backends/vulkan/shaders/argmax_f32.comp.spv",
-        [PIPELINE_LMHEAD_DECODE_F32] = "src/kernels/backends/vulkan/shaders/lmhead_decode_f32.comp.spv",
-        [PIPELINE_GEMV_W16A32]    = "src/kernels/backends/vulkan/shaders/gemv_w16a32.comp.spv",
-        [PIPELINE_GEMM_W16A32]    = "src/kernels/backends/vulkan/shaders/gemm_w16a32.comp.spv",
-    };
-    static const vk_desc_layout_type_t lt[NUM_PIPELINES] = {
-        [PIPELINE_RMSNORM_F32] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_RMSNORM_BF16] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_GEMV_F32] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_GEMV_BF16] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_GEMM_F32] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_GEMM_BF16] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_ROPE_F32] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_ROPE_BF16] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_QK_NORM_F32] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_QK_NORM_BF16] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_ATTENTION_F32] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_ATTENTION_BF16] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_GELU_F32] = VK_DESC_LAYOUT_WEIGHT_ONLY,
-        [PIPELINE_GELU_BF16] = VK_DESC_LAYOUT_WEIGHT_ONLY,
-        [PIPELINE_VEC_ADD_F32] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_ARGMAX_F32] = VK_DESC_LAYOUT_CUSTOM,
-        [PIPELINE_LMHEAD_DECODE_F32] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_GEMV_W16A32] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_GEMM_W16A32] = VK_DESC_LAYOUT_PROJECTION,
-    };
-    static const uint32_t spl[NUM_PIPELINES] = {
-        [PIPELINE_RMSNORM_F32] = 4, [PIPELINE_RMSNORM_BF16] = 4,
-        [PIPELINE_GEMV_F32] = 7,    [PIPELINE_GEMV_BF16] = 7,
-        [PIPELINE_GEMM_F32] = 0,    [PIPELINE_GEMM_BF16] = 0,
-        [PIPELINE_ROPE_F32] = 1,    [PIPELINE_ROPE_BF16] = 1,
-        [PIPELINE_QK_NORM_F32] = 1, [PIPELINE_QK_NORM_BF16] = 1,
-        [PIPELINE_ATTENTION_F32] = 1, [PIPELINE_ATTENTION_BF16] = 1,
-        [PIPELINE_GELU_F32] = 1,    [PIPELINE_GELU_BF16] = 1,
-        [PIPELINE_VEC_ADD_F32] = 2, [PIPELINE_ARGMAX_F32] = 0,
-        [PIPELINE_LMHEAD_DECODE_F32] = 0,
-        [PIPELINE_GEMV_W16A32] = 7,
-        [PIPELINE_GEMM_W16A32] = 0,
-    };
-    static const vk_desc_binding_t argmax_b[] = {
-        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
-        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
-    };
     int fail = 0;
     for (int i = 0; i < NUM_PIPELINES; i++) {
         vk_pipeline_config_t pc = {0};
-        pc.shader_path        = spv[i];
+        pc.shader_path        = VK_PIPELINE_SPV_PATHS[i];
         pc.entry_point        = "main";
-        pc.layout_type        = lt[i];
+        pc.layout_type        = VK_PIPELINE_LAYOUT_TYPES[i];
         pc.push_constant_size = sizeof(vk_kernel_push_constants_t);
         if (i == PIPELINE_ARGMAX_F32) {
-            pc.custom_bindings = argmax_b; pc.num_custom_bindings = 2;
+            pc.custom_bindings = VK_ARGMAX_BINDINGS; pc.num_custom_bindings = 2;
         }
-        pc.num_desc_sets = spl[i] * (uint32_t)cfg->num_hidden_layers;
+        if (i == PIPELINE_FFN_GEGLU_W16A32) {
+            pc.custom_bindings = VK_FFN_GEGLU_BINDINGS; pc.num_custom_bindings = 4;
+        }
+        pc.num_desc_sets = VK_PIPELINE_DESC_SETS_PER_LAYER[i] * (uint32_t)cfg->num_hidden_layers;
         if (i == PIPELINE_RMSNORM_F32 || i == PIPELINE_RMSNORM_BF16) pc.num_desc_sets++;
         if (i == PIPELINE_GEMV_F32    || i == PIPELINE_GEMV_BF16)    pc.num_desc_sets++;
         if (i == PIPELINE_GEMV_W16A32)                                pc.num_desc_sets++;
         if (i == PIPELINE_GEMM_W16A32) pc.num_desc_sets = 1;
-        if (i == PIPELINE_LMHEAD_DECODE_F32) pc.num_desc_sets++;
+        if (i == PIPELINE_LMHEAD_DECODE_F32)    pc.num_desc_sets++;
+        if (i == PIPELINE_LMHEAD_DECODE_W16A32) pc.num_desc_sets++;
+        if (i == PIPELINE_FFN_GEGLU_W16A32)     pc.num_desc_sets = (uint32_t)cfg->num_hidden_layers;
         if (i == PIPELINE_ARGMAX_F32) pc.num_desc_sets = 1;
         if (pc.num_desc_sets == 0)    pc.num_desc_sets = 1;
         if (vk_pipeline_create(bd->device, &pc, &bd->pipelines[i]) != 0) fail++;
@@ -1785,20 +1859,45 @@ static void setup_ffn_in_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *
     sdt_write_buf(dev, S[SDT_SLOT_PRE_FFN_NORM].ds, 0, sp->residual.buffer, 0, VK_WHOLE_SIZE);
     sdt_write_buf(dev, S[SDT_SLOT_PRE_FFN_NORM].ds, 1, wgt_ffn_norm, off_ffn_norm, VK_WHOLE_SIZE);
     sdt_write_buf(dev, S[SDT_SLOT_PRE_FFN_NORM].ds, 2, sp->ffn_gate.buffer, 0, VK_WHOLE_SIZE);
-    S[SDT_SLOT_GATE_PROJ].pipeline_idx = PI_GEMV;
-    S[SDT_SLOT_GATE_PROJ].ds = sdt_alloc_ds(bd, PI_GEMV);
-    sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 0, sp->ffn_gate.buffer,  0, VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 1, wgt_gate, off_gate,   VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 2, sp->ffn_value.buffer, 0, VK_WHOLE_SIZE);
-    S[SDT_SLOT_UP_PROJ].pipeline_idx = PI_GEMV;
-    S[SDT_SLOT_UP_PROJ].ds = sdt_alloc_ds(bd, PI_GEMV);
-    sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 0, sp->ffn_gate.buffer,    0, VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 1, wgt_up, off_up,         VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 2, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
-    S[SDT_SLOT_GELU].pipeline_idx = PI_GELU;
-    S[SDT_SLOT_GELU].ds = sdt_alloc_ds(bd, PI_GELU);
-    sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 0, sp->ffn_value.buffer,   0, VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 1, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
+    if (bd->proj_weights_bf16) {
+        /* Fused GeGLU path: GATE_PROJ slot holds the 4-binding fused descriptor.
+         * Bindings: input(ffn_gate) | gate_w | up_w | output(ffn_value)
+         * UP_PROJ and GELU slots are still allocated from their pools (preserves
+         * SDT cursor integrity) but are never dispatched in record_ffn_phase. */
+        S[SDT_SLOT_GATE_PROJ].pipeline_idx = PIPELINE_FFN_GEGLU_W16A32;
+        S[SDT_SLOT_GATE_PROJ].ds = sdt_alloc_ds(bd, PIPELINE_FFN_GEGLU_W16A32);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 0, sp->ffn_gate.buffer,  0,        VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 1, wgt_gate, off_gate,             VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 2, wgt_up,   off_up,               VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 3, sp->ffn_value.buffer, 0,        VK_WHOLE_SIZE);
+        /* UP_PROJ: allocate but mark unused (will not be dispatched) */
+        S[SDT_SLOT_UP_PROJ].pipeline_idx = PI_GEMV;
+        S[SDT_SLOT_UP_PROJ].ds = sdt_alloc_ds(bd, PI_GEMV);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 0, sp->ffn_gate.buffer,    0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 1, wgt_up, off_up,         VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 2, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
+        /* GELU: allocate but mark unused (will not be dispatched) */
+        S[SDT_SLOT_GELU].pipeline_idx = PI_GELU;
+        S[SDT_SLOT_GELU].ds = sdt_alloc_ds(bd, PI_GELU);
+        sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 0, sp->ffn_value.buffer,   0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 1, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
+    } else {
+        /* F32 path: separate gate_proj, up_proj, gelu descriptors (unchanged). */
+        S[SDT_SLOT_GATE_PROJ].pipeline_idx = PI_GEMV;
+        S[SDT_SLOT_GATE_PROJ].ds = sdt_alloc_ds(bd, PI_GEMV);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 0, sp->ffn_gate.buffer,  0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 1, wgt_gate, off_gate,   VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 2, sp->ffn_value.buffer, 0, VK_WHOLE_SIZE);
+        S[SDT_SLOT_UP_PROJ].pipeline_idx = PI_GEMV;
+        S[SDT_SLOT_UP_PROJ].ds = sdt_alloc_ds(bd, PI_GEMV);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 0, sp->ffn_gate.buffer,    0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 1, wgt_up, off_up,         VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 2, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
+        S[SDT_SLOT_GELU].pipeline_idx = PI_GELU;
+        S[SDT_SLOT_GELU].ds = sdt_alloc_ds(bd, PI_GELU);
+        sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 0, sp->ffn_value.buffer,   0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 1, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
+    }
 }
 
 /* Setup SDT slots: DOWN_PROJ, POST_FFN_NORM, FFN_RESIDUAL */
@@ -1876,11 +1975,19 @@ static int vulkan_prepopulate_descriptors(backend_vulkan_session_data_t *bd,
     sdt_write_buf(dev, bd->sdt.lmhead_norm.ds, 1, bd->final_norm_weight.buffer,     0, VK_WHOLE_SIZE);
     sdt_write_buf(dev, bd->sdt.lmhead_norm.ds, 2, sp->norm_buf.buffer,              0, VK_WHOLE_SIZE);
 
-    bd->sdt.lmhead_proj.pipeline_idx = PI_GEMV;
-    bd->sdt.lmhead_proj.ds = sdt_alloc_ds(bd, PI_GEMV);
+    /* lmhead_proj: use W16A32 pipeline when embedding was uploaded as BF16.
+     * Both F32 and BF16 variants share the PROJECTION descriptor layout
+     * (3 bindings: input, weight, output) so the descriptor set is compatible. */
+    const int PI_LMHEAD_PROJ = bd->emb_weights_bf16
+                               ? PIPELINE_LMHEAD_DECODE_W16A32
+                               : PI_GEMV;
+    bd->sdt.lmhead_proj.pipeline_idx = PI_LMHEAD_PROJ;
+    bd->sdt.lmhead_proj.ds = sdt_alloc_ds(bd, PI_LMHEAD_PROJ);
     sdt_write_buf(dev, bd->sdt.lmhead_proj.ds, 0, sp->norm_buf.buffer,              0, VK_WHOLE_SIZE);
     sdt_write_buf(dev, bd->sdt.lmhead_proj.ds, 1, bd->embedding_weight.buffer,      0, VK_WHOLE_SIZE);
     sdt_write_buf(dev, bd->sdt.lmhead_proj.ds, 2, bd->lm_head_logits.buffer,        0, VK_WHOLE_SIZE);
+    LOG_DEBUG("lmhead_proj pipeline: %s",
+              bd->emb_weights_bf16 ? "LMHEAD_DECODE_W16A32" : "GEMV_F32");
 
     bd->sdt.lmhead_argmax.pipeline_idx = PIPELINE_ARGMAX_F32;
     bd->sdt.lmhead_argmax.ds = sdt_alloc_ds(bd, PIPELINE_ARGMAX_F32);
@@ -2193,19 +2300,48 @@ static void record_ffn_phase(
     kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 11 pre-ffn norm */
 
     pc->d_model = d_model; pc->num_heads = d_ff;
-    pc->stride_0 = d_model; pc->stride_1 = use_gemm ? d_ff : 0;
-    proj_dispatch(cmd_buf, bd, &S[SDT_SLOT_GATE_PROJ], &_pm, d_ff, pc);
-    pc->num_heads = d_ff;
-    proj_dispatch(cmd_buf, bd, &S[SDT_SLOT_UP_PROJ], &_pm, d_ff, pc);
-    barrier_bufs2(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->ffn_value.buffer, sp->attn_output.buffer);
-    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 12 gate/up proj */
+    pc->stride_0 = d_model; pc->stride_1 = d_model;
+    if (bd->proj_weights_bf16) {
+        /* Fused path: gate_proj + up_proj + GELU in one shader dispatch.
+         * SDT_SLOT_GATE_PROJ holds the 4-binding fused descriptor set.
+         * Reads ffn_gate (input), gate_w, up_w → writes ffn_value.
+         * Replaces: gate_proj dispatch + up_proj dispatch + barrier_bufs2 + gelu dispatch + barrier.
+         * Net saving: ~7 ms/token on RDNA1 4B (d_ff=10240). */
+        const vk_compute_pipeline_t *fused_pipe =
+            &bd->pipelines[PIPELINE_FFN_GEGLU_W16A32];
+        /* Dispatch one WG per output row: (d_ff, batch_size, 1).
+         * The fused shader uses gl_WorkGroupID.x directly as the row index.
+         * head_dim push constant is not used by this shader. */
+        vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          fused_pipe->pipeline);
+        vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                fused_pipe->pipeline_layout, 0, 1,
+                                &S[SDT_SLOT_GATE_PROJ].ds, 0, NULL);
+        vk_pipeline_dispatch(cmd_buf, fused_pipe, pc,
+                             d_ff, (uint32_t)batch_size, 1);
+        barrier_buf(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->ffn_value.buffer);
+        kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 12 fused gate_geglu */
+        kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 13 (zero-dur, was geglu) */
+    } else {
+        /* F32 path: three separate dispatches + two barriers (unchanged). */
+        pc->stride_1 = use_gemm ? d_ff : 0;
+        proj_dispatch(cmd_buf, bd, &S[SDT_SLOT_GATE_PROJ], &_pm, d_ff, pc);
+        pc->num_heads = d_ff;
+        proj_dispatch(cmd_buf, bd, &S[SDT_SLOT_UP_PROJ], &_pm, d_ff, pc);
+        barrier_bufs2(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      sp->ffn_value.buffer, sp->attn_output.buffer);
+        kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 12 gate/up proj */
 
-    pc->stride_0 = 0; pc->stride_1 = 0;
-    sdt_bind(cmd_buf, &S[SDT_SLOT_GELU], bd);
-    vk_pipeline_dispatch(cmd_buf, &bd->pipelines[S[SDT_SLOT_GELU].pipeline_idx],
-                         pc, ceil_div((uint32_t)batch_size * d_ff, 256), 1, 1);
-    barrier_buf(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->ffn_value.buffer);
-    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 13 geglu */
+        pc->stride_0 = 0; pc->stride_1 = 0;
+        sdt_bind(cmd_buf, &S[SDT_SLOT_GELU], bd);
+        vk_pipeline_dispatch(cmd_buf, &bd->pipelines[S[SDT_SLOT_GELU].pipeline_idx],
+                             pc, ceil_div((uint32_t)batch_size * d_ff, 256), 1, 1);
+        barrier_buf(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->ffn_value.buffer);
+        kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 13 geglu */
+    }
 
     pc->d_model = d_ff; pc->num_heads = d_model;
     pc->stride_0 = d_ff; pc->stride_1 = use_gemm ? d_model : 0;
@@ -2336,7 +2472,12 @@ static void record_lmhead_block(
     pc.stride_1  = 0;
     pc.num_heads = (uint32_t)cfg->vocab_size;
     if (opts->emit_argmax && opts->batch_size == 1) {
-        const vk_compute_pipeline_t *decode_pipe = &bd->pipelines[PIPELINE_LMHEAD_DECODE_F32];
+        /* Decode path: one workgroup per vocab row.
+         * Use W16A32 when the embedding table stayed in BF16 on GPU. */
+        const int decode_pipe_idx = bd->emb_weights_bf16
+                                    ? PIPELINE_LMHEAD_DECODE_W16A32
+                                    : PIPELINE_LMHEAD_DECODE_F32;
+        const vk_compute_pipeline_t *decode_pipe = &bd->pipelines[decode_pipe_idx];
         const uint32_t max_groups_x = 65535u;
         const uint32_t groups_x = (uint32_t)cfg->vocab_size < max_groups_x
                                 ? (uint32_t)cfg->vocab_size
@@ -2348,7 +2489,11 @@ static void record_lmhead_block(
                                 decode_pipe->pipeline_layout, 0, 1, &bd->sdt.lmhead_proj.ds, 0, NULL);
         vk_pipeline_dispatch(bd->cmd_buffer, decode_pipe, &pc, groups_x, groups_y, 1);
     } else {
-        const vk_compute_pipeline_t *gemm_pipe = &bd->pipelines[PIPELINE_GEMM_F32];
+        /* Prefill path: tiled GEMM — also select W16A32 when embedding is BF16. */
+        const int gemm_pipe_idx = bd->emb_weights_bf16
+                                  ? PIPELINE_GEMM_W16A32
+                                  : PIPELINE_GEMM_F32;
+        const vk_compute_pipeline_t *gemm_pipe = &bd->pipelines[gemm_pipe_idx];
         vkCmdBindPipeline(bd->cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, gemm_pipe->pipeline);
         vkCmdBindDescriptorSets(bd->cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 gemm_pipe->pipeline_layout, 0, 1, &bd->sdt.lmhead_proj.ds, 0, NULL);
@@ -3053,6 +3198,22 @@ static int vulkan_forward_batch(inference_session_t* session, const int* token_i
     if (!cfg) {
         LOG_ERROR("Model config is NULL in vulkan_forward_batch");
         return -1;
+    }
+
+    /* Batched prefill with Vulkan KV paging is currently unstable on RADV
+     * for longer prompts (device loss during the prefill submit). Fall back
+     * to token-serial prefill when paging is enabled; keep decode (batch=1)
+     * on the fast GPU path. If logits are requested, only the final token's
+     * logits are materialized, which matches current caller expectations. */
+    if (bd->kv_pager && batch_size > 1) {
+        for (int i = 0; i < batch_size; ++i) {
+            float *iter_logits = (logits && i == (batch_size - 1)) ? logits : NULL;
+            if (vulkan_forward_batch(session, token_ids + i, start_pos + i, 1, iter_logits) != 0) {
+                LOG_ERROR("Paged Vulkan serial prefill failed at batch index %d", i);
+                return -1;
+            }
+        }
+        return 0;
     }
 
     /* Verify GPU resources are ready */

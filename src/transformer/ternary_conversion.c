@@ -53,6 +53,8 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
     ste_config.zero_threshold = 0.05f;
     ste_config.momentum = 0.85f;
     ste_config.regularization_strength = 0.01f;
+    ste_config.non_collapse_weight = 0.02f;
+    ste_config.zero_occupancy_floor = 0.75f;
     ste_config.clip_value = 1.0f;
     ste_config.calibration_samples = (config && config->calibration_sample_limit > 0)
         ? config->calibration_sample_limit

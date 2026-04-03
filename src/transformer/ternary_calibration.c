@@ -51,10 +51,32 @@ static transformer_ste_config_t default_ste_config(void) {
     config.zero_threshold = 0.05f;
     config.momentum = 0.85f;
     config.regularization_strength = 0.01f;
+    config.non_collapse_weight = 0.02f;
+    config.zero_occupancy_floor = 0.75f;
     config.clip_value = 1.0f;
     config.calibration_samples = 4;
     config.kl_weight = 0.05f;
     return config;
+}
+
+static void normalize_ste_config(transformer_ste_config_t *config) {
+    if (!config) {
+        return;
+    }
+
+    if (config->ste_steps <= 0) config->ste_steps = 1;
+    if (config->learning_rate <= 0.0f) config->learning_rate = 0.05f;
+    if (config->zero_threshold < 0.0f) config->zero_threshold = 0.05f;
+    if (config->momentum < 0.0f || config->momentum >= 1.0f) config->momentum = 0.85f;
+    if (config->regularization_strength < 0.0f) config->regularization_strength = 0.01f;
+    if (config->non_collapse_weight < 0.0f) config->non_collapse_weight = 0.02f;
+    if (config->zero_occupancy_floor < 0.0f || config->zero_occupancy_floor >= 1.0f) {
+        config->zero_occupancy_floor = 0.75f;
+    }
+    if (config->clip_value <= 0.0f) config->clip_value = 1.0f;
+    if (config->calibration_samples <= 0) config->calibration_samples = 4;
+    if (config->calibration_samples > 16) config->calibration_samples = 16;
+    if (config->kl_weight < 0.0f) config->kl_weight = 0.0f;
 }
 
 static size_t ternary_packed_bytes(uint32_t rows, uint32_t cols) {
@@ -322,6 +344,10 @@ static float ternary_regularizer_grad(float value, int8_t ternary_value) {
     return value;
 }
 
+static float ternary_non_collapse_push(float latent_value) {
+    return (latent_value < 0.0f) ? -1.0f : 1.0f;
+}
+
 typedef struct {
     uint32_t cols;
     const float *calibration_vectors;
@@ -330,6 +356,8 @@ typedef struct {
     float learning_rate;
     float momentum;
     float regularization_strength;
+    float non_collapse_weight;
+    float zero_occupancy_floor;
     float clip_value;
 } ste_row_update_context_t;
 
@@ -342,9 +370,24 @@ static void ste_update_row(float *latent_row,
     float weight_sum = 0.0f;
     uint32_t cols = context->cols;
     int sample_count = context->sample_count;
+    uint32_t zero_count = 0;
+    float non_collapse_scale = 0.0f;
 
     if (sample_count > (int)(sizeof(sample_diffs) / sizeof(sample_diffs[0]))) {
         sample_count = (int)(sizeof(sample_diffs) / sizeof(sample_diffs[0]));
+    }
+
+    for (uint32_t c = 0; c < cols; ++c) {
+        if (ternary_row[c] == 0) {
+            ++zero_count;
+        }
+    }
+    if (context->non_collapse_weight > 0.0f && cols > 0u) {
+        float zero_fraction = (float)zero_count / (float)cols;
+        if (zero_fraction > context->zero_occupancy_floor) {
+            non_collapse_scale = context->non_collapse_weight *
+                                 (zero_fraction - context->zero_occupancy_floor);
+        }
     }
 
     for (int s = 0; s < sample_count; ++s) {
@@ -366,6 +409,12 @@ static void ste_update_row(float *latent_row,
     for (uint32_t c = 0; c < cols; ++c) {
         float grad = context->regularization_strength *
                      ternary_regularizer_grad(latent_row[c], ternary_row[c]);
+
+        /* Anti-collapse: if a row quantizes to too many zeros, push zeroed
+         * weights away from the dead-zone so STE keeps exploring +/-1 states. */
+        if (non_collapse_scale > 0.0f && ternary_row[c] == 0) {
+            grad -= non_collapse_scale * ternary_non_collapse_push(latent_row[c]);
+        }
 
         for (int s = 0; s < sample_count; ++s) {
             const float *vec = context->calibration_vectors + (size_t)s * cols;
@@ -719,6 +768,8 @@ static void ste_calibrate_with_samples(const ste_calibration_context_t *context)
     row_context.learning_rate = context->config->learning_rate;
     row_context.momentum = context->config->momentum;
     row_context.regularization_strength = context->config->regularization_strength;
+    row_context.non_collapse_weight = context->config->non_collapse_weight;
+    row_context.zero_occupancy_floor = context->config->zero_occupancy_floor;
     row_context.clip_value = context->config->clip_value;
 
     for (uint32_t r = 0; r < context->rows; ++r) {
@@ -794,15 +845,7 @@ int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
     }
 
     effective_config = config ? *config : default_ste_config();
-    if (effective_config.ste_steps <= 0) effective_config.ste_steps = 1;
-    if (effective_config.learning_rate <= 0.0f) effective_config.learning_rate = 0.05f;
-    if (effective_config.zero_threshold < 0.0f) effective_config.zero_threshold = 0.05f;
-    if (effective_config.momentum < 0.0f || effective_config.momentum >= 1.0f) effective_config.momentum = 0.85f;
-    if (effective_config.regularization_strength < 0.0f) effective_config.regularization_strength = 0.01f;
-    if (effective_config.clip_value <= 0.0f) effective_config.clip_value = 1.0f;
-    if (effective_config.calibration_samples <= 0) effective_config.calibration_samples = 4;
-    if (effective_config.calibration_samples > 16) effective_config.calibration_samples = 16;
-    if (effective_config.kl_weight < 0.0f) effective_config.kl_weight = 0.0f;
+    normalize_ste_config(&effective_config);
 
     memset(out_result, 0, sizeof(*out_result));
     weight_count = (size_t)rows * cols;
@@ -880,12 +923,14 @@ int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
     free(velocity);
     free(calibration_vectors);
 
-    LOG_INFO("Calibrated ternary layer: rows=%u cols=%u steps=%d samples=%d kl_weight=%.4f packed=%zuB",
+    LOG_INFO("Calibrated ternary layer: rows=%u cols=%u steps=%d samples=%d kl_weight=%.4f non_collapse=%.4f floor=%.2f packed=%zuB",
              rows,
              cols,
              effective_config.ste_steps,
              effective_config.calibration_samples,
              (double)effective_config.kl_weight,
+             (double)effective_config.non_collapse_weight,
+             (double)effective_config.zero_occupancy_floor,
              packed_bytes);
     return 0;
 }

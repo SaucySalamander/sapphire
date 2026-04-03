@@ -23,6 +23,8 @@ typedef struct {
     float zero_threshold;
     float momentum;
     float regularization_strength;
+    float non_collapse_weight;
+    float zero_occupancy_floor;
     float clip_value;
     int calibration_samples;
     float kl_weight;

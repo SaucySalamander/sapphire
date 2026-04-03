@@ -1,0 +1,136 @@
+/**
+ * @file ffn_geglu_fused_w16a32.comp
+ * @brief Fused FFN GeGLU: gate_proj + up_proj + GELU in one dispatch.
+ *
+ * Replaces the 3-dispatch sequence (gate_proj GEMV, up_proj GEMV, gelu)
+ * plus the barrier_bufs2 separating them, collapsing into a single pass
+ * with one barrier afterward. Critical for 4B+ models on RDNA1 where
+ * the COMPUTE→COMPUTE barrier after two back-to-back 10240-WG dispatches
+ * costs ~7 ms/token.
+ *
+ * Binding layout (CUSTOM, 4 storage buffers):
+ *   binding 0: input   (F32)  [batch_size × d_model]
+ *   binding 1: gate_w  (BF16 packed uint) [d_ff × d_model / 2 words]
+ *   binding 2: up_w    (BF16 packed uint) [d_ff × d_model / 2 words]
+ *   binding 3: output  (F32)  [batch_size × d_ff]
+ */
+
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict readonly buffer InputBuffer {
+    float data[];
+} inputBuffer;
+
+layout(std430, binding = 1) restrict readonly buffer GateWeightBuffer {
+    uint data[];
+} gateWeightBuffer;
+
+layout(std430, binding = 2) restrict readonly buffer UpWeightBuffer {
+    uint data[];
+} upWeightBuffer;
+
+layout(std430, binding = 3) restrict writeonly buffer OutputBuffer {
+    float data[];
+} outputBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+float bf16_lo(uint packed) {
+    return uintBitsToFloat((packed & 0xFFFFu) << 16u);
+}
+
+float bf16_hi(uint packed) {
+    return uintBitsToFloat(packed & 0xFFFF0000u);
+}
+
+const float SQRT_2_OVER_PI = 0.7978845608028654;
+const float GELU_COEFF = 0.044715;
+
+float gelu_approx(float x) {
+    float c = x * x * x;
+    return 0.5 * x * (1.0 + tanh(SQRT_2_OVER_PI * (x + GELU_COEFF * c)));
+}
+
+shared float sh_gate[256];
+shared float sh_up[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint batch_idx = gl_WorkGroupID.y;
+    uint lane = gl_LocalInvocationID.x;
+
+    uint d_in = pc.d_model;
+    uint d_out = pc.num_heads;
+    uint gate_stride = (pc.stride_0 > 0u) ? pc.stride_0 : d_in;
+    uint up_stride = (pc.stride_1 > 0u) ? pc.stride_1 : d_in;
+
+    if (row >= d_out || batch_idx >= pc.batch_size) {
+        sh_gate[lane] = 0.0;
+        sh_up[lane] = 0.0;
+        barrier();
+        return;
+    }
+
+    uint input_base = batch_idx * d_in;
+    uint gate_base = row * gate_stride;
+    uint up_base = row * up_stride;
+
+    float gate_acc = 0.0;
+    float up_acc = 0.0;
+
+    uint i = lane * 2u;
+    for (; i + 1u < d_in; i += 512u) {
+        float in0 = inputBuffer.data[input_base + i];
+        float in1 = inputBuffer.data[input_base + i + 1u];
+
+        uint gword = gateWeightBuffer.data[(gate_base + i) >> 1u];
+        gate_acc += bf16_lo(gword) * in0;
+        gate_acc += bf16_hi(gword) * in1;
+
+        uint uword = upWeightBuffer.data[(up_base + i) >> 1u];
+        up_acc += bf16_lo(uword) * in0;
+        up_acc += bf16_hi(uword) * in1;
+    }
+
+    if (i < d_in) {
+        float in_val = inputBuffer.data[input_base + i];
+        bool even = ((i & 1u) == 0u);
+
+        uint gword = gateWeightBuffer.data[(gate_base + i) >> 1u];
+        gate_acc += (even ? bf16_lo(gword) : bf16_hi(gword)) * in_val;
+
+        uint uword = upWeightBuffer.data[(up_base + i) >> 1u];
+        up_acc += (even ? bf16_lo(uword) : bf16_hi(uword)) * in_val;
+    }
+
+    sh_gate[lane] = gate_acc;
+    sh_up[lane] = up_acc;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            sh_gate[lane] += sh_gate[lane + s];
+            sh_up[lane] += sh_up[lane + s];
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        outputBuffer.data[batch_idx * d_out + row] = gelu_approx(sh_gate[0u]) * sh_up[0u];
+    }
+}

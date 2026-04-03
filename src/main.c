@@ -69,6 +69,7 @@ static void print_help(const char* program_name) {
     printf("\nExample:\n");
     printf("  %s -m gemma3-270m-it -c 4096 -t 0.7 -n 200\n", program_name);
     printf("  %s -m gemma-3-27b-it --convert-ternary --output ./out/model-ternary\n", program_name);
+    printf("  %s -m gemma-3-7b-it --convert-ternary --output ./out/gemma-3-7b-it-ternary\n", program_name);
     printf("  %s -m gemma-3-270m-it --convert-ternary --layer model.layers.0.self_attn.q_proj.weight --output ./out/layer0-qproj.safetensors\n", program_name);
     printf("\n");
 }

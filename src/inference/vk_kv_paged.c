@@ -13,6 +13,9 @@ struct vk_kv_pager_t {
     uint32_t page_table_slots;
     int num_layers;
     int max_seq_len;
+    int sliding_window;
+    int latest_seq_pos_exclusive;
+    unsigned long long layer_types_mask;
     uint64_t page_hits;
     uint64_t page_misses;
     uint64_t page_binds;
@@ -26,6 +29,92 @@ struct vk_kv_pager_t {
     uint32_t pending_count;
     uint32_t pending_capacity;
 };
+
+typedef enum {
+    VK_KV_PAGE_CLASS_LOCAL_EXPIRED = 0,
+    VK_KV_PAGE_CLASS_GLOBAL = 1,
+    VK_KV_PAGE_CLASS_LOCAL_ACTIVE = 2
+} vk_kv_page_class_t;
+
+static int pager_layer_is_global(const vk_kv_pager_t *p, uint32_t layer) {
+    if (!p || layer >= (uint32_t)p->num_layers) return 0;
+    if (p->layer_types_mask != 0ULL) {
+        return (((p->layer_types_mask >> layer) & 1ULL) != 0ULL) ? 1 : 0;
+    }
+    return ((((int)layer + 1) % 6) == 0) ? 1 : 0;
+}
+
+static int pager_local_window_tokens(const vk_kv_pager_t *p) {
+    if (!p) return 1024;
+    return (p->sliding_window > 0) ? p->sliding_window : 1024;
+}
+
+static int pager_local_window_start(const vk_kv_pager_t *p) {
+    int window_tokens = pager_local_window_tokens(p);
+    if (!p || p->latest_seq_pos_exclusive <= window_tokens) return 0;
+    return p->latest_seq_pos_exclusive - window_tokens;
+}
+
+static vk_kv_page_class_t classify_page(const vk_kv_pager_t *p, const kv_page_t *page) {
+    if (!p || !page) return VK_KV_PAGE_CLASS_GLOBAL;
+    if (page->layer_id == UINT32_MAX || pager_layer_is_global(p, page->layer_id)) {
+        return VK_KV_PAGE_CLASS_GLOBAL;
+    }
+
+    int active_start = pager_local_window_start(p);
+    int active_end = p->latest_seq_pos_exclusive;
+    int page_start = (page->token_start == UINT64_MAX) ? 0 : (int)page->token_start;
+    int page_end = page_start + (int)page->token_count;
+    if (page_end > active_start && page_start < active_end) {
+        return VK_KV_PAGE_CLASS_LOCAL_ACTIVE;
+    }
+    return VK_KV_PAGE_CLASS_LOCAL_EXPIRED;
+}
+
+static void pin_non_class_pages(vk_kv_pager_t *p, vk_kv_page_class_t keep_class) {
+    if (!p || !p->page_table) return;
+    for (uint32_t slot = 0; slot < p->page_table_slots; ++slot) {
+        kv_page_t *page = p->page_table[slot];
+        if (!page) continue;
+        if (classify_page(p, page) != keep_class) {
+            (void)kv_pager_pin_page(page);
+        }
+    }
+}
+
+static void unpin_non_class_pages(vk_kv_pager_t *p, vk_kv_page_class_t keep_class) {
+    if (!p || !p->page_table) return;
+    for (uint32_t slot = 0; slot < p->page_table_slots; ++slot) {
+        kv_page_t *page = p->page_table[slot];
+        if (!page) continue;
+        if (classify_page(p, page) != keep_class) {
+            (void)kv_pager_unpin_page(page);
+        }
+    }
+}
+
+static kv_page_t *select_evict_candidate_for_class(vk_kv_pager_t *p,
+                                                   vk_kv_page_class_t target_class) {
+    kv_page_t *victim = NULL;
+    if (!p || !p->pager) return NULL;
+
+    pin_non_class_pages(p, target_class);
+    victim = kv_pager_evict_candidate(p->pager);
+    unpin_non_class_pages(p, target_class);
+
+    if (!victim) return NULL;
+    return (classify_page(p, victim) == target_class) ? victim : NULL;
+}
+
+static kv_page_t *select_priority_evict_candidate(vk_kv_pager_t *p) {
+    kv_page_t *victim = select_evict_candidate_for_class(p, VK_KV_PAGE_CLASS_LOCAL_EXPIRED);
+    if (victim) return victim;
+
+    victim = select_evict_candidate_for_class(p, VK_KV_PAGE_CLASS_GLOBAL);
+    if (victim) return victim;
+
+    return select_evict_candidate_for_class(p, VK_KV_PAGE_CLASS_LOCAL_ACTIVE);
+}
 
 static void clear_pending_for_slot(vk_kv_pager_t *p, uint32_t slot) {
     if (!p || slot >= p->page_table_slots) return;
@@ -112,7 +201,7 @@ static kv_page_t *bind_page_for_pos(vk_kv_pager_t *p, int layer, int pos) {
     p->page_misses++;
     page = kv_pager_alloc_page(p->pager);
     if (!page) {
-        kv_page_t *victim = kv_pager_evict_candidate(p->pager);
+        kv_page_t *victim = select_priority_evict_candidate(p);
         if (victim) {
             uint32_t victim_slot = 0u;
             if (get_slot_for_pos(p, (int)victim->layer_id, (int)victim->token_start, &victim_slot) == 0) {
@@ -168,6 +257,10 @@ static int touch_range(vk_kv_pager_t *p, int layer, int start_pos, int end_pos, 
     int clamped_end = (end_pos >= p->max_seq_len) ? (p->max_seq_len - 1) : end_pos;
     if (clamped_start > clamped_end) return 0;
 
+    if ((clamped_end + 1) > p->latest_seq_pos_exclusive) {
+        p->latest_seq_pos_exclusive = clamped_end + 1;
+    }
+
     int first_page_pos = (clamped_start / (int)p->page_tokens) * (int)p->page_tokens;
     int last_page_pos = (clamped_end / (int)p->page_tokens) * (int)p->page_tokens;
 
@@ -208,7 +301,9 @@ int vk_kv_pager_config_from_env(vk_kv_pager_config_t *cfg,
 
 vk_kv_pager_t *vk_kv_pager_create(const vk_kv_pager_config_t *cfg,
                                   int num_layers,
-                                  int max_seq_len) {
+                                  int max_seq_len,
+                                  unsigned long long layer_types_mask,
+                                  int sliding_window) {
     if (!cfg || !cfg->enabled) return NULL;
     if (num_layers <= 0 || max_seq_len <= 0 || cfg->page_tokens == 0u || cfg->max_pages == 0u) return NULL;
 
@@ -228,6 +323,9 @@ vk_kv_pager_t *vk_kv_pager_create(const vk_kv_pager_config_t *cfg,
 
     p->num_layers = num_layers;
     p->max_seq_len = max_seq_len;
+    p->sliding_window = sliding_window;
+    p->latest_seq_pos_exclusive = 0;
+    p->layer_types_mask = layer_types_mask;
     p->page_tokens = kv_pager_page_tokens(p->pager);
     p->pages_per_layer = (uint32_t)(((uint32_t)max_seq_len + p->page_tokens - 1u) / p->page_tokens);
     p->page_table_slots = p->pages_per_layer * (uint32_t)num_layers;
@@ -289,6 +387,7 @@ void vk_kv_pager_reset(vk_kv_pager_t *pager) {
     pager->page_evictions = 0u;
     pager->write_touches = 0u;
     pager->read_touches = 0u;
+    pager->latest_seq_pos_exclusive = 0;
 }
 
 int vk_kv_pager_touch_read_range(vk_kv_pager_t *pager,

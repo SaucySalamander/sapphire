@@ -39,7 +39,9 @@ int vk_kv_pager_config_from_env(vk_kv_pager_config_t *cfg,
 
 vk_kv_pager_t *vk_kv_pager_create(const vk_kv_pager_config_t *cfg,
                                   int num_layers,
-                                  int max_seq_len);
+                                  int max_seq_len,
+                                  unsigned long long layer_types_mask,
+                                  int sliding_window);
 
 void vk_kv_pager_destroy(vk_kv_pager_t *pager);
 

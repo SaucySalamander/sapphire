@@ -145,7 +145,9 @@ typedef struct {
 /* Mixed-precision tiled GEMM: F32 activations × BF16 weights → F32 output.
  * Prefill (batch>1) counterpart to PIPELINE_GEMV_W16A32. */
 #define PIPELINE_GEMM_W16A32        18
-#define NUM_PIPELINES               19
+#define PIPELINE_LMHEAD_DECODE_W16A32 19
+#define PIPELINE_FFN_GEGLU_W16A32   20
+#define NUM_PIPELINES               21
 
 /**
  * Vulkan backend session data (P11-02 + P11-03 integration).
@@ -238,6 +240,7 @@ typedef struct {
      * Enables the PIPELINE_GEMV_W16A32 path which halves VRAM for projection matrices
      * and eliminates PCIe spill on GPUs with < 12 GB VRAM (e.g. RX 5700 XT). */
     int proj_weights_bf16;
+    int emb_weights_bf16;
 
     /* Optional GPU timestamp profiling (SAPPHIRE_VK_PROFILE=1) */
     VkQueryPool timing_query_pool;
