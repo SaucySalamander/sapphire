@@ -17,7 +17,10 @@ extern "C" {
 
 typedef struct {
     uint32_t layer_idx;
+    uint32_t resume_step_idx;
     uint32_t step_idx;
+    uint32_t tape_hash;
+    uint32_t student_checkpoint_hash;
     float mse_loss;
     float grad_norm;
     float p_neg1;

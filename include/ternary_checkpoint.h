@@ -51,6 +51,9 @@ int ternary_student_checkpoint_load(const char *checkpoint_path,
 int ternary_student_checkpoint_compute_manifest_crc32(const char *manifest_path,
                                                       uint32_t *out_crc32);
 
+int ternary_student_checkpoint_compute_file_crc32(const char *checkpoint_path,
+                                                  uint32_t *out_crc32);
+
 int ternary_student_checkpoint_compute_tape_provenance_hash(const ternary_student_update_checkpoint_t *checkpoint,
                                                             const activation_tape_t *alignment_tape,
                                                             uint32_t *out_hash);

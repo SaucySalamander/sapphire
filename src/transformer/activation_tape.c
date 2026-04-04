@@ -518,6 +518,15 @@ const tape_file_header_t *activation_tape_header(const activation_tape_t *tape)
     return tape ? &tape->header : NULL;
 }
 
+uint32_t activation_tape_crc32(const activation_tape_t *tape)
+{
+    if (!tape || !tape->mmap_ptr || tape->mmap_size == 0u) {
+        return 0u;
+    }
+
+    return io_crc32_update(0u, tape->mmap_ptr, tape->mmap_size);
+}
+
 void activation_tape_prefetch_entry(const activation_tape_t *tape,
                                      uint32_t                 entry_idx)
 {

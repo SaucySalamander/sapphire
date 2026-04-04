@@ -141,6 +141,9 @@ uint32_t activation_tape_vector_dim(const activation_tape_t *tape,
 /** @return pointer to the tape header, or NULL if tape is NULL. */
 const tape_file_header_t *activation_tape_header(const activation_tape_t *tape);
 
+/** @return CRC32 of the mapped tape contents, or 0 if tape is NULL. */
+uint32_t activation_tape_crc32(const activation_tape_t *tape);
+
 /**
  * @brief Issue MADV_WILLNEED on the data range of manifest entry entry_idx.
  *

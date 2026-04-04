@@ -535,6 +535,27 @@ int ternary_student_checkpoint_compute_manifest_crc32(const char *manifest_path,
     return 0;
 }
 
+int ternary_student_checkpoint_compute_file_crc32(const char *checkpoint_path,
+                                                  uint32_t *out_crc32)
+{
+    char *buffer = NULL;
+    size_t buffer_size = 0u;
+    uint32_t crc32 = 0u;
+
+    if (!checkpoint_path || !out_crc32) {
+        return -1;
+    }
+
+    if (file_read_to_buffer(checkpoint_path, &buffer, &buffer_size) != 0) {
+        return -1;
+    }
+
+    crc32 = io_crc32_update(0u, buffer, buffer_size);
+    free(buffer);
+    *out_crc32 = crc32;
+    return 0;
+}
+
 int ternary_student_checkpoint_compute_tape_provenance_hash(const ternary_student_update_checkpoint_t *checkpoint,
                                                             const activation_tape_t *alignment_tape,
                                                             uint32_t *out_hash)

@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 typedef struct {
     calibration_corpus_t corpus_storage;
@@ -39,6 +40,8 @@ typedef struct {
     ternary_validation_state_t validation_state;
     char *checkpoint_path;
     char *checkpoint_tmp_path;
+    uint32_t activation_tape_hash;
+    uint32_t resume_step_index;
 } conversion_runtime_t;
 
 static uint32_t config_resume_hash(const ternary_conversion_config_t *config)
@@ -65,6 +68,56 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config)
     crc32 = io_crc32_update(crc32, &config->validate_every_n, sizeof(config->validate_every_n));
     crc32 = io_crc32_update(crc32, &config->kl_weight, sizeof(config->kl_weight));
     return crc32;
+}
+
+static float telemetry_elapsed_ms(const struct timespec *start,
+                                  const struct timespec *end)
+{
+    time_t sec = 0;
+    long nsec = 0;
+
+    if (!start || !end) {
+        return 0.0f;
+    }
+
+    sec = end->tv_sec - start->tv_sec;
+    nsec = end->tv_nsec - start->tv_nsec;
+    return (float)sec * 1000.0f + (float)nsec / 1000000.0f;
+}
+
+static uint32_t telemetry_checkpoint_hash_or_zero(const char *checkpoint_path)
+{
+    struct stat st;
+    uint32_t checkpoint_hash = 0u;
+
+    if (!checkpoint_path || checkpoint_path[0] == '\0') {
+        return 0u;
+    }
+
+    if (stat(checkpoint_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return 0u;
+    }
+
+    if (ternary_student_checkpoint_compute_file_crc32(checkpoint_path, &checkpoint_hash) != 0) {
+        return 0u;
+    }
+
+    return checkpoint_hash;
+}
+
+static void telemetry_prepare_layer_context(ternary_telemetry_t *telemetry,
+                                            const conversion_runtime_t *runtime,
+                                            int layer_index)
+{
+    if (!telemetry) {
+        return;
+    }
+
+    memset(telemetry, 0, sizeof(*telemetry));
+    telemetry->layer_idx = (uint32_t)layer_index;
+    telemetry->resume_step_idx = runtime ? runtime->resume_step_index : 0u;
+    telemetry->tape_hash = runtime ? runtime->activation_tape_hash : 0u;
+    telemetry->student_checkpoint_hash = runtime ? telemetry_checkpoint_hash_or_zero(runtime->checkpoint_path) : 0u;
 }
 
 static int checkpoint_path_for_output(const char *output_dir, char **out_path)
@@ -720,7 +773,8 @@ static void prefetch_activation_tape_lookahead(const conversion_runtime_t *runti
                                                const model_spec_t *spec,
                                                int start_idx,
                                                int lookahead_count,
-                                               int *last_prefetched_entry_idx)
+                                               int *last_prefetched_entry_idx,
+                                               float *out_io_ms)
 {
     int prefetched = 0;
 
@@ -744,7 +798,21 @@ static void prefetch_activation_tape_lookahead(const conversion_runtime_t *runti
             continue;
         }
 
-        activation_tape_prefetch_entry(runtime->activation_tape, (uint32_t)entry_idx);
+        if (out_io_ms) {
+            struct timespec prefetch_start;
+            struct timespec prefetch_end;
+
+            if (clock_gettime(CLOCK_MONOTONIC, &prefetch_start) == 0) {
+                activation_tape_prefetch_entry(runtime->activation_tape, (uint32_t)entry_idx);
+                if (clock_gettime(CLOCK_MONOTONIC, &prefetch_end) == 0) {
+                    *out_io_ms += telemetry_elapsed_ms(&prefetch_start, &prefetch_end);
+                }
+            } else {
+                activation_tape_prefetch_entry(runtime->activation_tape, (uint32_t)entry_idx);
+            }
+        } else {
+            activation_tape_prefetch_entry(runtime->activation_tape, (uint32_t)entry_idx);
+        }
         if (last_prefetched_entry_idx) {
             *last_prefetched_entry_idx = entry_idx;
         }
@@ -863,6 +931,7 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
             destroy_conversion_runtime(out_runtime);
             return -1;
         }
+        out_runtime->activation_tape_hash = activation_tape_crc32(out_runtime->activation_tape);
     }
 
     out_runtime->activation_ctx = create_inference_context(0.0f,
@@ -901,6 +970,7 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
             destroy_conversion_runtime(out_runtime);
             return -1;
         }
+        out_runtime->resume_step_index = out_runtime->checkpoint_state.next_layer_index;
         init_conversion_validation(config, out_runtime);
         if (resume_validation_from_manifest(config, out_runtime) != 0) {
             destroy_conversion_runtime(out_runtime);
@@ -948,6 +1018,8 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
         destroy_conversion_runtime(out_runtime);
         return -1;
     }
+
+    out_runtime->resume_step_index = out_runtime->checkpoint_state.next_layer_index;
 
     init_conversion_validation(config, out_runtime);
     if (resume_validation_from_manifest(config, out_runtime) != 0) {
@@ -1040,6 +1112,7 @@ typedef struct {
     ternary_calibration_result_t *out_result;
     uint32_t *out_crc32;
     int *out_skipped_vector;
+    float *out_io_ms;
 } convert_tensor_job_t;
 
 typedef enum {
@@ -1063,6 +1136,9 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     ternary_bf16_layer_map_t map;
     ternary_calibration_result_t result;
     ternary_layer_t layer;
+    struct timespec load_start;
+    struct timespec load_end;
+    int measure_io = 0;
     uint32_t crc32 = 0;
     int rc = -1;
 
@@ -1085,8 +1161,15 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     memset(&result, 0, sizeof(result));
     memset(&layer, 0, sizeof(layer));
 
+    measure_io = job->out_io_ms ? 1 : 0;
+    if (measure_io && clock_gettime(CLOCK_MONOTONIC, &load_start) != 0) {
+        measure_io = 0;
+    }
     if (io_mmap_layer_bf16(job->model_path, job->tensor_name, &map) != 0) {
         return -1;
+    }
+    if (measure_io && clock_gettime(CLOCK_MONOTONIC, &load_end) == 0) {
+        *job->out_io_ms += telemetry_elapsed_ms(&load_start, &load_end);
     }
 
     if (map.cols == 1u) {
@@ -1166,10 +1249,13 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     convert_tensor_job_t job;
     ternary_calibration_corpus_t active_corpus;
     ternary_calibration_result_t result;
+    ternary_telemetry_t layer_telemetry;
+    transformer_ste_config_t layer_ste_config;
     uint32_t crc32 = 0u;
     int skipped_vector = 0;
     int rc = 0;
     uint32_t converted_count = 0u;
+    int use_layer_telemetry = 0;
 
     if (!task) {
         return -1;
@@ -1180,6 +1266,8 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     }
 
     memset(&result, 0, sizeof(result));
+    memset(&layer_telemetry, 0, sizeof(layer_telemetry));
+    memset(&layer_ste_config, 0, sizeof(layer_ste_config));
 
     if (!task->tensor_name || task->tensor_name[0] == '\0') {
         if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count, 0) != 0) {
@@ -1202,12 +1290,17 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
         return FULL_MODEL_TENSOR_STATUS_SKIPPED_OTHER;
     }
 
-    if (task->runtime && task->runtime->activation_tape) {
+    if (task->runtime && task->runtime->activation_tape && tensor_name_is_layer_tensor(task->tensor_name)) {
+        use_layer_telemetry = 1;
+        layer_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
+        telemetry_prepare_layer_context(&layer_telemetry, task->runtime, task->layer_index);
+        layer_ste_config.telemetry = &layer_telemetry;
         prefetch_activation_tape_lookahead(task->runtime,
                                            task->spec,
                                            task->layer_index,
                                            2,
-                                           task->last_prefetched_entry_idx);
+                                           task->last_prefetched_entry_idx,
+                                           &layer_telemetry.io_ms);
     }
 
     memset(&active_corpus, 0, sizeof(active_corpus));
@@ -1221,11 +1314,12 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     job.output_dir = task->config->output_path;
     job.tensor_name = task->tensor_name;
     job.activation_tape = task->runtime ? task->runtime->activation_tape : NULL;
-    job.ste_config = task->ste_config;
+    job.ste_config = use_layer_telemetry ? &layer_ste_config : task->ste_config;
     job.calibration_corpus = task->runtime ? &active_corpus : NULL;
     job.out_result = &result;
     job.out_crc32 = &crc32;
     job.out_skipped_vector = &skipped_vector;
+    job.out_io_ms = use_layer_telemetry ? &layer_telemetry.io_ms : NULL;
 
     rc = convert_tensor_to_dir(&job);
     if (rc != 0) {
