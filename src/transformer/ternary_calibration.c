@@ -10,6 +10,8 @@
 #include "llm_model.h"
 #include "inference.h"
 #include "model_spec.h"
+#include "ternary_io.h"
+#include "ternary_telemetry.h"
 #include "tokenizer.h"
 #include "transformer.h"
 #include "tensor.h"
@@ -17,6 +19,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define TERNARY_SYMBOL_ZERO     0u
 #define TERNARY_SYMBOL_POSITIVE 1u
@@ -57,6 +60,9 @@ static transformer_ste_config_t default_ste_config(void) {
     config.clip_value = 1.0f;
     config.calibration_samples = 4;
     config.kl_weight = 0.05f;
+    config.telemetry_interval = 10;
+    config.telemetry_path = "./out/ternary_telemetry.jsonl";
+    config.telemetry = NULL;
     return config;
 }
 
@@ -78,6 +84,7 @@ static void normalize_ste_config(transformer_ste_config_t *config) {
     if (config->calibration_samples <= 0) config->calibration_samples = 4;
     if (config->calibration_samples > 16) config->calibration_samples = 16;
     if (config->kl_weight < 0.0f) config->kl_weight = 0.0f;
+    if (config->telemetry_interval <= 0) config->telemetry_interval = 10;
 }
 
 static size_t ternary_packed_bytes(uint32_t rows, uint32_t cols) {
@@ -98,6 +105,252 @@ static uint32_t mix_u32(uint32_t x) {
     x *= 0x846CA68Bu;
     x ^= x >> 16;
     return x;
+}
+
+static uint32_t telemetry_parse_layer_index(const char *tensor_name)
+{
+    const char *cursor = NULL;
+
+    if (!tensor_name) {
+        return 0u;
+    }
+
+    cursor = strstr(tensor_name, ".layers.");
+    if (cursor) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(cursor + 8, &end, 10);
+        if (end != cursor + 8 && parsed <= 0xFFFFFFFFul) {
+            return (uint32_t)parsed;
+        }
+    }
+
+    cursor = strstr(tensor_name, "blk.");
+    if (cursor) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(cursor + 4, &end, 10);
+        if (end != cursor + 4 && parsed <= 0xFFFFFFFFul) {
+            return (uint32_t)parsed;
+        }
+    }
+
+    return 0u;
+}
+
+static uint32_t telemetry_compute_config_hash(const transformer_ste_config_t *config,
+                                             const char *tensor_name,
+                                             uint32_t rows,
+                                             uint32_t cols)
+{
+    uint32_t crc32 = 0u;
+
+    if (!config) {
+        return 0u;
+    }
+
+    crc32 = io_crc32_update(crc32, &config->ste_steps, sizeof(config->ste_steps));
+    crc32 = io_crc32_update(crc32, &config->learning_rate, sizeof(config->learning_rate));
+    crc32 = io_crc32_update(crc32, &config->zero_threshold, sizeof(config->zero_threshold));
+    crc32 = io_crc32_update(crc32, &config->momentum, sizeof(config->momentum));
+    crc32 = io_crc32_update(crc32, &config->regularization_strength, sizeof(config->regularization_strength));
+    crc32 = io_crc32_update(crc32, &config->non_collapse_weight, sizeof(config->non_collapse_weight));
+    crc32 = io_crc32_update(crc32, &config->zero_occupancy_floor, sizeof(config->zero_occupancy_floor));
+    crc32 = io_crc32_update(crc32, &config->clip_value, sizeof(config->clip_value));
+    crc32 = io_crc32_update(crc32, &config->calibration_samples, sizeof(config->calibration_samples));
+    crc32 = io_crc32_update(crc32, &config->kl_weight, sizeof(config->kl_weight));
+    crc32 = io_crc32_update(crc32, &config->telemetry_interval, sizeof(config->telemetry_interval));
+    crc32 = io_crc32_update(crc32, tensor_name, tensor_name ? strlen(tensor_name) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, &rows, sizeof(rows));
+    crc32 = io_crc32_update(crc32, &cols, sizeof(cols));
+    return crc32;
+}
+
+static float telemetry_diff_ms(const struct timespec *start, const struct timespec *end)
+{
+    time_t sec = end->tv_sec - start->tv_sec;
+    long nsec = end->tv_nsec - start->tv_nsec;
+
+    return (float)sec * 1000.0f + (float)nsec / 1000000.0f;
+}
+
+typedef struct {
+    float p_neg1;
+    float p_zero;
+    float p_pos1;
+} ternary_distribution_stats_t;
+
+static void telemetry_compute_packed_distribution(const uint8_t *packed_weights,
+                                                  size_t packed_weight_bytes,
+                                                  uint32_t rows,
+                                                  uint32_t cols,
+                                                  ternary_distribution_stats_t *out_stats)
+{
+    size_t zero_count = 0u;
+    size_t pos_count = 0u;
+    size_t neg_count = 0u;
+    size_t total_count = (size_t)rows * cols;
+
+    if (!packed_weights || packed_weight_bytes == 0u || total_count == 0u) {
+        if (out_stats) {
+            out_stats->p_neg1 = 0.0f;
+            out_stats->p_zero = 0.0f;
+            out_stats->p_pos1 = 0.0f;
+        }
+        return;
+    }
+
+    for (uint32_t r = 0; r < rows; ++r) {
+        size_t row_base = (size_t)r * cols;
+        for (uint32_t c = 0; c < cols; ++c) {
+            size_t packed_idx = ((size_t)r * ((cols + (TERNARY_PACK_WIDTH - 1u)) / TERNARY_PACK_WIDTH)) + (size_t)c / TERNARY_PACK_WIDTH;
+            uint32_t lane = c % TERNARY_PACK_WIDTH;
+            uint8_t symbol = (uint8_t)((packed_weights[packed_idx] >> (lane * 2u)) & 0x3u);
+
+            (void)row_base;
+            if (symbol == TERNARY_SYMBOL_ZERO) {
+                ++zero_count;
+            } else if (symbol == TERNARY_SYMBOL_POSITIVE) {
+                ++pos_count;
+            } else if (symbol == TERNARY_SYMBOL_NEGATIVE) {
+                ++neg_count;
+            }
+        }
+    }
+
+    if (out_stats) {
+        out_stats->p_neg1 = (float)neg_count / (float)total_count;
+        out_stats->p_zero = (float)zero_count / (float)total_count;
+        out_stats->p_pos1 = (float)pos_count / (float)total_count;
+    }
+}
+
+static float telemetry_average_scale(const float *scales, uint32_t rows)
+{
+    float total = 0.0f;
+
+    if (!scales || rows == 0u) {
+        return 0.0f;
+    }
+
+    for (uint32_t r = 0; r < rows; ++r) {
+        total += scales[r];
+    }
+
+    return total / (float)rows;
+}
+
+static void seed_latent_weights(ternary_calibration_result_t *result,
+                                const uint16_t *bf16_weights,
+                                size_t weight_count,
+                                float clip_value)
+{
+    for (size_t i = 0; i < weight_count; ++i) {
+        float value = bf16_to_f32_scalar(bf16_weights[i]);
+
+        if (value > clip_value) {
+            value = clip_value;
+        }
+        if (value < -clip_value) {
+            value = -clip_value;
+        }
+
+        result->latent_weights[i] = value;
+    }
+}
+
+typedef struct {
+    int enabled;
+    uint32_t interval;
+    ternary_telemetry_writer_t writer;
+    ternary_telemetry_t telemetry;
+} ste_telemetry_runtime_t;
+
+typedef struct {
+    uint32_t step_idx;
+    uint32_t total_steps;
+    float mse_loss;
+    float grad_norm;
+    float compute_ms;
+} ste_telemetry_step_t;
+
+static int ste_telemetry_runtime_init(ste_telemetry_runtime_t *runtime,
+                                      const transformer_ste_config_t *config,
+                                      const char *tensor_name,
+                                      uint32_t rows,
+                                      uint32_t cols)
+{
+    if (!runtime || !config) {
+        return 0;
+    }
+
+    memset(runtime, 0, sizeof(*runtime));
+    if (!config->telemetry_path || config->telemetry_path[0] == '\0' || config->telemetry_interval <= 0) {
+        return 0;
+    }
+
+    runtime->interval = (uint32_t)config->telemetry_interval;
+    runtime->telemetry = config->telemetry ? *config->telemetry : (ternary_telemetry_t){0};
+    if (runtime->telemetry.config_hash == 0u) {
+        runtime->telemetry.config_hash = telemetry_compute_config_hash(config, tensor_name, rows, cols);
+    }
+    if (runtime->telemetry.layer_idx == 0u) {
+        runtime->telemetry.layer_idx = telemetry_parse_layer_index(tensor_name);
+    }
+
+    if (ternary_telemetry_writer_init(&runtime->writer, config->telemetry_path) != 0) {
+        LOG_WARN("telemetry: disabled for %s", tensor_name ? tensor_name : "<unknown>");
+        memset(runtime, 0, sizeof(*runtime));
+        return 0;
+    }
+
+    runtime->enabled = 1;
+    return 1;
+}
+
+static void ste_telemetry_runtime_close(ste_telemetry_runtime_t *runtime)
+{
+    if (!runtime) {
+        return;
+    }
+
+    if (runtime->enabled) {
+        ternary_telemetry_writer_close(&runtime->writer);
+    }
+    memset(runtime, 0, sizeof(*runtime));
+}
+
+static int ste_emit_telemetry_step(ste_telemetry_runtime_t *runtime,
+                                   const ternary_calibration_result_t *result,
+                                   const ste_telemetry_step_t *step)
+{
+    ternary_telemetry_t telemetry;
+
+    if (!runtime || !runtime->enabled || !result || !step) {
+        return 0;
+    }
+
+    if (step->step_idx + 1u < step->total_steps && runtime->interval > 0u && ((step->step_idx + 1u) % runtime->interval) != 0u) {
+        return 0;
+    }
+
+    telemetry = runtime->telemetry;
+    telemetry.step_idx = step->step_idx;
+    telemetry.mse_loss = step->mse_loss;
+    telemetry.grad_norm = step->grad_norm;
+    telemetry.compute_ms = step->compute_ms;
+    telemetry.gamma_scale = telemetry_average_scale(result->scales, result->rows);
+    {
+        ternary_distribution_stats_t distribution_stats;
+
+        telemetry_compute_packed_distribution(result->packed_weights,
+                                              result->packed_weight_bytes,
+                                              result->rows,
+                                              result->cols,
+                                              &distribution_stats);
+        telemetry.p_neg1 = distribution_stats.p_neg1;
+        telemetry.p_zero = distribution_stats.p_zero;
+        telemetry.p_pos1 = distribution_stats.p_pos1;
+    }
+    return telemetry_dump_step(&runtime->writer, &telemetry);
 }
 
 static void build_feature_hashed_vector(const int *tokens,
@@ -449,6 +702,8 @@ typedef struct {
     float non_collapse_weight;
     float zero_occupancy_floor;
     float clip_value;
+    float *mse_sum;
+    float *grad_norm_sq_sum;
 } ste_row_update_context_t;
 
 static void ste_update_row(float *latent_row,
@@ -496,6 +751,21 @@ static void ste_update_row(float *latent_row,
         sample_diffs[s] = proxy - reference;
     }
 
+    if (context->mse_sum) {
+        float row_mse = 0.0f;
+
+        for (int s = 0; s < sample_count; ++s) {
+            float w = context->sample_weights ? context->sample_weights[s] : 1.0f;
+
+            if (w < 0.0f) {
+                w = 0.0f;
+            }
+            row_mse += w * sample_diffs[s] * sample_diffs[s];
+        }
+
+        *context->mse_sum += row_mse / weight_sum;
+    }
+
     for (uint32_t c = 0; c < cols; ++c) {
         float grad = context->regularization_strength *
                      ternary_regularizer_grad(latent_row[c], ternary_row[c]);
@@ -510,6 +780,10 @@ static void ste_update_row(float *latent_row,
             const float *vec = context->calibration_vectors + (size_t)s * cols;
             float w = context->sample_weights ? context->sample_weights[s] : 1.0f;
             grad += (2.0f * w / weight_sum) * sample_diffs[s] * vec[c];
+        }
+
+        if (context->grad_norm_sq_sum) {
+            *context->grad_norm_sq_sum += grad * grad;
         }
 
         velocity_row[c] = context->momentum * velocity_row[c] - context->learning_rate * grad;
@@ -821,10 +1095,14 @@ typedef struct {
     const ternary_calibration_corpus_t *corpus;
 } ste_calibration_context_t;
 
-static void ste_calibrate_with_samples(const ste_calibration_context_t *context) {
+static void ste_calibrate_with_samples(const ste_calibration_context_t *context,
+                                       float *out_mse_sum,
+                                       float *out_grad_norm_sq_sum) {
     float sample_weights[16];
     ste_row_update_context_t row_context;
     distillation_weight_request_t distillation_request;
+    float mse_sum = 0.0f;
+    float grad_norm_sq_sum = 0.0f;
 
     if (context->config->calibration_samples > (int)(sizeof(sample_weights) / sizeof(sample_weights[0]))) {
         memset(sample_weights, 0, sizeof(sample_weights));
@@ -861,6 +1139,8 @@ static void ste_calibrate_with_samples(const ste_calibration_context_t *context)
     row_context.non_collapse_weight = context->config->non_collapse_weight;
     row_context.zero_occupancy_floor = context->config->zero_occupancy_floor;
     row_context.clip_value = context->config->clip_value;
+    row_context.mse_sum = &mse_sum;
+    row_context.grad_norm_sq_sum = &grad_norm_sq_sum;
 
     for (uint32_t r = 0; r < context->rows; ++r) {
         size_t row_base = (size_t)r * context->cols;
@@ -869,6 +1149,13 @@ static void ste_calibrate_with_samples(const ste_calibration_context_t *context)
                        context->ternary + row_base,
                        context->scales[r],
                        &row_context);
+    }
+
+    if (out_mse_sum) {
+        *out_mse_sum = mse_sum;
+    }
+    if (out_grad_norm_sq_sum) {
+        *out_grad_norm_sq_sum = grad_norm_sq_sum;
     }
 }
 
@@ -905,6 +1192,62 @@ static int pack_ternary_2bit(const int8_t *ternary,
     return 0;
 }
 
+static int run_ste_calibration_steps(const ste_calibration_context_t *context,
+                                     ternary_calibration_result_t *out_result,
+                                     ste_telemetry_runtime_t *telemetry_runtime)
+{
+    uint32_t weight_count = 0u;
+    size_t packed_bytes = 0u;
+
+    if (!context || !out_result) {
+        return -1;
+    }
+
+    weight_count = context->rows * context->cols;
+    packed_bytes = ternary_packed_bytes(context->rows, context->cols);
+    for (int step = 0; step < context->config->ste_steps; ++step) {
+        float step_mse_sum = 0.0f;
+        float step_grad_norm_sq_sum = 0.0f;
+        struct timespec step_start;
+        struct timespec step_end;
+        ste_telemetry_step_t telemetry_step;
+
+        if (telemetry_runtime && telemetry_runtime->enabled) {
+            (void)clock_gettime(CLOCK_MONOTONIC, &step_start);
+        }
+
+        ste_calibrate_with_samples(context,
+                                   (telemetry_runtime && telemetry_runtime->enabled) ? &step_mse_sum : NULL,
+                                   (telemetry_runtime && telemetry_runtime->enabled) ? &step_grad_norm_sq_sum : NULL);
+
+        if (telemetry_runtime && telemetry_runtime->enabled) {
+            (void)clock_gettime(CLOCK_MONOTONIC, &step_end);
+            memset(&telemetry_step, 0, sizeof(telemetry_step));
+            telemetry_step.step_idx = (uint32_t)step;
+            telemetry_step.total_steps = (uint32_t)context->config->ste_steps;
+            telemetry_step.mse_loss = (context->rows > 0u) ? (step_mse_sum / (float)context->rows) : 0.0f;
+            telemetry_step.grad_norm = (weight_count > 0u)
+                ? sqrtf(step_grad_norm_sq_sum / (float)weight_count)
+                : 0.0f;
+            telemetry_step.compute_ms = telemetry_diff_ms(&step_start, &step_end);
+
+            if (pack_ternary_2bit(out_result->ternary_weights,
+                                  context->rows,
+                                  context->cols,
+                                  out_result->packed_weights,
+                                  packed_bytes) == 0) {
+                if (ste_emit_telemetry_step(telemetry_runtime, out_result, &telemetry_step) != 0) {
+                    LOG_WARN("telemetry: failed to dump step %d", step);
+                }
+            } else {
+                LOG_WARN("telemetry: failed to pack step snapshot");
+            }
+        }
+    }
+
+    return 0;
+}
+
 void transformer_free_ternary_calibration_result(ternary_calibration_result_t *result) {
     if (!result) {
         return;
@@ -924,6 +1267,7 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
                                               ternary_calibration_result_t *out_result) {
     transformer_ste_config_t effective_config;
     ste_calibration_context_t calibration_context;
+    ste_telemetry_runtime_t telemetry_runtime;
     float *velocity = NULL;
     float *calibration_vectors = NULL;
     size_t weight_count = 0;
@@ -931,6 +1275,8 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
     int actual_sample_count = 0;
     const ternary_calibration_corpus_t *corpus = source ? source->corpus : NULL;
     const ternary_activation_tape_context_t *tape_context = source ? source->tape_context : NULL;
+    const char *tensor_name = NULL;
+    int telemetry_active = 0;
 
     if (!bf16_weights || !out_result || rows == 0 || cols == 0) {
         LOG_ERROR("transformer_calibrate_layer_ste: invalid arguments");
@@ -970,16 +1316,11 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
     }
 
     effective_config.calibration_samples = actual_sample_count;
+    tensor_name = (corpus && corpus->tensor_name && corpus->tensor_name[0] != '\0')
+        ? corpus->tensor_name
+        : (tape_context ? tape_context->tensor_name : NULL);
 
-    for (size_t i = 0; i < weight_count; ++i) {
-        out_result->latent_weights[i] = bf16_to_f32_scalar(bf16_weights[i]);
-        if (out_result->latent_weights[i] > effective_config.clip_value) {
-            out_result->latent_weights[i] = effective_config.clip_value;
-        }
-        if (out_result->latent_weights[i] < -effective_config.clip_value) {
-            out_result->latent_weights[i] = -effective_config.clip_value;
-        }
-    }
+    seed_latent_weights(out_result, bf16_weights, weight_count, effective_config.clip_value);
 
     memset(&calibration_context, 0, sizeof(calibration_context));
     calibration_context.latent = out_result->latent_weights;
@@ -992,9 +1333,24 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
     calibration_context.calibration_vectors = calibration_vectors;
     calibration_context.corpus = corpus;
 
-    for (int step = 0; step < effective_config.ste_steps; ++step) {
-        ste_calibrate_with_samples(&calibration_context);
+    telemetry_active = ste_telemetry_runtime_init(&telemetry_runtime,
+                                                  &effective_config,
+                                                  tensor_name,
+                                                  rows,
+                                                  cols);
+    if (telemetry_active && telemetry_runtime.telemetry.layer_idx == 0u && tensor_name) {
+        telemetry_runtime.telemetry.layer_idx = telemetry_parse_layer_index(tensor_name);
     }
+
+    if (run_ste_calibration_steps(&calibration_context, out_result, &telemetry_runtime) != 0) {
+        free(velocity);
+        free(calibration_vectors);
+        ste_telemetry_runtime_close(&telemetry_runtime);
+        transformer_free_ternary_calibration_result(out_result);
+        return -1;
+    }
+
+    ste_telemetry_runtime_close(&telemetry_runtime);
 
     for (uint32_t r = 0; r < rows; ++r) {
         size_t row_base = (size_t)r * cols;
@@ -1009,6 +1365,7 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
                           out_result->packed_weights, packed_bytes) != 0) {
         free(velocity);
         free(calibration_vectors);
+        ste_telemetry_runtime_close(&telemetry_runtime);
         transformer_free_ternary_calibration_result(out_result);
         return -1;
     }
@@ -1020,6 +1377,7 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
 
     free(velocity);
     free(calibration_vectors);
+    ste_telemetry_runtime_close(&telemetry_runtime);
 
     LOG_INFO("Calibrated ternary layer: rows=%u cols=%u steps=%d samples=%d kl_weight=%.4f non_collapse=%.4f floor=%.2f packed=%zuB",
              rows,

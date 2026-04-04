@@ -705,6 +705,9 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
         ? config->calibration_sample_limit
         : 4;
     ste_config.kl_weight = (config && config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f;
+    ste_config.telemetry_interval = 10;
+    ste_config.telemetry_path = "./out/ternary_telemetry.jsonl";
+    ste_config.telemetry = NULL;
     return ste_config;
 }
 

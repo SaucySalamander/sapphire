@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ternary_telemetry.h"
+
 typedef struct sapphire_tokenizer_t sapphire_tokenizer_t;
 typedef struct model_spec model_spec_t;
 typedef struct inference_session_t inference_session_t;
@@ -29,6 +31,9 @@ typedef struct {
     float clip_value;
     int calibration_samples;
     float kl_weight;
+    int telemetry_interval;
+    const char *telemetry_path;
+    ternary_telemetry_t *telemetry;
 } transformer_ste_config_t;
 
 typedef struct {
