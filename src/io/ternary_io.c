@@ -577,6 +577,141 @@ int io_write_layer_ternary_into_dir(const char *output_dir,
     return rc;
 }
 
+static int load_layer_tensor_copy(const safetensors_file_t *file,
+                                  const char *name,
+                                  const safetensors_tensor_meta_t **out_meta,
+                                  void **out_copy,
+                                  size_t *out_size)
+{
+    const safetensors_tensor_meta_t *meta = NULL;
+    void *copy = NULL;
+    const void *data_ptr = NULL;
+
+    if (!file || !name || !out_meta || !out_copy || !out_size) {
+        return -1;
+    }
+
+    meta = safetensors_get_tensor_by_name(file, name);
+    if (!meta) {
+        LOG_ERROR("ternary I/O: tensor not found: %s", name);
+        return -1;
+    }
+
+    data_ptr = safetensors_data_ptr(file, meta);
+    if (!data_ptr) {
+        return -1;
+    }
+
+    copy = malloc((size_t)meta->size_bytes);
+    if (!copy) {
+        LOG_ERROR("ternary I/O: failed to allocate %zu bytes for %s", (size_t)meta->size_bytes, name);
+        return -1;
+    }
+
+    memcpy(copy, data_ptr, (size_t)meta->size_bytes);
+    *out_meta = meta;
+    *out_copy = copy;
+    *out_size = (size_t)meta->size_bytes;
+    return 0;
+}
+
+int io_load_layer_ternary_payload(const char *layer_path,
+                                  const char *tensor_name,
+                                  uint32_t expected_rows,
+                                  uint32_t expected_cols,
+                                  ternary_layer_payload_t *out_payload) {
+    safetensors_file_t *file = NULL;
+    safetensors_tensor_meta_t packed_meta;
+    safetensors_tensor_meta_t scales_meta;
+    const safetensors_tensor_meta_t *meta = NULL;
+    void *packed_copy = NULL;
+    void *scales_copy = NULL;
+    size_t packed_size = 0u;
+    size_t scales_size = 0u;
+    char packed_name[320];
+    char scales_name[320];
+    size_t packed_cols = 0u;
+    int rc = -1;
+
+    if (!layer_path || !tensor_name || !out_payload || expected_rows == 0u || expected_cols == 0u) {
+        LOG_ERROR("ternary I/O: invalid payload load arguments");
+        return -1;
+    }
+
+    memset(out_payload, 0, sizeof(*out_payload));
+    memset(&packed_meta, 0, sizeof(packed_meta));
+    memset(&scales_meta, 0, sizeof(scales_meta));
+
+    if (snprintf(packed_name, sizeof(packed_name), "%s.packed", tensor_name) < 0 ||
+        snprintf(scales_name, sizeof(scales_name), "%s.scales", tensor_name) < 0) {
+        return -1;
+    }
+
+    file = safetensors_open(layer_path);
+    if (!file) {
+        LOG_ERROR("ternary I/O: failed to open ternary layer file %s", layer_path);
+        return -1;
+    }
+
+    if (load_layer_tensor_copy(file, packed_name, &meta, &packed_copy, &packed_size) != 0) {
+        goto payload_cleanup;
+    }
+    memcpy(&packed_meta, meta, sizeof(packed_meta));
+
+    if (load_layer_tensor_copy(file, scales_name, &meta, &scales_copy, &scales_size) != 0) {
+        goto payload_cleanup;
+    }
+    memcpy(&scales_meta, meta, sizeof(scales_meta));
+
+    if (packed_meta.dtype != SAFETENSORS_U8 || scales_meta.dtype != SAFETENSORS_F32) {
+        LOG_ERROR("ternary I/O: unexpected ternary payload dtypes for %s", tensor_name);
+        goto payload_cleanup;
+    }
+    if (packed_meta.ndim != 2 || scales_meta.ndim != 1) {
+        LOG_ERROR("ternary I/O: unexpected ternary payload rank for %s", tensor_name);
+        goto payload_cleanup;
+    }
+    if (packed_meta.shape[0] != expected_rows || scales_meta.shape[0] != expected_rows) {
+        LOG_ERROR("ternary I/O: row count mismatch for %s", tensor_name);
+        goto payload_cleanup;
+    }
+
+    packed_cols = ((size_t)expected_cols + (TERNARY_PACKED_WEIGHTS_PER_BYTE - 1u)) / TERNARY_PACKED_WEIGHTS_PER_BYTE;
+    if (packed_meta.shape[1] != packed_cols) {
+        LOG_ERROR("ternary I/O: packed column count mismatch for %s", tensor_name);
+        goto payload_cleanup;
+    }
+
+    out_payload->packed_weights = (uint8_t *)packed_copy;
+    out_payload->packed_weight_bytes = packed_size;
+    out_payload->scales = (float *)scales_copy;
+    out_payload->scale_count = expected_rows;
+    out_payload->scale_bytes = scales_size;
+    out_payload->rows = expected_rows;
+    out_payload->cols = expected_cols;
+    packed_copy = NULL;
+    scales_copy = NULL;
+    rc = 0;
+
+payload_cleanup:
+    if (rc != 0) {
+        free(packed_copy);
+        free(scales_copy);
+    }
+    safetensors_close(file);
+    return rc;
+}
+
+void io_free_layer_ternary_payload(ternary_layer_payload_t *payload) {
+    if (!payload) {
+        return;
+    }
+
+    free(payload->packed_weights);
+    free(payload->scales);
+    memset(payload, 0, sizeof(*payload));
+}
+
 /* -------------------------------------------------------------------------
  * Sharded safetensors helpers for multi-file models (e.g. Gemma 3 27B).
  * model.safetensors.index.json format:

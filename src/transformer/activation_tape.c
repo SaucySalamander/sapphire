@@ -513,6 +513,11 @@ uint32_t activation_tape_vector_dim(const activation_tape_t *tape,
     return e ? e->vector_dim : 0u;
 }
 
+const tape_file_header_t *activation_tape_header(const activation_tape_t *tape)
+{
+    return tape ? &tape->header : NULL;
+}
+
 void activation_tape_prefetch_entry(const activation_tape_t *tape,
                                      uint32_t                 entry_idx)
 {

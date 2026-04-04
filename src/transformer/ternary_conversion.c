@@ -13,24 +13,583 @@
 #include "log.h"
 #include "model_reader.h"
 #include "model_spec.h"
+#include "ternary_checkpoint.h"
 #include "ternary_calibration.h"
 #include "ternary_io.h"
 #include "ternary_validation.h"
 
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 typedef struct {
     calibration_corpus_t corpus_storage;
     calibration_corpus_t validation_corpus_storage;
     ternary_calibration_corpus_t calibration_corpus;
+    ternary_student_update_checkpoint_t checkpoint_state;
     inference_context_t *activation_ctx;
     activation_tape_t *activation_tape;
+    char *alignment_manifest_path;
+    char *alignment_tape_path;
     sapphire_tokenizer_t *tokenizer;
     model_spec_t *model_spec;
     sapphire_tokenizer_t *previous_tokenizer_handle;
     ternary_validation_state_t validation_state;
+    char *checkpoint_path;
+    char *checkpoint_tmp_path;
 } conversion_runtime_t;
+
+static uint32_t config_resume_hash(const ternary_conversion_config_t *config)
+{
+    uint32_t crc32 = 0u;
+
+    if (!config) {
+        return 0u;
+    }
+
+    crc32 = io_crc32_update(crc32, config->model_name, strlen(config->model_name) + 1u);
+    crc32 = io_crc32_update(crc32, config->output_path, strlen(config->output_path) + 1u);
+    crc32 = io_crc32_update(crc32, config->layer_name, config->layer_name ? strlen(config->layer_name) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, config->activation_tape_path, config->activation_tape_path ? strlen(config->activation_tape_path) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, config->teacher_model_name, config->teacher_model_name ? strlen(config->teacher_model_name) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, config->calibration_corpus_path, config->calibration_corpus_path ? strlen(config->calibration_corpus_path) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, config->calibration_corpus_manifest_path, config->calibration_corpus_manifest_path ? strlen(config->calibration_corpus_manifest_path) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, config->validation_corpus_path, config->validation_corpus_path ? strlen(config->validation_corpus_path) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, config->validation_corpus_manifest_path, config->validation_corpus_manifest_path ? strlen(config->validation_corpus_manifest_path) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, &config->context_len, sizeof(config->context_len));
+    crc32 = io_crc32_update(crc32, &config->calibration_sample_limit, sizeof(config->calibration_sample_limit));
+    crc32 = io_crc32_update(crc32, &config->validation_sample_limit, sizeof(config->validation_sample_limit));
+    crc32 = io_crc32_update(crc32, &config->checkpoint_every_n_layers, sizeof(config->checkpoint_every_n_layers));
+    crc32 = io_crc32_update(crc32, &config->validate_every_n, sizeof(config->validate_every_n));
+    crc32 = io_crc32_update(crc32, &config->kl_weight, sizeof(config->kl_weight));
+    return crc32;
+}
+
+static int checkpoint_path_for_output(const char *output_dir, char **out_path)
+{
+    if (!output_dir || !out_path) {
+        return -1;
+    }
+
+    *out_path = construct_safe_path(output_dir, "student_update_checkpoint.txt", NULL);
+    return *out_path ? 0 : -1;
+}
+
+static int checkpoint_tmp_path_for_output(const char *output_dir, char **out_path)
+{
+    if (!output_dir || !out_path) {
+        return -1;
+    }
+
+    *out_path = construct_safe_path(output_dir, "student_update_checkpoint.txt.tmp", NULL);
+    return *out_path ? 0 : -1;
+}
+
+typedef struct {
+    char tensor_name[256];
+    char file_name[256];
+    uint32_t rows;
+    uint32_t cols;
+    size_t packed_weight_bytes;
+    uint32_t crc32;
+} resume_manifest_entry_t;
+
+static int copy_text_field_local(char *dst, size_t dst_size, const char *src)
+{
+    size_t len = 0u;
+
+    if (!dst || dst_size == 0u) {
+        return -1;
+    }
+    dst[0] = '\0';
+    if (!src) {
+        return 0;
+    }
+
+    len = strlen(src);
+    if (len >= dst_size) {
+        return -1;
+    }
+    memcpy(dst, src, len + 1u);
+    return 0;
+}
+
+static char *duplicate_text_local(const char *src)
+{
+    size_t len = 0u;
+    char *copy = NULL;
+
+    if (!src) {
+        return NULL;
+    }
+
+    len = strlen(src);
+    copy = (char *)malloc(len + 1u);
+    if (!copy) {
+        return NULL;
+    }
+    memcpy(copy, src, len + 1u);
+    return copy;
+}
+
+static int parse_u32_field(const char *text, uint32_t *out_value)
+{
+    char *end = NULL;
+    unsigned long parsed = 0ul;
+
+    if (!text || !out_value) {
+        return -1;
+    }
+
+    errno = 0;
+    parsed = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || parsed > 0xFFFFFFFFul) {
+        return -1;
+    }
+
+    *out_value = (uint32_t)parsed;
+    return 0;
+}
+
+static int parse_size_field(const char *text, size_t *out_value)
+{
+    char *end = NULL;
+    unsigned long long parsed = 0ull;
+
+    if (!text || !out_value) {
+        return -1;
+    }
+
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || parsed > (unsigned long long)SIZE_MAX) {
+        return -1;
+    }
+
+    *out_value = (size_t)parsed;
+    return 0;
+}
+
+static int parse_hex_u32_field(const char *text, uint32_t *out_value)
+{
+    char *end = NULL;
+    unsigned long parsed = 0ul;
+
+    if (!text || !out_value) {
+        return -1;
+    }
+
+    errno = 0;
+    parsed = strtoul(text, &end, 16);
+    if (errno != 0 || end == text || *end != '\0' || parsed > 0xFFFFFFFFul) {
+        return -1;
+    }
+
+    *out_value = (uint32_t)parsed;
+    return 0;
+}
+
+static int parse_resume_manifest_line(char *line, resume_manifest_entry_t *out_entry)
+{
+    char *saveptr = NULL;
+    const char *field = NULL;
+
+    if (!line || !out_entry) {
+        return -1;
+    }
+
+    memset(out_entry, 0, sizeof(*out_entry));
+    field = strtok_r(line, "\t", &saveptr);
+    if (!field || copy_text_field_local(out_entry->tensor_name, sizeof(out_entry->tensor_name), field) != 0) {
+        return -1;
+    }
+
+    field = strtok_r(NULL, "\t", &saveptr);
+    if (!field || copy_text_field_local(out_entry->file_name, sizeof(out_entry->file_name), field) != 0) {
+        return -1;
+    }
+
+    field = strtok_r(NULL, "\t", &saveptr);
+    if (!field || parse_u32_field(field, &out_entry->rows) != 0) {
+        return -1;
+    }
+
+    field = strtok_r(NULL, "\t", &saveptr);
+    if (!field || parse_u32_field(field, &out_entry->cols) != 0) {
+        return -1;
+    }
+
+    field = strtok_r(NULL, "\t", &saveptr);
+    if (!field || parse_size_field(field, &out_entry->packed_weight_bytes) != 0) {
+        return -1;
+    }
+
+    field = strtok_r(NULL, "\t\r\n", &saveptr);
+    if (!field || parse_hex_u32_field(field, &out_entry->crc32) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int read_text_file(const char *path, char **out_text, size_t *out_size)
+{
+    char *buffer = NULL;
+    size_t buffer_size = 0u;
+    char *text = NULL;
+
+    if (!path || !out_text || !out_size) {
+        return -1;
+    }
+
+    if (file_read_to_buffer(path, &buffer, &buffer_size) != 0) {
+        return -1;
+    }
+
+    text = (char *)malloc(buffer_size + 1u);
+    if (!text) {
+        free(buffer);
+        return -1;
+    }
+    memcpy(text, buffer, buffer_size);
+    text[buffer_size] = '\0';
+    free(buffer);
+
+    *out_text = text;
+    *out_size = buffer_size;
+    return 0;
+}
+
+static int manifest_path_exists(const char *output_dir)
+{
+    char *manifest_path = NULL;
+    struct stat st;
+    int rc = -1;
+
+    manifest_path = construct_safe_path(output_dir, "manifest.tsv", NULL);
+    if (!manifest_path) {
+        return -1;
+    }
+
+    if (stat(manifest_path, &st) == 0) {
+        rc = 1;
+    } else if (errno == ENOENT) {
+        rc = 0;
+    }
+
+    free(manifest_path);
+    return rc;
+}
+
+static int resume_validation_from_manifest(const ternary_conversion_config_t *config,
+                                           conversion_runtime_t *runtime)
+{
+    char *manifest_path = NULL;
+    char *manifest_text = NULL;
+    size_t manifest_size = 0u;
+    char *cursor = NULL;
+    int replayed = 0;
+
+    if (!config || !runtime || !runtime->model_spec) {
+        return -1;
+    }
+    if (runtime->checkpoint_state.converted_tensor_count == 0u) {
+        return 0;
+    }
+    if (runtime->validation_state.config.sample_count <= 0) {
+        return 0;
+    }
+
+    manifest_path = construct_safe_path(config->output_path, "manifest.tsv", NULL);
+    if (!manifest_path) {
+        return -1;
+    }
+
+    if (read_text_file(manifest_path, &manifest_text, &manifest_size) != 0) {
+        free(manifest_path);
+        return -1;
+    }
+    free(manifest_path);
+
+    if (manifest_size == 0u) {
+        if (runtime->checkpoint_state.converted_tensor_count > 0u) {
+            LOG_ERROR("student update: manifest is empty but checkpoint expects %u converted tensors",
+                      runtime->checkpoint_state.converted_tensor_count);
+            free(manifest_text);
+            return -1;
+        }
+        free(manifest_text);
+        return 0;
+    }
+
+    cursor = manifest_text;
+    while (cursor && *cursor != '\0' && replayed < (int)runtime->checkpoint_state.converted_tensor_count) {
+        char *line_end = strchr(cursor, '\n');
+        resume_manifest_entry_t entry;
+
+        if (line_end) {
+            *line_end = '\0';
+        }
+        if (cursor[0] != '\0') {
+            char *layer_path = NULL;
+            ternary_layer_payload_t payload;
+            uint32_t actual_crc32 = 0u;
+
+            if (parse_resume_manifest_line(cursor, &entry) != 0) {
+                free(manifest_text);
+                return -1;
+            }
+
+            layer_path = construct_safe_path(config->output_path, entry.file_name, NULL);
+            if (!layer_path) {
+                free(manifest_text);
+                return -1;
+            }
+
+            if (io_load_layer_ternary_payload(layer_path,
+                                              entry.tensor_name,
+                                              entry.rows,
+                                              entry.cols,
+                                              &payload) != 0) {
+                free(layer_path);
+                free(manifest_text);
+                return -1;
+            }
+
+            actual_crc32 = io_crc32_update(0u, payload.packed_weights, payload.packed_weight_bytes);
+            actual_crc32 = io_crc32_update(actual_crc32, payload.scales, payload.scale_bytes);
+            if (actual_crc32 != entry.crc32) {
+                LOG_ERROR("student update: manifest CRC mismatch for %s (expected=%08x actual=%08x)",
+                          entry.tensor_name,
+                          entry.crc32,
+                          actual_crc32);
+                io_free_layer_ternary_payload(&payload);
+                free(layer_path);
+                free(manifest_text);
+                return -1;
+            }
+
+            if (ternary_validation_apply_proxy_from_payload(&runtime->validation_state,
+                                                            entry.tensor_name,
+                                                            &payload,
+                                                            entry.crc32,
+                                                            0) != 0) {
+                io_free_layer_ternary_payload(&payload);
+                free(layer_path);
+                free(manifest_text);
+                return -1;
+            }
+
+            io_free_layer_ternary_payload(&payload);
+            free(layer_path);
+            replayed++;
+        }
+
+        if (!line_end) {
+            break;
+        }
+        cursor = line_end + 1;
+    }
+
+    if (replayed != (int)runtime->checkpoint_state.converted_tensor_count) {
+        LOG_ERROR("student update: manifest replay count mismatch (checkpoint=%u replayed=%d)",
+                  runtime->checkpoint_state.converted_tensor_count,
+                  replayed);
+        free(manifest_text);
+        return -1;
+    }
+
+    runtime->validation_state.last_reported_count = replayed;
+    free(manifest_text);
+    return 0;
+}
+
+static int write_student_checkpoint(const ternary_conversion_config_t *config,
+                                    conversion_runtime_t *runtime,
+                                    const char *alignment_manifest_path,
+                                    const char *alignment_tape_path);
+
+static int student_checkpoint_progress(const ternary_conversion_config_t *config,
+                                       conversion_runtime_t *runtime,
+                                       uint32_t next_layer_index,
+                                       uint32_t converted_count,
+                                       int force_write)
+{
+    uint32_t every_n_layers = 0u;
+    uint32_t total_layers = 0u;
+
+    if (!runtime) {
+        return 0;
+    }
+
+    runtime->checkpoint_state.next_layer_index = next_layer_index;
+    runtime->checkpoint_state.last_completed_layer = (next_layer_index > 0u) ? (next_layer_index - 1u) : 0u;
+    runtime->checkpoint_state.converted_tensor_count = converted_count;
+
+    every_n_layers = runtime->checkpoint_state.checkpoint_every_n_layers;
+    total_layers = runtime->checkpoint_state.total_layer_count;
+    if (!force_write && every_n_layers > 0u) {
+        if ((next_layer_index % every_n_layers) != 0u && next_layer_index < total_layers) {
+            return 0;
+        }
+    }
+
+    return write_student_checkpoint(config,
+                                    runtime,
+                                    runtime->alignment_manifest_path,
+                                    runtime->alignment_tape_path);
+}
+
+static int init_checkpoint_state(const ternary_conversion_config_t *config,
+                                 conversion_runtime_t *runtime)
+{
+    char *checkpoint_path = NULL;
+    char *tmp_path = NULL;
+    char *alignment_manifest_path = NULL;
+    char *alignment_tape_path = NULL;
+    int load_rc = 0;
+    uint32_t total_layer_count = 0u;
+
+    if (!config || !runtime) {
+        return -1;
+    }
+    if (!runtime->model_spec) {
+        return -1;
+    }
+
+    if (checkpoint_path_for_output(config->output_path, &checkpoint_path) != 0 ||
+        checkpoint_tmp_path_for_output(config->output_path, &tmp_path) != 0) {
+        free(checkpoint_path);
+        return -1;
+    }
+
+    runtime->checkpoint_path = checkpoint_path;
+    runtime->checkpoint_tmp_path = tmp_path;
+    total_layer_count = (runtime->model_spec->tensor_map_size > 0)
+        ? (uint32_t)runtime->model_spec->tensor_map_size
+        : 0u;
+    runtime->checkpoint_state.total_layer_count = total_layer_count;
+    runtime->checkpoint_state.schema_version = TERNARY_STUDENT_CHECKPOINT_VERSION;
+    runtime->checkpoint_state.config_hash = config_resume_hash(config);
+    runtime->checkpoint_state.checkpoint_every_n_layers = (config->checkpoint_every_n_layers > 0)
+        ? (uint32_t)config->checkpoint_every_n_layers
+        : 1u;
+    runtime->checkpoint_state.validate_every_n = (config->validate_every_n > 0) ? (uint32_t)config->validate_every_n : 0u;
+    runtime->checkpoint_state.next_layer_index = 0u;
+    runtime->checkpoint_state.last_completed_layer = 0u;
+    runtime->checkpoint_state.converted_tensor_count = 0u;
+    copy_text_field_local(runtime->checkpoint_state.model_name, sizeof(runtime->checkpoint_state.model_name), config->model_name);
+    copy_text_field_local(runtime->checkpoint_state.teacher_model_name, sizeof(runtime->checkpoint_state.teacher_model_name), config->teacher_model_name);
+    copy_text_field_local(runtime->checkpoint_state.output_dir, sizeof(runtime->checkpoint_state.output_dir), config->output_path);
+    copy_text_field_local(runtime->checkpoint_state.activation_tape_path, sizeof(runtime->checkpoint_state.activation_tape_path), config->activation_tape_path);
+    copy_text_field_local(runtime->checkpoint_state.calibration_corpus_path, sizeof(runtime->checkpoint_state.calibration_corpus_path), config->calibration_corpus_path);
+    copy_text_field_local(runtime->checkpoint_state.calibration_corpus_manifest_path, sizeof(runtime->checkpoint_state.calibration_corpus_manifest_path), config->calibration_corpus_manifest_path);
+    copy_text_field_local(runtime->checkpoint_state.validation_corpus_path, sizeof(runtime->checkpoint_state.validation_corpus_path), config->validation_corpus_path);
+    copy_text_field_local(runtime->checkpoint_state.validation_corpus_manifest_path, sizeof(runtime->checkpoint_state.validation_corpus_manifest_path), config->validation_corpus_manifest_path);
+
+    load_rc = ternary_student_checkpoint_load(checkpoint_path, &runtime->checkpoint_state);
+    if (load_rc == 1) {
+        LOG_INFO("student update: no checkpoint found at %s; starting fresh", checkpoint_path);
+        if (manifest_path_exists(config->output_path) > 0) {
+            LOG_ERROR("student update: output directory %s already contains a manifest but no checkpoint", config->output_path);
+            return -1;
+        }
+        return 0;
+    }
+    if (load_rc != 0) {
+        return -1;
+    }
+    if (runtime->checkpoint_state.total_layer_count != total_layer_count) {
+        LOG_ERROR("student update: checkpoint total layer count mismatch (checkpoint=%u current=%u)",
+                  runtime->checkpoint_state.total_layer_count,
+                  total_layer_count);
+        return -1;
+    }
+    if (runtime->checkpoint_state.schema_version != TERNARY_STUDENT_CHECKPOINT_VERSION) {
+        LOG_ERROR("student update: checkpoint schema mismatch");
+        return -1;
+    }
+    if (runtime->checkpoint_state.config_hash != config_resume_hash(config)) {
+        LOG_ERROR("student update: checkpoint config hash mismatch");
+        return -1;
+    }
+
+    if (runtime->checkpoint_state.alignment_manifest_path[0] != '\0') {
+        free(runtime->alignment_manifest_path);
+        runtime->alignment_manifest_path = NULL;
+        alignment_manifest_path = duplicate_text_local(runtime->checkpoint_state.alignment_manifest_path);
+        if (!alignment_manifest_path) {
+            return -1;
+        }
+        runtime->alignment_manifest_path = alignment_manifest_path;
+        alignment_manifest_path = NULL;
+    }
+    if (runtime->checkpoint_state.alignment_tape_path[0] != '\0') {
+        free(runtime->alignment_tape_path);
+        runtime->alignment_tape_path = NULL;
+        alignment_tape_path = duplicate_text_local(runtime->checkpoint_state.alignment_tape_path);
+        if (!alignment_tape_path) {
+            return -1;
+        }
+        runtime->alignment_tape_path = alignment_tape_path;
+        alignment_tape_path = NULL;
+    }
+
+    if (ternary_student_checkpoint_validate_alignment(&runtime->checkpoint_state, runtime->activation_tape) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int write_student_checkpoint(const ternary_conversion_config_t *config,
+                                    conversion_runtime_t *runtime,
+                                    const char *alignment_manifest_path,
+                                    const char *alignment_tape_path)
+{
+    ternary_student_update_checkpoint_t checkpoint;
+    const char *effective_alignment_manifest_path = NULL;
+    const char *effective_alignment_tape_path = NULL;
+
+    if (!config || !runtime || !runtime->checkpoint_path) {
+        return -1;
+    }
+
+    effective_alignment_manifest_path = runtime->alignment_manifest_path
+        ? runtime->alignment_manifest_path
+        : alignment_manifest_path;
+    effective_alignment_tape_path = runtime->alignment_tape_path
+        ? runtime->alignment_tape_path
+        : alignment_tape_path;
+
+    checkpoint = runtime->checkpoint_state;
+    copy_text_field_local(checkpoint.alignment_manifest_path,
+                          sizeof(checkpoint.alignment_manifest_path),
+                          effective_alignment_manifest_path);
+    copy_text_field_local(checkpoint.alignment_tape_path,
+                          sizeof(checkpoint.alignment_tape_path),
+                          effective_alignment_tape_path);
+    checkpoint.alignment_manifest_crc32 = 0u;
+    checkpoint.alignment_tape_provenance_hash = 0u;
+
+    if (effective_alignment_manifest_path && effective_alignment_manifest_path[0] != '\0') {
+        if (ternary_student_checkpoint_compute_manifest_crc32(effective_alignment_manifest_path,
+                                                              &checkpoint.alignment_manifest_crc32) != 0) {
+            return -1;
+        }
+    }
+    if (effective_alignment_tape_path && effective_alignment_tape_path[0] != '\0' && runtime->activation_tape) {
+        if (ternary_student_checkpoint_compute_tape_provenance_hash(&checkpoint,
+                                                                    runtime->activation_tape,
+                                                                    &checkpoint.alignment_tape_provenance_hash) != 0) {
+            return -1;
+        }
+    }
+
+    return ternary_student_checkpoint_write_atomic(runtime->checkpoint_path, &checkpoint);
+}
 
 static int prepare_teacher_student_alignment(const ternary_conversion_config_t *config,
                                              conversion_runtime_t *runtime)
@@ -89,6 +648,17 @@ static int prepare_teacher_student_alignment(const ternary_conversion_config_t *
 
     LOG_INFO("ternary alignment: manifest=%s", aligned_manifest_path);
     LOG_INFO("ternary alignment: tape=%s", aligned_tape_path);
+
+    free(runtime->alignment_manifest_path);
+    runtime->alignment_manifest_path = duplicate_text_local(aligned_manifest_path);
+    if (!runtime->alignment_manifest_path) {
+        goto alignment_cleanup;
+    }
+    free(runtime->alignment_tape_path);
+    runtime->alignment_tape_path = duplicate_text_local(aligned_tape_path);
+    if (!runtime->alignment_tape_path) {
+        goto alignment_cleanup;
+    }
 
     activation_tape_close(runtime->activation_tape);
     runtime->activation_tape = aligned_tape;
@@ -187,6 +757,12 @@ static void destroy_conversion_runtime(conversion_runtime_t *runtime) {
     if (runtime->activation_tape) {
         activation_tape_close(runtime->activation_tape);
     }
+    free(runtime->checkpoint_path);
+    free(runtime->checkpoint_tmp_path);
+    runtime->checkpoint_path = NULL;
+    runtime->checkpoint_tmp_path = NULL;
+    free(runtime->alignment_manifest_path);
+    free(runtime->alignment_tape_path);
     if (runtime->activation_ctx) {
         ternary_validation_destroy(&runtime->validation_state);
         destroy_inference_context(runtime->activation_ctx);
@@ -318,7 +894,15 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
             destroy_conversion_runtime(out_runtime);
             return -1;
         }
+        if (init_checkpoint_state(config, out_runtime) != 0) {
+            destroy_conversion_runtime(out_runtime);
+            return -1;
+        }
         init_conversion_validation(config, out_runtime);
+        if (resume_validation_from_manifest(config, out_runtime) != 0) {
+            destroy_conversion_runtime(out_runtime);
+            return -1;
+        }
         return 0;
     }
 
@@ -353,6 +937,17 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
     }
 
     if (prepare_teacher_student_alignment(config, out_runtime) != 0) {
+        destroy_conversion_runtime(out_runtime);
+        return -1;
+    }
+
+    if (init_checkpoint_state(config, out_runtime) != 0) {
+        destroy_conversion_runtime(out_runtime);
+        return -1;
+    }
+
+    init_conversion_validation(config, out_runtime);
+    if (resume_validation_from_manifest(config, out_runtime) != 0) {
         destroy_conversion_runtime(out_runtime);
         return -1;
     }
@@ -443,6 +1038,23 @@ typedef struct {
     uint32_t *out_crc32;
     int *out_skipped_vector;
 } convert_tensor_job_t;
+
+typedef enum {
+    FULL_MODEL_TENSOR_STATUS_CONVERTED = 0,
+    FULL_MODEL_TENSOR_STATUS_SKIPPED_VECTOR = 1,
+    FULL_MODEL_TENSOR_STATUS_SKIPPED_OTHER = 2
+} full_model_tensor_status_t;
+
+typedef struct {
+    const ternary_conversion_config_t *config;
+    conversion_runtime_t *runtime;
+    const model_spec_t *spec;
+    const transformer_ste_config_t *ste_config;
+    const char *model_path;
+    int layer_index;
+    const char *tensor_name;
+    int *last_prefetched_entry_idx;
+} full_model_tensor_task_t;
 
 static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     ternary_bf16_layer_map_t map;
@@ -546,6 +1158,109 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     return rc;
 }
 
+static int process_full_model_tensor(const full_model_tensor_task_t *task)
+{
+    convert_tensor_job_t job;
+    ternary_calibration_corpus_t active_corpus;
+    ternary_calibration_result_t result;
+    uint32_t crc32 = 0u;
+    int skipped_vector = 0;
+    int rc = 0;
+    uint32_t converted_count = 0u;
+
+    if (!task) {
+        return -1;
+    }
+
+    if (task->runtime) {
+        converted_count = task->runtime->checkpoint_state.converted_tensor_count;
+    }
+
+    memset(&result, 0, sizeof(result));
+
+    if (!task->tensor_name || task->tensor_name[0] == '\0') {
+        if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count, 0) != 0) {
+            LOG_WARN("student update: checkpoint write failed after layer %d", task->layer_index);
+        }
+        return FULL_MODEL_TENSOR_STATUS_SKIPPED_OTHER;
+    }
+    if (strcmp(task->tensor_name, "model.embed_tokens.weight") == 0) {
+        LOG_INFO("Skipping embedding tensor in full conversion: %s", task->tensor_name);
+        if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count, 0) != 0) {
+            LOG_WARN("student update: checkpoint write failed after layer %d", task->layer_index);
+        }
+        return FULL_MODEL_TENSOR_STATUS_SKIPPED_OTHER;
+    }
+    if (strcmp(task->tensor_name, "lm_head.weight") == 0) {
+        LOG_INFO("Skipping tied output tensor in full conversion: %s", task->tensor_name);
+        if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count, 0) != 0) {
+            LOG_WARN("student update: checkpoint write failed after layer %d", task->layer_index);
+        }
+        return FULL_MODEL_TENSOR_STATUS_SKIPPED_OTHER;
+    }
+
+    if (task->runtime && task->runtime->activation_tape) {
+        prefetch_activation_tape_lookahead(task->runtime,
+                                           task->spec,
+                                           task->layer_index,
+                                           2,
+                                           task->last_prefetched_entry_idx);
+    }
+
+    memset(&active_corpus, 0, sizeof(active_corpus));
+    if (task->runtime) {
+        active_corpus = task->runtime->calibration_corpus;
+        active_corpus.tensor_name = task->tensor_name;
+    }
+
+    memset(&job, 0, sizeof(job));
+    job.model_path = task->model_path;
+    job.output_dir = task->config->output_path;
+    job.tensor_name = task->tensor_name;
+    job.activation_tape = task->runtime ? task->runtime->activation_tape : NULL;
+    job.ste_config = task->ste_config;
+    job.calibration_corpus = task->runtime ? &active_corpus : NULL;
+    job.out_result = &result;
+    job.out_crc32 = &crc32;
+    job.out_skipped_vector = &skipped_vector;
+
+    rc = convert_tensor_to_dir(&job);
+    if (rc != 0) {
+        LOG_WARN("Failed to convert tensor: %s", task->tensor_name);
+        transformer_free_ternary_calibration_result(&result);
+        if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)task->layer_index, converted_count, 1) != 0) {
+            LOG_WARN("student update: checkpoint write failed while handling tensor failure at %s", task->tensor_name);
+        }
+        return -1;
+    }
+
+    if (skipped_vector) {
+        transformer_free_ternary_calibration_result(&result);
+        if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count, 0) != 0) {
+            LOG_WARN("student update: checkpoint write failed after skipped vector %s", task->tensor_name);
+        }
+        return FULL_MODEL_TENSOR_STATUS_SKIPPED_VECTOR;
+    }
+
+    if (task->runtime && task->runtime->validation_state.config.sample_count > 0) {
+        if (ternary_validation_apply_proxy(&task->runtime->validation_state,
+                                          task->tensor_name,
+                                          &result,
+                                          crc32,
+                                          (int)(converted_count + 1u)) != 0) {
+            LOG_WARN("Validation checkpoint failed after tensor: %s", task->tensor_name);
+        }
+    }
+
+    transformer_free_ternary_calibration_result(&result);
+
+    if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count + 1u, 0) != 0) {
+        LOG_WARN("student update: checkpoint write failed after tensor %s", task->tensor_name);
+    }
+
+    return FULL_MODEL_TENSOR_STATUS_CONVERTED;
+}
+
 static int run_full_model_conversion(const ternary_conversion_config_t *config,
                                      const char *model_path,
                                      conversion_runtime_t *runtime) {
@@ -553,12 +1268,27 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
     transformer_ste_config_t ste_config;
     int converted = 0;
     int skipped_vectors = 0;
-    int failed = 0;
+    int start_layer = 0;
 
     spec = runtime ? runtime->model_spec : get_model_spec(config->model_name);
     if (!spec || !spec->tensor_map || spec->tensor_map_size <= 0) {
         LOG_ERROR("Full ternary conversion: failed to resolve model spec for %s", config->model_name);
         return -1;
+    }
+    if (runtime) {
+        start_layer = (runtime->checkpoint_state.next_layer_index > 0)
+            ? (int)runtime->checkpoint_state.next_layer_index
+            : 0;
+        converted = (runtime->checkpoint_state.converted_tensor_count > 0)
+            ? (int)runtime->checkpoint_state.converted_tensor_count
+            : 0;
+        if (start_layer < 0 || start_layer > spec->tensor_map_size) {
+            LOG_ERROR("student update: invalid resume layer index %d", start_layer);
+            return -1;
+        }
+        if (converted > 0) {
+            LOG_INFO("student update: resuming from layer %d with %d converted tensors", start_layer, converted);
+        }
     }
     ste_config = default_runtime_ste_config(config);
     if (io_prepare_ternary_output_dir(config->output_path) != 0) {
@@ -567,77 +1297,30 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
 
     int last_prefetched_entry_idx = -1;
 
-    for (int i = 0; i < spec->tensor_map_size; ++i) {
+    for (int i = start_layer; i < spec->tensor_map_size; ++i) {
         const char *tensor_name = spec->tensor_map[i].hf_name;
-        convert_tensor_job_t job;
-        ternary_calibration_corpus_t active_corpus;
-        ternary_calibration_result_t result;
-        uint32_t crc32 = 0;
-        int skipped_vector = 0;
-        int rc = 0;
+        full_model_tensor_task_t task;
+        int status = 0;
 
-        memset(&result, 0, sizeof(result));
+        memset(&task, 0, sizeof(task));
+        task.config = config;
+        task.runtime = runtime;
+        task.spec = spec;
+        task.ste_config = &ste_config;
+        task.model_path = model_path;
+        task.layer_index = i;
+        task.tensor_name = tensor_name;
+        task.last_prefetched_entry_idx = &last_prefetched_entry_idx;
+        status = process_full_model_tensor(&task);
 
-        if (!tensor_name || tensor_name[0] == '\0') {
-            continue;
+        if (status < 0) {
+            return -1;
         }
-        if (strcmp(tensor_name, "model.embed_tokens.weight") == 0) {
-            LOG_INFO("Skipping embedding tensor in full conversion: %s", tensor_name);
-            continue;
-        }
-        if (strcmp(tensor_name, "lm_head.weight") == 0) {
-            LOG_INFO("Skipping tied output tensor in full conversion: %s", tensor_name);
-            continue;
-        }
-
-        if (runtime && runtime->activation_tape) {
-            prefetch_activation_tape_lookahead(runtime,
-                                               spec,
-                                               i,
-                                               2,
-                                               &last_prefetched_entry_idx);
-        }
-
-        memset(&active_corpus, 0, sizeof(active_corpus));
-        if (runtime) {
-            active_corpus = runtime->calibration_corpus;
-            active_corpus.tensor_name = tensor_name;
-        }
-
-        memset(&job, 0, sizeof(job));
-        job.model_path = model_path;
-        job.output_dir = config->output_path;
-        job.tensor_name = tensor_name;
-        job.activation_tape = runtime ? runtime->activation_tape : NULL;
-        job.ste_config = &ste_config;
-        job.calibration_corpus = runtime ? &active_corpus : NULL;
-        job.out_result = &result;
-        job.out_crc32 = &crc32;
-        job.out_skipped_vector = &skipped_vector;
-        rc = convert_tensor_to_dir(&job);
-        if (rc != 0) {
-            LOG_WARN("Failed to convert tensor: %s", tensor_name);
-            transformer_free_ternary_calibration_result(&result);
-            failed++;
-            continue;
-        }
-        if (skipped_vector) {
-            transformer_free_ternary_calibration_result(&result);
+        if (status == FULL_MODEL_TENSOR_STATUS_SKIPPED_VECTOR) {
             skipped_vectors++;
-            continue;
+        } else if (status == FULL_MODEL_TENSOR_STATUS_CONVERTED) {
+            converted++;
         }
-        converted++;
-
-        if (runtime && runtime->validation_state.config.sample_count > 0) {
-            if (ternary_validation_apply_proxy(&runtime->validation_state,
-                                              tensor_name,
-                                              &result,
-                                              crc32,
-                                              converted) != 0) {
-                LOG_WARN("Validation checkpoint failed after tensor: %s", tensor_name);
-            }
-        }
-        transformer_free_ternary_calibration_result(&result);
     }
 
     if (runtime && runtime->validation_state.config.sample_count > 0) {
@@ -646,8 +1329,18 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
         }
     }
 
-    LOG_INFO("Full ternary conversion summary: converted=%d skipped_vectors=%d failed=%d",
-             converted, skipped_vectors, failed);
+    if (student_checkpoint_progress(config,
+                                    runtime,
+                                    runtime ? runtime->checkpoint_state.next_layer_index : 0u,
+                                    runtime ? runtime->checkpoint_state.converted_tensor_count : 0u,
+                                    1) != 0) {
+        if (runtime) {
+            LOG_WARN("student update: final checkpoint write failed");
+        }
+    }
+
+    LOG_INFO("Full ternary conversion summary: converted=%d skipped_vectors=%d",
+             converted, skipped_vectors);
     return (converted > 0) ? 0 : -1;
 }
 

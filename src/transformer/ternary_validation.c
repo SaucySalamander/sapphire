@@ -207,6 +207,216 @@ static tensor_t *build_proxy_tensor_from_ternary(const ternary_calibration_resul
     return proxy;
 }
 
+static tensor_t *build_proxy_tensor_from_payload(const ternary_layer_payload_t *payload)
+{
+    int shape[2] = { 0, 0 };
+    tensor_t *proxy = NULL;
+    float *data = NULL;
+    size_t packed_cols = 0u;
+
+    if (!payload || !payload->packed_weights || !payload->scales || payload->rows == 0u || payload->cols == 0u) {
+        return NULL;
+    }
+
+    packed_cols = ((size_t)payload->cols + (TERNARY_PACKED_WEIGHTS_PER_BYTE - 1u))
+                  / TERNARY_PACKED_WEIGHTS_PER_BYTE;
+    if (payload->packed_weight_bytes != (size_t)payload->rows * packed_cols) {
+        return NULL;
+    }
+
+    shape[0] = (int)payload->rows;
+    shape[1] = (int)payload->cols;
+    proxy = tensor_create(2, shape, DTYPE_F32);
+    if (!proxy) {
+        return NULL;
+    }
+
+    data = tensor_data_f32(proxy);
+    if (!data) {
+        tensor_release(proxy);
+        return NULL;
+    }
+
+    for (uint32_t r = 0; r < payload->rows; ++r) {
+        size_t row_base = (size_t)r * payload->cols;
+        size_t packed_row_base = (size_t)r * packed_cols;
+        float scale = payload->scales[r];
+
+        for (uint32_t c = 0; c < payload->cols; ++c) {
+            size_t packed_idx = packed_row_base + (size_t)c / TERNARY_PACKED_WEIGHTS_PER_BYTE;
+            uint32_t lane = c % TERNARY_PACKED_WEIGHTS_PER_BYTE;
+            uint8_t packed = payload->packed_weights[packed_idx];
+            uint8_t symbol = (uint8_t)((packed >> (lane * 2u)) & 0x3u);
+            float value = 0.0f;
+
+            if (symbol == 1u) {
+                value = 1.0f;
+            } else if (symbol == 2u) {
+                value = -1.0f;
+            }
+
+            data[row_base + c] = value * scale;
+        }
+    }
+
+    return proxy;
+}
+
+static int run_checkpoint(ternary_validation_state_t *state, int converted_count);
+
+static int make_proxy_record_from_payload(inference_context_t *ctx,
+                                          const char *tensor_name,
+                                          const ternary_layer_payload_t *payload,
+                                          uint32_t crc32,
+                                          ternary_validation_patch_record_t *out_record)
+{
+    llm_model_t *model = NULL;
+    tensor_t **slot = NULL;
+    tensor_t *proxy_tensor = NULL;
+
+    if (!ctx || !tensor_name || !payload || !out_record || !ctx->spec || !ctx->spec->llm_model) {
+        return -1;
+    }
+
+    model = (llm_model_t *)ctx->spec->llm_model;
+    slot = resolve_tensor_slot(model, ctx->spec, tensor_name);
+    if (!slot || !*slot) {
+        return 0;
+    }
+
+    proxy_tensor = build_proxy_tensor_from_payload(payload);
+    if (!proxy_tensor) {
+        return -1;
+    }
+
+    memset(out_record, 0, sizeof(*out_record));
+    memcpy(out_record->tensor_name, tensor_name, strlen(tensor_name) + 1u);
+    out_record->slot = slot;
+    out_record->original_tensor = *slot;
+    out_record->proxy_tensor = proxy_tensor;
+    out_record->crc32 = crc32;
+    *slot = proxy_tensor;
+    return 1;
+}
+
+static int make_proxy_record(inference_context_t *ctx,
+                             const char *tensor_name,
+                             const ternary_calibration_result_t *result,
+                             uint32_t crc32,
+                             ternary_validation_patch_record_t *out_record)
+{
+    llm_model_t *model = NULL;
+    tensor_t **slot = NULL;
+    tensor_t *proxy_tensor = NULL;
+
+    if (!ctx || !tensor_name || !result || !out_record || !ctx->spec || !ctx->spec->llm_model) {
+        return -1;
+    }
+
+    model = (llm_model_t *)ctx->spec->llm_model;
+    slot = resolve_tensor_slot(model, ctx->spec, tensor_name);
+    if (!slot || !*slot) {
+        return 0;
+    }
+
+    proxy_tensor = build_proxy_tensor_from_ternary(result);
+    if (!proxy_tensor) {
+        return -1;
+    }
+
+    memset(out_record, 0, sizeof(*out_record));
+    memcpy(out_record->tensor_name, tensor_name, strlen(tensor_name) + 1u);
+    out_record->slot = slot;
+    out_record->original_tensor = *slot;
+    out_record->proxy_tensor = proxy_tensor;
+    out_record->crc32 = crc32;
+    *slot = proxy_tensor;
+    return 1;
+}
+
+int ternary_validation_capture_proxy_record(inference_context_t *ctx,
+                                            const char *tensor_name,
+                                            const ternary_calibration_result_t *result,
+                                            ternary_validation_patch_record_t *out_record)
+{
+    return make_proxy_record(ctx, tensor_name, result, 0u, out_record) > 0 ? 0 : -1;
+}
+
+int ternary_validation_apply_proxy_from_payload(ternary_validation_state_t *state,
+                                                const char *tensor_name,
+                                                const ternary_layer_payload_t *payload,
+                                                uint32_t crc32,
+                                                int converted_count)
+{
+    ternary_validation_patch_record_t record;
+    ternary_validation_patch_t *patch = NULL;
+    int rc = 0;
+
+    if (!state || !tensor_name || !payload || !state->ctx || !state->ctx->spec || !state->ctx->spec->llm_model) {
+        return -1;
+    }
+    if (state->config.sample_count <= 0) {
+        return 0;
+    }
+
+    rc = make_proxy_record_from_payload(state->ctx, tensor_name, payload, crc32, &record);
+    if (rc <= 0) {
+        return rc;
+    }
+    if (state->patch_count >= state->patch_capacity) {
+        LOG_ERROR("Validation patch table exhausted");
+        if (record.slot) {
+            *record.slot = record.original_tensor;
+        }
+        tensor_release(record.proxy_tensor);
+        return -1;
+    }
+
+    patch = &state->patches[state->patch_count++];
+    memset(patch, 0, sizeof(*patch));
+    memcpy(patch->tensor_name, record.tensor_name, strlen(record.tensor_name) + 1u);
+    patch->slot = record.slot;
+    patch->original_tensor = record.original_tensor;
+    patch->proxy_tensor = record.proxy_tensor;
+    patch->crc32 = record.crc32;
+
+    memcpy(state->last_tensor_name, tensor_name, strlen(tensor_name) + 1u);
+    state->last_crc32 = crc32;
+
+    if (state->config.validate_every_n > 0 &&
+        converted_count > 0 &&
+        (converted_count % state->config.validate_every_n) == 0) {
+        return run_checkpoint(state, converted_count);
+    }
+    return 0;
+}
+
+int ternary_validation_adopt_patch_records(ternary_validation_state_t *state,
+                                           const ternary_validation_patch_record_t *records,
+                                           int record_count)
+{
+    if (!state || !records || record_count < 0) {
+        return -1;
+    }
+    if (state->patch_count + record_count > state->patch_capacity) {
+        LOG_ERROR("Validation patch table exhausted while adopting resume patches");
+        return -1;
+    }
+
+    for (int i = 0; i < record_count; ++i) {
+        ternary_validation_patch_t *patch = &state->patches[state->patch_count++];
+
+        memset(patch, 0, sizeof(*patch));
+        memcpy(patch->tensor_name, records[i].tensor_name, strlen(records[i].tensor_name) + 1u);
+        patch->slot = records[i].slot;
+        patch->original_tensor = records[i].original_tensor;
+        patch->proxy_tensor = records[i].proxy_tensor;
+        patch->crc32 = records[i].crc32;
+    }
+
+    return 0;
+}
+
 static int run_checkpoint(ternary_validation_state_t *state, int converted_count) {
     const gemma3_270m_config_t *config = NULL;
     ternary_validation_checkpoint_t checkpoint;
@@ -339,10 +549,9 @@ int ternary_validation_apply_proxy(ternary_validation_state_t *state,
                                    const ternary_calibration_result_t *result,
                                    uint32_t crc32,
                                    int converted_count) {
-    llm_model_t *model = NULL;
-    tensor_t **slot = NULL;
-    tensor_t *proxy_tensor = NULL;
+    ternary_validation_patch_record_t record;
     ternary_validation_patch_t *patch = NULL;
+    int rc = 0;
 
     if (!state || !tensor_name || !result || !state->ctx || !state->ctx->spec || !state->ctx->spec->llm_model) {
         return -1;
@@ -351,29 +560,26 @@ int ternary_validation_apply_proxy(ternary_validation_state_t *state,
         return 0;
     }
 
-    model = (llm_model_t *)state->ctx->spec->llm_model;
-    slot = resolve_tensor_slot(model, state->ctx->spec, tensor_name);
-    if (!slot || !*slot) {
-        return 0;
+    rc = make_proxy_record(state->ctx, tensor_name, result, crc32, &record);
+    if (rc <= 0) {
+        return rc;
     }
     if (state->patch_count >= state->patch_capacity) {
         LOG_ERROR("Validation patch table exhausted");
-        return -1;
-    }
-
-    proxy_tensor = build_proxy_tensor_from_ternary(result);
-    if (!proxy_tensor) {
+        if (record.slot) {
+            *record.slot = record.original_tensor;
+        }
+        tensor_release(record.proxy_tensor);
         return -1;
     }
 
     patch = &state->patches[state->patch_count++];
     memset(patch, 0, sizeof(*patch));
-    memcpy(patch->tensor_name, tensor_name, strlen(tensor_name) + 1u);
-    patch->slot = slot;
-    patch->original_tensor = *slot;
-    patch->proxy_tensor = proxy_tensor;
-    patch->crc32 = crc32;
-    *slot = proxy_tensor;
+    memcpy(patch->tensor_name, record.tensor_name, strlen(record.tensor_name) + 1u);
+    patch->slot = record.slot;
+    patch->original_tensor = record.original_tensor;
+    patch->proxy_tensor = record.proxy_tensor;
+    patch->crc32 = record.crc32;
 
     memcpy(state->last_tensor_name, tensor_name, strlen(tensor_name) + 1u);
     state->last_crc32 = crc32;

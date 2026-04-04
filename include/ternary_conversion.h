@@ -23,6 +23,7 @@ typedef struct {
     int context_len;
     int calibration_sample_limit;
     int validation_sample_limit;
+    int checkpoint_every_n_layers;
     int validate_every_n;
     float kl_weight;
 } ternary_conversion_config_t;

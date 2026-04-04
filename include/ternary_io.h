@@ -58,6 +58,16 @@ typedef struct {
     ternary_io_integrity_t integrity;
 } ternary_layer_t;
 
+typedef struct ternary_layer_payload_t {
+    uint8_t *packed_weights;
+    size_t packed_weight_bytes;
+    float *scales;
+    size_t scale_count;
+    size_t scale_bytes;
+    uint32_t rows;
+    uint32_t cols;
+} ternary_layer_payload_t;
+
 /**
  * @brief mmap a BF16 layer tensor from a safetensors file.
  *
@@ -145,6 +155,23 @@ int io_write_layer_ternary_into_dir(const char *output_dir,
                                     const char *tensor_name,
                                     const ternary_layer_t *layer,
                                     uint32_t *out_crc32);
+
+/**
+ * @brief Load a previously written ternary layer payload from a safetensors file.
+ *
+ * The payload is allocated by the loader and must be released with
+ * io_free_layer_ternary_payload().
+ */
+int io_load_layer_ternary_payload(const char *layer_path,
+                                  const char *tensor_name,
+                                  uint32_t expected_rows,
+                                  uint32_t expected_cols,
+                                  ternary_layer_payload_t *out_payload);
+
+/**
+ * @brief Release a payload loaded by io_load_layer_ternary_payload().
+ */
+void io_free_layer_ternary_payload(ternary_layer_payload_t *payload);
 
 typedef struct {
     int converted_count;

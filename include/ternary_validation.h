@@ -22,7 +22,18 @@ typedef struct {
     int sample_count;
 } ternary_validation_config_t;
 
+typedef struct tensor_t tensor_t;
+typedef struct ternary_layer_payload_t ternary_layer_payload_t;
+
 typedef struct ternary_validation_patch ternary_validation_patch_t;
+
+typedef struct {
+    char tensor_name[256];
+    tensor_t **slot;
+    tensor_t *original_tensor;
+    tensor_t *proxy_tensor;
+    uint32_t crc32;
+} ternary_validation_patch_record_t;
 
 typedef struct ternary_validation_state {
     ternary_validation_config_t config;
@@ -50,6 +61,21 @@ int ternary_validation_apply_proxy(ternary_validation_state_t *state,
                                    const ternary_calibration_result_t *result,
                                    uint32_t crc32,
                                    int converted_count);
+
+int ternary_validation_capture_proxy_record(inference_context_t *ctx,
+                                            const char *tensor_name,
+                                            const ternary_calibration_result_t *result,
+                                            ternary_validation_patch_record_t *out_record);
+
+int ternary_validation_apply_proxy_from_payload(ternary_validation_state_t *state,
+                                                const char *tensor_name,
+                                                const ternary_layer_payload_t *payload,
+                                                uint32_t crc32,
+                                                int converted_count);
+
+int ternary_validation_adopt_patch_records(ternary_validation_state_t *state,
+                                           const ternary_validation_patch_record_t *records,
+                                           int record_count);
 
 int ternary_validation_finish(ternary_validation_state_t *state,
                               int converted_count);

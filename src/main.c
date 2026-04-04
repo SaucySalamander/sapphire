@@ -50,6 +50,7 @@ static void print_help(const char* program_name) {
     printf("  --validation-corpus <p>   Optional held-out text corpus file or URL for checkpoints\n");
     printf("  --validation-manifest <p> Optional local held-out corpus manifest file\n");
     printf("  --validation-samples <n>  Held-out prompt count for checkpoint evaluation\n");
+    printf("  --checkpoint-every <n>    Persist student checkpoints every N converted tensors\n");
     printf("  --validate-every <n>      Run checkpoint validation every N converted tensors\n");
     printf("  --kl-weight <value>       Optional KL distillation weight (default: 0.05)\n");
     printf("  --save-state <path>       Save session state to .sapphire file before exit\n");
@@ -93,6 +94,7 @@ typedef struct {
     const char *validation_corpus_path;
     const char *validation_corpus_manifest_path;
     int validation_sample_limit;
+    int checkpoint_every_n_layers;
     int validate_every_n;
     float kl_weight;
     const char *save_state_path;
@@ -121,6 +123,7 @@ static void cli_args_init(cli_args_t *args)
     args->validation_corpus_path = NULL;
     args->validation_corpus_manifest_path = NULL;
     args->validation_sample_limit = 4;
+    args->checkpoint_every_n_layers = 1;
     args->validate_every_n = 0;
     args->kl_weight = 0.05f;
     args->save_state_path = NULL;
@@ -191,6 +194,10 @@ static int validate_cli_args(const cli_args_t *args)
             LOG_ERROR("ERROR: --validate-every must be >= 0.");
             return -1;
         }
+        if (args->checkpoint_every_n_layers <= 0) {
+            LOG_ERROR("ERROR: --checkpoint-every must be > 0.");
+            return -1;
+        }
         if (args->layer_name && args->validate_every_n > 0) {
             LOG_ERROR("ERROR: --validate-every is only supported for full-model ternary conversion.");
             return -1;
@@ -221,6 +228,7 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.context_len = args->context_len;
     config.calibration_sample_limit = args->calibration_sample_limit;
     config.validation_sample_limit = args->validation_sample_limit;
+    config.checkpoint_every_n_layers = args->checkpoint_every_n_layers;
     config.validate_every_n = args->validate_every_n;
     config.kl_weight = args->kl_weight;
     return transformer_run_ternary_conversion(&config);
@@ -365,6 +373,7 @@ typedef enum {
     CLI_OPT_VALIDATION_CORPUS,
     CLI_OPT_VALIDATION_MANIFEST,
     CLI_OPT_VALIDATION_SAMPLES,
+    CLI_OPT_CHECKPOINT_EVERY,
     CLI_OPT_VALIDATE_EVERY,
     CLI_OPT_KL_WEIGHT,
     CLI_OPT_SAVE_STATE,
@@ -392,6 +401,7 @@ static cli_option_t parse_cli_option(const char *arg)
     if (strcmp(arg, "--validation-corpus") == 0) return CLI_OPT_VALIDATION_CORPUS;
     if (strcmp(arg, "--validation-manifest") == 0) return CLI_OPT_VALIDATION_MANIFEST;
     if (strcmp(arg, "--validation-samples") == 0) return CLI_OPT_VALIDATION_SAMPLES;
+    if (strcmp(arg, "--checkpoint-every") == 0) return CLI_OPT_CHECKPOINT_EVERY;
     if (strcmp(arg, "--validate-every") == 0) return CLI_OPT_VALIDATE_EVERY;
     if (strcmp(arg, "--kl-weight") == 0) return CLI_OPT_KL_WEIGHT;
     if (strcmp(arg, "--save-state") == 0) return CLI_OPT_SAVE_STATE;
@@ -417,6 +427,7 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_VALIDATION_CORPUS: args->validation_corpus_path = value; break;
         case CLI_OPT_VALIDATION_MANIFEST: args->validation_corpus_manifest_path = value; break;
         case CLI_OPT_VALIDATION_SAMPLES: args->validation_sample_limit = atoi(value); break;
+        case CLI_OPT_CHECKPOINT_EVERY: args->checkpoint_every_n_layers = atoi(value); break;
         case CLI_OPT_VALIDATE_EVERY: args->validate_every_n = atoi(value); break;
         case CLI_OPT_KL_WEIGHT: args->kl_weight = (float)atof(value); break;
         case CLI_OPT_SAVE_STATE: args->save_state_path = value; break;
