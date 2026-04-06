@@ -700,6 +700,9 @@ int sapphire_record_pass(struct inference_session_t  *session,
         for (int l = 0; l < config->num_hidden_layers; ++l) {
             transformer_rope_t rope = select_layer_rope(session, l);
             if (is_final) {
+                if (l == 0 || ((l + 1) % 3) == 0 || (l + 1) == config->num_hidden_layers) {
+                    LOG_INFO("Recording layer %d/%d", l + 1, config->num_hidden_layers);
+                }
                 capture_layer_input_request_t req;
                 req.token_pos  = pos;
                 req.hidden     = hidden;

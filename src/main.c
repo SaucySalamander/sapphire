@@ -1,13 +1,18 @@
 #include <math.h>
+#include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "activation_tape.h"
+#include "calibration_corpus.h"
 #include "ggml_model.h"
 #include "inference.h"
 #include "ternary_conversion.h"
+#include "ternary_io.h"
 #include "tokenizer.h"
 #include "utils.h"
 #include "log.h"
@@ -39,6 +44,7 @@ static void print_help(const char* program_name) {
     printf("  -t, --temp <value>        Temperature for sampling (default: 1.0)\n");
     printf("  -n, --max-tokens <num>    Maximum tokens to generate (default: 100)\n");
     printf("  -p, --prompt <string>     Run a single prompt non-interactively and exit (echoes prompt)\n");
+    printf("  --record-tape <path>      Record a raw activation tape using --calib-manifest\n");
     printf("  --convert-ternary         Run ternary conversion mode instead of inference\n");
     printf("  --output <path>           Output file (single-layer) or output directory (full-model)\n");
     printf("  --layer <name>            Optional single-layer conversion filter\n");
@@ -71,6 +77,7 @@ static void print_help(const char* program_name) {
     printf("  /help                     Show command help\n");
     printf("\nExample:\n");
     printf("  %s -m gemma3-270m-it -c 4096 -t 0.7 -n 200\n", program_name);
+    printf("  %s -m gemma-3-1b-it --record-tape ./data/1b-teacher-raw.tape --calib-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
     printf("  %s -m gemma-3-27b-it --convert-ternary --output ./out/model-ternary\n", program_name);
     printf("  %s -m gemma-3-7b-it --convert-ternary --output ./out/gemma-3-7b-it-ternary\n", program_name);
     printf("  %s -m gemma-3-270m-it --convert-ternary --layer model.layers.0.self_attn.q_proj.weight --output ./out/layer0-qproj.safetensors\n", program_name);
@@ -83,6 +90,7 @@ typedef struct {
     float temperature;
     int max_tokens;
     const char *prompt_arg;
+    const char *record_tape_path;
     int convert_ternary;
     const char *output_path;
     const char *layer_name;
@@ -112,6 +120,7 @@ static void cli_args_init(cli_args_t *args)
     args->temperature = TEMPERATURE;
     args->max_tokens = MAX_TOKENS_GENERATE;
     args->prompt_arg = NULL;
+    args->record_tape_path = NULL;
     args->convert_ternary = 0;
     args->output_path = NULL;
     args->layer_name = NULL;
@@ -130,6 +139,105 @@ static void cli_args_init(cli_args_t *args)
     args->load_state_path = NULL;
 }
 
+static int validate_record_tape_args(const cli_args_t *args)
+{
+    if (!args->record_tape_path) {
+        return 0;
+    }
+
+    if (args->record_tape_path[0] == '\0') {
+        LOG_ERROR("ERROR: --record-tape must not be empty.");
+        return -1;
+    }
+    if (!args->calibration_corpus_manifest_path || args->calibration_corpus_manifest_path[0] == '\0') {
+        LOG_ERROR("ERROR: --record-tape requires --calib-manifest.");
+        return -1;
+    }
+    if (args->calibration_corpus_path && args->calibration_corpus_path[0] != '\0') {
+        LOG_ERROR("ERROR: --record-tape uses --calib-manifest, not --calibration-corpus.");
+        return -1;
+    }
+    if (args->convert_ternary || args->output_path || args->layer_name ||
+        args->activation_tape_path || args->teacher_model_name ||
+        args->validation_corpus_path || args->validation_corpus_manifest_path ||
+        args->prompt_arg || args->save_state_path || args->load_state_path) {
+        LOG_ERROR("ERROR: --record-tape cannot be combined with conversion, prompt, state, or validation flags.");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int validate_convert_ternary_args(const cli_args_t *args)
+{
+    if (!args->convert_ternary) {
+        return 0;
+    }
+
+    if (!args->output_path) {
+        LOG_ERROR("ERROR: --output is required with --convert-ternary.");
+        return -1;
+    }
+    if (args->prompt_arg) {
+        LOG_ERROR("ERROR: --prompt cannot be combined with --convert-ternary.");
+        return -1;
+    }
+    if (args->save_state_path || args->load_state_path) {
+        LOG_ERROR("ERROR: session state flags are not valid in --convert-ternary mode.");
+        return -1;
+    }
+    if (args->calibration_sample_limit <= 0) {
+        LOG_ERROR("ERROR: --calibration-samples must be > 0.");
+        return -1;
+    }
+    if (args->activation_tape_path && args->activation_tape_path[0] == '\0') {
+        LOG_ERROR("ERROR: --activation-tape must not be empty.");
+        return -1;
+    }
+    if (args->teacher_model_name && args->teacher_model_name[0] == '\0') {
+        LOG_ERROR("ERROR: --teacher-model must not be empty.");
+        return -1;
+    }
+    if (args->teacher_model_name && !args->activation_tape_path) {
+        LOG_ERROR("ERROR: --teacher-model requires --activation-tape.");
+        return -1;
+    }
+    if (args->teacher_model_name && args->layer_name) {
+        LOG_ERROR("ERROR: --teacher-model is only supported for full-model ternary conversion.");
+        return -1;
+    }
+    if (args->calibration_corpus_path && args->calibration_corpus_manifest_path) {
+        LOG_ERROR("ERROR: use either --calibration-corpus or --calib-manifest, not both.");
+        return -1;
+    }
+    if (args->validation_corpus_path && args->validation_corpus_manifest_path) {
+        LOG_ERROR("ERROR: use either --validation-corpus or --validation-manifest, not both.");
+        return -1;
+    }
+    if (args->kl_weight < 0.0f) {
+        LOG_ERROR("ERROR: --kl-weight must be >= 0.");
+        return -1;
+    }
+    if (args->validation_sample_limit < 0) {
+        LOG_ERROR("ERROR: --validation-samples must be >= 0.");
+        return -1;
+    }
+    if (args->validate_every_n < 0) {
+        LOG_ERROR("ERROR: --validate-every must be >= 0.");
+        return -1;
+    }
+    if (args->checkpoint_every_n_layers <= 0) {
+        LOG_ERROR("ERROR: --checkpoint-every must be > 0.");
+        return -1;
+    }
+    if (args->layer_name && args->validate_every_n > 0) {
+        LOG_ERROR("ERROR: --validate-every is only supported for full-model ternary conversion.");
+        return -1;
+    }
+
+    return 0;
+}
+
 static int validate_cli_args(const cli_args_t *args)
 {
     if (!args) {
@@ -141,67 +249,12 @@ static int validate_cli_args(const cli_args_t *args)
         return -1;
     }
 
-    if (args->convert_ternary) {
-        if (!args->output_path) {
-            LOG_ERROR("ERROR: --output is required with --convert-ternary.");
-            return -1;
-        }
-        if (args->prompt_arg) {
-            LOG_ERROR("ERROR: --prompt cannot be combined with --convert-ternary.");
-            return -1;
-        }
-        if (args->save_state_path || args->load_state_path) {
-            LOG_ERROR("ERROR: session state flags are not valid in --convert-ternary mode.");
-            return -1;
-        }
-        if (args->calibration_sample_limit <= 0) {
-            LOG_ERROR("ERROR: --calibration-samples must be > 0.");
-            return -1;
-        }
-        if (args->activation_tape_path && args->activation_tape_path[0] == '\0') {
-            LOG_ERROR("ERROR: --activation-tape must not be empty.");
-            return -1;
-        }
-        if (args->teacher_model_name && args->teacher_model_name[0] == '\0') {
-            LOG_ERROR("ERROR: --teacher-model must not be empty.");
-            return -1;
-        }
-        if (args->teacher_model_name && !args->activation_tape_path) {
-            LOG_ERROR("ERROR: --teacher-model requires --activation-tape.");
-            return -1;
-        }
-        if (args->teacher_model_name && args->layer_name) {
-            LOG_ERROR("ERROR: --teacher-model is only supported for full-model ternary conversion.");
-            return -1;
-        }
-        if (args->calibration_corpus_path && args->calibration_corpus_manifest_path) {
-            LOG_ERROR("ERROR: use either --calibration-corpus or --calib-manifest, not both.");
-            return -1;
-        }
-        if (args->validation_corpus_path && args->validation_corpus_manifest_path) {
-            LOG_ERROR("ERROR: use either --validation-corpus or --validation-manifest, not both.");
-            return -1;
-        }
-        if (args->kl_weight < 0.0f) {
-            LOG_ERROR("ERROR: --kl-weight must be >= 0.");
-            return -1;
-        }
-        if (args->validation_sample_limit < 0) {
-            LOG_ERROR("ERROR: --validation-samples must be >= 0.");
-            return -1;
-        }
-        if (args->validate_every_n < 0) {
-            LOG_ERROR("ERROR: --validate-every must be >= 0.");
-            return -1;
-        }
-        if (args->checkpoint_every_n_layers <= 0) {
-            LOG_ERROR("ERROR: --checkpoint-every must be > 0.");
-            return -1;
-        }
-        if (args->layer_name && args->validate_every_n > 0) {
-            LOG_ERROR("ERROR: --validate-every is only supported for full-model ternary conversion.");
-            return -1;
-        }
+    if (validate_record_tape_args(args) != 0) {
+        return -1;
+    }
+
+    if (validate_convert_ternary_args(args) != 0) {
+        return -1;
     }
 
     return 0;
@@ -232,6 +285,153 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.validate_every_n = args->validate_every_n;
     config.kl_weight = args->kl_weight;
     return transformer_run_ternary_conversion(&config);
+}
+
+static void record_tape_signal_handler(int signum)
+{
+    (void)signum;
+    activation_tape_request_stop();
+}
+
+static int install_record_tape_signal_handlers(struct sigaction *old_int,
+                                               struct sigaction *old_term)
+{
+    struct sigaction action;
+
+    if (!old_int || !old_term) {
+        return -1;
+    }
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = record_tape_signal_handler;
+    sigemptyset(&action.sa_mask);
+
+    if (sigaction(SIGINT, &action, old_int) != 0) {
+        LOG_ERROR("record-tape: failed to install SIGINT handler");
+        return -1;
+    }
+    if (sigaction(SIGTERM, &action, old_term) != 0) {
+        LOG_ERROR("record-tape: failed to install SIGTERM handler");
+        (void)sigaction(SIGINT, old_int, NULL);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void restore_record_tape_signal_handlers(const struct sigaction *old_int,
+                                                const struct sigaction *old_term)
+{
+    if (old_int) {
+        (void)sigaction(SIGINT, old_int, NULL);
+    }
+    if (old_term) {
+        (void)sigaction(SIGTERM, old_term, NULL);
+    }
+}
+
+static int ensure_parent_directory_for_file(const char *path)
+{
+    const char *slash = NULL;
+    char *parent_dir = NULL;
+    size_t parent_len = 0u;
+    int rc = 0;
+
+    if (!path) {
+        return -1;
+    }
+
+    slash = strrchr(path, '/');
+    if (!slash) {
+        return 0;
+    }
+
+    parent_len = (size_t)(slash - path);
+    if (parent_len == 0u) {
+        return 0;
+    }
+
+    parent_dir = (char *)malloc(parent_len + 1u);
+    if (!parent_dir) {
+        LOG_ERROR("record-tape: failed to allocate output directory path");
+        return -1;
+    }
+
+    memcpy(parent_dir, path, parent_len);
+    parent_dir[parent_len] = '\0';
+    rc = io_prepare_ternary_output_dir(parent_dir);
+    free(parent_dir);
+    return rc;
+}
+
+static int run_record_tape_mode(const cli_args_t *args)
+{
+    inference_context_t *ctx = NULL;
+    calibration_corpus_t corpus;
+    struct sigaction old_sigint;
+    struct sigaction old_sigterm;
+    int signal_handlers_installed = 0;
+    int rc = -1;
+
+    if (!args || !args->record_tape_path || !args->model_name) {
+        LOG_ERROR("record-tape mode: invalid arguments");
+        return -1;
+    }
+
+    memset(&corpus, 0, sizeof(corpus));
+    activation_tape_clear_stop_request();
+
+    if (install_record_tape_signal_handlers(&old_sigint, &old_sigterm) != 0) {
+        goto cleanup;
+    }
+    signal_handlers_installed = 1;
+
+    LOG_INFO("Recording activation tape to %s", args->record_tape_path);
+
+    ctx = create_inference_context(0.0f, 0, args->context_len, args->model_name);
+    if (!ctx) {
+        LOG_ERROR("record-tape: failed to create inference context");
+        goto cleanup;
+    }
+    if (!ctx->session || !ctx->session->backend || ctx->session->backend->type != SAPPHIRE_BACKEND_TYPE_CPU) {
+        LOG_ERROR("record-tape: CPU backend is required; set SAPPHIRE_BACKEND=cpu");
+        goto cleanup;
+    }
+
+    if (ensure_parent_directory_for_file(args->record_tape_path) != 0) {
+        goto cleanup;
+    }
+
+    if (calibration_corpus_load_manifest(args->calibration_corpus_manifest_path,
+                                         INT_MAX,
+                                         &corpus) != 0) {
+        LOG_ERROR("record-tape: failed to load calibration manifest %s",
+                  args->calibration_corpus_manifest_path);
+        goto cleanup;
+    }
+
+    rc = activation_tape_record(args->record_tape_path,
+                                ctx->session,
+                                ctx->tokenizer,
+                                ctx->spec,
+                                (const struct calibration_corpus_t *)&corpus,
+                                0);
+    if (rc == 0 && activation_tape_stop_requested()) {
+        LOG_WARN("record-tape: interrupted; partial tape saved to %s", args->record_tape_path);
+    } else if (rc == 0) {
+        LOG_INFO("record-tape: completed %s", args->record_tape_path);
+    }
+
+cleanup:
+    calibration_corpus_free(&corpus);
+    if (ctx) {
+        destroy_inference_context(ctx);
+    }
+    if (signal_handlers_installed) {
+        restore_record_tape_signal_handlers(&old_sigint, &old_sigterm);
+    }
+    activation_tape_clear_stop_request();
+    return rc;
 }
 
 static void print_session_state(const inference_context_t *ctx,
@@ -362,6 +562,7 @@ typedef enum {
     CLI_OPT_TEMP,
     CLI_OPT_MAX_TOKENS,
     CLI_OPT_PROMPT,
+    CLI_OPT_RECORD_TAPE,
     CLI_OPT_CONVERT_TERNARY,
     CLI_OPT_OUTPUT,
     CLI_OPT_LAYER,
@@ -390,6 +591,7 @@ static cli_option_t parse_cli_option(const char *arg)
     if (strcmp(arg, "-t") == 0 || strcmp(arg, "--temp") == 0) return CLI_OPT_TEMP;
     if (strcmp(arg, "-n") == 0 || strcmp(arg, "--max-tokens") == 0) return CLI_OPT_MAX_TOKENS;
     if (strcmp(arg, "-p") == 0 || strcmp(arg, "--prompt") == 0) return CLI_OPT_PROMPT;
+    if (strcmp(arg, "--record-tape") == 0) return CLI_OPT_RECORD_TAPE;
     if (strcmp(arg, "--convert-ternary") == 0) return CLI_OPT_CONVERT_TERNARY;
     if (strcmp(arg, "--output") == 0) return CLI_OPT_OUTPUT;
     if (strcmp(arg, "--layer") == 0) return CLI_OPT_LAYER;
@@ -417,6 +619,7 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_TEMP: args->temperature = atof(value); break;
         case CLI_OPT_MAX_TOKENS: args->max_tokens = atoi(value); break;
         case CLI_OPT_PROMPT: args->prompt_arg = value; break;
+        case CLI_OPT_RECORD_TAPE: args->record_tape_path = value; break;
         case CLI_OPT_OUTPUT: args->output_path = value; break;
         case CLI_OPT_LAYER: args->layer_name = value; break;
         case CLI_OPT_ACTIVATION_TAPE: args->activation_tape_path = value; break;
@@ -632,6 +835,14 @@ int main(int argc, char* argv[]) {
     printf("================================================================================\n");
     printf("                      SAPPHIRE INFERENCE ENGINE (v1.0)\n");
     printf("================================================================================\n");
+
+    if (args.record_tape_path) {
+        int rc = run_record_tape_mode(&args);
+        printf("\n================================================================================\n");
+        printf("                    Sapphire Inference Engine Closed\n");
+        printf("================================================================================\n");
+        return rc;
+    }
 
     if (args.convert_ternary) {
         int rc = run_ternary_conversion_mode(&args);

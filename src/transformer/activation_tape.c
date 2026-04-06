@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -82,6 +83,23 @@ struct activation_tape_t {
     uint32_t                     entry_count;
 };
 
+static volatile sig_atomic_t g_activation_tape_stop_requested = 0;
+
+void activation_tape_request_stop(void)
+{
+    g_activation_tape_stop_requested = 1;
+}
+
+void activation_tape_clear_stop_request(void)
+{
+    g_activation_tape_stop_requested = 0;
+}
+
+int activation_tape_stop_requested(void)
+{
+    return g_activation_tape_stop_requested != 0;
+}
+
 /* -------------------------------------------------------------------------
  * Small helpers
  * -------------------------------------------------------------------------*/
@@ -114,6 +132,28 @@ static const char *tape_tensor_prefix(const model_spec_t *ms)
     return "model.layers.";
 }
 
+static int write_all(int fd, const void *buffer, size_t size)
+{
+    const uint8_t *cursor = (const uint8_t *)buffer;
+
+    while (size > 0u) {
+        ssize_t written = write(fd, cursor, size);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (written == 0) {
+            return -1;
+        }
+        cursor += (size_t)written;
+        size -= (size_t)written;
+    }
+
+    return 0;
+}
+
 /* -------------------------------------------------------------------------
  * Staging allocation / free
  * -------------------------------------------------------------------------*/
@@ -133,6 +173,10 @@ static tape_staging_t *tape_alloc_staging(int n_layers, int n_samples,
             st[idx].target     = t;
             st[idx].vector_dim = dim_for_target(t, cfg);
             size_t nb = (size_t)n_samples * st[idx].vector_dim * sizeof(float);
+            if (nb == 0u) {
+                st[idx].buffer = NULL;
+                continue;
+            }
             st[idx].buffer = (float *)calloc(1, nb);
             if (!st[idx].buffer) {
                 LOG_ERROR("tape: OOM at layer=%d target=%d", l, ti);
@@ -237,14 +281,12 @@ static int tape_write_header_and_manifest(int fd,
                                            const tape_manifest_entry_t *manifest,
                                            int n_entries)
 {
-    ssize_t w = write(fd, hdr, sizeof(*hdr));
-    if (w != (ssize_t)sizeof(*hdr)) {
+    if (write_all(fd, hdr, sizeof(*hdr)) != 0) {
         LOG_ERROR("tape: header write failed: %s", strerror(errno));
         return -1;
     }
     size_t msz = (size_t)n_entries * sizeof(*manifest);
-    w = write(fd, manifest, msz);
-    if (w != (ssize_t)msz) {
+    if (write_all(fd, manifest, msz) != 0) {
         LOG_ERROR("tape: manifest write failed: %s", strerror(errno));
         return -1;
     }
@@ -256,8 +298,10 @@ static int tape_write_data_section(int fd, const tape_staging_t *st,
 {
     for (int i = 0; i < n_unique; ++i) {
         size_t block = (size_t)st[i].vector_dim * (size_t)n_samples * sizeof(float);
-        ssize_t w = write(fd, st[i].buffer, block);
-        if (w != (ssize_t)block) {
+        if (block == 0u) {
+            continue;
+        }
+        if (write_all(fd, st[i].buffer, block) != 0) {
             LOG_ERROR("tape: data write failed at slot %d: %s", i, strerror(errno));
             return -1;
         }
@@ -309,8 +353,15 @@ static int tape_write_file(const char *path, const tape_staging_t *st,
 
     hdr.crc32 = io_crc32_update(0u, &hdr, offsetof(tape_file_header_t, crc32));
     if (lseek(fd, (off_t)offsetof(tape_file_header_t, crc32), SEEK_SET) < 0 ||
-        write(fd, &hdr.crc32, sizeof(hdr.crc32)) != (ssize_t)sizeof(hdr.crc32)) {
+        write_all(fd, &hdr.crc32, sizeof(hdr.crc32)) != 0) {
         LOG_ERROR("tape: CRC patch failed");
+        goto wf_cleanup;
+    }
+    while (fsync(fd) != 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        LOG_ERROR("tape: fsync failed: %s", strerror(errno));
         goto wf_cleanup;
     }
     rc = 0;
@@ -318,7 +369,9 @@ static int tape_write_file(const char *path, const tape_staging_t *st,
              path, n_entries, ctx->n_samples, (double)data_size / (1024.0 * 1024.0));
 
 wf_cleanup:
-    if (fd >= 0 && close(fd) != 0) { LOG_ERROR("tape: close failed"); rc = -1; }
+    if (fd >= 0) {
+        if (close(fd) != 0 && errno != EINTR) { LOG_ERROR("tape: close failed"); rc = -1; }
+    }
     free(st_offsets);
     free(manifest);
     return rc;
@@ -340,6 +393,7 @@ int activation_tape_record(const char                        *output_path,
     tape_staging_t             *st   = NULL;
     activation_record_slot_t   *slots = NULL;
     int rc = -1;
+    int completed_samples = 0;
 
     if (!output_path || !session || !tokenizer || !ms || !corp) return -1;
 
@@ -365,6 +419,10 @@ int activation_tape_record(const char                        *output_path,
     if (!slots) { tape_free_staging(st, n_unique); return -1; }
 
     for (int s = 0; s < n_samples; ++s) {
+        if (activation_tape_stop_requested()) {
+            LOG_WARN("tape: stop requested before sample %d/%d", s + 1, n_samples);
+            break;
+        }
         tape_set_slot_vectors(slots, st, n_unique, s);
         if (sapphire_record_pass(session,
                                   (struct sapphire_tokenizer_t *)tokenizer,
@@ -372,14 +430,23 @@ int activation_tape_record(const char                        *output_path,
                                   corp->samples[s], slots, n_unique) != 0) {
             LOG_WARN("tape: sample %d/%d failed", s + 1, n_samples);
         }
-        if (s % 8 == 0)
+        completed_samples = s + 1;
+        if ((s % 8 == 0) || (s + 1 == n_samples))
             LOG_INFO("tape: sample %d/%d", s + 1, n_samples);
+        if (activation_tape_stop_requested()) {
+            LOG_WARN("tape: stop requested after sample %d/%d", completed_samples, n_samples);
+            break;
+        }
+    }
+
+    if (completed_samples < n_samples || activation_tape_stop_requested()) {
+        LOG_WARN("tape: writing partial tape with %d/%d samples", completed_samples, n_samples);
     }
 
     tape_manifest_ctx_t ctx = {
         .n_unique = n_unique,
         .n_layers = n_layers,
-        .n_samples = n_samples,
+        .n_samples = completed_samples,
         .cfg    = cfg,
         .prefix = tape_tensor_prefix(ms),
     };

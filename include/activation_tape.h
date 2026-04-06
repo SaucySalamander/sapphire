@@ -99,6 +99,20 @@ int activation_tape_record(const char                    *output_path,
                            const struct calibration_corpus_t *corpus,
                            int                            sample_limit);
 
+/**
+ * @brief Request that any in-flight tape recording stop at the next safe point.
+ *
+ * Intended for SIGINT / SIGTERM handlers. The recorder polls this flag between
+ * samples and will still flush any completed partial tape before returning.
+ */
+void activation_tape_request_stop(void);
+
+/** @brief Clear any pending tape-recording stop request. */
+void activation_tape_clear_stop_request(void);
+
+/** @return non-zero if a tape-recording stop request has been raised. */
+int activation_tape_stop_requested(void);
+
 /* -------------------------------------------------------------------------
  * Playback API
  * -------------------------------------------------------------------------*/

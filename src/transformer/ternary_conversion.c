@@ -1030,7 +1030,13 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
     return 0;
 }
 
+static int mmap_tensor_for_conversion(const char *model_dir,
+                                      const char *model_path,
+                                      const char *tensor_name,
+                                      ternary_bf16_layer_map_t *out_map);
+
 static int run_single_layer_conversion(const ternary_conversion_config_t *config,
+                                       const char *model_dir,
                                        const char *model_path,
                                        const conversion_runtime_t *runtime) {
     ternary_bf16_layer_map_t map;
@@ -1051,7 +1057,7 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
         return -1;
     }
 
-    if (io_mmap_layer_bf16(model_path, config->layer_name, &map) != 0) {
+    if (mmap_tensor_for_conversion(model_dir, model_path, config->layer_name, &map) != 0) {
         return -1;
     }
 
@@ -1104,6 +1110,7 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
 
 typedef struct {
     const char *model_path;
+    const char *model_dir;
     const char *output_dir;
     const char *tensor_name;
     const activation_tape_t *activation_tape;
@@ -1126,11 +1133,43 @@ typedef struct {
     conversion_runtime_t *runtime;
     const model_spec_t *spec;
     const transformer_ste_config_t *ste_config;
+    const char *model_dir;
     const char *model_path;
     int layer_index;
     const char *tensor_name;
     int *last_prefetched_entry_idx;
 } full_model_tensor_task_t;
+
+static int mmap_tensor_for_conversion(const char *model_dir,
+                                      const char *model_path,
+                                      const char *tensor_name,
+                                      ternary_bf16_layer_map_t *out_map);
+
+static int mmap_tensor_for_conversion(const char *model_dir,
+                                      const char *model_path,
+                                      const char *tensor_name,
+                                      ternary_bf16_layer_map_t *out_map)
+{
+    struct stat st;
+
+    if (!tensor_name || !out_map) {
+        return -1;
+    }
+
+    if (model_path && stat(model_path, &st) == 0 && S_ISREG(st.st_mode)) {
+        return io_mmap_layer_bf16(model_path, tensor_name, out_map);
+    }
+
+    if (model_dir && model_dir[0] != '\0') {
+        return io_mmap_layer_bf16_sharded(model_dir, tensor_name, out_map);
+    }
+
+    if (model_path) {
+        return io_mmap_layer_bf16(model_path, tensor_name, out_map);
+    }
+
+    return -1;
+}
 
 static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     ternary_bf16_layer_map_t map;
@@ -1165,7 +1204,7 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     if (measure_io && clock_gettime(CLOCK_MONOTONIC, &load_start) != 0) {
         measure_io = 0;
     }
-    if (io_mmap_layer_bf16(job->model_path, job->tensor_name, &map) != 0) {
+    if (mmap_tensor_for_conversion(job->model_dir, job->model_path, job->tensor_name, &map) != 0) {
         return -1;
     }
     if (measure_io && clock_gettime(CLOCK_MONOTONIC, &load_end) == 0) {
@@ -1244,6 +1283,85 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     return rc;
 }
 
+static int process_full_model_tensor_skip_other(const full_model_tensor_task_t *task,
+                                                uint32_t converted_count,
+                                                const char *skip_message)
+{
+    if (skip_message) {
+        LOG_INFO(skip_message, task->tensor_name);
+    }
+
+    if (student_checkpoint_progress(task->config,
+                                    task->runtime,
+                                    (uint32_t)(task->layer_index + 1),
+                                    converted_count,
+                                    0) != 0) {
+        LOG_WARN("student update: checkpoint write failed after layer %d", task->layer_index);
+    }
+
+    return FULL_MODEL_TENSOR_STATUS_SKIPPED_OTHER;
+}
+
+static int process_full_model_tensor_skipped_vector(const full_model_tensor_task_t *task,
+                                                    ternary_calibration_result_t *result,
+                                                    uint32_t converted_count)
+{
+    transformer_free_ternary_calibration_result(result);
+    if (student_checkpoint_progress(task->config,
+                                    task->runtime,
+                                    (uint32_t)(task->layer_index + 1),
+                                    converted_count,
+                                    0) != 0) {
+        LOG_WARN("student update: checkpoint write failed after skipped vector %s", task->tensor_name);
+    }
+
+    return FULL_MODEL_TENSOR_STATUS_SKIPPED_VECTOR;
+}
+
+static int process_full_model_tensor_failed(const full_model_tensor_task_t *task,
+                                            ternary_calibration_result_t *result,
+                                            uint32_t converted_count)
+{
+    LOG_WARN("Failed to convert tensor: %s", task->tensor_name);
+    transformer_free_ternary_calibration_result(result);
+    if (student_checkpoint_progress(task->config,
+                                    task->runtime,
+                                    (uint32_t)task->layer_index,
+                                    converted_count,
+                                    1) != 0) {
+        LOG_WARN("student update: checkpoint write failed while handling tensor failure at %s", task->tensor_name);
+    }
+
+    return -1;
+}
+
+static int process_full_model_tensor_complete(const full_model_tensor_task_t *task,
+                                              ternary_calibration_result_t *result,
+                                              uint32_t converted_count,
+                                              uint32_t crc32)
+{
+    if (task->runtime && task->runtime->validation_state.config.sample_count > 0) {
+        if (ternary_validation_apply_proxy(&task->runtime->validation_state,
+                                          task->tensor_name,
+                                          result,
+                                          crc32,
+                                          (int)(converted_count + 1u)) != 0) {
+            LOG_WARN("Validation checkpoint failed after tensor: %s", task->tensor_name);
+        }
+    }
+
+    transformer_free_ternary_calibration_result(result);
+    if (student_checkpoint_progress(task->config,
+                                    task->runtime,
+                                    (uint32_t)(task->layer_index + 1),
+                                    converted_count + 1u,
+                                    0) != 0) {
+        LOG_WARN("student update: checkpoint write failed after tensor %s", task->tensor_name);
+    }
+
+    return FULL_MODEL_TENSOR_STATUS_CONVERTED;
+}
+
 static int process_full_model_tensor(const full_model_tensor_task_t *task)
 {
     convert_tensor_job_t job;
@@ -1270,24 +1388,19 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     memset(&layer_ste_config, 0, sizeof(layer_ste_config));
 
     if (!task->tensor_name || task->tensor_name[0] == '\0') {
-        if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count, 0) != 0) {
-            LOG_WARN("student update: checkpoint write failed after layer %d", task->layer_index);
-        }
-        return FULL_MODEL_TENSOR_STATUS_SKIPPED_OTHER;
+        return process_full_model_tensor_skip_other(task, converted_count, NULL);
     }
     if (strcmp(task->tensor_name, "model.embed_tokens.weight") == 0) {
         LOG_INFO("Skipping embedding tensor in full conversion: %s", task->tensor_name);
-        if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count, 0) != 0) {
-            LOG_WARN("student update: checkpoint write failed after layer %d", task->layer_index);
-        }
-        return FULL_MODEL_TENSOR_STATUS_SKIPPED_OTHER;
+        return process_full_model_tensor_skip_other(task,
+                                                    converted_count,
+                                                    "Skipping embedding tensor in full conversion: %s");
     }
     if (strcmp(task->tensor_name, "lm_head.weight") == 0) {
         LOG_INFO("Skipping tied output tensor in full conversion: %s", task->tensor_name);
-        if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count, 0) != 0) {
-            LOG_WARN("student update: checkpoint write failed after layer %d", task->layer_index);
-        }
-        return FULL_MODEL_TENSOR_STATUS_SKIPPED_OTHER;
+        return process_full_model_tensor_skip_other(task,
+                                                    converted_count,
+                                                    "Skipping tied output tensor in full conversion: %s");
     }
 
     if (task->runtime && task->runtime->activation_tape && tensor_name_is_layer_tensor(task->tensor_name)) {
@@ -1311,6 +1424,7 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
 
     memset(&job, 0, sizeof(job));
     job.model_path = task->model_path;
+    job.model_dir = task->model_dir;
     job.output_dir = task->config->output_path;
     job.tensor_name = task->tensor_name;
     job.activation_tape = task->runtime ? task->runtime->activation_tape : NULL;
@@ -1323,42 +1437,18 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
 
     rc = convert_tensor_to_dir(&job);
     if (rc != 0) {
-        LOG_WARN("Failed to convert tensor: %s", task->tensor_name);
-        transformer_free_ternary_calibration_result(&result);
-        if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)task->layer_index, converted_count, 1) != 0) {
-            LOG_WARN("student update: checkpoint write failed while handling tensor failure at %s", task->tensor_name);
-        }
-        return -1;
+        return process_full_model_tensor_failed(task, &result, converted_count);
     }
 
     if (skipped_vector) {
-        transformer_free_ternary_calibration_result(&result);
-        if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count, 0) != 0) {
-            LOG_WARN("student update: checkpoint write failed after skipped vector %s", task->tensor_name);
-        }
-        return FULL_MODEL_TENSOR_STATUS_SKIPPED_VECTOR;
+        return process_full_model_tensor_skipped_vector(task, &result, converted_count);
     }
 
-    if (task->runtime && task->runtime->validation_state.config.sample_count > 0) {
-        if (ternary_validation_apply_proxy(&task->runtime->validation_state,
-                                          task->tensor_name,
-                                          &result,
-                                          crc32,
-                                          (int)(converted_count + 1u)) != 0) {
-            LOG_WARN("Validation checkpoint failed after tensor: %s", task->tensor_name);
-        }
-    }
-
-    transformer_free_ternary_calibration_result(&result);
-
-    if (student_checkpoint_progress(task->config, task->runtime, (uint32_t)(task->layer_index + 1), converted_count + 1u, 0) != 0) {
-        LOG_WARN("student update: checkpoint write failed after tensor %s", task->tensor_name);
-    }
-
-    return FULL_MODEL_TENSOR_STATUS_CONVERTED;
+    return process_full_model_tensor_complete(task, &result, converted_count, crc32);
 }
 
 static int run_full_model_conversion(const ternary_conversion_config_t *config,
+                                     const char *model_dir,
                                      const char *model_path,
                                      conversion_runtime_t *runtime) {
     model_spec_t *spec = NULL;
@@ -1376,13 +1466,7 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
         start_layer = (runtime->checkpoint_state.next_layer_index > 0)
             ? (int)runtime->checkpoint_state.next_layer_index
             : 0;
-        converted = (runtime->checkpoint_state.converted_tensor_count > 0)
-            ? (int)runtime->checkpoint_state.converted_tensor_count
-            : 0;
-        if (start_layer < 0 || start_layer > spec->tensor_map_size) {
-            LOG_ERROR("student update: invalid resume layer index %d", start_layer);
-            return -1;
-        }
+        converted = (int)runtime->checkpoint_state.converted_tensor_count;
         if (converted > 0) {
             LOG_INFO("student update: resuming from layer %d with %d converted tensors", start_layer, converted);
         }
@@ -1404,6 +1488,7 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
         task.runtime = runtime;
         task.spec = spec;
         task.ste_config = &ste_config;
+        task.model_dir = model_dir;
         task.model_path = model_path;
         task.layer_index = i;
         task.tensor_name = tensor_name;
@@ -1502,9 +1587,9 @@ int transformer_run_ternary_conversion(const ternary_conversion_config_t *config
     }
 
     if (config->layer_name && config->layer_name[0] != '\0') {
-        rc = run_single_layer_conversion(config, model_path, &runtime);
+        rc = run_single_layer_conversion(config, model_dir, model_path, &runtime);
     } else {
-        rc = run_full_model_conversion(config, model_path, &runtime);
+        rc = run_full_model_conversion(config, model_dir, model_path, &runtime);
     }
     free(model_path);
     free(model_dir);
