@@ -11,6 +11,7 @@
 #include "inference.h"
 #include "model_spec.h"
 #include "ternary_io.h"
+#include "ternary_hessian_proxy.h"
 #include "ternary_telemetry.h"
 #include "tokenizer.h"
 #include "transformer.h"
@@ -60,6 +61,12 @@ static transformer_ste_config_t default_ste_config(void) {
     config.clip_value = 1.0f;
     config.calibration_samples = 4;
     config.kl_weight = 0.05f;
+    config.use_hessian_proxy = 1;
+    config.hessian_proxy_strength = 1.0f;
+    config.hessian_proxy_floor = 0.05f;
+    config.max_grad_norm = 1.0f;
+    config.adam_beta2 = 0.95f;
+    config.adam_epsilon = 1e-8f;
     config.telemetry_interval = 10;
     config.telemetry_path = "./out/ternary_telemetry.jsonl";
     config.telemetry = NULL;
@@ -84,6 +91,12 @@ static void normalize_ste_config(transformer_ste_config_t *config) {
     if (config->calibration_samples <= 0) config->calibration_samples = 4;
     if (config->calibration_samples > 16) config->calibration_samples = 16;
     if (config->kl_weight < 0.0f) config->kl_weight = 0.0f;
+    config->use_hessian_proxy = config->use_hessian_proxy ? 1 : 0;
+    if (config->hessian_proxy_strength < 0.0f) config->hessian_proxy_strength = 1.0f;
+    if (config->hessian_proxy_floor < 0.0f) config->hessian_proxy_floor = 0.05f;
+    if (config->max_grad_norm <= 0.0f) config->max_grad_norm = 1.0f;
+    if (config->adam_beta2 < 0.0f || config->adam_beta2 >= 1.0f) config->adam_beta2 = 0.95f;
+    if (config->adam_epsilon <= 0.0f) config->adam_epsilon = 1e-8f;
     if (config->telemetry_interval <= 0) config->telemetry_interval = 10;
 }
 
@@ -157,6 +170,12 @@ static uint32_t telemetry_compute_config_hash(const transformer_ste_config_t *co
     crc32 = io_crc32_update(crc32, &config->clip_value, sizeof(config->clip_value));
     crc32 = io_crc32_update(crc32, &config->calibration_samples, sizeof(config->calibration_samples));
     crc32 = io_crc32_update(crc32, &config->kl_weight, sizeof(config->kl_weight));
+    crc32 = io_crc32_update(crc32, &config->use_hessian_proxy, sizeof(config->use_hessian_proxy));
+    crc32 = io_crc32_update(crc32, &config->hessian_proxy_strength, sizeof(config->hessian_proxy_strength));
+    crc32 = io_crc32_update(crc32, &config->hessian_proxy_floor, sizeof(config->hessian_proxy_floor));
+    crc32 = io_crc32_update(crc32, &config->max_grad_norm, sizeof(config->max_grad_norm));
+    crc32 = io_crc32_update(crc32, &config->adam_beta2, sizeof(config->adam_beta2));
+    crc32 = io_crc32_update(crc32, &config->adam_epsilon, sizeof(config->adam_epsilon));
     crc32 = io_crc32_update(crc32, &config->telemetry_interval, sizeof(config->telemetry_interval));
     crc32 = io_crc32_update(crc32, tensor_name, tensor_name ? strlen(tensor_name) + 1u : 0u);
     crc32 = io_crc32_update(crc32, &rows, sizeof(rows));
@@ -272,7 +291,10 @@ typedef struct {
     uint32_t step_idx;
     uint32_t total_steps;
     float mse_loss;
-    float grad_norm;
+    float raw_grad_norm;
+    float clipped_grad_norm;
+    float clip_scale;
+    float latent_saturation;
     float compute_ms;
 } ste_telemetry_step_t;
 
@@ -339,7 +361,11 @@ static int ste_emit_telemetry_step(ste_telemetry_runtime_t *runtime,
     telemetry = runtime->telemetry;
     telemetry.step_idx = step->step_idx;
     telemetry.mse_loss = step->mse_loss;
-    telemetry.grad_norm = step->grad_norm;
+    telemetry.grad_norm = step->raw_grad_norm;
+    telemetry.raw_grad_norm = step->raw_grad_norm;
+    telemetry.clipped_grad_norm = step->clipped_grad_norm;
+    telemetry.clip_scale = step->clip_scale;
+    telemetry.latent_saturation = step->latent_saturation;
     telemetry.compute_ms = step->compute_ms;
     telemetry.gamma_scale = telemetry_average_scale(result->scales, result->rows);
     {
@@ -699,22 +725,54 @@ typedef struct {
     uint32_t cols;
     const float *calibration_vectors;
     const float *sample_weights;
+    const float *hessian_proxy;
     int sample_count;
-    float learning_rate;
-    float momentum;
     float regularization_strength;
     float non_collapse_weight;
     float zero_occupancy_floor;
-    float clip_value;
     float *mse_sum;
-    float *grad_norm_sq_sum;
-} ste_row_update_context_t;
+} ste_gradient_accum_context_t;
 
-static void ste_update_row(float *latent_row,
-                           float *velocity_row,
-                           const int8_t *ternary_row,
-                           float scale,
-                           const ste_row_update_context_t *context) {
+typedef struct {
+    float learning_rate;
+    float beta1;
+    float beta2;
+    float epsilon;
+    float clip_value;
+    uint32_t step_index;
+} ste_optimizer_context_t;
+
+static void quantize_all_rows(const float *latent,
+                              int8_t *ternary,
+                              float *scales,
+                              uint32_t rows,
+                              uint32_t cols,
+                              float zero_threshold)
+{
+    for (uint32_t row = 0; row < rows; ++row) {
+        size_t row_base = (size_t)row * cols;
+
+        quantize_row_ternary(latent + row_base,
+                             cols,
+                             zero_threshold,
+                             &scales[row],
+                             ternary + row_base);
+    }
+}
+
+static void ste_fill_unit_sample_weights(float *sample_weights, int sample_count)
+{
+    for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+        sample_weights[sample_idx] = 1.0f;
+    }
+}
+
+static void ste_accumulate_row_gradients(const float *latent_row,
+                                         const int8_t *ternary_row,
+                                         float scale,
+                                         float *gradient_row,
+                                         const ste_gradient_accum_context_t *context)
+{
     float sample_diffs[16];
     float weight_sum = 0.0f;
     uint32_t cols = context->cols;
@@ -773,6 +831,7 @@ static void ste_update_row(float *latent_row,
     for (uint32_t c = 0; c < cols; ++c) {
         float grad = context->regularization_strength *
                      ternary_regularizer_grad(latent_row[c], ternary_row[c]);
+        float curvature_scale = context->hessian_proxy ? context->hessian_proxy[c] : 1.0f;
 
         /* Anti-collapse: if a row quantizes to too many zeros, push zeroed
          * weights away from the dead-zone so STE keeps exploring +/-1 states. */
@@ -783,18 +842,108 @@ static void ste_update_row(float *latent_row,
         for (int s = 0; s < sample_count; ++s) {
             const float *vec = context->calibration_vectors + (size_t)s * cols;
             float w = context->sample_weights ? context->sample_weights[s] : 1.0f;
-            grad += (2.0f * w / weight_sum) * sample_diffs[s] * vec[c];
+            grad += curvature_scale * (2.0f * w / weight_sum) * sample_diffs[s] * vec[c];
         }
 
-        if (context->grad_norm_sq_sum) {
-            *context->grad_norm_sq_sum += grad * grad;
-        }
-
-        velocity_row[c] = context->momentum * velocity_row[c] - context->learning_rate * grad;
-        latent_row[c] += velocity_row[c];
-        if (latent_row[c] > context->clip_value) latent_row[c] = context->clip_value;
-        if (latent_row[c] < -context->clip_value) latent_row[c] = -context->clip_value;
+        gradient_row[c] = grad;
     }
+}
+
+static float compute_gradient_norm(const float *gradient, size_t weight_count)
+{
+    double sumsq = 0.0;
+
+    if (!gradient || weight_count == 0u) {
+        return 0.0f;
+    }
+
+    for (size_t weight_idx = 0; weight_idx < weight_count; ++weight_idx) {
+        double grad = (double)gradient[weight_idx];
+
+        sumsq += grad * grad;
+    }
+
+    return (float)sqrt(sumsq);
+}
+
+static float clip_tensor_gradients(float *gradient,
+                                   size_t weight_count,
+                                   float max_grad_norm,
+                                   float *out_raw_grad_norm,
+                                   float *out_clipped_grad_norm)
+{
+    float raw_grad_norm = compute_gradient_norm(gradient, weight_count);
+    float clip_scale = 1.0f;
+
+    if (out_raw_grad_norm) {
+        *out_raw_grad_norm = raw_grad_norm;
+    }
+    if (raw_grad_norm > 0.0f && max_grad_norm > 0.0f && raw_grad_norm > max_grad_norm) {
+        clip_scale = max_grad_norm / raw_grad_norm;
+        for (size_t weight_idx = 0; weight_idx < weight_count; ++weight_idx) {
+            gradient[weight_idx] *= clip_scale;
+        }
+    }
+    if (out_clipped_grad_norm) {
+        *out_clipped_grad_norm = raw_grad_norm * clip_scale;
+    }
+
+    return clip_scale;
+}
+
+static float apply_adam_updates(float *latent,
+                                const float *gradient,
+                                float *first_moment,
+                                float *second_moment,
+                                size_t weight_count,
+                                const ste_optimizer_context_t *context)
+{
+    float beta1 = 0.0f;
+    float beta2 = 0.0f;
+    float beta1_correction = 0.0f;
+    float beta2_correction = 0.0f;
+    float inv_beta1_correction = 1.0f;
+    float inv_beta2_correction = 1.0f;
+    float one_minus_beta1 = 0.0f;
+    float one_minus_beta2 = 0.0f;
+    size_t saturated_count = 0u;
+
+    if (!latent || !gradient || !first_moment || !second_moment || !context || weight_count == 0u) {
+        return 0.0f;
+    }
+
+    beta1 = context->beta1;
+    beta2 = context->beta2;
+    beta1_correction = 1.0f - powf(beta1, (float)context->step_index);
+    beta2_correction = 1.0f - powf(beta2, (float)context->step_index);
+    inv_beta1_correction = (beta1_correction > 1e-12f) ? (1.0f / beta1_correction) : 1.0f;
+    inv_beta2_correction = (beta2_correction > 1e-12f) ? (1.0f / beta2_correction) : 1.0f;
+    one_minus_beta1 = 1.0f - beta1;
+    one_minus_beta2 = 1.0f - beta2;
+
+    for (size_t weight_idx = 0; weight_idx < weight_count; ++weight_idx) {
+        float grad = gradient[weight_idx];
+        float first = beta1 * first_moment[weight_idx] + one_minus_beta1 * grad;
+        float second = beta2 * second_moment[weight_idx] + one_minus_beta2 * grad * grad;
+        float first_hat = first * inv_beta1_correction;
+        float second_hat = second * inv_beta2_correction;
+        float denom = sqrtf(second_hat) + context->epsilon;
+
+        first_moment[weight_idx] = first;
+        second_moment[weight_idx] = second;
+        latent[weight_idx] -= context->learning_rate * (first_hat / denom);
+        if (latent[weight_idx] > context->clip_value) {
+            latent[weight_idx] = context->clip_value;
+        }
+        if (latent[weight_idx] < -context->clip_value) {
+            latent[weight_idx] = -context->clip_value;
+        }
+        if (fabsf(latent[weight_idx]) >= context->clip_value - 1e-6f) {
+            ++saturated_count;
+        }
+    }
+
+    return (float)saturated_count / (float)weight_count;
 }
 
 static tensor_t **resolve_tensor_slot(llm_model_t *model,
@@ -1090,7 +1239,9 @@ cleanup:
 
 typedef struct {
     float *latent;
-    float *velocity;
+    float *first_moment;
+    float *second_moment;
+    float *gradient;
     int8_t *ternary;
     float *scales;
     uint32_t rows;
@@ -1098,70 +1249,299 @@ typedef struct {
     const transformer_ste_config_t *config;
     const float *calibration_vectors;
     const ternary_calibration_corpus_t *corpus;
+    const float *hessian_proxy;
+    ternary_hessian_proxy_stats_t hessian_proxy_stats;
+    ternary_hessian_proxy_source_t hessian_proxy_source;
 } ste_calibration_context_t;
 
-static void ste_calibrate_with_samples(const ste_calibration_context_t *context,
-                                       float *out_mse_sum,
-                                       float *out_grad_norm_sq_sum) {
+typedef struct {
+    float mse_sum;
+    float raw_grad_norm;
+    float clipped_grad_norm;
+    float clip_scale;
+    float latent_saturation;
+} ste_step_metrics_t;
+
+typedef struct {
+    const transformer_ste_config_t *config;
+    const ternary_activation_tape_context_t *tape_context;
+    const float *calibration_vectors;
+    int sample_count;
+    uint32_t cols;
+} hessian_proxy_request_t;
+
+typedef struct {
+    float *owned_proxy;
+    const float *proxy;
+    ternary_hessian_proxy_stats_t stats;
+    ternary_hessian_proxy_source_t source;
+} hessian_proxy_result_t;
+
+static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_context_t *context,
+                                                     uint32_t step_index)
+{
     float sample_weights[16];
-    ste_row_update_context_t row_context;
+    ste_gradient_accum_context_t gradient_context;
+    ste_optimizer_context_t optimizer_context;
     distillation_weight_request_t distillation_request;
+    ste_step_metrics_t metrics;
+    size_t weight_count = 0u;
+    int sample_count = 0;
     float mse_sum = 0.0f;
-    float grad_norm_sq_sum = 0.0f;
 
-    if (context->config->calibration_samples > (int)(sizeof(sample_weights) / sizeof(sample_weights[0]))) {
-        memset(sample_weights, 0, sizeof(sample_weights));
+    memset(&metrics, 0, sizeof(metrics));
+    metrics.clip_scale = 1.0f;
+
+    if (!context || !context->config || !context->gradient || !context->first_moment || !context->second_moment) {
+        return metrics;
     }
+
+    sample_count = context->config->calibration_samples;
+    if (sample_count > (int)(sizeof(sample_weights) / sizeof(sample_weights[0]))) {
+        sample_count = (int)(sizeof(sample_weights) / sizeof(sample_weights[0]));
+    }
+    weight_count = (size_t)context->rows * context->cols;
+    ste_fill_unit_sample_weights(sample_weights, sample_count);
+
+    quantize_all_rows(context->latent,
+                      context->ternary,
+                      context->scales,
+                      context->rows,
+                      context->cols,
+                      context->config->zero_threshold);
+
+    if (context->config->kl_weight > 0.0f &&
+        context->hessian_proxy_source == TERNARY_HESSIAN_PROXY_SOURCE_NONE) {
+        memset(&distillation_request, 0, sizeof(distillation_request));
+        distillation_request.ternary = context->ternary;
+        distillation_request.scales = context->scales;
+        distillation_request.rows = context->rows;
+        distillation_request.cols = context->cols;
+        distillation_request.config = context->config;
+        distillation_request.corpus = context->corpus;
+        distillation_request.out_sample_weights = sample_weights;
+        distillation_request.sample_count = sample_count;
+        compute_distillation_sample_weights(&distillation_request);
+    }
+
+    memset(context->gradient, 0, weight_count * sizeof(float));
+
+    memset(&gradient_context, 0, sizeof(gradient_context));
+    gradient_context.cols = context->cols;
+    gradient_context.calibration_vectors = context->calibration_vectors;
+    gradient_context.sample_weights = sample_weights;
+    gradient_context.hessian_proxy = context->hessian_proxy;
+    gradient_context.sample_count = sample_count;
+    gradient_context.regularization_strength = context->config->regularization_strength;
+    gradient_context.non_collapse_weight = context->config->non_collapse_weight;
+    gradient_context.zero_occupancy_floor = context->config->zero_occupancy_floor;
+    gradient_context.mse_sum = &mse_sum;
 
     for (uint32_t r = 0; r < context->rows; ++r) {
         size_t row_base = (size_t)r * context->cols;
-        quantize_row_ternary(context->latent + row_base,
-                             context->cols,
-                             context->config->zero_threshold,
-                             &context->scales[r],
-                             context->ternary + row_base);
+        ste_accumulate_row_gradients(context->latent + row_base,
+                                     context->ternary + row_base,
+                                     context->scales[r],
+                                     context->gradient + row_base,
+                                     &gradient_context);
     }
 
-    memset(&distillation_request, 0, sizeof(distillation_request));
-    distillation_request.ternary = context->ternary;
-    distillation_request.scales = context->scales;
-    distillation_request.rows = context->rows;
-    distillation_request.cols = context->cols;
-    distillation_request.config = context->config;
-    distillation_request.corpus = context->corpus;
-    distillation_request.out_sample_weights = sample_weights;
-    distillation_request.sample_count = context->config->calibration_samples;
-    compute_distillation_sample_weights(&distillation_request);
+    metrics.clip_scale = clip_tensor_gradients(context->gradient,
+                                               weight_count,
+                                               context->config->max_grad_norm,
+                                               &metrics.raw_grad_norm,
+                                               &metrics.clipped_grad_norm);
 
-    memset(&row_context, 0, sizeof(row_context));
-    row_context.cols = context->cols;
-    row_context.calibration_vectors = context->calibration_vectors;
-    row_context.sample_weights = sample_weights;
-    row_context.sample_count = context->config->calibration_samples;
-    row_context.learning_rate = context->config->learning_rate;
-    row_context.momentum = context->config->momentum;
-    row_context.regularization_strength = context->config->regularization_strength;
-    row_context.non_collapse_weight = context->config->non_collapse_weight;
-    row_context.zero_occupancy_floor = context->config->zero_occupancy_floor;
-    row_context.clip_value = context->config->clip_value;
-    row_context.mse_sum = &mse_sum;
-    row_context.grad_norm_sq_sum = &grad_norm_sq_sum;
+    memset(&optimizer_context, 0, sizeof(optimizer_context));
+    optimizer_context.learning_rate = context->config->learning_rate;
+    optimizer_context.beta1 = context->config->momentum;
+    optimizer_context.beta2 = context->config->adam_beta2;
+    optimizer_context.epsilon = context->config->adam_epsilon;
+    optimizer_context.clip_value = context->config->clip_value;
+    optimizer_context.step_index = step_index;
 
-    for (uint32_t r = 0; r < context->rows; ++r) {
-        size_t row_base = (size_t)r * context->cols;
-        ste_update_row(context->latent + row_base,
-                       context->velocity + row_base,
-                       context->ternary + row_base,
-                       context->scales[r],
-                       &row_context);
+    metrics.latent_saturation = apply_adam_updates(context->latent,
+                                                   context->gradient,
+                                                   context->first_moment,
+                                                   context->second_moment,
+                                                   weight_count,
+                                                   &optimizer_context);
+
+    quantize_all_rows(context->latent,
+                      context->ternary,
+                      context->scales,
+                      context->rows,
+                      context->cols,
+                      context->config->zero_threshold);
+
+    metrics.mse_sum = mse_sum;
+    return metrics;
+}
+
+static void hessian_proxy_result_reset(hessian_proxy_result_t *result)
+{
+    if (!result) {
+        return;
     }
 
-    if (out_mse_sum) {
-        *out_mse_sum = mse_sum;
+    memset(result, 0, sizeof(*result));
+    result->source = TERNARY_HESSIAN_PROXY_SOURCE_NONE;
+}
+
+static int hessian_proxy_request_is_valid(const hessian_proxy_request_t *request)
+{
+    return request && request->config && request->config->use_hessian_proxy &&
+           request->tape_context && request->tape_context->tape &&
+           request->tape_context->tensor_name && request->calibration_vectors &&
+           request->sample_count > 0 && request->cols > 0u;
+}
+
+static int hessian_proxy_cache_matches(const ternary_hessian_proxy_cache_t *cache,
+                                       int tape_entry_idx,
+                                       int sample_count,
+                                       uint32_t cols)
+{
+    return cache && cache->valid && cache->diagonal && cache->tape_entry_idx == tape_entry_idx &&
+           cache->sample_count == sample_count && cache->cols == cols;
+}
+
+static void hessian_proxy_publish_cache_hit(const ternary_hessian_proxy_cache_t *cache,
+                                            hessian_proxy_result_t *result)
+{
+    if (!cache || !result) {
+        return;
     }
-    if (out_grad_norm_sq_sum) {
-        *out_grad_norm_sq_sum = grad_norm_sq_sum;
+
+    result->proxy = cache->diagonal;
+    result->stats = cache->stats;
+    result->source = TERNARY_HESSIAN_PROXY_SOURCE_ACTIVATION_DIAGONAL;
+}
+
+static int hessian_proxy_acquire_buffer(ternary_hessian_proxy_cache_t *cache,
+                                        uint32_t cols,
+                                        float **out_proxy_buffer,
+                                        float **out_owned_proxy)
+{
+    if (!out_proxy_buffer || !out_owned_proxy) {
+        return -1;
     }
+
+    *out_proxy_buffer = NULL;
+    *out_owned_proxy = NULL;
+
+    if (cache) {
+        float *resized = (float *)realloc(cache->diagonal, (size_t)cols * sizeof(float));
+
+        if (!resized) {
+            return -1;
+        }
+        cache->diagonal = resized;
+        *out_proxy_buffer = cache->diagonal;
+        return 0;
+    }
+
+    *out_owned_proxy = (float *)malloc((size_t)cols * sizeof(float));
+    if (!*out_owned_proxy) {
+        return -1;
+    }
+
+    *out_proxy_buffer = *out_owned_proxy;
+    return 0;
+}
+
+static void hessian_proxy_invalidate_cache(ternary_hessian_proxy_cache_t *cache)
+{
+    if (cache) {
+        cache->valid = 0;
+    }
+}
+
+static void hessian_proxy_store_cache(ternary_hessian_proxy_cache_t *cache,
+                                      int tape_entry_idx,
+                                      int sample_count,
+                                      uint32_t cols,
+                                      const ternary_hessian_proxy_stats_t *stats)
+{
+    if (!cache || !stats) {
+        return;
+    }
+
+    cache->valid = 1;
+    cache->tape_entry_idx = tape_entry_idx;
+    cache->sample_count = sample_count;
+    cache->cols = cols;
+    cache->stats = *stats;
+}
+
+static void prepare_hessian_proxy(const hessian_proxy_request_t *request,
+                                  hessian_proxy_result_t *result)
+{
+    ternary_hessian_proxy_build_request_t build_request;
+    ternary_hessian_proxy_cache_t *cache = NULL;
+    float *proxy_buffer = NULL;
+    int tape_entry_idx = -1;
+
+    if (!result) {
+        return;
+    }
+
+    hessian_proxy_result_reset(result);
+    if (!hessian_proxy_request_is_valid(request)) {
+        return;
+    }
+
+    tape_entry_idx = activation_tape_entry_index(request->tape_context->tape,
+                                                 request->tape_context->tensor_name);
+    if (tape_entry_idx < 0) {
+        LOG_WARN("hessian proxy: failed to resolve tape entry for %s", request->tape_context->tensor_name);
+        return;
+    }
+
+    cache = request->tape_context->proxy_cache;
+    if (hessian_proxy_cache_matches(cache, tape_entry_idx, request->sample_count, request->cols)) {
+        hessian_proxy_publish_cache_hit(cache, result);
+        return;
+    }
+
+    if (hessian_proxy_acquire_buffer(cache, request->cols, &proxy_buffer, &result->owned_proxy) != 0) {
+        LOG_WARN("hessian proxy: allocation failed for %s", request->tape_context->tensor_name);
+        hessian_proxy_invalidate_cache(cache);
+        return;
+    }
+
+    memset(&build_request, 0, sizeof(build_request));
+    build_request.calibration_vectors = request->calibration_vectors;
+    build_request.sample_count = request->sample_count;
+    build_request.cols = request->cols;
+    build_request.floor = request->config->hessian_proxy_floor;
+    build_request.strength = request->config->hessian_proxy_strength;
+
+    if (ternary_hessian_proxy_build_diagonal(&build_request, proxy_buffer, &result->stats) != 0) {
+        if (result->owned_proxy) {
+            free(result->owned_proxy);
+            result->owned_proxy = NULL;
+        }
+        hessian_proxy_invalidate_cache(cache);
+        return;
+    }
+
+    if (cache) {
+        hessian_proxy_store_cache(cache,
+                                  tape_entry_idx,
+                                  request->sample_count,
+                                  request->cols,
+                                  &result->stats);
+    }
+
+    result->proxy = proxy_buffer;
+    result->source = TERNARY_HESSIAN_PROXY_SOURCE_ACTIVATION_DIAGONAL;
+
+    LOG_INFO("Built activation-diagonal Hessian proxy: tensor=%s entry=%d samples=%d mean=%.4f max=%.4f",
+             request->tape_context->tensor_name,
+             tape_entry_idx,
+             request->sample_count,
+             (double)result->stats.mean,
+             (double)result->stats.max);
 }
 
 static int pack_ternary_2bit(const int8_t *ternary,
@@ -1201,18 +1581,15 @@ static int run_ste_calibration_steps(const ste_calibration_context_t *context,
                                      ternary_calibration_result_t *out_result,
                                      ste_telemetry_runtime_t *telemetry_runtime)
 {
-    uint32_t weight_count = 0u;
     size_t packed_bytes = 0u;
 
     if (!context || !out_result) {
         return -1;
     }
 
-    weight_count = context->rows * context->cols;
     packed_bytes = ternary_packed_bytes(context->rows, context->cols);
     for (int step = 0; step < context->config->ste_steps; ++step) {
-        float step_mse_sum = 0.0f;
-        float step_grad_norm_sq_sum = 0.0f;
+        ste_step_metrics_t step_metrics;
         struct timespec step_start;
         struct timespec step_end;
         ste_telemetry_step_t telemetry_step;
@@ -1221,19 +1598,18 @@ static int run_ste_calibration_steps(const ste_calibration_context_t *context,
             (void)clock_gettime(CLOCK_MONOTONIC, &step_start);
         }
 
-        ste_calibrate_with_samples(context,
-                                   (telemetry_runtime && telemetry_runtime->enabled) ? &step_mse_sum : NULL,
-                                   (telemetry_runtime && telemetry_runtime->enabled) ? &step_grad_norm_sq_sum : NULL);
+        step_metrics = ste_calibrate_with_samples(context, (uint32_t)(step + 1));
 
         if (telemetry_runtime && telemetry_runtime->enabled) {
             (void)clock_gettime(CLOCK_MONOTONIC, &step_end);
             memset(&telemetry_step, 0, sizeof(telemetry_step));
             telemetry_step.step_idx = (uint32_t)step;
             telemetry_step.total_steps = (uint32_t)context->config->ste_steps;
-            telemetry_step.mse_loss = (context->rows > 0u) ? (step_mse_sum / (float)context->rows) : 0.0f;
-            telemetry_step.grad_norm = (weight_count > 0u)
-                ? sqrtf(step_grad_norm_sq_sum / (float)weight_count)
-                : 0.0f;
+            telemetry_step.mse_loss = (context->rows > 0u) ? (step_metrics.mse_sum / (float)context->rows) : 0.0f;
+            telemetry_step.raw_grad_norm = step_metrics.raw_grad_norm;
+            telemetry_step.clipped_grad_norm = step_metrics.clipped_grad_norm;
+            telemetry_step.clip_scale = step_metrics.clip_scale;
+            telemetry_step.latent_saturation = step_metrics.latent_saturation;
             telemetry_step.compute_ms = telemetry_diff_ms(&step_start, &step_end);
 
             if (pack_ternary_2bit(out_result->ternary_weights,
@@ -1253,6 +1629,192 @@ static int run_ste_calibration_steps(const ste_calibration_context_t *context,
     return 0;
 }
 
+typedef struct {
+    float *first_moment;
+    float *second_moment;
+    float *gradient;
+    float *calibration_vectors;
+    int actual_sample_count;
+    hessian_proxy_result_t hessian_proxy;
+} ste_calibration_workspace_t;
+
+typedef struct {
+    const transformer_ste_config_t *config;
+    const ternary_calibration_corpus_t *corpus;
+    const ternary_activation_tape_context_t *tape_context;
+    size_t weight_count;
+    uint32_t cols;
+} ste_calibration_workspace_request_t;
+
+typedef struct {
+    ternary_calibration_result_t *result;
+    uint32_t rows;
+    uint32_t cols;
+    const transformer_ste_config_t *config;
+    const ternary_calibration_corpus_t *corpus;
+    const ste_calibration_workspace_t *workspace;
+} ste_calibration_context_request_t;
+
+typedef struct {
+    const transformer_ste_config_t *config;
+    const char *tensor_name;
+    uint32_t rows;
+    uint32_t cols;
+    const ternary_activation_tape_context_t *tape_context;
+    const ste_calibration_workspace_t *workspace;
+} ste_telemetry_request_t;
+
+static void ste_calibration_workspace_reset(ste_calibration_workspace_t *workspace)
+{
+    if (!workspace) {
+        return;
+    }
+
+    memset(workspace, 0, sizeof(*workspace));
+}
+
+static void ste_calibration_workspace_release(ste_calibration_workspace_t *workspace)
+{
+    if (!workspace) {
+        return;
+    }
+
+    free(workspace->first_moment);
+    free(workspace->second_moment);
+    free(workspace->gradient);
+    free(workspace->calibration_vectors);
+    free(workspace->hessian_proxy.owned_proxy);
+    ste_calibration_workspace_reset(workspace);
+}
+
+static int ste_prepare_output_buffers(ternary_calibration_result_t *out_result,
+                                      size_t weight_count,
+                                      uint32_t rows,
+                                      uint32_t cols)
+{
+    size_t packed_bytes = ternary_packed_bytes(rows, cols);
+
+    if (!out_result) {
+        return -1;
+    }
+
+    memset(out_result, 0, sizeof(*out_result));
+    out_result->latent_weights = (float *)malloc(weight_count * sizeof(float));
+    out_result->ternary_weights = (int8_t *)malloc(weight_count * sizeof(int8_t));
+    out_result->packed_weights = (uint8_t *)malloc(packed_bytes);
+    out_result->scales = (float *)malloc((size_t)rows * sizeof(float));
+    if (!out_result->latent_weights || !out_result->ternary_weights ||
+        !out_result->packed_weights || !out_result->scales) {
+        transformer_free_ternary_calibration_result(out_result);
+        return -1;
+    }
+
+    out_result->weight_count = weight_count;
+    out_result->packed_weight_bytes = packed_bytes;
+    out_result->rows = rows;
+    out_result->cols = cols;
+    return 0;
+}
+
+static int ste_prepare_workspace(const ste_calibration_workspace_request_t *request,
+                                 ste_calibration_workspace_t *workspace)
+{
+    hessian_proxy_request_t proxy_request;
+
+    if (!request || !request->config || !workspace) {
+        return -1;
+    }
+
+    ste_calibration_workspace_reset(workspace);
+    workspace->first_moment = (float *)calloc(request->weight_count, sizeof(float));
+    workspace->second_moment = (float *)calloc(request->weight_count, sizeof(float));
+    workspace->gradient = (float *)malloc(request->weight_count * sizeof(float));
+    workspace->actual_sample_count = request->config->calibration_samples;
+    workspace->calibration_vectors = build_calibration_vectors(request->cols,
+                                                               request->config->calibration_samples,
+                                                               request->corpus,
+                                                               request->tape_context,
+                                                               &workspace->actual_sample_count);
+    if (!workspace->first_moment || !workspace->second_moment || !workspace->gradient ||
+        !workspace->calibration_vectors) {
+        ste_calibration_workspace_release(workspace);
+        return -1;
+    }
+
+    memset(&proxy_request, 0, sizeof(proxy_request));
+    proxy_request.config = request->config;
+    proxy_request.tape_context = request->tape_context;
+    proxy_request.calibration_vectors = workspace->calibration_vectors;
+    proxy_request.sample_count = workspace->actual_sample_count;
+    proxy_request.cols = request->cols;
+    prepare_hessian_proxy(&proxy_request, &workspace->hessian_proxy);
+    return 0;
+}
+
+static const char *resolve_calibration_tensor_name(const ternary_calibration_corpus_t *corpus,
+                                                   const ternary_activation_tape_context_t *tape_context)
+{
+    if (corpus && corpus->tensor_name && corpus->tensor_name[0] != '\0') {
+        return corpus->tensor_name;
+    }
+
+    return tape_context ? tape_context->tensor_name : NULL;
+}
+
+static void ste_init_calibration_context(ste_calibration_context_t *context,
+                                         const ste_calibration_context_request_t *request)
+{
+    if (!context || !request || !request->result || !request->config || !request->workspace) {
+        return;
+    }
+
+    memset(context, 0, sizeof(*context));
+    context->latent = request->result->latent_weights;
+    context->first_moment = request->workspace->first_moment;
+    context->second_moment = request->workspace->second_moment;
+    context->gradient = request->workspace->gradient;
+    context->ternary = request->result->ternary_weights;
+    context->scales = request->result->scales;
+    context->rows = request->rows;
+    context->cols = request->cols;
+    context->config = request->config;
+    context->calibration_vectors = request->workspace->calibration_vectors;
+    context->corpus = request->corpus;
+    context->hessian_proxy = request->workspace->hessian_proxy.proxy;
+    context->hessian_proxy_stats = request->workspace->hessian_proxy.stats;
+    context->hessian_proxy_source = request->workspace->hessian_proxy.source;
+}
+
+static int ste_prepare_telemetry_runtime(ste_telemetry_runtime_t *runtime,
+                                         const ste_telemetry_request_t *request)
+{
+    int telemetry_active = 0;
+
+    if (!runtime || !request || !request->config) {
+        return 0;
+    }
+
+    memset(runtime, 0, sizeof(*runtime));
+    telemetry_active = ste_telemetry_runtime_init(runtime,
+                                                  request->config,
+                                                  request->tensor_name,
+                                                  request->rows,
+                                                  request->cols);
+    if (telemetry_active && runtime->telemetry.layer_idx == 0u && request->tensor_name) {
+        runtime->telemetry.layer_idx = telemetry_parse_layer_index(request->tensor_name);
+    }
+    if (telemetry_active && runtime->telemetry.tape_hash == 0u && request->tape_context && request->tape_context->tape) {
+        runtime->telemetry.tape_hash = activation_tape_crc32(request->tape_context->tape);
+    }
+    if (telemetry_active && request->workspace) {
+        runtime->telemetry.hessian_proxy_mean = request->workspace->hessian_proxy.stats.mean;
+        runtime->telemetry.hessian_proxy_max = request->workspace->hessian_proxy.stats.max;
+        runtime->telemetry.hessian_proxy_source = (uint32_t)request->workspace->hessian_proxy.source;
+    }
+
+    return telemetry_active;
+}
+
 void transformer_free_ternary_calibration_result(ternary_calibration_result_t *result) {
     if (!result) {
         return;
@@ -1270,18 +1832,18 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
                                               const transformer_ste_config_t *config,
                                               const ternary_calibration_source_t *source,
                                               ternary_calibration_result_t *out_result) {
+    ste_calibration_workspace_request_t workspace_request;
+    ste_calibration_context_request_t context_request;
+    ste_telemetry_request_t telemetry_request;
     transformer_ste_config_t effective_config;
     ste_calibration_context_t calibration_context;
+    ste_calibration_workspace_t workspace;
     ste_telemetry_runtime_t telemetry_runtime;
-    float *velocity = NULL;
-    float *calibration_vectors = NULL;
+    int status = -1;
     size_t weight_count = 0;
-    size_t packed_bytes = 0;
-    int actual_sample_count = 0;
     const ternary_calibration_corpus_t *corpus = source ? source->corpus : NULL;
     const ternary_activation_tape_context_t *tape_context = source ? source->tape_context : NULL;
     const char *tensor_name = NULL;
-    int telemetry_active = 0;
 
     if (!bf16_weights || !out_result || rows == 0 || cols == 0) {
         LOG_ERROR("transformer_calibrate_layer_ste: invalid arguments");
@@ -1290,113 +1852,88 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
 
     effective_config = config ? *config : default_ste_config();
     normalize_ste_config(&effective_config);
+    ste_calibration_workspace_reset(&workspace);
+    memset(&telemetry_runtime, 0, sizeof(telemetry_runtime));
 
-    memset(out_result, 0, sizeof(*out_result));
     weight_count = (size_t)rows * cols;
-    packed_bytes = ternary_packed_bytes(rows, cols);
-
-    out_result->latent_weights = (float *)malloc(weight_count * sizeof(float));
-    out_result->ternary_weights = (int8_t *)malloc(weight_count * sizeof(int8_t));
-    out_result->packed_weights = (uint8_t *)malloc(packed_bytes);
-    out_result->scales = (float *)malloc((size_t)rows * sizeof(float));
-    if (!out_result->latent_weights || !out_result->ternary_weights ||
-        !out_result->packed_weights || !out_result->scales) {
+    if (ste_prepare_output_buffers(out_result, weight_count, rows, cols) != 0) {
         LOG_ERROR("transformer_calibrate_layer_ste: allocation failed");
-        transformer_free_ternary_calibration_result(out_result);
-        return -1;
-    }
-    out_result->weight_count = weight_count;
-    out_result->packed_weight_bytes = packed_bytes;
-    out_result->rows = rows;
-    out_result->cols = cols;
-    velocity = (float *)calloc(weight_count, sizeof(float));
-    actual_sample_count = effective_config.calibration_samples;
-    calibration_vectors = build_calibration_vectors(cols,
-                                                    effective_config.calibration_samples,
-                                                    corpus,
-                                                    tape_context,
-                                                    &actual_sample_count);
-    if (!velocity || !calibration_vectors) {
-        LOG_ERROR("transformer_calibrate_layer_ste: calibration buffer allocation failed");
-        free(velocity);
-        free(calibration_vectors);
-        transformer_free_ternary_calibration_result(out_result);
         return -1;
     }
 
-    effective_config.calibration_samples = actual_sample_count;
-    tensor_name = (corpus && corpus->tensor_name && corpus->tensor_name[0] != '\0')
-        ? corpus->tensor_name
-        : (tape_context ? tape_context->tensor_name : NULL);
+    memset(&workspace_request, 0, sizeof(workspace_request));
+    workspace_request.config = &effective_config;
+    workspace_request.corpus = corpus;
+    workspace_request.tape_context = tape_context;
+    workspace_request.weight_count = weight_count;
+    workspace_request.cols = cols;
+    if (ste_prepare_workspace(&workspace_request, &workspace) != 0) {
+        LOG_ERROR("transformer_calibrate_layer_ste: calibration buffer allocation failed");
+        goto cleanup;
+    }
+
+    effective_config.calibration_samples = workspace.actual_sample_count;
+    tensor_name = resolve_calibration_tensor_name(corpus, tape_context);
 
     seed_latent_weights(out_result, bf16_weights, weight_count, effective_config.clip_value);
 
-    memset(&calibration_context, 0, sizeof(calibration_context));
-    calibration_context.latent = out_result->latent_weights;
-    calibration_context.velocity = velocity;
-    calibration_context.ternary = out_result->ternary_weights;
-    calibration_context.scales = out_result->scales;
-    calibration_context.rows = rows;
-    calibration_context.cols = cols;
-    calibration_context.config = &effective_config;
-    calibration_context.calibration_vectors = calibration_vectors;
-    calibration_context.corpus = corpus;
+    memset(&context_request, 0, sizeof(context_request));
+    context_request.result = out_result;
+    context_request.rows = rows;
+    context_request.cols = cols;
+    context_request.config = &effective_config;
+    context_request.corpus = corpus;
+    context_request.workspace = &workspace;
+    ste_init_calibration_context(&calibration_context, &context_request);
 
-    telemetry_active = ste_telemetry_runtime_init(&telemetry_runtime,
-                                                  &effective_config,
-                                                  tensor_name,
-                                                  rows,
-                                                  cols);
-    if (telemetry_active && telemetry_runtime.telemetry.layer_idx == 0u && tensor_name) {
-        telemetry_runtime.telemetry.layer_idx = telemetry_parse_layer_index(tensor_name);
-    }
+    memset(&telemetry_request, 0, sizeof(telemetry_request));
+    telemetry_request.config = &effective_config;
+    telemetry_request.tensor_name = tensor_name;
+    telemetry_request.rows = rows;
+    telemetry_request.cols = cols;
+    telemetry_request.tape_context = tape_context;
+    telemetry_request.workspace = &workspace;
+    (void)ste_prepare_telemetry_runtime(&telemetry_runtime, &telemetry_request);
 
     if (run_ste_calibration_steps(&calibration_context, out_result, &telemetry_runtime) != 0) {
-        free(velocity);
-        free(calibration_vectors);
-        ste_telemetry_runtime_close(&telemetry_runtime);
-        transformer_free_ternary_calibration_result(out_result);
-        return -1;
+        goto cleanup;
     }
 
-    ste_telemetry_runtime_close(&telemetry_runtime);
-
-    for (uint32_t r = 0; r < rows; ++r) {
-        size_t row_base = (size_t)r * cols;
-        quantize_row_ternary(out_result->latent_weights + row_base,
-                             cols,
-                             effective_config.zero_threshold,
-                             &out_result->scales[r],
-                             out_result->ternary_weights + row_base);
-    }
+    quantize_all_rows(out_result->latent_weights,
+                      out_result->ternary_weights,
+                      out_result->scales,
+                      rows,
+                      cols,
+                      effective_config.zero_threshold);
 
     if (pack_ternary_2bit(out_result->ternary_weights, rows, cols,
-                          out_result->packed_weights, packed_bytes) != 0) {
-        free(velocity);
-        free(calibration_vectors);
-        ste_telemetry_runtime_close(&telemetry_runtime);
+                          out_result->packed_weights,
+                          out_result->packed_weight_bytes) != 0) {
+        goto cleanup;
+    }
+
+    status = 0;
+
+cleanup:
+    ste_telemetry_runtime_close(&telemetry_runtime);
+    if (status != 0) {
+        ste_calibration_workspace_release(&workspace);
         transformer_free_ternary_calibration_result(out_result);
         return -1;
     }
 
-    out_result->weight_count = weight_count;
-    out_result->packed_weight_bytes = packed_bytes;
-    out_result->rows = rows;
-    out_result->cols = cols;
-
-    free(velocity);
-    free(calibration_vectors);
-    ste_telemetry_runtime_close(&telemetry_runtime);
-
-    LOG_INFO("Calibrated ternary layer: rows=%u cols=%u steps=%d samples=%d kl_weight=%.4f non_collapse=%.4f floor=%.2f packed=%zuB",
+    LOG_INFO("Calibrated ternary layer: rows=%u cols=%u steps=%d samples=%d proxy=%u grad_clip=%.4f kl_weight=%.4f non_collapse=%.4f floor=%.2f packed=%zuB",
              rows,
              cols,
              effective_config.ste_steps,
              effective_config.calibration_samples,
+             (unsigned)workspace.hessian_proxy.source,
+             (double)effective_config.max_grad_norm,
              (double)effective_config.kl_weight,
              (double)effective_config.non_collapse_weight,
              (double)effective_config.zero_occupancy_floor,
-             packed_bytes);
+             out_result->packed_weight_bytes);
+    ste_calibration_workspace_release(&workspace);
     return 0;
 }
 
@@ -1406,10 +1943,14 @@ int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
                                     const transformer_ste_config_t *config,
                                     const ternary_calibration_corpus_t *corpus,
                                     ternary_calibration_result_t *out_result) {
+    ternary_calibration_source_t source;
+
+    memset(&source, 0, sizeof(source));
+    source.corpus = corpus;
     return transformer_calibrate_layer_ste_with_tape(bf16_weights,
                                                      rows,
                                                      cols,
                                                      config,
-                                                     NULL,
+                                                     &source,
                                                      out_result);
 }

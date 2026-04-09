@@ -27,6 +27,10 @@ typedef struct {
     int validate_every_n;
     int ste_steps;
     float kl_weight;
+    int disable_hessian_proxy;
+    float hessian_proxy_strength;
+    float hessian_proxy_floor;
+    float max_grad_norm;
 } ternary_conversion_config_t;
 
 int transformer_run_ternary_conversion(const ternary_conversion_config_t *config);

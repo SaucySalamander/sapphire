@@ -42,6 +42,7 @@ typedef struct {
     char *checkpoint_tmp_path;
     uint32_t activation_tape_hash;
     uint32_t resume_step_index;
+    ternary_hessian_proxy_cache_t hessian_proxy_cache;
 } conversion_runtime_t;
 
 static uint32_t config_resume_hash(const ternary_conversion_config_t *config)
@@ -73,6 +74,10 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config)
     crc32 = io_crc32_update(crc32, &config->validate_every_n, sizeof(config->validate_every_n));
     crc32 = io_crc32_update(crc32, &ste_steps, sizeof(ste_steps));
     crc32 = io_crc32_update(crc32, &config->kl_weight, sizeof(config->kl_weight));
+    crc32 = io_crc32_update(crc32, &config->disable_hessian_proxy, sizeof(config->disable_hessian_proxy));
+    crc32 = io_crc32_update(crc32, &config->hessian_proxy_strength, sizeof(config->hessian_proxy_strength));
+    crc32 = io_crc32_update(crc32, &config->hessian_proxy_floor, sizeof(config->hessian_proxy_floor));
+    crc32 = io_crc32_update(crc32, &config->max_grad_norm, sizeof(config->max_grad_norm));
     return crc32;
 }
 
@@ -769,6 +774,18 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
         ? config->calibration_sample_limit
         : 4;
     ste_config.kl_weight = (config && config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f;
+    ste_config.use_hessian_proxy = (!config || !config->disable_hessian_proxy) ? 1 : 0;
+    ste_config.hessian_proxy_strength = (config && config->hessian_proxy_strength >= 0.0f)
+        ? config->hessian_proxy_strength
+        : 1.0f;
+    ste_config.hessian_proxy_floor = (config && config->hessian_proxy_floor >= 0.0f)
+        ? config->hessian_proxy_floor
+        : 0.05f;
+    ste_config.max_grad_norm = (config && config->max_grad_norm > 0.0f)
+        ? config->max_grad_norm
+        : 1.0f;
+    ste_config.adam_beta2 = 0.95f;
+    ste_config.adam_epsilon = 1e-8f;
     ste_config.telemetry_interval = 10;
     ste_config.telemetry_path = "./out/ternary_telemetry.jsonl";
     ste_config.telemetry = NULL;
@@ -839,6 +856,7 @@ static void destroy_conversion_runtime(conversion_runtime_t *runtime) {
     if (runtime->activation_tape) {
         activation_tape_close(runtime->activation_tape);
     }
+    ternary_hessian_proxy_cache_release(&runtime->hessian_proxy_cache);
     free(runtime->checkpoint_path);
     free(runtime->checkpoint_tmp_path);
     runtime->checkpoint_path = NULL;
@@ -1090,7 +1108,8 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
                                                       .tape_context = (runtime->activation_tape && tensor_name_is_layer_tensor(config->layer_name))
                                                           ? &(ternary_activation_tape_context_t){
                                                                 .tape = runtime->activation_tape,
-                                                                .tensor_name = config->layer_name
+                                                                .tensor_name = config->layer_name,
+                                                                .proxy_cache = NULL
                                                             }
                                                           : NULL
                                                   } : NULL,
@@ -1125,6 +1144,7 @@ typedef struct {
     const char *output_dir;
     const char *tensor_name;
     const activation_tape_t *activation_tape;
+    ternary_hessian_proxy_cache_t *hessian_proxy_cache;
     const transformer_ste_config_t *ste_config;
     const ternary_calibration_corpus_t *calibration_corpus;
     ternary_calibration_result_t *out_result;
@@ -1245,7 +1265,8 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
         calibration_source.corpus = job->calibration_corpus;
         calibration_source.tape_context = &(ternary_activation_tape_context_t){
             .tape = job->activation_tape,
-            .tensor_name = job->tensor_name
+            .tensor_name = job->tensor_name,
+            .proxy_cache = job->hessian_proxy_cache
         };
 
         if (transformer_calibrate_layer_ste_with_tape(map.bf16_weights,
@@ -1439,6 +1460,7 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     job.output_dir = task->config->output_path;
     job.tensor_name = task->tensor_name;
     job.activation_tape = task->runtime ? task->runtime->activation_tape : NULL;
+    job.hessian_proxy_cache = task->runtime ? &task->runtime->hessian_proxy_cache : NULL;
     job.ste_config = use_layer_telemetry ? &layer_ste_config : task->ste_config;
     job.calibration_corpus = task->runtime ? &active_corpus : NULL;
     job.out_result = &result;
@@ -1537,6 +1559,83 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
     return (converted > 0) ? 0 : -1;
 }
 
+static int config_has_text(const char *value)
+{
+    return value && value[0] != '\0';
+}
+
+static void log_conversion_corpus_inputs(const ternary_conversion_config_t *config)
+{
+    if (config_has_text(config->calibration_corpus_manifest_path)) {
+        if (config_has_text(config->calibration_corpus_path)) {
+            LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);
+        } else {
+            LOG_INFO("  calibration_corpus: <loaded from manifest>");
+        }
+        LOG_INFO("  calibration_manifest: %s", config->calibration_corpus_manifest_path);
+        return;
+    }
+
+    if (config_has_text(config->calibration_corpus_path)) {
+        LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);
+    } else {
+        LOG_INFO("  calibration_corpus: <built-in fallback>");
+    }
+}
+
+static void log_conversion_validation_inputs(const ternary_conversion_config_t *config)
+{
+    if (config_has_text(config->validation_corpus_path)) {
+        LOG_INFO("  validation_corpus: %s", config->validation_corpus_path);
+    }
+    if (config_has_text(config->validation_corpus_manifest_path)) {
+        LOG_INFO("  validation_manifest: %s", config->validation_corpus_manifest_path);
+    }
+}
+
+static void log_conversion_config(const ternary_conversion_config_t *config)
+{
+    LOG_INFO("Ternary conversion mode selected");
+    LOG_INFO("  model: %s", config->model_name);
+    LOG_INFO("  output: %s", config->output_path);
+    LOG_INFO("  context_len: %d", config->context_len);
+    LOG_INFO("  calibration_samples: %d",
+             (config->calibration_sample_limit > 0) ? config->calibration_sample_limit : 4);
+    LOG_INFO("  ste_steps: %d", (config->ste_steps > 0) ? config->ste_steps : 3);
+    LOG_INFO("  max_grad_norm: %.4f", (double)((config->max_grad_norm > 0.0f) ? config->max_grad_norm : 1.0f));
+    LOG_INFO("  validate_every: %d", config->validate_every_n);
+    LOG_INFO("  kl_weight: %.4f", (double)((config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f));
+    LOG_INFO("  hessian_proxy: %s", config->disable_hessian_proxy ? "disabled" : "activation-diagonal");
+    LOG_INFO("  hessian_proxy_strength: %.4f",
+             (double)((config->hessian_proxy_strength >= 0.0f) ? config->hessian_proxy_strength : 1.0f));
+    LOG_INFO("  hessian_proxy_floor: %.4f",
+             (double)((config->hessian_proxy_floor >= 0.0f) ? config->hessian_proxy_floor : 0.05f));
+    LOG_INFO("  layer filter: %s",
+             config_has_text(config->layer_name) ? config->layer_name : "<all layers>");
+
+    if (config_has_text(config->activation_tape_path)) {
+        LOG_INFO("  activation_tape: %s", config->activation_tape_path);
+    }
+    if (config_has_text(config->teacher_model_name)) {
+        LOG_INFO("  teacher_model: %s", config->teacher_model_name);
+    }
+
+    log_conversion_corpus_inputs(config);
+    log_conversion_validation_inputs(config);
+}
+
+static int run_requested_conversion(const ternary_conversion_config_t *config,
+                                    const char *model_dir,
+                                    const char *model_path,
+                                    const conversion_runtime_t *runtime)
+{
+    if (config_has_text(config->layer_name)) {
+        return run_single_layer_conversion(config, model_dir, model_path, runtime);
+    }
+
+    return run_full_model_conversion(config, model_dir, model_path, (conversion_runtime_t *)runtime);
+}
+
 int transformer_run_ternary_conversion(const ternary_conversion_config_t *config) {
     conversion_runtime_t runtime;
     char *model_dir = NULL;
@@ -1548,44 +1647,7 @@ int transformer_run_ternary_conversion(const ternary_conversion_config_t *config
         return -1;
     }
 
-    LOG_INFO("Ternary conversion mode selected");
-    LOG_INFO("  model: %s", config->model_name);
-    LOG_INFO("  output: %s", config->output_path);
-    LOG_INFO("  context_len: %d", config->context_len);
-    LOG_INFO("  calibration_samples: %d",
-             (config->calibration_sample_limit > 0) ? config->calibration_sample_limit : 4);
-    LOG_INFO("  ste_steps: %d", (config->ste_steps > 0) ? config->ste_steps : 3);
-    LOG_INFO("  validate_every: %d", config->validate_every_n);
-    LOG_INFO("  kl_weight: %.4f", (double)((config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f));
-    if (config->layer_name && config->layer_name[0] != '\0') {
-        LOG_INFO("  layer filter: %s", config->layer_name);
-    } else {
-        LOG_INFO("  layer filter: <all layers>");
-    }
-    if (config->activation_tape_path && config->activation_tape_path[0] != '\0') {
-        LOG_INFO("  activation_tape: %s", config->activation_tape_path);
-    }
-    if (config->teacher_model_name && config->teacher_model_name[0] != '\0') {
-        LOG_INFO("  teacher_model: %s", config->teacher_model_name);
-    }
-    if (config->calibration_corpus_manifest_path && config->calibration_corpus_manifest_path[0] != '\0') {
-        if (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0') {
-            LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);
-        } else {
-            LOG_INFO("  calibration_corpus: <loaded from manifest>");
-        }
-        LOG_INFO("  calibration_manifest: %s", config->calibration_corpus_manifest_path);
-    } else if (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0') {
-        LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);
-    } else {
-        LOG_INFO("  calibration_corpus: <built-in fallback>");
-    }
-    if (config->validation_corpus_path && config->validation_corpus_path[0] != '\0') {
-        LOG_INFO("  validation_corpus: %s", config->validation_corpus_path);
-    }
-    if (config->validation_corpus_manifest_path && config->validation_corpus_manifest_path[0] != '\0') {
-        LOG_INFO("  validation_manifest: %s", config->validation_corpus_manifest_path);
-    }
+    log_conversion_config(config);
 
     model_dir = construct_safe_path("./models", config->model_name, NULL);
     if (!model_dir) {
@@ -1602,11 +1664,7 @@ int transformer_run_ternary_conversion(const ternary_conversion_config_t *config
         return -1;
     }
 
-    if (config->layer_name && config->layer_name[0] != '\0') {
-        rc = run_single_layer_conversion(config, model_dir, model_path, &runtime);
-    } else {
-        rc = run_full_model_conversion(config, model_dir, model_path, &runtime);
-    }
+    rc = run_requested_conversion(config, model_dir, model_path, &runtime);
     free(model_path);
     free(model_dir);
     destroy_conversion_runtime(&runtime);

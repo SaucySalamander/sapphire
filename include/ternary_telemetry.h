@@ -23,10 +23,17 @@ typedef struct {
     uint32_t student_checkpoint_hash;
     float mse_loss;
     float grad_norm;
+    float raw_grad_norm;
+    float clipped_grad_norm;
+    float clip_scale;
+    float latent_saturation;
     float p_neg1;
     float p_zero;
     float p_pos1;
     float gamma_scale;
+    float hessian_proxy_mean;
+    float hessian_proxy_max;
+    uint32_t hessian_proxy_source;
     float io_ms;
     float compute_ms;
     uint32_t config_hash;

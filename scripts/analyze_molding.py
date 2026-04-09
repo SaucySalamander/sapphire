@@ -70,10 +70,36 @@ def load_metrics(path: Path, run_label: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Telemetry file {path} is missing required columns: {', '.join(missing)}")
 
-    numeric_columns = required_columns + ["resume_step_idx", "tps"]
+    numeric_columns = required_columns + [
+        "resume_step_idx",
+        "tps",
+        "grad_norm",
+        "raw_grad_norm",
+        "clipped_grad_norm",
+        "clip_scale",
+        "latent_saturation",
+        "hessian_proxy_mean",
+        "hessian_proxy_max",
+        "hessian_proxy_source",
+    ]
     for column in numeric_columns:
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    if "raw_grad_norm" not in frame.columns:
+        frame["raw_grad_norm"] = pd.to_numeric(frame.get("grad_norm"), errors="coerce")
+    if "clipped_grad_norm" not in frame.columns:
+        frame["clipped_grad_norm"] = pd.to_numeric(frame.get("grad_norm"), errors="coerce")
+    if "clip_scale" not in frame.columns:
+        frame["clip_scale"] = 1.0
+    if "latent_saturation" not in frame.columns:
+        frame["latent_saturation"] = float("nan")
+    if "hessian_proxy_mean" not in frame.columns:
+        frame["hessian_proxy_mean"] = float("nan")
+    if "hessian_proxy_max" not in frame.columns:
+        frame["hessian_proxy_max"] = float("nan")
+    if "hessian_proxy_source" not in frame.columns:
+        frame["hessian_proxy_source"] = float("nan")
 
     if "resume_step_idx" not in frame.columns:
         frame["resume_step_idx"] = 0.0
@@ -358,16 +384,126 @@ def plot_efficiency(primary: pd.DataFrame, compare: pd.DataFrame | None, output_
     plt.close(fig)
 
 
+def plot_stability(primary: pd.DataFrame, compare: pd.DataFrame | None, output_path: Path) -> None:
+    fig, (ax_norms, ax_saturation) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    ax_clip = ax_norms.twinx()
+    ax_proxy = ax_saturation.twinx()
+    series_styles = build_series_style_map(primary, compare) if compare is not None else build_series_style_map(primary)
+
+    for frame, alpha in ((primary, 0.92), (compare, 0.65)) if compare is not None else ((primary, 0.92),):
+        if frame is None or frame.empty:
+            continue
+        for series_key, series_label, series_frame in iter_series(frame):
+            grouped = grouped_mean(
+                series_frame,
+                ["raw_grad_norm", "clipped_grad_norm", "clip_scale", "latent_saturation", "hessian_proxy_mean", "hessian_proxy_max"],
+            )
+            if grouped.empty:
+                continue
+            series_style = series_styles.get(series_key, "-")
+
+            ax_norms.plot(
+                grouped.index,
+                grouped["raw_grad_norm"],
+                color="#264653",
+                linestyle=series_style,
+                linewidth=2.1 if frame is primary else 1.8,
+                alpha=alpha,
+                marker="o",
+                markersize=4,
+                label=f"{series_label} raw_grad_norm",
+            )
+            ax_norms.plot(
+                grouped.index,
+                grouped["clipped_grad_norm"],
+                color="#e76f51",
+                linestyle=series_style,
+                linewidth=2.1 if frame is primary else 1.8,
+                alpha=alpha,
+                marker="s",
+                markersize=4,
+                label=f"{series_label} clipped_grad_norm",
+            )
+            ax_clip.plot(
+                grouped.index,
+                grouped["clip_scale"],
+                color="#2a9d8f",
+                linestyle=series_style,
+                linewidth=1.8 if frame is primary else 1.6,
+                alpha=alpha,
+                marker="^",
+                markersize=4,
+                label=f"{series_label} clip_scale",
+            )
+
+            ax_saturation.plot(
+                grouped.index,
+                grouped["latent_saturation"],
+                color="#7f5539",
+                linestyle=series_style,
+                linewidth=2.1 if frame is primary else 1.8,
+                alpha=alpha,
+                marker="o",
+                markersize=4,
+                label=f"{series_label} latent_saturation",
+            )
+            ax_proxy.plot(
+                grouped.index,
+                grouped["hessian_proxy_mean"],
+                color="#577590",
+                linestyle=series_style,
+                linewidth=1.8 if frame is primary else 1.6,
+                alpha=alpha,
+                marker="d",
+                markersize=4,
+                label=f"{series_label} hessian_proxy_mean",
+            )
+            ax_proxy.plot(
+                grouped.index,
+                grouped["hessian_proxy_max"],
+                color="#f4a261",
+                linestyle=series_style,
+                linewidth=1.8 if frame is primary else 1.6,
+                alpha=alpha,
+                marker="x",
+                markersize=4,
+                label=f"{series_label} hessian_proxy_max",
+            )
+
+    ax_norms.set_title("Stability: Gradient Norms, Clipping, and Latent Saturation")
+    ax_norms.set_ylabel("gradient norm")
+    ax_clip.set_ylabel("clip_scale")
+    ax_norms.grid(True, alpha=0.28)
+
+    ax_saturation.set_xlabel("analysis step")
+    ax_saturation.set_ylabel("latent_saturation")
+    ax_proxy.set_ylabel("proxy summary")
+    ax_saturation.grid(True, alpha=0.28)
+
+    handles_norms, labels_norms = ax_norms.get_legend_handles_labels()
+    handles_clip, labels_clip = ax_clip.get_legend_handles_labels()
+    handles_sat, labels_sat = ax_saturation.get_legend_handles_labels()
+    handles_proxy, labels_proxy = ax_proxy.get_legend_handles_labels()
+    ax_norms.legend(handles_norms + handles_clip, labels_norms + labels_clip, loc="upper right", fontsize=8)
+    ax_saturation.legend(handles_sat + handles_proxy, labels_sat + labels_proxy, loc="upper right", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
 def write_plots(primary: pd.DataFrame, compare: pd.DataFrame | None, output_dir: Path) -> list[Path]:
     compare_suffix = "_compare" if compare is not None else ""
     outputs = [
         output_dir / f"convergence{compare_suffix}.png",
         output_dir / f"sparsity{compare_suffix}.png",
         output_dir / f"efficiency{compare_suffix}.png",
+        output_dir / f"stability{compare_suffix}.png",
     ]
     plot_convergence(primary, compare, outputs[0])
     plot_sparsity(primary, compare, outputs[1])
     plot_efficiency(primary, compare, outputs[2])
+    plot_stability(primary, compare, outputs[3])
     return outputs
 
 

@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ternary_hessian_proxy.h"
 #include "ternary_telemetry.h"
 
 typedef struct sapphire_tokenizer_t sapphire_tokenizer_t;
@@ -31,6 +32,12 @@ typedef struct {
     float clip_value;
     int calibration_samples;
     float kl_weight;
+    int use_hessian_proxy;
+    float hessian_proxy_strength;
+    float hessian_proxy_floor;
+    float max_grad_norm;
+    float adam_beta2;
+    float adam_epsilon;
     int telemetry_interval;
     const char *telemetry_path;
     ternary_telemetry_t *telemetry;
@@ -48,6 +55,7 @@ typedef struct {
 typedef struct {
     const activation_tape_t *tape;
     const char *tensor_name;
+    ternary_hessian_proxy_cache_t *proxy_cache;
 } ternary_activation_tape_context_t;
 
 typedef struct {

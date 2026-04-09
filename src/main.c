@@ -54,6 +54,10 @@ static void print_help(const char* program_name) {
     printf("  --calib-manifest <p>      Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
     printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
     printf("  --ste-steps <n>          STE optimization steps per tensor (default: 3)\n");
+    printf("  --max-grad-norm <value>  Global gradient norm clip for STE (default: 1.0)\n");
+    printf("  --disable-hessian-proxy  Disable tape-derived diagonal Hessian proxying\n");
+    printf("  --hessian-proxy-strength <value>  Diagonal Hessian proxy strength (default: 1.0)\n");
+    printf("  --hessian-proxy-floor <value>     Minimum diagonal Hessian proxy scale (default: 0.05)\n");
     printf("  --validation-corpus <p>   Optional held-out text corpus file or URL for checkpoints\n");
     printf("  --validation-manifest <p> Optional local held-out corpus manifest file\n");
     printf("  --validation-samples <n>  Held-out prompt count for checkpoint evaluation\n");
@@ -107,6 +111,10 @@ typedef struct {
     int validate_every_n;
     int ste_steps;
     float kl_weight;
+    int disable_hessian_proxy;
+    float hessian_proxy_strength;
+    float hessian_proxy_floor;
+    float max_grad_norm;
     const char *save_state_path;
     const char *load_state_path;
 } cli_args_t;
@@ -138,6 +146,10 @@ static void cli_args_init(cli_args_t *args)
     args->validate_every_n = 0;
     args->ste_steps = 3;
     args->kl_weight = 0.05f;
+    args->disable_hessian_proxy = 0;
+    args->hessian_proxy_strength = 1.0f;
+    args->hessian_proxy_floor = 0.05f;
+    args->max_grad_norm = 1.0f;
     args->save_state_path = NULL;
     args->load_state_path = NULL;
 }
@@ -221,6 +233,18 @@ static int validate_convert_ternary_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --kl-weight must be >= 0.");
         return -1;
     }
+    if (args->hessian_proxy_strength < 0.0f) {
+        LOG_ERROR("ERROR: --hessian-proxy-strength must be >= 0.");
+        return -1;
+    }
+    if (args->hessian_proxy_floor < 0.0f) {
+        LOG_ERROR("ERROR: --hessian-proxy-floor must be >= 0.");
+        return -1;
+    }
+    if (args->max_grad_norm <= 0.0f) {
+        LOG_ERROR("ERROR: --max-grad-norm must be > 0.");
+        return -1;
+    }
     if (args->validation_sample_limit < 0) {
         LOG_ERROR("ERROR: --validation-samples must be >= 0.");
         return -1;
@@ -292,6 +316,10 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.validate_every_n = args->validate_every_n;
     config.ste_steps = args->ste_steps;
     config.kl_weight = args->kl_weight;
+    config.disable_hessian_proxy = args->disable_hessian_proxy;
+    config.hessian_proxy_strength = args->hessian_proxy_strength;
+    config.hessian_proxy_floor = args->hessian_proxy_floor;
+    config.max_grad_norm = args->max_grad_norm;
     return transformer_run_ternary_conversion(&config);
 }
 
@@ -585,39 +613,69 @@ typedef enum {
     CLI_OPT_CHECKPOINT_EVERY,
     CLI_OPT_VALIDATE_EVERY,
     CLI_OPT_STE_STEPS,
+    CLI_OPT_MAX_GRAD_NORM,
     CLI_OPT_KL_WEIGHT,
+    CLI_OPT_DISABLE_HESSIAN_PROXY,
+    CLI_OPT_HESSIAN_PROXY_STRENGTH,
+    CLI_OPT_HESSIAN_PROXY_FLOOR,
     CLI_OPT_SAVE_STATE,
     CLI_OPT_LOAD_STATE
 } cli_option_t;
 
+typedef struct {
+    const char *name;
+    cli_option_t option;
+} cli_option_alias_t;
+
+static const cli_option_alias_t g_cli_option_aliases[] = {
+    { "-m", CLI_OPT_MODEL },
+    { "--model", CLI_OPT_MODEL },
+    { "-c", CLI_OPT_CONTEXT },
+    { "--context", CLI_OPT_CONTEXT },
+    { "-t", CLI_OPT_TEMP },
+    { "--temp", CLI_OPT_TEMP },
+    { "-n", CLI_OPT_MAX_TOKENS },
+    { "--max-tokens", CLI_OPT_MAX_TOKENS },
+    { "-p", CLI_OPT_PROMPT },
+    { "--prompt", CLI_OPT_PROMPT },
+    { "--record-tape", CLI_OPT_RECORD_TAPE },
+    { "--convert-ternary", CLI_OPT_CONVERT_TERNARY },
+    { "--output", CLI_OPT_OUTPUT },
+    { "--layer", CLI_OPT_LAYER },
+    { "--activation-tape", CLI_OPT_ACTIVATION_TAPE },
+    { "--teacher-model", CLI_OPT_TEACHER_MODEL },
+    { "--calibration-corpus", CLI_OPT_CALIBRATION_CORPUS },
+    { "--calib-manifest", CLI_OPT_CALIBRATION_MANIFEST },
+    { "--calibration-samples", CLI_OPT_CALIBRATION_SAMPLES },
+    { "--validation-corpus", CLI_OPT_VALIDATION_CORPUS },
+    { "--validation-manifest", CLI_OPT_VALIDATION_MANIFEST },
+    { "--validation-samples", CLI_OPT_VALIDATION_SAMPLES },
+    { "--checkpoint-every", CLI_OPT_CHECKPOINT_EVERY },
+    { "--validate-every", CLI_OPT_VALIDATE_EVERY },
+    { "--ste-steps", CLI_OPT_STE_STEPS },
+    { "--max-grad-norm", CLI_OPT_MAX_GRAD_NORM },
+    { "--kl-weight", CLI_OPT_KL_WEIGHT },
+    { "--disable-hessian-proxy", CLI_OPT_DISABLE_HESSIAN_PROXY },
+    { "--hessian-proxy-strength", CLI_OPT_HESSIAN_PROXY_STRENGTH },
+    { "--hessian-proxy-floor", CLI_OPT_HESSIAN_PROXY_FLOOR },
+    { "--save-state", CLI_OPT_SAVE_STATE },
+    { "--load-state", CLI_OPT_LOAD_STATE }
+};
+
 static cli_option_t parse_cli_option(const char *arg)
 {
+    size_t alias_count = sizeof(g_cli_option_aliases) / sizeof(g_cli_option_aliases[0]);
+
     if (!arg) {
         return CLI_OPT_UNKNOWN;
     }
-    if (strcmp(arg, "-m") == 0 || strcmp(arg, "--model") == 0) return CLI_OPT_MODEL;
-    if (strcmp(arg, "-c") == 0 || strcmp(arg, "--context") == 0) return CLI_OPT_CONTEXT;
-    if (strcmp(arg, "-t") == 0 || strcmp(arg, "--temp") == 0) return CLI_OPT_TEMP;
-    if (strcmp(arg, "-n") == 0 || strcmp(arg, "--max-tokens") == 0) return CLI_OPT_MAX_TOKENS;
-    if (strcmp(arg, "-p") == 0 || strcmp(arg, "--prompt") == 0) return CLI_OPT_PROMPT;
-    if (strcmp(arg, "--record-tape") == 0) return CLI_OPT_RECORD_TAPE;
-    if (strcmp(arg, "--convert-ternary") == 0) return CLI_OPT_CONVERT_TERNARY;
-    if (strcmp(arg, "--output") == 0) return CLI_OPT_OUTPUT;
-    if (strcmp(arg, "--layer") == 0) return CLI_OPT_LAYER;
-    if (strcmp(arg, "--activation-tape") == 0) return CLI_OPT_ACTIVATION_TAPE;
-    if (strcmp(arg, "--teacher-model") == 0) return CLI_OPT_TEACHER_MODEL;
-    if (strcmp(arg, "--calibration-corpus") == 0) return CLI_OPT_CALIBRATION_CORPUS;
-    if (strcmp(arg, "--calib-manifest") == 0) return CLI_OPT_CALIBRATION_MANIFEST;
-    if (strcmp(arg, "--calibration-samples") == 0) return CLI_OPT_CALIBRATION_SAMPLES;
-    if (strcmp(arg, "--validation-corpus") == 0) return CLI_OPT_VALIDATION_CORPUS;
-    if (strcmp(arg, "--validation-manifest") == 0) return CLI_OPT_VALIDATION_MANIFEST;
-    if (strcmp(arg, "--validation-samples") == 0) return CLI_OPT_VALIDATION_SAMPLES;
-    if (strcmp(arg, "--checkpoint-every") == 0) return CLI_OPT_CHECKPOINT_EVERY;
-    if (strcmp(arg, "--validate-every") == 0) return CLI_OPT_VALIDATE_EVERY;
-    if (strcmp(arg, "--ste-steps") == 0) return CLI_OPT_STE_STEPS;
-    if (strcmp(arg, "--kl-weight") == 0) return CLI_OPT_KL_WEIGHT;
-    if (strcmp(arg, "--save-state") == 0) return CLI_OPT_SAVE_STATE;
-    if (strcmp(arg, "--load-state") == 0) return CLI_OPT_LOAD_STATE;
+
+    for (size_t alias_idx = 0; alias_idx < alias_count; ++alias_idx) {
+        if (strcmp(arg, g_cli_option_aliases[alias_idx].name) == 0) {
+            return g_cli_option_aliases[alias_idx].option;
+        }
+    }
+
     return CLI_OPT_UNKNOWN;
 }
 
@@ -643,7 +701,10 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_CHECKPOINT_EVERY: args->checkpoint_every_n_layers = atoi(value); break;
         case CLI_OPT_VALIDATE_EVERY: args->validate_every_n = atoi(value); break;
         case CLI_OPT_STE_STEPS: args->ste_steps = atoi(value); break;
+        case CLI_OPT_MAX_GRAD_NORM: args->max_grad_norm = (float)atof(value); break;
         case CLI_OPT_KL_WEIGHT: args->kl_weight = (float)atof(value); break;
+        case CLI_OPT_HESSIAN_PROXY_STRENGTH: args->hessian_proxy_strength = (float)atof(value); break;
+        case CLI_OPT_HESSIAN_PROXY_FLOOR: args->hessian_proxy_floor = (float)atof(value); break;
         case CLI_OPT_SAVE_STATE: args->save_state_path = value; break;
         case CLI_OPT_LOAD_STATE: args->load_state_path = value; break;
         default: break;
@@ -661,6 +722,10 @@ static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
 
         if (option == CLI_OPT_CONVERT_TERNARY) {
             args->convert_ternary = 1;
+            continue;
+        }
+        if (option == CLI_OPT_DISABLE_HESSIAN_PROXY) {
+            args->disable_hessian_proxy = 1;
             continue;
         }
         if (option == CLI_OPT_UNKNOWN || i + 1 >= argc) {
