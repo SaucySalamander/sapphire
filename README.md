@@ -1,30 +1,33 @@
 # Sapphire
 
-Sapphire is a C18 codebase and a test bed for small, high-performance models.
-It currently targets the Gemma-3 family of models only and is not yet a
-fully reusable library — several components are experimental and intended for
-rapid iteration. It provides quantized matrix-vector kernels, a compact tensor
-abstraction with reference counting, KV-cache utilities, and transformer
-primitives (RoPE, ALiBi, activations, normalization) together with benchmark
-tools.
+Sapphire is a C18 codebase for Gemma 3 inference and model tooling. It supports
+CPU reference execution, Vulkan compute, a compact tensor abstraction with
+reference counting, KV-cache utilities, transformer primitives (RoPE, ALiBi,
+activations, normalization), and workflows for activation tapes, ternary
+conversion, validation, and benchmarking. Several components are still
+experimental and intended for rapid iteration.
 
 ## Highlights
 
 - Quantized GEMV kernels with Q4_0 and Q8_0 block formats in `src/kernels/`.
+- CPU reference execution and Vulkan compute backend code in `src/inference/`
+  and `src/kernels/backends/vulkan/`.
 - A compact tensor implementation with float and quantized types in `src/tensor/`.
 - Transformer primitives in `src/transformer/` (RoPE, ALiBi, activations,
   normalization, attention strategies).
 - KV cache utilities in `src/memory/`.
 - Loader and model-reader utilities in `src/io/` and `src/loader/` for safetensors
   and GGML-like formats.
-- A small inference/demo harness in `src/inference/` and benchmark tools.
-- Note: current kernels are CPU-only; GPU support is not available yet.
+- Inference orchestration, session lifecycle, and demo harness code in `src/inference/`.
+- Benchmark tools and workflow scripts in `scripts/`.
 
 ## Repository layout
 
 - `include/` - Public headers for tensors, transformer, KV cache, kernels, and
   model/loader interfaces.
 - `src/kernels/` - Quantized GEMV kernels and architecture-specific implementations.
+- `src/kernels/backends/vulkan/` - Vulkan buffers, pipelines, streaming, and
+  synchronization helpers.
 - `src/tensor/` - Tensor core implementation.
 - `src/transformer/` - Transformer blocks, activations, normalization, RoPE,
   attention strategies.
@@ -33,23 +36,27 @@ tools.
 - `src/loader/` - Model spec loader and model-format helpers.
 - `src/memory/` - KV cache implementation and related utilities.
 - `src/tokenizer/` - Tokenizer implementation.
-- `models/` - Example model artifacts and helper scripts (e.g. `models/gemma/270m-it`).
+- `models/` - Example model artifacts and helper scripts (e.g. `models/gemma-3-270m-it`).
 - `scripts/` - Utility scripts for weight dumping and comparisons.
 - `out/` - Build artifacts (created automatically).
 
 ## Building and running
 
 Prerequisites: `make` and a compiler with AVX2/FMA support (the Makefile uses
-`-mavx2 -mfma`). Optional HIP targets require `hipcc` and ROCm headers.
+`-mavx2 -mfma`). Vulkan SDK support is required for the Vulkan backend and
+shader builds. Optional HIP targets require `hipcc` and ROCm headers.
 
 Common targets:
 
 ```bash
 # Build the project
-make all
+make bin
 
 # Clean build artifacts
 make clean
+
+# Rebuild runtime + shaders after Vulkan or shader changes
+make clean bin shaders
 ```
 
 All build artifacts are produced in `out/`.
@@ -60,11 +67,16 @@ All build artifacts are produced in `out/`.
   or build in-tree via the Makefile.
 - The repository serves as a test bed for the Gemma-3 family; components are
   experimental and not guaranteed to be reusable as stable library APIs.
-- Example model artifacts and tokenizer files are in `models/gemma/270m-it`.
+- Select the backend with `SAPPHIRE_BACKEND=cpu` or `SAPPHIRE_BACKEND=vulkan`.
+  CPU is the reference path.
+- Example model artifacts and tokenizer files are in `models/gemma-3-270m-it`.
 
 ### Model artifacts
 
-- Model weights and tokenizer files for Gemma-3 models are NOT included. Download a Gemma-3 model (for example `gemma-3-270m-it`) from Hugging Face or another provider and place the required files under `models/<model-name>/`.
+- Model weights and tokenizer files for Gemma 3 models are NOT included. Download
+  a Gemma 3 model (for example `gemma-3-270m-it`, `gemma-3-1b-it`, or
+  `gemma-3-27b-it`) from Hugging Face or another provider and place the required
+  files under `models/<model-name>/`.
 
 Required files (typical):
 
@@ -99,10 +111,10 @@ Examples:
 make bin
 
 # Interactive mode (loads model from ./models/gemma-3-270m-it)
-./out/sapphire -m gemma3-270m-it
+./out/sapphire -m gemma-3-270m-it
 
 # Non-interactive one-shot prompt
-./out/sapphire -m gemma3-270m-it -p "Write a haiku about compiler optimizations" -n 80 -t 0.7
+./out/sapphire -m gemma-3-270m-it -p "Write a haiku about compiler optimizations" -n 80 -t 0.7
 ```
 
 Interactive REPL commands:
@@ -113,6 +125,13 @@ Interactive REPL commands:
 - `/help`            : Show command help
 
 If you want help for the runtime itself, run `./out/sapphire -h`.
+
+### Workflow notes
+
+- `--record-tape` runs on the CPU backend and requires `--calib-manifest`.
+- `--convert-ternary` requires `--output`.
+- `--teacher-model` requires `--activation-tape` and only applies to full-model
+  conversion.
 
 ### Ternary conversion corpora
 

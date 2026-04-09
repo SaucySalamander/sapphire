@@ -17,6 +17,8 @@ reports/
 docs/
 
 # Object and library files
+*.tape
+*.tsv
 *.o
 *.obj
 *.a

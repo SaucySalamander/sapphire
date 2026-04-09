@@ -90,9 +90,106 @@ bool attention_debug_should_log(const attention_debug_config_t* cfg, int layer_i
     return true;
 }
 
+static int attention_window_start(bool is_global_layer, int token_pos, int swa_window) {
+    if (is_global_layer) {
+        return 0;
+    }
+
+    int seq_len = token_pos + 1;
+    if (seq_len > swa_window) {
+        return seq_len - swa_window;
+    }
+    return 0;
+}
+
+typedef struct {
+    struct inference_session_t* session;
+    int layer_idx;
+    int token_pos;
+    float* q_proj;
+    float* attn_out;
+    float* scores_buf;
+    const float* cached_k_data;
+    const float* cached_v_data;
+    size_t cache_stride;
+} attention_forward_cached_args_t;
+
+static int sapphire_attention_forward_cached(const attention_forward_cached_args_t* args) {
+    if (!args || !args->session || !args->session->model_spec || !args->session->model_spec->variant_config ||
+        !args->q_proj || !args->attn_out || !args->scores_buf || !args->cached_k_data || !args->cached_v_data ||
+        args->cache_stride == 0u) {
+        return -1;
+    }
+
+    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)args->session->model_spec->variant_config;
+    if (config->head_dim <= 0 || config->num_attention_heads <= 0 || config->num_key_value_heads <= 0) {
+        return -1;
+    }
+
+    int seq_len = args->token_pos + 1;
+    int head_dim = config->head_dim;
+
+    bool is_global_layer = false;
+    if (config->layer_types_mask) {
+        is_global_layer = (((config->layer_types_mask >> (unsigned long long)args->layer_idx) & 1ULL) != 0ULL);
+    } else {
+        is_global_layer = ((args->layer_idx + 1) % 6 == 0);
+    }
+
+    const int swa_window = (config->sliding_window > 0) ? config->sliding_window : 1024;
+    int window_start = attention_window_start(is_global_layer, args->token_pos, swa_window);
+    int attn_len = seq_len;
+    if (!is_global_layer && seq_len > swa_window) {
+        attn_len = swa_window;
+    }
+
+    memset(args->attn_out, 0, (size_t)config->num_attention_heads * (size_t)head_dim * sizeof(float));
+
+    float head_scalar = (config->query_pre_attn_scalar > 0.0f)
+        ? (1.0f / sqrtf(config->query_pre_attn_scalar))
+        : (1.0f / sqrtf((float)head_dim));
+    int group_size = config->num_attention_heads / config->num_key_value_heads;
+
+    for (int h = 0; h < config->num_attention_heads; h++) {
+        int h_kv = h / group_size;
+        const float* k_base = args->cached_k_data + (size_t)h_kv * args->cache_stride +
+                              (size_t)window_start * (size_t)head_dim;
+        const float* v_base = args->cached_v_data + (size_t)h_kv * args->cache_stride +
+                              (size_t)window_start * (size_t)head_dim;
+        const float* head_q = args->q_proj + (size_t)h * (size_t)head_dim;
+        float* scores = args->scores_buf;
+
+        for (int t = 0; t < attn_len; t++) {
+            float raw_dot = vec_dot(head_q, k_base + (size_t)t * (size_t)head_dim, head_dim);
+            scores[t] = raw_dot * head_scalar;
+        }
+
+        softmax(scores, attn_len);
+
+        float* h_out = args->attn_out + (size_t)h * (size_t)head_dim;
+        for (int t = 0; t < attn_len; t++) {
+            float alpha = scores[t];
+            const float* v_vec = v_base + (size_t)t * (size_t)head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                h_out[d] += alpha * v_vec[d];
+            }
+        }
+    }
+
+    return 0;
+}
+
 int sapphire_attention_forward(struct inference_session_t* session, int layer_idx, int token_pos,
                                float* q_proj, float* attn_out, float* scores_buf) {
+    if (!session || !session->model_spec || !session->model_spec->variant_config || !session->kv_cache ||
+        !q_proj || !attn_out || !scores_buf) {
+        return -1;
+    }
+
     gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
+    if (config->head_dim <= 0 || config->num_attention_heads <= 0 || config->num_key_value_heads <= 0) {
+        return -1;
+    }
 
     int seq_len = token_pos + 1;  // Current token pos is 0-indexed, so length is pos + 1
 
@@ -111,57 +208,29 @@ int sapphire_attention_forward(struct inference_session_t* session, int layer_id
     }
 
     const int swa_window = (config->sliding_window > 0) ? config->sliding_window : 1024;
-
-    const float* cached_k_data = tensor_data(kv_cache_get_keys(session->kv_cache, layer_idx));
-    const float* cached_v_data = tensor_data(kv_cache_get_values(session->kv_cache, layer_idx));
-    int cache_stride = max_seq * head_dim;
-
-    // Zero attn_out - ensure we zero the full projection width (num_heads * head_dim)
-    memset(attn_out, 0, config->num_attention_heads * head_dim * sizeof(float));
-
-    int window_start = 0;
-    int attn_len = seq_len;
-    if (!is_global_layer && seq_len > swa_window) {
-        window_start = seq_len - swa_window;
-        attn_len = swa_window;
-    }
+    int window_start = attention_window_start(is_global_layer, token_pos, swa_window);
 
     (void)kv_cache_touch_range(session->kv_cache, layer_idx, window_start, seq_len - 1);
 
-    float head_scalar = (config->query_pre_attn_scalar > 0.0f) ? (1.0f / sqrtf(config->query_pre_attn_scalar)) : (1.0f / sqrtf((float)head_dim));
+    const tensor_t* cached_k_tensor = kv_cache_get_keys(session->kv_cache, layer_idx);
+    const tensor_t* cached_v_tensor = kv_cache_get_values(session->kv_cache, layer_idx);
+    const float* cached_k_data = cached_k_tensor ? tensor_data(cached_k_tensor) : NULL;
+    const float* cached_v_data = cached_v_tensor ? tensor_data(cached_v_tensor) : NULL;
+    size_t cache_stride = (size_t)max_seq * (size_t)head_dim;
 
-    int group_size = config->num_attention_heads / config->num_key_value_heads;
+    attention_forward_cached_args_t cached_args = {
+        .session = session,
+        .layer_idx = layer_idx,
+        .token_pos = token_pos,
+        .q_proj = q_proj,
+        .attn_out = attn_out,
+        .scores_buf = scores_buf,
+        .cached_k_data = cached_k_data,
+        .cached_v_data = cached_v_data,
+        .cache_stride = cache_stride,
+    };
 
-    for (int h = 0; h < config->num_attention_heads; h++) {
-        // GQA: Map query head 'h' to KV head 'h / group_size'
-        int h_kv = h / group_size;
-
-        const float* k_base = cached_k_data + h_kv * cache_stride + window_start * head_dim;
-        const float* v_base = cached_v_data + h_kv * cache_stride + window_start * head_dim;
-        const float* head_q = q_proj + h * head_dim;
-        float* scores = scores_buf;
-
-        // Step 1: Compute scores (Dot product)
-        for (int t = 0; t < attn_len; t++) {
-            float raw_dot = vec_dot(head_q, k_base + t * head_dim, head_dim);
-            scores[t] = raw_dot * head_scalar;
-        }
-
-        // Step 2: Softmax
-        softmax(scores, attn_len);
-
-        // Step 3: Accumulate Attention Output
-        float* h_out = attn_out + h * head_dim;
-        for (int t = 0; t < attn_len; t++) {
-            float alpha = scores[t];
-            const float* v_vec = v_base + t * head_dim;
-            for (int d = 0; d < head_dim; d++) {
-                h_out[d] += alpha * v_vec[d];
-            }
-        }
-    }
-
-    return 0;
+    return sapphire_attention_forward_cached(&cached_args);
 }
 
 typedef struct {
@@ -172,23 +241,68 @@ typedef struct {
     float* attn_out;
     int q_stride;
     int max_seq;
+    const float* cached_k_data;
+    const float* cached_v_data;
+    size_t cache_stride;
 } parallel_attn_args_t;
 
 static void parallel_attn_fn(void* arg, int idx) {
     parallel_attn_args_t* a = (parallel_attn_args_t*)arg;
     float* scores_buf = a->session->attn_scores + (size_t)idx * a->max_seq;
-    sapphire_attention_forward(a->session, a->layer_idx, a->start_pos + idx, 
-                               a->q_proj + (size_t)idx * a->q_stride, 
-                               a->attn_out + (size_t)idx * a->q_stride,
-                               scores_buf);
+    attention_forward_cached_args_t cached_args = {
+        .session = a->session,
+        .layer_idx = a->layer_idx,
+        .token_pos = a->start_pos + idx,
+        .q_proj = a->q_proj + (size_t)idx * a->q_stride,
+        .attn_out = a->attn_out + (size_t)idx * a->q_stride,
+        .scores_buf = scores_buf,
+        .cached_k_data = a->cached_k_data,
+        .cached_v_data = a->cached_v_data,
+        .cache_stride = a->cache_stride,
+    };
+    (void)sapphire_attention_forward_cached(&cached_args);
 }
 
 int sapphire_attention_forward_batch(struct inference_session_t* session, int layer_idx, int start_pos, int batch_size,
                                      float* q_proj, float* attn_out) {
+    if (!session || !session->model_spec || !session->model_spec->variant_config || !session->kv_cache ||
+        !q_proj || !attn_out || batch_size <= 0) {
+        return -1;
+    }
+
     const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
+    if (config->head_dim <= 0 || config->num_attention_heads <= 0 || config->num_key_value_heads <= 0) {
+        return -1;
+    }
+
+    bool is_global_layer = false;
+    const int swa_window = (config->sliding_window > 0) ? config->sliding_window : 1024;
     int head_dim = config->head_dim;
     int q_stride = config->num_attention_heads * head_dim;
     int max_seq = kv_cache_get_max_seq_len(session->kv_cache);
+    int touch_start = 0;
+    int touch_end = start_pos + batch_size - 1;
+    const tensor_t* cached_k_tensor = NULL;
+    const tensor_t* cached_v_tensor = NULL;
+    const float* cached_k_data = NULL;
+    const float* cached_v_data = NULL;
+
+    if (config->layer_types_mask) {
+        is_global_layer = (((config->layer_types_mask >> (unsigned long long)layer_idx) & 1ULL) != 0ULL);
+    } else {
+        is_global_layer = ((layer_idx + 1) % 6 == 0);
+    }
+
+    touch_start = attention_window_start(is_global_layer, start_pos, swa_window);
+    (void)kv_cache_touch_range(session->kv_cache, layer_idx, touch_start, touch_end);
+
+    cached_k_tensor = kv_cache_get_keys(session->kv_cache, layer_idx);
+    cached_v_tensor = kv_cache_get_values(session->kv_cache, layer_idx);
+    cached_k_data = cached_k_tensor ? tensor_data(cached_k_tensor) : NULL;
+    cached_v_data = cached_v_tensor ? tensor_data(cached_v_tensor) : NULL;
+    if (!cached_k_data || !cached_v_data) {
+        return -1;
+    }
 
     parallel_attn_args_t args = {
         .session = session,
@@ -197,7 +311,10 @@ int sapphire_attention_forward_batch(struct inference_session_t* session, int la
         .q_proj = q_proj,
         .attn_out = attn_out,
         .q_stride = q_stride,
-        .max_seq = max_seq
+        .max_seq = max_seq,
+        .cached_k_data = cached_k_data,
+        .cached_v_data = cached_v_data,
+        .cache_stride = (size_t)max_seq * (size_t)head_dim
     };
 
     if (session->gemv_ctx && batch_size > 1) {
@@ -207,10 +324,18 @@ int sapphire_attention_forward_batch(struct inference_session_t* session, int la
     /* Fallback for single batch or unthreaded context */
     for (int b = 0; b < batch_size; b++) {
         float* token_scores = session->attn_scores + (size_t)b * max_seq;
-        sapphire_attention_forward(session, layer_idx, start_pos + b, 
-                                   q_proj + (size_t)b * q_stride, 
-                                   attn_out + (size_t)b * q_stride,
-                                   token_scores);
+        attention_forward_cached_args_t cached_args = {
+            .session = session,
+            .layer_idx = layer_idx,
+            .token_pos = start_pos + b,
+            .q_proj = q_proj + (size_t)b * q_stride,
+            .attn_out = attn_out + (size_t)b * q_stride,
+            .scores_buf = token_scores,
+            .cached_k_data = cached_k_data,
+            .cached_v_data = cached_v_data,
+            .cache_stride = args.cache_stride,
+        };
+        (void)sapphire_attention_forward_cached(&cached_args);
     }
 
     return 0;

@@ -25,6 +25,7 @@ CATEGORY_COLORS = {
     "p_pos1": "#f4a261",
 }
 RUN_COLORS = ["#1d3557", "#6c5ce7"]
+SERIES_LINE_STYLES = ["-", "--", ":", "-.", (0, (3, 1, 1, 1))]
 DEFAULT_OUTPUT_DIR_NAME = "molding_analysis"
 
 
@@ -78,6 +79,19 @@ def load_metrics(path: Path, run_label: str) -> pd.DataFrame:
         frame["resume_step_idx"] = 0.0
     frame["resume_step_idx"] = frame["resume_step_idx"].fillna(0.0)
 
+    if "config_hash" not in frame.columns:
+        frame["config_hash"] = "unknown"
+    else:
+        frame["config_hash"] = frame["config_hash"].astype("string").fillna("unknown")
+
+    frame["series_key"] = frame["config_hash"]
+    frame.loc[frame["series_key"] == "unknown", "series_key"] = frame.loc[frame["series_key"] == "unknown", "run_label"]
+    frame["series_label"] = frame["run_label"]
+    known_hash = frame["config_hash"] != "unknown"
+    frame.loc[known_hash, "series_label"] = (
+        frame.loc[known_hash, "run_label"] + " [" + frame.loc[known_hash, "config_hash"].astype(str) + "]"
+    )
+
     frame["analysis_step"] = frame["resume_step_idx"] + frame["step_idx"]
 
     if "tps" in frame.columns:
@@ -88,7 +102,7 @@ def load_metrics(path: Path, run_label: str) -> pd.DataFrame:
     derived_tps = pd.Series(float("nan"), index=frame.index)
     valid_compute = frame["compute_ms"].notna() & (frame["compute_ms"] > 0)
     derived_tps.loc[valid_compute] = 1000.0 / frame.loc[valid_compute, "compute_ms"]
-    frame["tps_value"] = tps_series.fillna(derived_tps)
+    frame["tps_value"] = tps_series.fillna(derived_tps).fillna(0.0)
 
     frame = frame.sort_values(["analysis_step", "layer_idx", "step_idx"]).reset_index(drop=True)
     return frame
@@ -112,6 +126,29 @@ def unique_layers(*frames: pd.DataFrame) -> list[int]:
     return sorted(layers)
 
 
+def iter_series(frame: pd.DataFrame) -> list[tuple[str, str, pd.DataFrame]]:
+    if frame is None or frame.empty:
+        return []
+
+    series: list[tuple[str, str, pd.DataFrame]] = []
+    for _, subset in frame.groupby("series_key", sort=False):
+        grouped = subset.copy()
+        series_key = str(grouped.iloc[0]["series_key"])
+        series_label = str(grouped.iloc[0]["series_label"])
+        series.append((series_key, series_label, grouped))
+    return series
+
+
+def build_series_style_map(*frames: pd.DataFrame) -> dict[str, str | tuple[float, tuple[float, ...]]]:
+    style_map: dict[str, str | tuple[float, tuple[float, ...]]] = {}
+    for frame in frames:
+        for series_key, _, _ in iter_series(frame):
+            if series_key in style_map:
+                continue
+            style_map[series_key] = SERIES_LINE_STYLES[len(style_map) % len(SERIES_LINE_STYLES)]
+    return style_map
+
+
 def grouped_mean(frame: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
     selected = frame[["analysis_step", *columns]].dropna(subset=["analysis_step"]).copy()
     if selected.empty:
@@ -119,35 +156,56 @@ def grouped_mean(frame: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
     return selected.groupby("analysis_step", as_index=True)[list(columns)].mean().sort_index()
 
 
+def normalize_probability_columns(grouped: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    normalized = grouped.copy()
+    columns = list(columns)
+    if normalized.empty:
+        return normalized
+
+    totals = normalized[columns].sum(axis=1)
+    needs_normalization = totals > 1.0 + 1e-6
+    if needs_normalization.any():
+        normalized.loc[needs_normalization, columns] = normalized.loc[needs_normalization, columns].div(
+            totals[needs_normalization], axis=0
+        )
+    return normalized
+
+
+def single_point_bar_width(x_value: float) -> float:
+    if not pd.notna(x_value):
+        return 1.0
+    magnitude = abs(float(x_value))
+    if magnitude <= 0.0:
+        return 1.0
+    return max(1.0, magnitude * 0.02)
+
+
 def plot_convergence(primary: pd.DataFrame, compare: pd.DataFrame | None, output_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(12, 7))
     layers = unique_layers(primary, compare) if compare is not None else unique_layers(primary)
+    series_styles = build_series_style_map(primary, compare) if compare is not None else build_series_style_map(primary)
 
-    for index, layer_idx in enumerate(layers):
-        color = plt.get_cmap("tab20")(index % 20)
-        primary_layer = primary[primary["layer_idx"] == layer_idx].dropna(subset=["analysis_step", "mse_loss"])
-        if not primary_layer.empty:
-            primary_layer = primary_layer.sort_values("analysis_step")
-            ax.plot(
-                primary_layer["analysis_step"],
-                primary_layer["mse_loss"],
-                color=color,
-                linewidth=2.0,
-                label=f"{primary.iloc[0]['run_label']} layer {layer_idx}",
-            )
-
-        if compare is not None:
-            compare_layer = compare[compare["layer_idx"] == layer_idx].dropna(subset=["analysis_step", "mse_loss"])
-            if not compare_layer.empty:
-                compare_layer = compare_layer.sort_values("analysis_step")
+    for frame, alpha in ((primary, 0.92), (compare, 0.65)) if compare is not None else ((primary, 0.92),):
+        if frame is None or frame.empty:
+            continue
+        for series_key, series_label, series_frame in iter_series(frame):
+            series_style = series_styles.get(series_key, "-")
+            for index, layer_idx in enumerate(layers):
+                color = plt.get_cmap("tab20")(index % 20)
+                layer_frame = series_frame[series_frame["layer_idx"] == layer_idx].dropna(subset=["analysis_step", "mse_loss"])
+                if layer_frame.empty:
+                    continue
+                layer_frame = layer_frame.sort_values("analysis_step")
                 ax.plot(
-                    compare_layer["analysis_step"],
-                    compare_layer["mse_loss"],
+                    layer_frame["analysis_step"],
+                    layer_frame["mse_loss"],
                     color=color,
-                    linestyle="--",
-                    linewidth=1.8,
-                    alpha=0.85,
-                    label=f"{compare.iloc[0]['run_label']} layer {layer_idx}",
+                    linestyle=series_style,
+                    linewidth=2.0 if frame is primary else 1.8,
+                    alpha=alpha,
+                    marker="o",
+                    markersize=5,
+                    label=f"{series_label} layer {layer_idx}",
                 )
 
     ax.set_title("Convergence: MSE Loss vs Step")
@@ -162,26 +220,57 @@ def plot_convergence(primary: pd.DataFrame, compare: pd.DataFrame | None, output
 
 def plot_sparsity(primary: pd.DataFrame, compare: pd.DataFrame | None, output_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(12, 7))
+    series_styles = build_series_style_map(primary, compare) if compare is not None else build_series_style_map(primary)
 
-    def _stack(frame: pd.DataFrame, alpha: float, label: str) -> None:
-        grouped = grouped_mean(frame, ["p_neg1", "p_zero", "p_pos1"])
+    series_index = 0
+
+    def _stack(series_frame: pd.DataFrame, alpha: float) -> None:
+        nonlocal series_index
+        grouped = normalize_probability_columns(
+            grouped_mean(series_frame, ["p_neg1", "p_zero", "p_pos1"]),
+            ["p_neg1", "p_zero", "p_pos1"],
+        )
         if grouped.empty:
             return
         x = grouped.index.to_numpy()
         values = [grouped[column].to_numpy() for column in ["p_neg1", "p_zero", "p_pos1"]]
-        ax.stackplot(
-            x,
-            *values,
-            colors=[CATEGORY_COLORS["p_neg1"], CATEGORY_COLORS["p_zero"], CATEGORY_COLORS["p_pos1"]],
-            alpha=alpha,
-        )
-        ax.plot(x, grouped["p_neg1"], color=CATEGORY_COLORS["p_neg1"], alpha=alpha, linewidth=1.2)
-        ax.plot(x, grouped["p_zero"], color=CATEGORY_COLORS["p_zero"], alpha=alpha, linewidth=1.2)
-        ax.plot(x, grouped["p_pos1"], color=CATEGORY_COLORS["p_pos1"], alpha=alpha, linewidth=1.2)
+        series_label = str(series_frame.iloc[0]["series_label"])
+        series_key = str(series_frame.iloc[0]["series_key"])
+        series_style = series_styles.get(series_key, "-")
+
+        if len(x) == 1:
+            width = single_point_bar_width(float(x[0]))
+            bottom = 0.0
+            for value, color in zip(values, [CATEGORY_COLORS["p_neg1"], CATEGORY_COLORS["p_zero"], CATEGORY_COLORS["p_pos1"]]):
+                ax.bar(
+                    x,
+                    value,
+                    width=width,
+                    bottom=bottom,
+                    color=color,
+                    alpha=alpha,
+                    align="center",
+                )
+                bottom = bottom + float(value[0])
+        else:
+            ax.stackplot(
+                x,
+                *values,
+                colors=[CATEGORY_COLORS["p_neg1"], CATEGORY_COLORS["p_zero"], CATEGORY_COLORS["p_pos1"]],
+                alpha=alpha,
+            )
+
+        ax.plot(x, grouped["p_neg1"], color=CATEGORY_COLORS["p_neg1"], linestyle=series_style, alpha=alpha, linewidth=1.2, marker="o", markersize=4)
+        ax.plot(x, grouped["p_zero"], color=CATEGORY_COLORS["p_zero"], linestyle=series_style, alpha=alpha, linewidth=1.2, marker="o", markersize=4)
+        ax.plot(x, grouped["p_pos1"], color=CATEGORY_COLORS["p_pos1"], linestyle=series_style, alpha=alpha, linewidth=1.2, marker="o", markersize=4)
+
+        label_y = 0.95 - (0.05 * series_index)
+        if label_y < 0.08:
+            label_y = 0.08
         ax.text(
             0.01,
-            0.95 if label == primary.iloc[0]["run_label"] else 0.90,
-            f"{label}",
+            label_y,
+            series_label,
             transform=ax.transAxes,
             fontsize=9,
             color="black",
@@ -189,10 +278,13 @@ def plot_sparsity(primary: pd.DataFrame, compare: pd.DataFrame | None, output_pa
             verticalalignment="top",
             bbox={"facecolor": "white", "alpha": 0.5, "edgecolor": "none", "pad": 2.5},
         )
+        series_index += 1
 
-    _stack(primary, 0.72, primary.iloc[0]["run_label"])
+    for series_key, series_label, series_frame in iter_series(primary):
+        _stack(series_frame, 0.72)
     if compare is not None:
-        _stack(compare, 0.28, compare.iloc[0]["run_label"])
+        for series_key, series_label, series_frame in iter_series(compare):
+            _stack(series_frame, 0.28)
 
     category_handles = [Patch(facecolor=color, label=label) for label, color in CATEGORY_COLORS.items()]
     category_legend = ax.legend(handles=category_handles, loc="upper left", fontsize=9, title="distribution")
@@ -218,44 +310,38 @@ def plot_sparsity(primary: pd.DataFrame, compare: pd.DataFrame | None, output_pa
 def plot_efficiency(primary: pd.DataFrame, compare: pd.DataFrame | None, output_path: Path) -> None:
     fig, ax_tps = plt.subplots(figsize=(12, 7))
     ax_io = ax_tps.twinx()
+    series_styles = build_series_style_map(primary, compare) if compare is not None else build_series_style_map(primary)
 
-    primary_grouped = grouped_mean(primary, ["tps_value", "io_ms"])
-    if not primary_grouped.empty:
-        ax_tps.plot(
-            primary_grouped.index,
-            primary_grouped["tps_value"],
-            color=RUN_COLORS[0],
-            linewidth=2.2,
-            label=f"{primary.iloc[0]['run_label']} tps",
-        )
-        ax_io.plot(
-            primary_grouped.index,
-            primary_grouped["io_ms"],
-            color=RUN_COLORS[1],
-            linewidth=2.2,
-            label=f"{primary.iloc[0]['run_label']} io_ms",
-        )
+    for frame, alpha in ((primary, 0.92), (compare, 0.65)) if compare is not None else ((primary, 0.92),):
+        if frame is None or frame.empty:
+            continue
+        for series_key, series_label, series_frame in iter_series(frame):
+            grouped = grouped_mean(series_frame, ["tps_value", "io_ms"])
+            if grouped.empty:
+                continue
+            series_style = series_styles.get(series_key, "-")
 
-    if compare is not None:
-        compare_grouped = grouped_mean(compare, ["tps_value", "io_ms"])
-        if not compare_grouped.empty:
             ax_tps.plot(
-                compare_grouped.index,
-                compare_grouped["tps_value"],
+                grouped.index,
+                grouped["tps_value"],
                 color=RUN_COLORS[0],
-                linestyle="--",
-                linewidth=1.9,
-                alpha=0.85,
-                label=f"{compare.iloc[0]['run_label']} tps",
+                linestyle=series_style,
+                linewidth=2.2 if frame is primary else 1.9,
+                alpha=alpha,
+                marker="o",
+                markersize=5,
+                label=f"{series_label} tps",
             )
             ax_io.plot(
-                compare_grouped.index,
-                compare_grouped["io_ms"],
+                grouped.index,
+                grouped["io_ms"],
                 color=RUN_COLORS[1],
-                linestyle="--",
-                linewidth=1.9,
-                alpha=0.85,
-                label=f"{compare.iloc[0]['run_label']} io_ms",
+                linestyle=series_style,
+                linewidth=2.2 if frame is primary else 1.9,
+                alpha=alpha,
+                marker="o",
+                markersize=5,
+                label=f"{series_label} io_ms",
             )
 
     ax_tps.set_title("Efficiency: tps vs io_ms")

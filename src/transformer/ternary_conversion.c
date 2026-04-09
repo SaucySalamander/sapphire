@@ -47,9 +47,14 @@ typedef struct {
 static uint32_t config_resume_hash(const ternary_conversion_config_t *config)
 {
     uint32_t crc32 = 0u;
+    int ste_steps = 3;
 
     if (!config) {
         return 0u;
+    }
+
+    if (config->ste_steps > 0) {
+        ste_steps = config->ste_steps;
     }
 
     crc32 = io_crc32_update(crc32, config->model_name, strlen(config->model_name) + 1u);
@@ -66,6 +71,7 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config)
     crc32 = io_crc32_update(crc32, &config->validation_sample_limit, sizeof(config->validation_sample_limit));
     crc32 = io_crc32_update(crc32, &config->checkpoint_every_n_layers, sizeof(config->checkpoint_every_n_layers));
     crc32 = io_crc32_update(crc32, &config->validate_every_n, sizeof(config->validate_every_n));
+    crc32 = io_crc32_update(crc32, &ste_steps, sizeof(ste_steps));
     crc32 = io_crc32_update(crc32, &config->kl_weight, sizeof(config->kl_weight));
     return crc32;
 }
@@ -745,8 +751,13 @@ static int load_runtime_corpus(const char *manifest_path,
 
 static transformer_ste_config_t default_runtime_ste_config(const ternary_conversion_config_t *config) {
     transformer_ste_config_t ste_config;
+    int ste_steps = 3;
 
-    ste_config.ste_steps = 3;
+    if (config && config->ste_steps > 0) {
+        ste_steps = config->ste_steps;
+    }
+
+    ste_config.ste_steps = ste_steps;
     ste_config.learning_rate = 0.03f;
     ste_config.zero_threshold = 0.05f;
     ste_config.momentum = 0.85f;
@@ -1543,6 +1554,7 @@ int transformer_run_ternary_conversion(const ternary_conversion_config_t *config
     LOG_INFO("  context_len: %d", config->context_len);
     LOG_INFO("  calibration_samples: %d",
              (config->calibration_sample_limit > 0) ? config->calibration_sample_limit : 4);
+    LOG_INFO("  ste_steps: %d", (config->ste_steps > 0) ? config->ste_steps : 3);
     LOG_INFO("  validate_every: %d", config->validate_every_n);
     LOG_INFO("  kl_weight: %.4f", (double)((config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f));
     if (config->layer_name && config->layer_name[0] != '\0') {
@@ -1556,13 +1568,17 @@ int transformer_run_ternary_conversion(const ternary_conversion_config_t *config
     if (config->teacher_model_name && config->teacher_model_name[0] != '\0') {
         LOG_INFO("  teacher_model: %s", config->teacher_model_name);
     }
-    if (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0') {
+    if (config->calibration_corpus_manifest_path && config->calibration_corpus_manifest_path[0] != '\0') {
+        if (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0') {
+            LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);
+        } else {
+            LOG_INFO("  calibration_corpus: <loaded from manifest>");
+        }
+        LOG_INFO("  calibration_manifest: %s", config->calibration_corpus_manifest_path);
+    } else if (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0') {
         LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);
     } else {
         LOG_INFO("  calibration_corpus: <built-in fallback>");
-    }
-    if (config->calibration_corpus_manifest_path && config->calibration_corpus_manifest_path[0] != '\0') {
-        LOG_INFO("  calibration_manifest: %s", config->calibration_corpus_manifest_path);
     }
     if (config->validation_corpus_path && config->validation_corpus_path[0] != '\0') {
         LOG_INFO("  validation_corpus: %s", config->validation_corpus_path);

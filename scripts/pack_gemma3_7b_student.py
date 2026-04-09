@@ -19,17 +19,21 @@ import argparse
 import json
 import math
 import re
+import os
 import shutil
+import struct
+import sys
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from safetensors.numpy import save_file
 
 
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[1] / "models" / "gemma-3-7b-q1.58b"
 DEFAULT_MAX_SHARD_SIZE = 2 * 1024**3
-FLOAT16_BYTES = np.dtype(np.float16).itemsize
+STAGING_BYTES = np.dtype(np.float16).itemsize
+BF16_BYTES = np.dtype(np.uint16).itemsize
 METADATA_FILES = (
     "config.json",
     "tokenizer.json",
@@ -222,7 +226,7 @@ def _load_tensor(model_dir: Path, spec: TensorSpec) -> np.ndarray:
         raise FileNotFoundError(source_path)
 
     expected_elements = math.prod(spec.shape)
-    expected_size = expected_elements * FLOAT16_BYTES
+    expected_size = expected_elements * STAGING_BYTES
     actual_size = source_path.stat().st_size
     if actual_size != expected_size:
         raise ValueError(
@@ -230,6 +234,61 @@ def _load_tensor(model_dir: Path, spec: TensorSpec) -> np.ndarray:
         )
 
     return np.memmap(source_path, dtype=np.float16, mode="r", shape=spec.shape)
+
+
+def _float32_to_bf16_words(values: np.ndarray) -> np.ndarray:
+    float32_values = np.asarray(values, dtype=np.float32)
+    float32_bits = float32_values.view(np.uint32)
+    rounded_bits = float32_bits + np.uint32(0x7FFF) + ((float32_bits >> np.uint32(16)) & np.uint32(1))
+    bf16_words = (rounded_bits >> np.uint32(16)).astype(np.uint16)
+    if sys.byteorder != "little":
+        bf16_words = bf16_words.byteswap()
+    return bf16_words
+
+
+def _write_bf16_tensor_data(output_file, tensor: np.ndarray, chunk_elements: int = 1 << 20) -> None:
+    flat_tensor = np.asarray(tensor, dtype=np.float16).reshape(-1)
+
+    for start_idx in range(0, flat_tensor.size, chunk_elements):
+        chunk = flat_tensor[start_idx:start_idx + chunk_elements]
+        bf16_words = _float32_to_bf16_words(chunk)
+        output_file.write(bf16_words.tobytes(order="C"))
+
+
+def _write_safetensors_file(output_path: Path,
+                            tensor_items: list[tuple[TensorSpec, np.ndarray]],
+                            total_size: int,
+                            overwrite: bool) -> None:
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"Refusing to overwrite existing file: {output_path}")
+
+    header = OrderedDict()
+    header["__metadata__"] = OrderedDict([("total_size", str(total_size))])
+
+    data_offset = 0
+    for spec, tensor in tensor_items:
+        tensor_bytes = int(tensor.size) * BF16_BYTES
+        header[spec.hf_name] = OrderedDict(
+            (
+                ("dtype", "BF16"),
+                ("shape", [int(dim) for dim in spec.shape]),
+                ("data_offsets", [data_offset, data_offset + tensor_bytes]),
+            )
+        )
+        data_offset += tensor_bytes
+
+    header_bytes = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("wb") as output_file:
+        output_file.write(struct.pack("<Q", len(header_bytes)))
+        output_file.write(header_bytes)
+
+        for _spec, tensor in tensor_items:
+            _write_bf16_tensor_data(output_file, tensor)
+
+        output_file.flush()
+        os.fsync(output_file.fileno())
 
 
 def _copy_metadata_files(source_dir: Path, output_dir: Path, overwrite: bool) -> None:
@@ -322,8 +381,7 @@ def pack_student(source_dir: Path, output_dir: Path, max_shard_size: int, includ
 
     if shard_count == 1:
         shard_path = output_dir / "model.safetensors"
-        shard_payload = {spec.hf_name: tensor for spec, tensor in shards[0]}
-        save_file(shard_payload, str(shard_path), metadata={"total_size": str(total_size)})
+        _write_safetensors_file(shard_path, shards[0], total_size, overwrite)
 
         for spec, _tensor in shards[0]:
             weight_map[spec.hf_name] = shard_path.name
@@ -332,8 +390,7 @@ def pack_student(source_dir: Path, output_dir: Path, max_shard_size: int, includ
         for shard_idx, shard in enumerate(shards, start=1):
             shard_name = f"model-{shard_idx:0{shard_name_width}d}-of-{shard_count:0{shard_name_width}d}.safetensors"
             shard_path = output_dir / shard_name
-            shard_payload = {spec.hf_name: tensor for spec, tensor in shard}
-            save_file(shard_payload, str(shard_path), metadata={"total_size": str(total_size)})
+            _write_safetensors_file(shard_path, shard, total_size, overwrite)
 
             for spec, _tensor in shard:
                 weight_map[spec.hf_name] = shard_name

@@ -53,6 +53,7 @@ static void print_help(const char* program_name) {
     printf("  --activation-tape <path>  Optional activation tape for tape-backed calibration\n");
     printf("  --calib-manifest <p>      Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
     printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
+    printf("  --ste-steps <n>          STE optimization steps per tensor (default: 3)\n");
     printf("  --validation-corpus <p>   Optional held-out text corpus file or URL for checkpoints\n");
     printf("  --validation-manifest <p> Optional local held-out corpus manifest file\n");
     printf("  --validation-samples <n>  Held-out prompt count for checkpoint evaluation\n");
@@ -104,6 +105,7 @@ typedef struct {
     int validation_sample_limit;
     int checkpoint_every_n_layers;
     int validate_every_n;
+    int ste_steps;
     float kl_weight;
     const char *save_state_path;
     const char *load_state_path;
@@ -134,6 +136,7 @@ static void cli_args_init(cli_args_t *args)
     args->validation_sample_limit = 4;
     args->checkpoint_every_n_layers = 1;
     args->validate_every_n = 0;
+    args->ste_steps = 3;
     args->kl_weight = 0.05f;
     args->save_state_path = NULL;
     args->load_state_path = NULL;
@@ -226,6 +229,10 @@ static int validate_convert_ternary_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --validate-every must be >= 0.");
         return -1;
     }
+    if (args->ste_steps <= 0) {
+        LOG_ERROR("ERROR: --ste-steps must be > 0.");
+        return -1;
+    }
     if (args->checkpoint_every_n_layers <= 0) {
         LOG_ERROR("ERROR: --checkpoint-every must be > 0.");
         return -1;
@@ -283,6 +290,7 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.validation_sample_limit = args->validation_sample_limit;
     config.checkpoint_every_n_layers = args->checkpoint_every_n_layers;
     config.validate_every_n = args->validate_every_n;
+    config.ste_steps = args->ste_steps;
     config.kl_weight = args->kl_weight;
     return transformer_run_ternary_conversion(&config);
 }
@@ -576,6 +584,7 @@ typedef enum {
     CLI_OPT_VALIDATION_SAMPLES,
     CLI_OPT_CHECKPOINT_EVERY,
     CLI_OPT_VALIDATE_EVERY,
+    CLI_OPT_STE_STEPS,
     CLI_OPT_KL_WEIGHT,
     CLI_OPT_SAVE_STATE,
     CLI_OPT_LOAD_STATE
@@ -605,6 +614,7 @@ static cli_option_t parse_cli_option(const char *arg)
     if (strcmp(arg, "--validation-samples") == 0) return CLI_OPT_VALIDATION_SAMPLES;
     if (strcmp(arg, "--checkpoint-every") == 0) return CLI_OPT_CHECKPOINT_EVERY;
     if (strcmp(arg, "--validate-every") == 0) return CLI_OPT_VALIDATE_EVERY;
+    if (strcmp(arg, "--ste-steps") == 0) return CLI_OPT_STE_STEPS;
     if (strcmp(arg, "--kl-weight") == 0) return CLI_OPT_KL_WEIGHT;
     if (strcmp(arg, "--save-state") == 0) return CLI_OPT_SAVE_STATE;
     if (strcmp(arg, "--load-state") == 0) return CLI_OPT_LOAD_STATE;
@@ -632,6 +642,7 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_VALIDATION_SAMPLES: args->validation_sample_limit = atoi(value); break;
         case CLI_OPT_CHECKPOINT_EVERY: args->checkpoint_every_n_layers = atoi(value); break;
         case CLI_OPT_VALIDATE_EVERY: args->validate_every_n = atoi(value); break;
+        case CLI_OPT_STE_STEPS: args->ste_steps = atoi(value); break;
         case CLI_OPT_KL_WEIGHT: args->kl_weight = (float)atof(value); break;
         case CLI_OPT_SAVE_STATE: args->save_state_path = value; break;
         case CLI_OPT_LOAD_STATE: args->load_state_path = value; break;

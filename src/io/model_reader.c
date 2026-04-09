@@ -272,15 +272,16 @@ static llm_model_t *load_model_sharded(const model_spec_t *model_spec,
 
     for (int i = 0; i < shard_count; i++) free(shard_paths[i]);
     free(shard_paths);
-    shard_paths  = NULL;
-    shard_count  = 0;
+    shard_paths = NULL;
+    int loaded_shard_count = shard_count;
+    shard_count = 0;
 
     /* Post-pass: weight-tie lm_head and verify mandatory tensors */
     if (resolve_post_shard(model) != 0) {
         goto fail_shards;
     }
 
-    LOG_INFO("\u2713 All %d shards loaded successfully", shard_count);
+    LOG_INFO("\u2713 All %d shards loaded successfully", loaded_shard_count);
     return model;
 
 fail_shards:

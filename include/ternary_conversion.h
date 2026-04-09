@@ -25,6 +25,7 @@ typedef struct {
     int validation_sample_limit;
     int checkpoint_every_n_layers;
     int validate_every_n;
+    int ste_steps;
     float kl_weight;
 } ternary_conversion_config_t;
 

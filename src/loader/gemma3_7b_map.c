@@ -44,7 +44,13 @@ const tensor_map_entry_t GEMMA3_7B_TENSOR_MAP[] = {
     G7B_LAYER(10), G7B_LAYER(11), G7B_LAYER(12), G7B_LAYER(13), G7B_LAYER(14),
     G7B_LAYER(15), G7B_LAYER(16), G7B_LAYER(17), G7B_LAYER(18), G7B_LAYER(19),
     G7B_LAYER(20), G7B_LAYER(21), G7B_LAYER(22), G7B_LAYER(23), G7B_LAYER(24),
-    G7B_LAYER(25), G7B_LAYER(26), G7B_LAYER(27), G7B_LAYER(28), G7B_LAYER(29),
+    G7B_LAYER(25), G7B_LAYER(26), G7B_LAYER(27),
+
+    /* Final norm and LM head must stay within the trimmed 7B runtime prefix. */
+    {"language_model.model.norm.weight", "final", "norm_final_weight"},
+    {"language_model.lm_head.weight",    "final", "lm_head_weight"},
+
+    G7B_LAYER(28), G7B_LAYER(29),
     G7B_LAYER(30), G7B_LAYER(31), G7B_LAYER(32), G7B_LAYER(33), G7B_LAYER(34),
     G7B_LAYER(35), G7B_LAYER(36), G7B_LAYER(37), G7B_LAYER(38), G7B_LAYER(39),
     G7B_LAYER(40), G7B_LAYER(41), G7B_LAYER(42), G7B_LAYER(43), G7B_LAYER(44),
@@ -52,9 +58,6 @@ const tensor_map_entry_t GEMMA3_7B_TENSOR_MAP[] = {
     G7B_LAYER(50), G7B_LAYER(51), G7B_LAYER(52), G7B_LAYER(53), G7B_LAYER(54),
     G7B_LAYER(55), G7B_LAYER(56), G7B_LAYER(57), G7B_LAYER(58), G7B_LAYER(59),
     G7B_LAYER(60), G7B_LAYER(61), G7B_LAYER(62), G7B_LAYER(63),
-
-    {"language_model.model.norm.weight", "final", "norm_final_weight"},
-    {"language_model.lm_head.weight",    "final", "lm_head_weight"},
 
     {NULL, NULL, NULL}
 };

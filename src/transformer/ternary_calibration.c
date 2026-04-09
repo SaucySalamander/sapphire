@@ -244,7 +244,11 @@ static void seed_latent_weights(ternary_calibration_result_t *result,
                                 float clip_value)
 {
     for (size_t i = 0; i < weight_count; ++i) {
-        float value = bf16_to_f32_scalar(bf16_weights[i]);
+        uint16_t raw_value = 0;
+        memcpy(&raw_value,
+               (const unsigned char *)bf16_weights + i * sizeof(uint16_t),
+               sizeof(raw_value));
+        float value = bf16_to_f32_scalar(raw_value);
 
         if (value > clip_value) {
             value = clip_value;
@@ -1012,7 +1016,8 @@ static void compute_distillation_sample_weights(const distillation_weight_reques
     }
 
     if (!config || config->kl_weight <= 0.0f || !corpus || !corpus->session ||
-        !corpus->tokenizer || !corpus->model_spec || !corpus->tensor_name || sample_count <= 0) {
+        !corpus->tokenizer || !corpus->model_spec || !corpus->tensor_name ||
+        !corpus->sample_texts || corpus->sample_count <= 0 || sample_count <= 0) {
         return;
     }
 
@@ -1300,6 +1305,10 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
         transformer_free_ternary_calibration_result(out_result);
         return -1;
     }
+    out_result->weight_count = weight_count;
+    out_result->packed_weight_bytes = packed_bytes;
+    out_result->rows = rows;
+    out_result->cols = cols;
     velocity = (float *)calloc(weight_count, sizeof(float));
     actual_sample_count = effective_config.calibration_samples;
     calibration_vectors = build_calibration_vectors(cols,
