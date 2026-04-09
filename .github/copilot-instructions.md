@@ -67,6 +67,12 @@ Workflow-Specific Rules
 
 Validation
 
+- Any code change prepared for handoff or commit must be brought to pre-commit-clean state, not merely buildable in isolation.
+- For changes I make, the minimum required local gate is:
+    - `make bin`
+    - `make check-cppcheck`
+    - `make check-complexity`
+- If a change cannot be validated against those gates in the current environment, stop and report that explicitly instead of assuming it is ready to commit.
 - For general runtime changes, build with:
     - `make bin`
 - For Vulkan or shader changes, build with:

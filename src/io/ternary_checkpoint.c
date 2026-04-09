@@ -74,6 +74,8 @@ static size_t checkpoint_payload_size(const ternary_student_update_checkpoint_t 
     size += sizeof("teacher_model_name\t\n") - 1u + text_len(checkpoint->teacher_model_name);
     size += sizeof("output_dir\t\n") - 1u + text_len(checkpoint->output_dir);
     size += sizeof("activation_tape_path\t\n") - 1u + text_len(checkpoint->activation_tape_path);
+    size += sizeof("hessian_sidecar_path\t\n") - 1u + text_len(checkpoint->hessian_sidecar_path);
+    size += sizeof("hessian_sidecar_crc32\t00000000\n") - 1u;
     size += sizeof("alignment_manifest_path\t\n") - 1u + text_len(checkpoint->alignment_manifest_path);
     size += sizeof("alignment_manifest_crc32\t00000000\n") - 1u;
     size += sizeof("alignment_tape_path\t\n") - 1u + text_len(checkpoint->alignment_tape_path);
@@ -120,6 +122,8 @@ static int build_checkpoint_payload(const ternary_student_update_checkpoint_t *c
         append_line(&cursor, &remaining, "teacher_model_name", checkpoint->teacher_model_name) != 0 ||
         append_line(&cursor, &remaining, "output_dir", checkpoint->output_dir) != 0 ||
         append_line(&cursor, &remaining, "activation_tape_path", checkpoint->activation_tape_path) != 0 ||
+        append_line(&cursor, &remaining, "hessian_sidecar_path", checkpoint->hessian_sidecar_path) != 0 ||
+        append_hex32_line(&cursor, &remaining, "hessian_sidecar_crc32", checkpoint->hessian_sidecar_crc32) != 0 ||
         append_line(&cursor, &remaining, "alignment_manifest_path", checkpoint->alignment_manifest_path) != 0 ||
         append_hex32_line(&cursor, &remaining, "alignment_manifest_crc32", checkpoint->alignment_manifest_crc32) != 0 ||
         append_line(&cursor, &remaining, "alignment_tape_path", checkpoint->alignment_tape_path) != 0 ||
@@ -245,6 +249,12 @@ static int parse_checkpoint_line(ternary_student_update_checkpoint_t *checkpoint
     }
     if (strcmp(key, "activation_tape_path") == 0) {
         return copy_line_field(checkpoint->activation_tape_path, sizeof(checkpoint->activation_tape_path), value);
+    }
+    if (strcmp(key, "hessian_sidecar_path") == 0) {
+        return copy_line_field(checkpoint->hessian_sidecar_path, sizeof(checkpoint->hessian_sidecar_path), value);
+    }
+    if (strcmp(key, "hessian_sidecar_crc32") == 0) {
+        return parse_hex_u32_value(value, &checkpoint->hessian_sidecar_crc32);
     }
     if (strcmp(key, "alignment_manifest_path") == 0) {
         return copy_line_field(checkpoint->alignment_manifest_path, sizeof(checkpoint->alignment_manifest_path), value);

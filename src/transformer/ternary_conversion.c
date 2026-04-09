@@ -16,6 +16,7 @@
 #include "ternary_checkpoint.h"
 #include "ternary_calibration.h"
 #include "ternary_io.h"
+#include "ternary_hessian_sidecar.h"
 #include "ternary_validation.h"
 
 #include <errno.h>
@@ -41,11 +42,14 @@ typedef struct {
     char *checkpoint_path;
     char *checkpoint_tmp_path;
     uint32_t activation_tape_hash;
+    uint32_t hessian_sidecar_crc32;
     uint32_t resume_step_index;
     ternary_hessian_proxy_cache_t hessian_proxy_cache;
+    ternary_hessian_sidecar_t *hessian_sidecar;
 } conversion_runtime_t;
 
-static uint32_t config_resume_hash(const ternary_conversion_config_t *config)
+static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
+                                   uint32_t hessian_sidecar_crc32)
 {
     uint32_t crc32 = 0u;
     int ste_steps = 3;
@@ -78,6 +82,8 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config)
     crc32 = io_crc32_update(crc32, &config->hessian_proxy_strength, sizeof(config->hessian_proxy_strength));
     crc32 = io_crc32_update(crc32, &config->hessian_proxy_floor, sizeof(config->hessian_proxy_floor));
     crc32 = io_crc32_update(crc32, &config->max_grad_norm, sizeof(config->max_grad_norm));
+    crc32 = io_crc32_update(crc32, config->hessian_sidecar_path, config->hessian_sidecar_path ? strlen(config->hessian_sidecar_path) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, &hessian_sidecar_crc32, sizeof(hessian_sidecar_crc32));
     return crc32;
 }
 
@@ -506,20 +512,13 @@ static int student_checkpoint_progress(const ternary_conversion_config_t *config
                                     runtime->alignment_tape_path);
 }
 
-static int init_checkpoint_state(const ternary_conversion_config_t *config,
+static int init_checkpoint_paths(const ternary_conversion_config_t *config,
                                  conversion_runtime_t *runtime)
 {
     char *checkpoint_path = NULL;
     char *tmp_path = NULL;
-    char *alignment_manifest_path = NULL;
-    char *alignment_tape_path = NULL;
-    int load_rc = 0;
-    uint32_t total_layer_count = 0u;
 
     if (!config || !runtime) {
-        return -1;
-    }
-    if (!runtime->model_spec) {
         return -1;
     }
 
@@ -531,12 +530,17 @@ static int init_checkpoint_state(const ternary_conversion_config_t *config,
 
     runtime->checkpoint_path = checkpoint_path;
     runtime->checkpoint_tmp_path = tmp_path;
-    total_layer_count = (runtime->model_spec->tensor_map_size > 0)
-        ? (uint32_t)runtime->model_spec->tensor_map_size
-        : 0u;
+    return 0;
+}
+
+static void seed_checkpoint_state_defaults(const ternary_conversion_config_t *config,
+                                           conversion_runtime_t *runtime,
+                                           uint32_t total_layer_count,
+                                           uint32_t config_hash)
+{
     runtime->checkpoint_state.total_layer_count = total_layer_count;
     runtime->checkpoint_state.schema_version = TERNARY_STUDENT_CHECKPOINT_VERSION;
-    runtime->checkpoint_state.config_hash = config_resume_hash(config);
+    runtime->checkpoint_state.config_hash = config_hash;
     runtime->checkpoint_state.checkpoint_every_n_layers = (config->checkpoint_every_n_layers > 0)
         ? (uint32_t)config->checkpoint_every_n_layers
         : 1u;
@@ -548,23 +552,18 @@ static int init_checkpoint_state(const ternary_conversion_config_t *config,
     copy_text_field_local(runtime->checkpoint_state.teacher_model_name, sizeof(runtime->checkpoint_state.teacher_model_name), config->teacher_model_name);
     copy_text_field_local(runtime->checkpoint_state.output_dir, sizeof(runtime->checkpoint_state.output_dir), config->output_path);
     copy_text_field_local(runtime->checkpoint_state.activation_tape_path, sizeof(runtime->checkpoint_state.activation_tape_path), config->activation_tape_path);
+    copy_text_field_local(runtime->checkpoint_state.hessian_sidecar_path, sizeof(runtime->checkpoint_state.hessian_sidecar_path), config->hessian_sidecar_path);
     copy_text_field_local(runtime->checkpoint_state.calibration_corpus_path, sizeof(runtime->checkpoint_state.calibration_corpus_path), config->calibration_corpus_path);
     copy_text_field_local(runtime->checkpoint_state.calibration_corpus_manifest_path, sizeof(runtime->checkpoint_state.calibration_corpus_manifest_path), config->calibration_corpus_manifest_path);
     copy_text_field_local(runtime->checkpoint_state.validation_corpus_path, sizeof(runtime->checkpoint_state.validation_corpus_path), config->validation_corpus_path);
     copy_text_field_local(runtime->checkpoint_state.validation_corpus_manifest_path, sizeof(runtime->checkpoint_state.validation_corpus_manifest_path), config->validation_corpus_manifest_path);
+}
 
-    load_rc = ternary_student_checkpoint_load(checkpoint_path, &runtime->checkpoint_state);
-    if (load_rc == 1) {
-        LOG_INFO("student update: no checkpoint found at %s; starting fresh", checkpoint_path);
-        if (manifest_path_exists(config->output_path) > 0) {
-            LOG_ERROR("student update: output directory %s already contains a manifest but no checkpoint", config->output_path);
-            return -1;
-        }
-        return 0;
-    }
-    if (load_rc != 0) {
-        return -1;
-    }
+static int validate_loaded_checkpoint_state(const ternary_conversion_config_t *config,
+                                            const conversion_runtime_t *runtime,
+                                            uint32_t total_layer_count,
+                                            uint32_t config_hash)
+{
     if (runtime->checkpoint_state.total_layer_count != total_layer_count) {
         LOG_ERROR("student update: checkpoint total layer count mismatch (checkpoint=%u current=%u)",
                   runtime->checkpoint_state.total_layer_count,
@@ -575,30 +574,103 @@ static int init_checkpoint_state(const ternary_conversion_config_t *config,
         LOG_ERROR("student update: checkpoint schema mismatch");
         return -1;
     }
-    if (runtime->checkpoint_state.config_hash != config_resume_hash(config)) {
+    if (runtime->checkpoint_state.config_hash != config_hash) {
         LOG_ERROR("student update: checkpoint config hash mismatch");
+        return -1;
+    }
+    if (config->hessian_sidecar_path && config->hessian_sidecar_path[0] != '\0') {
+        if (runtime->checkpoint_state.hessian_sidecar_path[0] == '\0' ||
+            strcmp(runtime->checkpoint_state.hessian_sidecar_path, config->hessian_sidecar_path) != 0) {
+            LOG_ERROR("student update: checkpoint Hessian sidecar path mismatch");
+            return -1;
+        }
+        if (runtime->checkpoint_state.hessian_sidecar_crc32 != runtime->hessian_sidecar_crc32) {
+            LOG_ERROR("student update: checkpoint Hessian sidecar checksum mismatch");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int restore_checkpoint_alignment_paths(conversion_runtime_t *runtime)
+{
+    char *alignment_manifest_path = NULL;
+    char *alignment_tape_path = NULL;
+
+    if (!runtime) {
         return -1;
     }
 
     if (runtime->checkpoint_state.alignment_manifest_path[0] != '\0') {
-        free(runtime->alignment_manifest_path);
-        runtime->alignment_manifest_path = NULL;
         alignment_manifest_path = duplicate_text_local(runtime->checkpoint_state.alignment_manifest_path);
         if (!alignment_manifest_path) {
-            return -1;
+            goto fail;
         }
+        free(runtime->alignment_manifest_path);
         runtime->alignment_manifest_path = alignment_manifest_path;
         alignment_manifest_path = NULL;
     }
     if (runtime->checkpoint_state.alignment_tape_path[0] != '\0') {
-        free(runtime->alignment_tape_path);
-        runtime->alignment_tape_path = NULL;
         alignment_tape_path = duplicate_text_local(runtime->checkpoint_state.alignment_tape_path);
         if (!alignment_tape_path) {
-            return -1;
+            goto fail;
         }
+        free(runtime->alignment_tape_path);
         runtime->alignment_tape_path = alignment_tape_path;
         alignment_tape_path = NULL;
+    }
+
+    return 0;
+
+fail:
+    free(alignment_manifest_path);
+    free(alignment_tape_path);
+    return -1;
+}
+
+static int init_checkpoint_state(const ternary_conversion_config_t *config,
+                                 conversion_runtime_t *runtime)
+{
+    int load_rc = 0;
+    uint32_t config_hash = 0u;
+    uint32_t total_layer_count = 0u;
+
+    if (!config || !runtime) {
+        return -1;
+    }
+    if (!runtime->model_spec) {
+        return -1;
+    }
+
+    if (init_checkpoint_paths(config, runtime) != 0) {
+        return -1;
+    }
+
+    total_layer_count = (runtime->model_spec->tensor_map_size > 0)
+        ? (uint32_t)runtime->model_spec->tensor_map_size
+        : 0u;
+    config_hash = config_resume_hash(config,
+                                     runtime->hessian_sidecar ? runtime->hessian_sidecar_crc32 : 0u);
+    seed_checkpoint_state_defaults(config, runtime, total_layer_count, config_hash);
+
+    load_rc = ternary_student_checkpoint_load(runtime->checkpoint_path, &runtime->checkpoint_state);
+    if (load_rc == 1) {
+        LOG_INFO("student update: no checkpoint found at %s; starting fresh", runtime->checkpoint_path);
+        if (manifest_path_exists(config->output_path) > 0) {
+            LOG_ERROR("student update: output directory %s already contains a manifest but no checkpoint", config->output_path);
+            return -1;
+        }
+        return 0;
+    }
+    if (load_rc != 0) {
+        return -1;
+    }
+    if (validate_loaded_checkpoint_state(config, runtime, total_layer_count, config_hash) != 0) {
+        return -1;
+    }
+    if (restore_checkpoint_alignment_paths(runtime) != 0) {
+        return -1;
     }
 
     if (ternary_student_checkpoint_validate_alignment(&runtime->checkpoint_state, runtime->activation_tape) != 0) {
@@ -635,8 +707,12 @@ static int write_student_checkpoint(const ternary_conversion_config_t *config,
     copy_text_field_local(checkpoint.alignment_tape_path,
                           sizeof(checkpoint.alignment_tape_path),
                           effective_alignment_tape_path);
+    copy_text_field_local(checkpoint.hessian_sidecar_path,
+                          sizeof(checkpoint.hessian_sidecar_path),
+                          config->hessian_sidecar_path);
     checkpoint.alignment_manifest_crc32 = 0u;
     checkpoint.alignment_tape_provenance_hash = 0u;
+    checkpoint.hessian_sidecar_crc32 = runtime->hessian_sidecar_crc32;
 
     if (effective_alignment_manifest_path && effective_alignment_manifest_path[0] != '\0') {
         if (ternary_student_checkpoint_compute_manifest_crc32(effective_alignment_manifest_path,
@@ -788,6 +864,8 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
     ste_config.adam_epsilon = 1e-8f;
     ste_config.telemetry_interval = 10;
     ste_config.telemetry_path = "./out/ternary_telemetry.jsonl";
+    ste_config.hessian_sidecar_path = config ? config->hessian_sidecar_path : NULL;
+    ste_config.hessian_sidecar_crc32 = 0u;
     ste_config.telemetry = NULL;
     return ste_config;
 }
@@ -853,6 +931,9 @@ static void destroy_conversion_runtime(conversion_runtime_t *runtime) {
         return;
     }
 
+    if (runtime->hessian_sidecar) {
+        ternary_hessian_sidecar_close(runtime->hessian_sidecar);
+    }
     if (runtime->activation_tape) {
         activation_tape_close(runtime->activation_tape);
     }
@@ -936,6 +1017,138 @@ static void init_conversion_validation(const ternary_conversion_config_t *config
     }
 }
 
+static int open_runtime_activation_tape(const ternary_conversion_config_t *config,
+                                        conversion_runtime_t *runtime)
+{
+    if (!config || !runtime) {
+        return -1;
+    }
+
+    if (!config->activation_tape_path || config->activation_tape_path[0] == '\0') {
+        return 0;
+    }
+
+    runtime->activation_tape = activation_tape_open(config->activation_tape_path);
+    if (!runtime->activation_tape) {
+        LOG_ERROR("ternary conversion: failed to open activation tape %s", config->activation_tape_path);
+        return -1;
+    }
+    runtime->activation_tape_hash = activation_tape_crc32(runtime->activation_tape);
+    return 0;
+}
+
+static int open_runtime_hessian_sidecar(const ternary_conversion_config_t *config,
+                                        conversion_runtime_t *runtime)
+{
+    const char *sidecar_teacher_name = NULL;
+
+    if (!config || !runtime) {
+        return -1;
+    }
+
+    if (!config->hessian_sidecar_path || config->hessian_sidecar_path[0] == '\0') {
+        return 0;
+    }
+    if (!runtime->activation_tape) {
+        LOG_ERROR("ternary conversion: --hessian-sidecar requires --activation-tape");
+        return -1;
+    }
+
+    runtime->hessian_sidecar = ternary_hessian_sidecar_open(config->hessian_sidecar_path);
+    if (!runtime->hessian_sidecar) {
+        LOG_ERROR("ternary conversion: failed to open Hessian sidecar %s", config->hessian_sidecar_path);
+        return -1;
+    }
+
+    runtime->hessian_sidecar_crc32 = ternary_hessian_sidecar_crc32(runtime->hessian_sidecar);
+    if (activation_tape_crc32(runtime->activation_tape) != ternary_hessian_sidecar_tape_crc32(runtime->hessian_sidecar)) {
+        LOG_ERROR("ternary conversion: Hessian sidecar tape CRC mismatch for %s", config->hessian_sidecar_path);
+        return -1;
+    }
+
+    sidecar_teacher_name = ternary_hessian_sidecar_teacher_model_name(runtime->hessian_sidecar);
+    if (config->teacher_model_name && config->teacher_model_name[0] != '\0' &&
+        sidecar_teacher_name && strcmp(config->teacher_model_name, sidecar_teacher_name) != 0) {
+        LOG_ERROR("ternary conversion: Hessian sidecar teacher model mismatch (config=%s sidecar=%s)",
+                  config->teacher_model_name,
+                  sidecar_teacher_name);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void attach_runtime_activation_context(conversion_runtime_t *runtime)
+{
+    runtime->model_spec = runtime->activation_ctx->spec;
+    runtime->tokenizer = runtime->activation_ctx->tokenizer;
+    runtime->calibration_corpus.tokenizer = runtime->activation_ctx->tokenizer;
+    runtime->calibration_corpus.model_spec = runtime->activation_ctx->spec;
+    runtime->calibration_corpus.session = runtime->activation_ctx->session;
+}
+
+static int attach_runtime_tokenizer_fallback(const char *model_dir,
+                                             model_spec_t *spec,
+                                             conversion_runtime_t *runtime)
+{
+    runtime->tokenizer = tokenizer_load(model_dir);
+    if (!runtime->tokenizer) {
+        LOG_ERROR("ternary conversion: failed to load tokenizer from %s", model_dir);
+        return -1;
+    }
+
+    runtime->model_spec = spec;
+    runtime->previous_tokenizer_handle = spec->tokenizer_handle;
+    spec->tokenizer_handle = runtime->tokenizer;
+    runtime->calibration_corpus.tokenizer = runtime->tokenizer;
+    runtime->calibration_corpus.model_spec = spec;
+    runtime->calibration_corpus.session = NULL;
+    return 0;
+}
+
+static int load_runtime_corpus_if_needed(const ternary_conversion_config_t *config,
+                                         conversion_runtime_t *runtime)
+{
+    if (!config || !runtime) {
+        return -1;
+    }
+
+    if ((!config->calibration_corpus_manifest_path || config->calibration_corpus_manifest_path[0] == '\0') &&
+        (!config->calibration_corpus_path || config->calibration_corpus_path[0] == '\0')) {
+        return 0;
+    }
+
+    if (load_runtime_corpus(config->calibration_corpus_manifest_path,
+                            config->calibration_corpus_path,
+                            config->calibration_sample_limit,
+                            &runtime->corpus_storage) != 0) {
+        return -1;
+    }
+
+    runtime->calibration_corpus.sample_texts = (const char *const *)runtime->corpus_storage.samples;
+    runtime->calibration_corpus.sample_count = runtime->corpus_storage.sample_count;
+    return 0;
+}
+
+static int finalize_conversion_runtime_state(const ternary_conversion_config_t *config,
+                                             conversion_runtime_t *runtime)
+{
+    if (prepare_teacher_student_alignment(config, runtime) != 0) {
+        return -1;
+    }
+    if (init_checkpoint_state(config, runtime) != 0) {
+        return -1;
+    }
+
+    runtime->resume_step_index = runtime->checkpoint_state.next_layer_index;
+    init_conversion_validation(config, runtime);
+    if (resume_validation_from_manifest(config, runtime) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
 static int init_conversion_runtime(const ternary_conversion_config_t *config,
                                    const char *model_dir,
                                    conversion_runtime_t *out_runtime) {
@@ -953,14 +1166,10 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
         return -1;
     }
 
-    if (config->activation_tape_path && config->activation_tape_path[0] != '\0') {
-        out_runtime->activation_tape = activation_tape_open(config->activation_tape_path);
-        if (!out_runtime->activation_tape) {
-            LOG_ERROR("ternary conversion: failed to open activation tape %s", config->activation_tape_path);
-            destroy_conversion_runtime(out_runtime);
-            return -1;
-        }
-        out_runtime->activation_tape_hash = activation_tape_crc32(out_runtime->activation_tape);
+    if (open_runtime_activation_tape(config, out_runtime) != 0 ||
+        open_runtime_hessian_sidecar(config, out_runtime) != 0) {
+        destroy_conversion_runtime(out_runtime);
+        return -1;
     }
 
     out_runtime->activation_ctx = create_inference_context(0.0f,
@@ -968,90 +1177,21 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
                                                            config->context_len > 0 ? config->context_len : 2048,
                                                            config->model_name);
     if (out_runtime->activation_ctx) {
-        out_runtime->model_spec = out_runtime->activation_ctx->spec;
-        out_runtime->tokenizer = out_runtime->activation_ctx->tokenizer;
-        out_runtime->calibration_corpus.tokenizer = out_runtime->activation_ctx->tokenizer;
-        out_runtime->calibration_corpus.model_spec = out_runtime->activation_ctx->spec;
-        out_runtime->calibration_corpus.session = out_runtime->activation_ctx->session;
+        attach_runtime_activation_context(out_runtime);
     } else {
         LOG_WARN("ternary conversion: failed to initialize activation replay context; using tokenized fallback vectors");
-    }
-
-    if (out_runtime->activation_ctx) {
-        if ((config->calibration_corpus_manifest_path && config->calibration_corpus_manifest_path[0] != '\0') ||
-            (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0')) {
-            if (load_runtime_corpus(config->calibration_corpus_manifest_path,
-                                    config->calibration_corpus_path,
-                                    config->calibration_sample_limit,
-                                    &out_runtime->corpus_storage) != 0) {
-                destroy_conversion_runtime(out_runtime);
-                return -1;
-            }
-            out_runtime->calibration_corpus.sample_texts =
-                (const char *const *)out_runtime->corpus_storage.samples;
-            out_runtime->calibration_corpus.sample_count = out_runtime->corpus_storage.sample_count;
-        }
-        if (prepare_teacher_student_alignment(config, out_runtime) != 0) {
+        if (attach_runtime_tokenizer_fallback(model_dir, spec, out_runtime) != 0) {
             destroy_conversion_runtime(out_runtime);
             return -1;
         }
-        if (init_checkpoint_state(config, out_runtime) != 0) {
-            destroy_conversion_runtime(out_runtime);
-            return -1;
-        }
-        out_runtime->resume_step_index = out_runtime->checkpoint_state.next_layer_index;
-        init_conversion_validation(config, out_runtime);
-        if (resume_validation_from_manifest(config, out_runtime) != 0) {
-            destroy_conversion_runtime(out_runtime);
-            return -1;
-        }
-        return 0;
-    }
-
-    out_runtime->tokenizer = tokenizer_load(model_dir);
-    if (!out_runtime->tokenizer) {
-        LOG_ERROR("ternary conversion: failed to load tokenizer from %s", model_dir);
-        destroy_conversion_runtime(out_runtime);
-        return -1;
-    }
-
-    out_runtime->model_spec = spec;
-    out_runtime->previous_tokenizer_handle = spec->tokenizer_handle;
-    spec->tokenizer_handle = out_runtime->tokenizer;
-    out_runtime->calibration_corpus.tokenizer = out_runtime->tokenizer;
-    out_runtime->calibration_corpus.model_spec = spec;
-    out_runtime->calibration_corpus.session = NULL;
-
-    if ((config->calibration_corpus_manifest_path && config->calibration_corpus_manifest_path[0] != '\0') ||
-        (config->calibration_corpus_path && config->calibration_corpus_path[0] != '\0')) {
-        if (load_runtime_corpus(config->calibration_corpus_manifest_path,
-                                config->calibration_corpus_path,
-                                config->calibration_sample_limit,
-                                &out_runtime->corpus_storage) != 0) {
-            destroy_conversion_runtime(out_runtime);
-            return -1;
-        }
-        out_runtime->calibration_corpus.sample_texts =
-            (const char *const *)out_runtime->corpus_storage.samples;
-        out_runtime->calibration_corpus.sample_count = out_runtime->corpus_storage.sample_count;
-    } else {
+        if ((!config->calibration_corpus_manifest_path || config->calibration_corpus_manifest_path[0] == '\0') &&
+            (!config->calibration_corpus_path || config->calibration_corpus_path[0] == '\0')) {
         LOG_WARN("ternary conversion: no calibration corpus provided; using built-in fallback prompts");
+        }
     }
 
-    if (prepare_teacher_student_alignment(config, out_runtime) != 0) {
-        destroy_conversion_runtime(out_runtime);
-        return -1;
-    }
-
-    if (init_checkpoint_state(config, out_runtime) != 0) {
-        destroy_conversion_runtime(out_runtime);
-        return -1;
-    }
-
-    out_runtime->resume_step_index = out_runtime->checkpoint_state.next_layer_index;
-
-    init_conversion_validation(config, out_runtime);
-    if (resume_validation_from_manifest(config, out_runtime) != 0) {
+    if (load_runtime_corpus_if_needed(config, out_runtime) != 0 ||
+        finalize_conversion_runtime_state(config, out_runtime) != 0) {
         destroy_conversion_runtime(out_runtime);
         return -1;
     }
@@ -1091,6 +1231,8 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
     }
 
     ste_config = default_runtime_ste_config(config);
+    ste_config.hessian_sidecar_path = config->hessian_sidecar_path;
+    ste_config.hessian_sidecar_crc32 = runtime ? runtime->hessian_sidecar_crc32 : 0u;
 
     if (transformer_calibrate_layer_ste_with_tape(map.bf16_weights,
                                                   map.rows,
@@ -1111,7 +1253,8 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
                                                                 .tensor_name = config->layer_name,
                                                                 .proxy_cache = NULL
                                                             }
-                                                          : NULL
+                                                          : NULL,
+                                                      .sidecar = runtime ? runtime->hessian_sidecar : NULL
                                                   } : NULL,
                                                   &result) != 0) {
         io_unmap_layer_bf16(&map);
@@ -1144,6 +1287,7 @@ typedef struct {
     const char *output_dir;
     const char *tensor_name;
     const activation_tape_t *activation_tape;
+    const ternary_hessian_sidecar_t *hessian_sidecar;
     ternary_hessian_proxy_cache_t *hessian_proxy_cache;
     const transformer_ste_config_t *ste_config;
     const ternary_calibration_corpus_t *calibration_corpus;
@@ -1268,6 +1412,7 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
             .tensor_name = job->tensor_name,
             .proxy_cache = job->hessian_proxy_cache
         };
+        calibration_source.sidecar = job->hessian_sidecar;
 
         if (transformer_calibrate_layer_ste_with_tape(map.bf16_weights,
                                                       map.rows,
@@ -1438,6 +1583,8 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     if (task->runtime && task->runtime->activation_tape && tensor_name_is_layer_tensor(task->tensor_name)) {
         use_layer_telemetry = 1;
         layer_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
+        layer_ste_config.hessian_sidecar_path = task->config->hessian_sidecar_path;
+        layer_ste_config.hessian_sidecar_crc32 = task->runtime->hessian_sidecar_crc32;
         telemetry_prepare_layer_context(&layer_telemetry, task->runtime, task->layer_index);
         layer_ste_config.telemetry = &layer_telemetry;
         prefetch_activation_tape_lookahead(task->runtime,
@@ -1460,6 +1607,7 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     job.output_dir = task->config->output_path;
     job.tensor_name = task->tensor_name;
     job.activation_tape = task->runtime ? task->runtime->activation_tape : NULL;
+    job.hessian_sidecar = task->runtime ? task->runtime->hessian_sidecar : NULL;
     job.hessian_proxy_cache = task->runtime ? &task->runtime->hessian_proxy_cache : NULL;
     job.ste_config = use_layer_telemetry ? &layer_ste_config : task->ste_config;
     job.calibration_corpus = task->runtime ? &active_corpus : NULL;
@@ -1505,9 +1653,8 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
         }
     }
     ste_config = default_runtime_ste_config(config);
-    if (io_prepare_ternary_output_dir(config->output_path) != 0) {
-        return -1;
-    }
+    ste_config.hessian_sidecar_path = config->hessian_sidecar_path;
+    ste_config.hessian_sidecar_crc32 = runtime ? runtime->hessian_sidecar_crc32 : 0u;
 
     int last_prefetched_entry_idx = -1;
 
@@ -1618,6 +1765,9 @@ static void log_conversion_config(const ternary_conversion_config_t *config)
     }
     if (config_has_text(config->teacher_model_name)) {
         LOG_INFO("  teacher_model: %s", config->teacher_model_name);
+    }
+    if (config_has_text(config->hessian_sidecar_path)) {
+        LOG_INFO("  hessian_sidecar: %s", config->hessian_sidecar_path);
     }
 
     log_conversion_corpus_inputs(config);

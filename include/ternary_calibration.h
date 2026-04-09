@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ternary_hessian_sidecar.h"
 #include "ternary_hessian_proxy.h"
 #include "ternary_telemetry.h"
 
@@ -40,6 +41,8 @@ typedef struct {
     float adam_epsilon;
     int telemetry_interval;
     const char *telemetry_path;
+    const char *hessian_sidecar_path;
+    uint32_t hessian_sidecar_crc32;
     ternary_telemetry_t *telemetry;
 } transformer_ste_config_t;
 
@@ -61,6 +64,7 @@ typedef struct {
 typedef struct {
     const ternary_calibration_corpus_t *corpus;
     const ternary_activation_tape_context_t *tape_context;
+    const ternary_hessian_sidecar_t *sidecar;
 } ternary_calibration_source_t;
 
 typedef struct {

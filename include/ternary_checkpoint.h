@@ -29,10 +29,12 @@ typedef struct {
     uint32_t validate_every_n;
     uint32_t alignment_manifest_crc32;
     uint32_t alignment_tape_provenance_hash;
+    uint32_t hessian_sidecar_crc32;
     char model_name[TERNARY_STUDENT_CHECKPOINT_MODEL_MAX];
     char teacher_model_name[TERNARY_STUDENT_CHECKPOINT_MODEL_MAX];
     char output_dir[TERNARY_STUDENT_CHECKPOINT_PATH_MAX];
     char activation_tape_path[TERNARY_STUDENT_CHECKPOINT_PATH_MAX];
+    char hessian_sidecar_path[TERNARY_STUDENT_CHECKPOINT_PATH_MAX];
     char alignment_manifest_path[TERNARY_STUDENT_CHECKPOINT_PATH_MAX];
     char alignment_tape_path[TERNARY_STUDENT_CHECKPOINT_PATH_MAX];
     char calibration_corpus_path[TERNARY_STUDENT_CHECKPOINT_PATH_MAX];

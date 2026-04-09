@@ -51,6 +51,7 @@ static void print_help(const char* program_name) {
     printf("  --teacher-model <name>    Optional teacher model for cross-architecture alignment\n");
     printf("  --calibration-corpus <p>  Optional text corpus file or URL for tokenized STE calibration\n");
     printf("  --activation-tape <path>  Optional activation tape for tape-backed calibration\n");
+    printf("  --hessian-sidecar <path>  Optional diagonal curvature sidecar keyed to --activation-tape\n");
     printf("  --calib-manifest <p>      Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
     printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
     printf("  --ste-steps <n>          STE optimization steps per tensor (default: 3)\n");
@@ -100,6 +101,7 @@ typedef struct {
     const char *output_path;
     const char *layer_name;
     const char *activation_tape_path;
+    const char *hessian_sidecar_path;
     const char *teacher_model_name;
     const char *calibration_corpus_path;
     const char *calibration_corpus_manifest_path;
@@ -135,6 +137,7 @@ static void cli_args_init(cli_args_t *args)
     args->output_path = NULL;
     args->layer_name = NULL;
     args->activation_tape_path = NULL;
+    args->hessian_sidecar_path = NULL;
     args->teacher_model_name = NULL;
     args->calibration_corpus_path = NULL;
     args->calibration_corpus_manifest_path = NULL;
@@ -183,7 +186,7 @@ static int validate_record_tape_args(const cli_args_t *args)
     return 0;
 }
 
-static int validate_convert_ternary_args(const cli_args_t *args)
+static int validate_convert_ternary_mode_args(const cli_args_t *args)
 {
     if (!args->convert_ternary) {
         return 0;
@@ -201,12 +204,26 @@ static int validate_convert_ternary_args(const cli_args_t *args)
         LOG_ERROR("ERROR: session state flags are not valid in --convert-ternary mode.");
         return -1;
     }
-    if (args->calibration_sample_limit <= 0) {
-        LOG_ERROR("ERROR: --calibration-samples must be > 0.");
-        return -1;
-    }
+
+    return 0;
+}
+
+static int validate_convert_ternary_tape_args(const cli_args_t *args)
+{
     if (args->activation_tape_path && args->activation_tape_path[0] == '\0') {
         LOG_ERROR("ERROR: --activation-tape must not be empty.");
+        return -1;
+    }
+    if (args->hessian_sidecar_path && args->hessian_sidecar_path[0] == '\0') {
+        LOG_ERROR("ERROR: --hessian-sidecar must not be empty.");
+        return -1;
+    }
+    if (args->hessian_sidecar_path && !args->activation_tape_path) {
+        LOG_ERROR("ERROR: --hessian-sidecar requires --activation-tape.");
+        return -1;
+    }
+    if (args->hessian_sidecar_path && args->disable_hessian_proxy) {
+        LOG_ERROR("ERROR: --hessian-sidecar cannot be combined with --disable-hessian-proxy.");
         return -1;
     }
     if (args->teacher_model_name && args->teacher_model_name[0] == '\0') {
@@ -221,12 +238,35 @@ static int validate_convert_ternary_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --teacher-model is only supported for full-model ternary conversion.");
         return -1;
     }
+
+    return 0;
+}
+
+static int validate_convert_ternary_corpus_args(const cli_args_t *args)
+{
     if (args->calibration_corpus_path && args->calibration_corpus_manifest_path) {
         LOG_ERROR("ERROR: use either --calibration-corpus or --calib-manifest, not both.");
         return -1;
     }
     if (args->validation_corpus_path && args->validation_corpus_manifest_path) {
         LOG_ERROR("ERROR: use either --validation-corpus or --validation-manifest, not both.");
+        return -1;
+    }
+    if (args->layer_name && args->validate_every_n > 0) {
+        LOG_ERROR("ERROR: --validate-every is only supported for full-model ternary conversion.");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int validate_convert_ternary_numeric_args(const cli_args_t *args)
+{
+    if (!args->convert_ternary) {
+        return 0;
+    }
+    if (args->calibration_sample_limit <= 0) {
+        LOG_ERROR("ERROR: --calibration-samples must be > 0.");
         return -1;
     }
     if (args->kl_weight < 0.0f) {
@@ -261,8 +301,16 @@ static int validate_convert_ternary_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --checkpoint-every must be > 0.");
         return -1;
     }
-    if (args->layer_name && args->validate_every_n > 0) {
-        LOG_ERROR("ERROR: --validate-every is only supported for full-model ternary conversion.");
+
+    return 0;
+}
+
+static int validate_convert_ternary_args(const cli_args_t *args)
+{
+    if (validate_convert_ternary_mode_args(args) != 0 ||
+        validate_convert_ternary_tape_args(args) != 0 ||
+        validate_convert_ternary_corpus_args(args) != 0 ||
+        validate_convert_ternary_numeric_args(args) != 0) {
         return -1;
     }
 
@@ -304,6 +352,7 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.output_path = args->output_path;
     config.layer_name = args->layer_name;
     config.activation_tape_path = args->activation_tape_path;
+    config.hessian_sidecar_path = args->hessian_sidecar_path;
     config.teacher_model_name = args->teacher_model_name;
     config.calibration_corpus_path = args->calibration_corpus_path;
     config.calibration_corpus_manifest_path = args->calibration_corpus_manifest_path;
@@ -603,6 +652,7 @@ typedef enum {
     CLI_OPT_OUTPUT,
     CLI_OPT_LAYER,
     CLI_OPT_ACTIVATION_TAPE,
+    CLI_OPT_HESSIAN_SIDECAR,
     CLI_OPT_TEACHER_MODEL,
     CLI_OPT_CALIBRATION_CORPUS,
     CLI_OPT_CALIBRATION_MANIFEST,
@@ -643,6 +693,7 @@ static const cli_option_alias_t g_cli_option_aliases[] = {
     { "--output", CLI_OPT_OUTPUT },
     { "--layer", CLI_OPT_LAYER },
     { "--activation-tape", CLI_OPT_ACTIVATION_TAPE },
+    { "--hessian-sidecar", CLI_OPT_HESSIAN_SIDECAR },
     { "--teacher-model", CLI_OPT_TEACHER_MODEL },
     { "--calibration-corpus", CLI_OPT_CALIBRATION_CORPUS },
     { "--calib-manifest", CLI_OPT_CALIBRATION_MANIFEST },
@@ -691,6 +742,7 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_OUTPUT: args->output_path = value; break;
         case CLI_OPT_LAYER: args->layer_name = value; break;
         case CLI_OPT_ACTIVATION_TAPE: args->activation_tape_path = value; break;
+        case CLI_OPT_HESSIAN_SIDECAR: args->hessian_sidecar_path = value; break;
         case CLI_OPT_TEACHER_MODEL: args->teacher_model_name = value; break;
         case CLI_OPT_CALIBRATION_CORPUS: args->calibration_corpus_path = value; break;
         case CLI_OPT_CALIBRATION_MANIFEST: args->calibration_corpus_manifest_path = value; break;

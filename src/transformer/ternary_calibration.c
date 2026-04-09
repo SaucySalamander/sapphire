@@ -69,6 +69,8 @@ static transformer_ste_config_t default_ste_config(void) {
     config.adam_epsilon = 1e-8f;
     config.telemetry_interval = 10;
     config.telemetry_path = "./out/ternary_telemetry.jsonl";
+    config.hessian_sidecar_path = NULL;
+    config.hessian_sidecar_crc32 = 0u;
     config.telemetry = NULL;
     return config;
 }
@@ -177,6 +179,8 @@ static uint32_t telemetry_compute_config_hash(const transformer_ste_config_t *co
     crc32 = io_crc32_update(crc32, &config->adam_beta2, sizeof(config->adam_beta2));
     crc32 = io_crc32_update(crc32, &config->adam_epsilon, sizeof(config->adam_epsilon));
     crc32 = io_crc32_update(crc32, &config->telemetry_interval, sizeof(config->telemetry_interval));
+    crc32 = io_crc32_update(crc32, config->hessian_sidecar_path, config->hessian_sidecar_path ? strlen(config->hessian_sidecar_path) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, &config->hessian_sidecar_crc32, sizeof(config->hessian_sidecar_crc32));
     crc32 = io_crc32_update(crc32, tensor_name, tensor_name ? strlen(tensor_name) + 1u : 0u);
     crc32 = io_crc32_update(crc32, &rows, sizeof(rows));
     crc32 = io_crc32_update(crc32, &cols, sizeof(cols));
@@ -1265,6 +1269,7 @@ typedef struct {
 typedef struct {
     const transformer_ste_config_t *config;
     const ternary_activation_tape_context_t *tape_context;
+    const ternary_hessian_sidecar_t *sidecar;
     const float *calibration_vectors;
     int sample_count;
     uint32_t cols;
@@ -1391,9 +1396,7 @@ static void hessian_proxy_result_reset(hessian_proxy_result_t *result)
 static int hessian_proxy_request_is_valid(const hessian_proxy_request_t *request)
 {
     return request && request->config && request->config->use_hessian_proxy &&
-           request->tape_context && request->tape_context->tape &&
-           request->tape_context->tensor_name && request->calibration_vectors &&
-           request->sample_count > 0 && request->cols > 0u;
+           request->calibration_vectors && request->sample_count > 0 && request->cols > 0u;
 }
 
 static int hessian_proxy_cache_matches(const ternary_hessian_proxy_cache_t *cache,
@@ -1415,6 +1418,66 @@ static void hessian_proxy_publish_cache_hit(const ternary_hessian_proxy_cache_t 
     result->proxy = cache->diagonal;
     result->stats = cache->stats;
     result->source = TERNARY_HESSIAN_PROXY_SOURCE_ACTIVATION_DIAGONAL;
+}
+
+static void hessian_proxy_invalidate_cache(ternary_hessian_proxy_cache_t *cache);
+
+static int hessian_proxy_publish_sidecar_hit(const hessian_proxy_request_t *request,
+                                             hessian_proxy_result_t *result)
+{
+    const ternary_hessian_sidecar_entry_t *entry = NULL;
+    const float *diagonal = NULL;
+
+    if (!request || !result || !request->sidecar || !request->tape_context ||
+        !request->tape_context->tape || !request->tape_context->tensor_name) {
+        return -1;
+    }
+
+    if (activation_tape_crc32(request->tape_context->tape) != ternary_hessian_sidecar_tape_crc32(request->sidecar)) {
+        LOG_ERROR("hessian proxy: sidecar tape provenance mismatch for %s", request->tape_context->tensor_name);
+        return -1;
+    }
+
+    entry = ternary_hessian_sidecar_entry(request->sidecar, request->tape_context->tensor_name);
+    if (!entry) {
+        LOG_ERROR("hessian proxy: sidecar missing tensor %s", request->tape_context->tensor_name);
+        return -1;
+    }
+    if (entry->vector_dim != request->cols) {
+        LOG_ERROR("hessian proxy: sidecar dimension mismatch for %s (sidecar=%u expected=%u)",
+                  request->tape_context->tensor_name,
+                  entry->vector_dim,
+                  request->cols);
+        return -1;
+    }
+    if (entry->sample_count != (uint32_t)request->sample_count) {
+        LOG_ERROR("hessian proxy: sidecar sample count mismatch for %s (sidecar=%u expected=%d)",
+                  request->tape_context->tensor_name,
+                  entry->sample_count,
+                  request->sample_count);
+        return -1;
+    }
+
+    diagonal = ternary_hessian_sidecar_diagonal(request->sidecar, request->tape_context->tensor_name);
+    if (!diagonal) {
+        LOG_ERROR("hessian proxy: failed to resolve sidecar diagonal for %s", request->tape_context->tensor_name);
+        return -1;
+    }
+    if (ternary_hessian_sidecar_stats(request->sidecar,
+                                      request->tape_context->tensor_name,
+                                      &result->stats) != 0) {
+        LOG_ERROR("hessian proxy: failed to read sidecar stats for %s", request->tape_context->tensor_name);
+        return -1;
+    }
+
+    result->proxy = diagonal;
+    result->source = TERNARY_HESSIAN_PROXY_SOURCE_EXTERNAL_SIDECAR;
+    LOG_INFO("Built external Hessian sidecar proxy: tensor=%s samples=%d mean=%.4f max=%.4f",
+             request->tape_context->tensor_name,
+             request->sample_count,
+             (double)result->stats.mean,
+             (double)result->stats.max);
+    return 0;
 }
 
 static int hessian_proxy_acquire_buffer(ternary_hessian_proxy_cache_t *cache,
@@ -1473,40 +1536,54 @@ static void hessian_proxy_store_cache(ternary_hessian_proxy_cache_t *cache,
     cache->stats = *stats;
 }
 
-static void prepare_hessian_proxy(const hessian_proxy_request_t *request,
-                                  hessian_proxy_result_t *result)
+static int prepare_hessian_proxy(const hessian_proxy_request_t *request,
+                                 hessian_proxy_result_t *result)
 {
     ternary_hessian_proxy_build_request_t build_request;
     ternary_hessian_proxy_cache_t *cache = NULL;
     float *proxy_buffer = NULL;
     int tape_entry_idx = -1;
+    const char *tensor_name = NULL;
 
     if (!result) {
-        return;
+        return -1;
     }
 
     hessian_proxy_result_reset(result);
     if (!hessian_proxy_request_is_valid(request)) {
-        return;
+        return 0;
     }
 
-    tape_entry_idx = activation_tape_entry_index(request->tape_context->tape,
-                                                 request->tape_context->tensor_name);
-    if (tape_entry_idx < 0) {
-        LOG_WARN("hessian proxy: failed to resolve tape entry for %s", request->tape_context->tensor_name);
-        return;
+    if (request->sidecar) {
+        if (hessian_proxy_publish_sidecar_hit(request, result) != 0) {
+            hessian_proxy_invalidate_cache(request->tape_context ? request->tape_context->proxy_cache : NULL);
+            return -1;
+        }
+        return 0;
     }
 
-    cache = request->tape_context->proxy_cache;
-    if (hessian_proxy_cache_matches(cache, tape_entry_idx, request->sample_count, request->cols)) {
+    tensor_name = (request->tape_context && request->tape_context->tensor_name)
+        ? request->tape_context->tensor_name
+        : "<calibration-vectors>";
+
+    if (request->tape_context && request->tape_context->tape && request->tape_context->tensor_name) {
+        tape_entry_idx = activation_tape_entry_index(request->tape_context->tape,
+                                                     request->tape_context->tensor_name);
+        if (tape_entry_idx < 0) {
+            LOG_WARN("hessian proxy: failed to resolve tape entry for %s", request->tape_context->tensor_name);
+        }
+    }
+
+    cache = request->tape_context ? request->tape_context->proxy_cache : NULL;
+    if (cache && tape_entry_idx >= 0 && hessian_proxy_cache_matches(cache, tape_entry_idx, request->sample_count, request->cols)) {
         hessian_proxy_publish_cache_hit(cache, result);
-        return;
+        return 0;
     }
 
     if (hessian_proxy_acquire_buffer(cache, request->cols, &proxy_buffer, &result->owned_proxy) != 0) {
-        LOG_WARN("hessian proxy: allocation failed for %s", request->tape_context->tensor_name);
+        LOG_WARN("hessian proxy: allocation failed for %s", tensor_name);
         hessian_proxy_invalidate_cache(cache);
-        return;
+        return 0;
     }
 
     memset(&build_request, 0, sizeof(build_request));
@@ -1522,7 +1599,7 @@ static void prepare_hessian_proxy(const hessian_proxy_request_t *request,
             result->owned_proxy = NULL;
         }
         hessian_proxy_invalidate_cache(cache);
-        return;
+        return 0;
     }
 
     if (cache) {
@@ -1537,11 +1614,13 @@ static void prepare_hessian_proxy(const hessian_proxy_request_t *request,
     result->source = TERNARY_HESSIAN_PROXY_SOURCE_ACTIVATION_DIAGONAL;
 
     LOG_INFO("Built activation-diagonal Hessian proxy: tensor=%s entry=%d samples=%d mean=%.4f max=%.4f",
-             request->tape_context->tensor_name,
+             tensor_name,
              tape_entry_idx,
              request->sample_count,
              (double)result->stats.mean,
              (double)result->stats.max);
+
+    return 0;
 }
 
 static int pack_ternary_2bit(const int8_t *ternary,
@@ -1642,6 +1721,7 @@ typedef struct {
     const transformer_ste_config_t *config;
     const ternary_calibration_corpus_t *corpus;
     const ternary_activation_tape_context_t *tape_context;
+    const ternary_hessian_sidecar_t *sidecar;
     size_t weight_count;
     uint32_t cols;
 } ste_calibration_workspace_request_t;
@@ -1744,10 +1824,14 @@ static int ste_prepare_workspace(const ste_calibration_workspace_request_t *requ
     memset(&proxy_request, 0, sizeof(proxy_request));
     proxy_request.config = request->config;
     proxy_request.tape_context = request->tape_context;
+    proxy_request.sidecar = request->sidecar;
     proxy_request.calibration_vectors = workspace->calibration_vectors;
     proxy_request.sample_count = workspace->actual_sample_count;
     proxy_request.cols = request->cols;
-    prepare_hessian_proxy(&proxy_request, &workspace->hessian_proxy);
+    if (prepare_hessian_proxy(&proxy_request, &workspace->hessian_proxy) != 0) {
+        ste_calibration_workspace_release(workspace);
+        return -1;
+    }
     return 0;
 }
 
@@ -1865,6 +1949,7 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
     workspace_request.config = &effective_config;
     workspace_request.corpus = corpus;
     workspace_request.tape_context = tape_context;
+    workspace_request.sidecar = source ? source->sidecar : NULL;
     workspace_request.weight_count = weight_count;
     workspace_request.cols = cols;
     if (ste_prepare_workspace(&workspace_request, &workspace) != 0) {
