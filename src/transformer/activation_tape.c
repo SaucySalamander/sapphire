@@ -876,6 +876,119 @@ static const tape_manifest_entry_t *tape_find_entry(const activation_tape_t *tap
     return NULL;
 }
 
+static const char *tape_layer_prefix(const activation_tape_t *tape)
+{
+    static const char *const prefixes[] = {
+        "language_model.model.layers.",
+        "model.layers.",
+        NULL
+    };
+
+    if (!tape || !tape->manifest) {
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < tape->entry_count; ++i) {
+        const char *name = tape->manifest[i].tensor_name;
+
+        for (int p = 0; prefixes[p] != NULL; ++p) {
+            size_t prefix_len = strlen(prefixes[p]);
+
+            if (strncmp(name, prefixes[p], prefix_len) == 0) {
+                return prefixes[p];
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static int tape_parse_layer_tensor_name(const char *tensor_name,
+                                        uint32_t *out_layer_idx,
+                                        const char **out_suffix)
+{
+    static const char *const prefixes[] = {
+        "language_model.model.layers.",
+        "model.layers.",
+        NULL
+    };
+
+    if (!tensor_name || !out_layer_idx || !out_suffix) {
+        return -1;
+    }
+
+    for (int p = 0; prefixes[p] != NULL; ++p) {
+        size_t prefix_len = strlen(prefixes[p]);
+
+        if (strncmp(tensor_name, prefixes[p], prefix_len) != 0) {
+            continue;
+        }
+
+        const char *cursor = tensor_name + prefix_len;
+        char *end = NULL;
+        unsigned long parsed = 0ul;
+
+        errno = 0;
+        parsed = strtoul(cursor, &end, 10);
+        if (errno != 0 || end == cursor || parsed > 0xFFFFFFFFul || *end != '.') {
+            return -1;
+        }
+
+        *out_layer_idx = (uint32_t)parsed;
+        *out_suffix = end;
+        return 0;
+    }
+
+    return -1;
+}
+
+static const tape_manifest_entry_t *tape_find_entry_with_alias(const activation_tape_t *tape,
+                                                               const char *tensor_name)
+{
+    const tape_manifest_entry_t *entry = NULL;
+    const char *layer_prefix = NULL;
+    const char *suffix = NULL;
+    char resolved_name[TAPE_TENSOR_NAME_MAX];
+    uint32_t layer_idx = 0u;
+    uint32_t layer_count = 0u;
+    int written = 0;
+
+    if (!tape || !tensor_name) {
+        return NULL;
+    }
+
+    entry = tape_find_entry(tape, tensor_name);
+    if (entry) {
+        return entry;
+    }
+
+    if (tape->entry_count == 0u || (tape->entry_count % TAPE_N_WT) != 0u) {
+        return NULL;
+    }
+
+    layer_prefix = tape_layer_prefix(tape);
+    if (!layer_prefix || tape_parse_layer_tensor_name(tensor_name, &layer_idx, &suffix) != 0) {
+        return NULL;
+    }
+
+    layer_count = tape->entry_count / TAPE_N_WT;
+    if (layer_count == 0u) {
+        return NULL;
+    }
+
+    written = snprintf(resolved_name,
+                       sizeof(resolved_name),
+                       "%s%u%s",
+                       layer_prefix,
+                       (unsigned int)(layer_idx % layer_count),
+                       suffix);
+    if (written < 0 || (size_t)written >= sizeof(resolved_name)) {
+        return NULL;
+    }
+
+    return tape_find_entry(tape, resolved_name);
+}
+
 int activation_tape_entry_index(const activation_tape_t *tape,
                                 const char              *tensor_name)
 {
@@ -885,7 +998,7 @@ int activation_tape_entry_index(const activation_tape_t *tape,
         return -1;
     }
 
-    entry = tape_find_entry(tape, tensor_name);
+    entry = tape_find_entry_with_alias(tape, tensor_name);
     if (!entry) {
         return -1;
     }
@@ -968,7 +1081,7 @@ int activation_tape_get_vector(const activation_tape_t *tape,
 {
     if (!tape || !tensor_name || sample_idx < 0 || !out_vector) return -1;
 
-    const tape_manifest_entry_t *e = tape_find_entry(tape, tensor_name);
+    const tape_manifest_entry_t *e = tape_find_entry_with_alias(tape, tensor_name);
     if (!e) { LOG_WARN("tape: tensor not found: %s", tensor_name); return -1; }
     if ((uint32_t)sample_idx >= e->sample_count) return -1;
 
@@ -995,7 +1108,7 @@ uint32_t activation_tape_vector_dim(const activation_tape_t *tape,
                                      const char              *tensor_name)
 {
     if (!tape || !tensor_name) return 0u;
-    const tape_manifest_entry_t *e = tape_find_entry(tape, tensor_name);
+    const tape_manifest_entry_t *e = tape_find_entry_with_alias(tape, tensor_name);
     return e ? e->vector_dim : 0u;
 }
 

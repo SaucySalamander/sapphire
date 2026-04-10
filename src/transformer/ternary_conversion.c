@@ -1165,6 +1165,11 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
         LOG_ERROR("ternary conversion: failed to resolve model spec for %s", config->model_name);
         return -1;
     }
+    if (config->output_path && config->output_path[0] != '\0' &&
+        io_prepare_ternary_output_dir(config->output_path) != 0) {
+        LOG_ERROR("ternary conversion: failed to prepare output directory %s", config->output_path);
+        return -1;
+    }
 
     if (open_runtime_activation_tape(config, out_runtime) != 0 ||
         open_runtime_hessian_sidecar(config, out_runtime) != 0) {

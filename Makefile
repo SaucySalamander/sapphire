@@ -20,6 +20,7 @@ CURL_DEFS = $(if $(strip $(CURL_PKG_LIBS)$(CURL_LIB_PATHS)),-DSAPPHIRE_HAVE_LIBC
 # Compilation flags
 CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS) $(CURL_PKG_CFLAGS) $(CURL_INCLUDE_PATHS) $(CURL_DEFS)
 LDFLAGS = -lm -pthread -lvulkan -lstdc++ $(VK_LIB_PATHS) $(CURL_PKG_LIBS) $(CURL_LIB_PATHS)
+DEPFLAGS = -MMD -MP
 
 # AddressSanitizer + UndefinedBehaviorSanitizer flags
 # Use -g for debug info (better error messages), -O1 for reasonable speed
@@ -42,6 +43,10 @@ HIPCFLAGS_LINK = -O3 -fPIC -D__HIP_PLATFORM_AMD__ -std=c++14 $(HIP_LIBDIRS)
 TARGETS = \
 	$(OUTDIR)/sapphire \
 
+
+DEPS := $(shell test -d $(OUTDIR) && find $(OUTDIR) -name '*.d' -print; \
+	test -d $(ASAN_OUTDIR) && find $(ASAN_OUTDIR) -name '*.d' -print)
+-include $(DEPS)
 
 .PHONY: all bench check-bench bench_f32 bench_bf16 kv-paging-matrix test clean shaders
 
@@ -70,47 +75,47 @@ $(OUTDIR):
 # Generic compilation rule for all C files
 $(OUTDIR)/%.o: $(SRCDIR)/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/inference/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/io/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/kernels/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/kernels/backends/vulkan/%.o: $(SRCDIR)/kernels/backends/vulkan/%.cpp | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CXX) $(CFLAGS) -c $< -o $@
+	$(CXX) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/loader/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/memory/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/tensor/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/tokenizer/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/transformer/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Build non-test binary from non-test sources
 # Discover all non-test .c files under $(SRCDIR) (exclude test/)
@@ -137,7 +142,7 @@ TEST_BINS := $(patsubst $(SRCDIR)/test/%.c, $(OUTDIR)/test/%, $(TEST_SRCS))
 # Rule for test objects
 $(OUTDIR)/test/%.o: $(SRCDIR)/test/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Rule for test binaries
 $(OUTDIR)/test/%: $(OUTDIR)/test/%.o $(LIB_OBJS)
@@ -187,47 +192,47 @@ $(ASAN_OUTDIR):
 # Generic rules for sanitizer builds (mirrors normal rules but uses SANITIZER_FLAGS)
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/inference/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/io/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/kernels/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/kernels/backends/vulkan/%.o: $(SRCDIR)/kernels/backends/vulkan/%.cpp | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CXX) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CXX) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/loader/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/memory/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/tensor/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/tokenizer/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/transformer/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Reuse NON_TEST_SRCS and NON_TEST_OBJS but map to asan directory
 ASAN_TEST_OBJS := $(patsubst $(SRCDIR)/%.c,$(ASAN_OUTDIR)/%.o,$(NON_TEST_SRCS))

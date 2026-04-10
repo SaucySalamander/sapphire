@@ -148,7 +148,9 @@ activation_tape_t *activation_tape_open(const char *tape_path);
 /**
  * @brief Copy the activation vector for tensor_name / sample_idx into out_vector.
  *
- * tensor_name must match a manifest entry exactly.
+ * tensor_name is resolved against the manifest, and layer tensors may fall
+ * back to the modulo-equivalent teacher layer when the exact student entry is
+ * missing.
  * out_vector must hold at least activation_tape_vector_dim() floats.
  *
  * @return 0 on success, -1 on error.

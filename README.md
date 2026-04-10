@@ -191,6 +191,26 @@ Example full-model conversion run:
   --kl-weight 0.05
 ```
 
+The conversion output directory is a Sapphire workflow artifact, not a directly
+loadable runtime model package. To turn it into a normal safetensors model the
+inference loader can consume, repack it against the base dense model:
+
+```bash
+./.venv/bin/python scripts/repack_ternary_model.py \
+  --base-model-dir ./models/gemma-3-7b-q1.58b \
+  --ternary-dir ./out/gemma-3-7b-q1.58b-ternary \
+  --output-dir ./models/gemma-3-7b-q1.58b-ternary-infer \
+  --overwrite
+
+./out/sapphire -m gemma-3-7b-q1.58b-ternary-infer -t 0.0 -p "The capital of France is" -n 10
+```
+
+The repacker reconstructs every tensor listed in `manifest.tsv` from the ternary
+payloads, copies any remaining tensors from `--base-model-dir`, and writes a
+standard `model.safetensors` or sharded `model-00001-of-NNNNN.safetensors`
+package plus tokenizer/config assets. This means partial conversion outputs can
+still be exported for inference, with missing tensors falling back to the base model.
+
 Recommended 27B mix rationale:
 
 - 50% FineWeb-Edu prose to preserve language coherence.

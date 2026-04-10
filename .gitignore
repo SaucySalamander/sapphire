@@ -15,6 +15,10 @@ logs/
 ./logs/
 reports/
 docs/
+data/
+corpora/
+configs/
+
 
 # Object and library files
 *.tape

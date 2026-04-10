@@ -1450,12 +1450,18 @@ static int hessian_proxy_publish_sidecar_hit(const hessian_proxy_request_t *requ
                   request->cols);
         return -1;
     }
-    if (entry->sample_count != (uint32_t)request->sample_count) {
-        LOG_ERROR("hessian proxy: sidecar sample count mismatch for %s (sidecar=%u expected=%d)",
+    if (entry->sample_count < (uint32_t)request->sample_count) {
+        LOG_ERROR("hessian proxy: sidecar sample count is too small for %s (sidecar=%u required=%d)",
                   request->tape_context->tensor_name,
                   entry->sample_count,
                   request->sample_count);
         return -1;
+    }
+    if (entry->sample_count != (uint32_t)request->sample_count) {
+        LOG_INFO("hessian proxy: reusing sidecar diagonal for %s with subset calibration (sidecar=%u calibration=%d)",
+                 request->tape_context->tensor_name,
+                 entry->sample_count,
+                 request->sample_count);
     }
 
     diagonal = ternary_hessian_sidecar_diagonal(request->sidecar, request->tape_context->tensor_name);
