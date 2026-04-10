@@ -44,6 +44,12 @@ int ternary_hessian_proxy_build_diagonal(const ternary_hessian_proxy_build_reque
                                          float *out_proxy,
                                          ternary_hessian_proxy_stats_t *out_stats);
 
+int ternary_hessian_proxy_finalize_diagonal(float *inout_proxy,
+                                            uint32_t cols,
+                                            float floor,
+                                            float strength,
+                                            ternary_hessian_proxy_stats_t *out_stats);
+
 void ternary_hessian_proxy_cache_release(ternary_hessian_proxy_cache_t *cache);
 
 #ifdef __cplusplus

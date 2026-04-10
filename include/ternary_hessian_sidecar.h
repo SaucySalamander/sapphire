@@ -48,7 +48,28 @@ typedef struct {
     uint32_t _pad[2];
 } ternary_hessian_sidecar_entry_t;
 
+typedef struct {
+    const char *tensor_name;
+    uint32_t vector_dim;
+    uint32_t sample_count;
+    const float *diagonal;
+    uint32_t alias_of_entry;
+    uint32_t layer_type;
+} ternary_hessian_sidecar_write_entry_t;
+
+typedef struct {
+    const char *teacher_model_name;
+    uint32_t tape_crc32;
+    uint32_t sample_count;
+} ternary_hessian_sidecar_write_config_t;
+
 typedef struct ternary_hessian_sidecar_t ternary_hessian_sidecar_t;
+
+int ternary_hessian_sidecar_write(const char *sidecar_path,
+                                  const ternary_hessian_sidecar_write_config_t *config,
+                                  const ternary_hessian_sidecar_write_entry_t *entries,
+                                  uint32_t entry_count,
+                                  uint32_t *out_crc32);
 
 ternary_hessian_sidecar_t *ternary_hessian_sidecar_open(const char *sidecar_path);
 

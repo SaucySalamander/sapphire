@@ -11,6 +11,7 @@
 #include "calibration_corpus.h"
 #include "ggml_model.h"
 #include "inference.h"
+#include "ternary_hessian_oracle.h"
 #include "ternary_conversion.h"
 #include "ternary_io.h"
 #include "tokenizer.h"
@@ -45,6 +46,7 @@ static void print_help(const char* program_name) {
     printf("  -n, --max-tokens <num>    Maximum tokens to generate (default: 100)\n");
     printf("  -p, --prompt <string>     Run a single prompt non-interactively and exit (echoes prompt)\n");
     printf("  --record-tape <path>      Record a raw activation tape using --calib-manifest\n");
+    printf("  --record-hessian-sidecar <path>  Record a native Vulkan Hessian sidecar; combine with --record-tape or use with --activation-tape\n");
     printf("  --convert-ternary         Run ternary conversion mode instead of inference\n");
     printf("  --output <path>           Output file (single-layer) or output directory (full-model)\n");
     printf("  --layer <name>            Optional single-layer conversion filter\n");
@@ -84,6 +86,8 @@ static void print_help(const char* program_name) {
     printf("\nExample:\n");
     printf("  %s -m gemma3-270m-it -c 4096 -t 0.7 -n 200\n", program_name);
     printf("  %s -m gemma-3-1b-it --record-tape ./data/1b-teacher-raw.tape --calib-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
+    printf("  %s -m gemma-3-1b-it --record-tape ./data/1b-teacher-raw.tape --record-hessian-sidecar ./data/1b-teacher.hsc --calib-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
+    printf("  %s -m gemma-3-1b-it --record-hessian-sidecar ./data/1b-teacher.hsc --activation-tape ./data/1b-teacher-raw.tape --calib-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
     printf("  %s -m gemma-3-27b-it --convert-ternary --output ./out/model-ternary\n", program_name);
     printf("  %s -m gemma-3-7b-it --convert-ternary --output ./out/gemma-3-7b-it-ternary\n", program_name);
     printf("  %s -m gemma-3-270m-it --convert-ternary --layer model.layers.0.self_attn.q_proj.weight --output ./out/layer0-qproj.safetensors\n", program_name);
@@ -97,6 +101,7 @@ typedef struct {
     int max_tokens;
     const char *prompt_arg;
     const char *record_tape_path;
+    const char *record_hessian_sidecar_path;
     int convert_ternary;
     const char *output_path;
     const char *layer_name;
@@ -133,6 +138,7 @@ static void cli_args_init(cli_args_t *args)
     args->max_tokens = MAX_TOKENS_GENERATE;
     args->prompt_arg = NULL;
     args->record_tape_path = NULL;
+    args->record_hessian_sidecar_path = NULL;
     args->convert_ternary = 0;
     args->output_path = NULL;
     args->layer_name = NULL;
@@ -157,6 +163,11 @@ static void cli_args_init(cli_args_t *args)
     args->load_state_path = NULL;
 }
 
+static int cli_is_combined_record_mode(const cli_args_t *args)
+{
+    return args && args->record_tape_path && args->record_hessian_sidecar_path;
+}
+
 static int validate_record_tape_args(const cli_args_t *args)
 {
     if (!args->record_tape_path) {
@@ -176,10 +187,57 @@ static int validate_record_tape_args(const cli_args_t *args)
         return -1;
     }
     if (args->convert_ternary || args->output_path || args->layer_name ||
-        args->activation_tape_path || args->teacher_model_name ||
+        args->activation_tape_path || args->hessian_sidecar_path ||
+        args->teacher_model_name ||
         args->validation_corpus_path || args->validation_corpus_manifest_path ||
         args->prompt_arg || args->save_state_path || args->load_state_path) {
         LOG_ERROR("ERROR: --record-tape cannot be combined with conversion, prompt, state, or validation flags.");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int validate_record_hessian_sidecar_args(const cli_args_t *args)
+{
+    int combined_record_mode = 0;
+
+    if (!args->record_hessian_sidecar_path) {
+        return 0;
+    }
+
+    combined_record_mode = cli_is_combined_record_mode(args);
+
+    if (args->record_hessian_sidecar_path[0] == '\0') {
+        LOG_ERROR("ERROR: --record-hessian-sidecar must not be empty.");
+        return -1;
+    }
+    if (combined_record_mode) {
+        if (args->disable_hessian_proxy) {
+            LOG_ERROR("ERROR: --disable-hessian-proxy does not apply when recording a Hessian sidecar.");
+            return -1;
+        }
+        return 0;
+    }
+    if (!args->activation_tape_path || args->activation_tape_path[0] == '\0') {
+        LOG_ERROR("ERROR: --record-hessian-sidecar requires --activation-tape.");
+        return -1;
+    }
+    if ((args->calibration_corpus_path && args->calibration_corpus_path[0] != '\0') &&
+        (args->calibration_corpus_manifest_path && args->calibration_corpus_manifest_path[0] != '\0')) {
+        LOG_ERROR("ERROR: use either --calibration-corpus or --calib-manifest with --record-hessian-sidecar, not both.");
+        return -1;
+    }
+    if ((!args->calibration_corpus_path || args->calibration_corpus_path[0] == '\0') &&
+        (!args->calibration_corpus_manifest_path || args->calibration_corpus_manifest_path[0] == '\0')) {
+        LOG_ERROR("ERROR: --record-hessian-sidecar requires --calibration-corpus or --calib-manifest.");
+        return -1;
+    }
+    if (args->record_tape_path || args->convert_ternary || args->output_path || args->layer_name ||
+        args->hessian_sidecar_path || args->teacher_model_name || args->validation_corpus_path ||
+        args->validation_corpus_manifest_path || args->prompt_arg || args->save_state_path ||
+        args->load_state_path || args->disable_hessian_proxy) {
+        LOG_ERROR("ERROR: --record-hessian-sidecar cannot be combined with tape recording, conversion, prompt, validation, state, teacher, or consumer sidecar flags.");
         return -1;
     }
 
@@ -332,6 +390,10 @@ static int validate_cli_args(const cli_args_t *args)
         return -1;
     }
 
+    if (validate_record_hessian_sidecar_args(args) != 0) {
+        return -1;
+    }
+
     if (validate_convert_ternary_args(args) != 0) {
         return -1;
     }
@@ -370,6 +432,24 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.hessian_proxy_floor = args->hessian_proxy_floor;
     config.max_grad_norm = args->max_grad_norm;
     return transformer_run_ternary_conversion(&config);
+}
+
+static int load_record_hessian_corpus(const cli_args_t *args,
+                                      calibration_corpus_t *corpus)
+{
+    if (!args || !corpus) {
+        return -1;
+    }
+
+    if (args->calibration_corpus_manifest_path && args->calibration_corpus_manifest_path[0] != '\0') {
+        return calibration_corpus_load_manifest(args->calibration_corpus_manifest_path,
+                                                INT_MAX,
+                                                corpus);
+    }
+
+    return calibration_corpus_load(args->calibration_corpus_path,
+                                   INT_MAX,
+                                   corpus);
 }
 
 static void record_tape_signal_handler(int signum)
@@ -451,10 +531,12 @@ static int ensure_parent_directory_for_file(const char *path)
 
 static int run_record_tape_mode(const cli_args_t *args)
 {
+    activation_tape_record_config_t record_config;
     inference_context_t *ctx = NULL;
     calibration_corpus_t corpus;
     struct sigaction old_sigint;
     struct sigaction old_sigterm;
+    int backend_type = -1;
     int signal_handlers_installed = 0;
     int rc = -1;
 
@@ -471,19 +553,40 @@ static int run_record_tape_mode(const cli_args_t *args)
     }
     signal_handlers_installed = 1;
 
-    LOG_INFO("Recording activation tape to %s", args->record_tape_path);
+    if (args->record_hessian_sidecar_path) {
+        LOG_INFO("Recording activation tape to %s and Hessian sidecar to %s",
+                 args->record_tape_path,
+                 args->record_hessian_sidecar_path);
+    } else {
+        LOG_INFO("Recording activation tape to %s", args->record_tape_path);
+    }
 
     ctx = create_inference_context(0.0f, 0, args->context_len, args->model_name);
     if (!ctx) {
         LOG_ERROR("record-tape: failed to create inference context");
         goto cleanup;
     }
-    if (!ctx->session || !ctx->session->backend || ctx->session->backend->type != SAPPHIRE_BACKEND_TYPE_CPU) {
-        LOG_ERROR("record-tape: CPU backend is required; set SAPPHIRE_BACKEND=cpu");
+    if (!ctx->session || !ctx->session->backend) {
+        LOG_ERROR("record-tape: failed to initialize backend");
+        goto cleanup;
+    }
+    backend_type = ctx->session->backend->type;
+    if (backend_type != SAPPHIRE_BACKEND_TYPE_CPU &&
+        backend_type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        LOG_ERROR("record-tape: backend %s is not supported for tape capture",
+                  ctx->session->backend->name ? ctx->session->backend->name : "unknown");
+        goto cleanup;
+    }
+    if (args->record_hessian_sidecar_path && backend_type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        LOG_ERROR("record-tape: --record-hessian-sidecar requires SAPPHIRE_BACKEND=vulkan");
         goto cleanup;
     }
 
     if (ensure_parent_directory_for_file(args->record_tape_path) != 0) {
+        goto cleanup;
+    }
+    if (args->record_hessian_sidecar_path &&
+        ensure_parent_directory_for_file(args->record_hessian_sidecar_path) != 0) {
         goto cleanup;
     }
 
@@ -495,12 +598,19 @@ static int run_record_tape_mode(const cli_args_t *args)
         goto cleanup;
     }
 
-    rc = activation_tape_record(args->record_tape_path,
-                                ctx->session,
-                                ctx->tokenizer,
-                                ctx->spec,
-                                (const struct calibration_corpus_t *)&corpus,
-                                0);
+    memset(&record_config, 0, sizeof(record_config));
+    record_config.output_path = args->record_tape_path;
+    record_config.oracle_output_path = args->record_hessian_sidecar_path;
+    record_config.session = ctx->session;
+    record_config.tokenizer = ctx->tokenizer;
+    record_config.spec = ctx->spec;
+    record_config.corpus = (const struct calibration_corpus_t *)&corpus;
+    record_config.sample_limit = 0;
+    record_config.max_prompt_tokens = args->context_len;
+    record_config.hessian_proxy_strength = args->hessian_proxy_strength;
+    record_config.hessian_proxy_floor = args->hessian_proxy_floor;
+
+    rc = activation_tape_record_ex(&record_config);
     if (rc == 0 && activation_tape_stop_requested()) {
         LOG_WARN("record-tape: interrupted; partial tape saved to %s", args->record_tape_path);
     } else if (rc == 0) {
@@ -516,6 +626,66 @@ cleanup:
         restore_record_tape_signal_handlers(&old_sigint, &old_sigterm);
     }
     activation_tape_clear_stop_request();
+    return rc;
+}
+
+static int run_record_hessian_sidecar_mode(const cli_args_t *args)
+{
+    inference_context_t *ctx = NULL;
+    calibration_corpus_t corpus;
+    activation_tape_t *tape = NULL;
+    int rc = -1;
+
+    if (!args || !args->record_hessian_sidecar_path || !args->model_name) {
+        LOG_ERROR("record-hessian-sidecar mode: invalid arguments");
+        return -1;
+    }
+
+    memset(&corpus, 0, sizeof(corpus));
+
+    LOG_INFO("Recording Hessian sidecar to %s", args->record_hessian_sidecar_path);
+
+    ctx = create_inference_context(0.0f, 0, args->context_len, args->model_name);
+    if (!ctx) {
+        LOG_ERROR("record-hessian-sidecar: failed to create inference context");
+        goto cleanup;
+    }
+    if (!ctx->session || !ctx->session->backend || ctx->session->backend->type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        LOG_ERROR("record-hessian-sidecar: Vulkan backend is required; set SAPPHIRE_BACKEND=vulkan");
+        goto cleanup;
+    }
+    if (ensure_parent_directory_for_file(args->record_hessian_sidecar_path) != 0) {
+        goto cleanup;
+    }
+
+    tape = activation_tape_open(args->activation_tape_path);
+    if (!tape) {
+        LOG_ERROR("record-hessian-sidecar: failed to open activation tape %s", args->activation_tape_path);
+        goto cleanup;
+    }
+    if (load_record_hessian_corpus(args, &corpus) != 0) {
+        LOG_ERROR("record-hessian-sidecar: failed to load calibration corpus input");
+        goto cleanup;
+    }
+
+    rc = ternary_record_hessian_sidecar_vulkan(args->record_hessian_sidecar_path,
+                                               ctx,
+                                               &corpus,
+                                               tape,
+                                               args->hessian_proxy_strength,
+                                               args->hessian_proxy_floor);
+    if (rc == 0) {
+        LOG_INFO("record-hessian-sidecar: completed %s", args->record_hessian_sidecar_path);
+    }
+
+cleanup:
+    if (tape) {
+        activation_tape_close(tape);
+    }
+    calibration_corpus_free(&corpus);
+    if (ctx) {
+        destroy_inference_context(ctx);
+    }
     return rc;
 }
 
@@ -648,6 +818,7 @@ typedef enum {
     CLI_OPT_MAX_TOKENS,
     CLI_OPT_PROMPT,
     CLI_OPT_RECORD_TAPE,
+    CLI_OPT_RECORD_HESSIAN_SIDECAR,
     CLI_OPT_CONVERT_TERNARY,
     CLI_OPT_OUTPUT,
     CLI_OPT_LAYER,
@@ -689,6 +860,7 @@ static const cli_option_alias_t g_cli_option_aliases[] = {
     { "-p", CLI_OPT_PROMPT },
     { "--prompt", CLI_OPT_PROMPT },
     { "--record-tape", CLI_OPT_RECORD_TAPE },
+    { "--record-hessian-sidecar", CLI_OPT_RECORD_HESSIAN_SIDECAR },
     { "--convert-ternary", CLI_OPT_CONVERT_TERNARY },
     { "--output", CLI_OPT_OUTPUT },
     { "--layer", CLI_OPT_LAYER },
@@ -739,6 +911,7 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_MAX_TOKENS: args->max_tokens = atoi(value); break;
         case CLI_OPT_PROMPT: args->prompt_arg = value; break;
         case CLI_OPT_RECORD_TAPE: args->record_tape_path = value; break;
+        case CLI_OPT_RECORD_HESSIAN_SIDECAR: args->record_hessian_sidecar_path = value; break;
         case CLI_OPT_OUTPUT: args->output_path = value; break;
         case CLI_OPT_LAYER: args->layer_name = value; break;
         case CLI_OPT_ACTIVATION_TAPE: args->activation_tape_path = value; break;
@@ -966,6 +1139,14 @@ int main(int argc, char* argv[]) {
 
     if (args.record_tape_path) {
         int rc = run_record_tape_mode(&args);
+        printf("\n================================================================================\n");
+        printf("                    Sapphire Inference Engine Closed\n");
+        printf("================================================================================\n");
+        return rc;
+    }
+
+    if (args.record_hessian_sidecar_path) {
+        int rc = run_record_hessian_sidecar_mode(&args);
         printf("\n================================================================================\n");
         printf("                    Sapphire Inference Engine Closed\n");
         printf("================================================================================\n");

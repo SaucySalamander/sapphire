@@ -7,7 +7,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -26,6 +28,323 @@ struct ternary_hessian_sidecar_t {
     const float *data_section;
     uint32_t crc32;
 };
+
+static int sidecar_validate_tensor_name(const char *tensor_name);
+
+static int sidecar_write_all(int fd, const void *buffer, size_t size)
+{
+    const uint8_t *cursor = (const uint8_t *)buffer;
+
+    while (size > 0u) {
+        ssize_t written = write(fd, cursor, size);
+
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (written == 0) {
+            return -1;
+        }
+        cursor += (size_t)written;
+        size -= (size_t)written;
+    }
+
+    return 0;
+}
+
+static int sidecar_compute_stats(const float *diagonal,
+                                 uint32_t vector_dim,
+                                 float *out_mean,
+                                 float *out_max)
+{
+    double sum = 0.0;
+    float max_value = 0.0f;
+
+    if (!diagonal || vector_dim == 0u || !out_mean || !out_max) {
+        return -1;
+    }
+
+    max_value = diagonal[0];
+    for (uint32_t idx = 0; idx < vector_dim; ++idx) {
+        float value = diagonal[idx];
+
+        sum += (double)value;
+        if (value > max_value) {
+            max_value = value;
+        }
+    }
+
+    *out_mean = (float)(sum / (double)vector_dim);
+    *out_max = max_value;
+    return 0;
+}
+
+static int sidecar_open_temp_file(const char *sidecar_path,
+                                  char *temp_path,
+                                  size_t temp_path_size)
+{
+    int fd = -1;
+    int written = 0;
+
+    if (!sidecar_path || !temp_path || temp_path_size == 0u) {
+        return -1;
+    }
+
+    written = snprintf(temp_path, temp_path_size, "%s.tmpXXXXXX", sidecar_path);
+    if (written < 0 || (size_t)written >= temp_path_size) {
+        return -1;
+    }
+
+    fd = mkstemp(temp_path);
+    if (fd < 0) {
+        LOG_ERROR("hessian sidecar: mkstemp failed for %s: %s", sidecar_path, strerror(errno));
+        return -1;
+    }
+
+    return fd;
+}
+
+static int sidecar_validate_write_inputs(const char *sidecar_path,
+                                         const ternary_hessian_sidecar_write_config_t *config,
+                                         const ternary_hessian_sidecar_write_entry_t *entries,
+                                         uint32_t entry_count)
+{
+    const char *teacher_model_name = NULL;
+
+    if (!sidecar_path || sidecar_path[0] == '\0') {
+        LOG_ERROR("hessian sidecar: output path is empty");
+        return -1;
+    }
+    if (!config) {
+        LOG_ERROR("hessian sidecar: write config is NULL");
+        return -1;
+    }
+    teacher_model_name = config->teacher_model_name;
+    if (!teacher_model_name || teacher_model_name[0] == '\0') {
+        LOG_ERROR("hessian sidecar: teacher model name is empty");
+        return -1;
+    }
+    if (strlen(teacher_model_name) >= TERNARY_HESSIAN_SIDECAR_TEACHER_MODEL_MAX) {
+        LOG_ERROR("hessian sidecar: teacher model name too long: %s", teacher_model_name);
+        return -1;
+    }
+    if (!entries || entry_count == 0u || config->sample_count == 0u) {
+        LOG_ERROR("hessian sidecar: invalid write inputs");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int sidecar_prepare_manifest(const ternary_hessian_sidecar_write_entry_t *entries,
+                                    uint32_t entry_count,
+                                    uint32_t sample_count,
+                                    ternary_hessian_sidecar_entry_t *manifest,
+                                    uint64_t *out_data_section_size)
+{
+    uint64_t data_offset = 0u;
+
+    if (!entries || !manifest || !out_data_section_size) {
+        return -1;
+    }
+
+    for (uint32_t entry_idx = 0; entry_idx < entry_count; ++entry_idx) {
+        const ternary_hessian_sidecar_write_entry_t *src = &entries[entry_idx];
+        ternary_hessian_sidecar_entry_t *dst = &manifest[entry_idx];
+
+        if (sidecar_validate_tensor_name(src->tensor_name) != 0) {
+            return -1;
+        }
+        if (src->vector_dim == 0u || src->sample_count != sample_count) {
+            LOG_ERROR("hessian sidecar: invalid write metadata for %s", src->tensor_name);
+            return -1;
+        }
+
+        memset(dst, 0, sizeof(*dst));
+        memcpy(dst->tensor_name, src->tensor_name, strlen(src->tensor_name) + 1u);
+        dst->vector_dim = src->vector_dim;
+        dst->sample_count = src->sample_count;
+        dst->layer_type = src->layer_type;
+
+        if (src->alias_of_entry == TERNARY_HESSIAN_SIDECAR_NO_ALIAS) {
+            if (!src->diagonal) {
+                LOG_ERROR("hessian sidecar: primary entry is missing diagonal data for %s", src->tensor_name);
+                return -1;
+            }
+            dst->alias_of_entry = TERNARY_HESSIAN_SIDECAR_NO_ALIAS;
+            dst->data_offset = data_offset;
+            dst->data_bytes = (uint64_t)src->vector_dim * sizeof(float);
+            if (sidecar_compute_stats(src->diagonal, src->vector_dim, &dst->mean, &dst->max) != 0) {
+                return -1;
+            }
+            data_offset += dst->data_bytes;
+            continue;
+        }
+
+        if (src->alias_of_entry >= entry_count) {
+            LOG_ERROR("hessian sidecar: alias index out of range for %s", src->tensor_name);
+            return -1;
+        }
+        dst->alias_of_entry = src->alias_of_entry;
+    }
+
+    for (uint32_t entry_idx = 0; entry_idx < entry_count; ++entry_idx) {
+        const ternary_hessian_sidecar_entry_t *primary = NULL;
+        ternary_hessian_sidecar_entry_t *dst = &manifest[entry_idx];
+
+        if (dst->alias_of_entry == TERNARY_HESSIAN_SIDECAR_NO_ALIAS) {
+            continue;
+        }
+
+        primary = &manifest[dst->alias_of_entry];
+        if (primary->alias_of_entry != TERNARY_HESSIAN_SIDECAR_NO_ALIAS) {
+            LOG_ERROR("hessian sidecar: aliases must reference primary entries directly: %s", dst->tensor_name);
+            return -1;
+        }
+        if (dst->vector_dim != primary->vector_dim ||
+            dst->sample_count != primary->sample_count ||
+            dst->layer_type != primary->layer_type) {
+            LOG_ERROR("hessian sidecar: alias metadata mismatch for %s", dst->tensor_name);
+            return -1;
+        }
+        dst->data_offset = primary->data_offset;
+        dst->data_bytes = primary->data_bytes;
+        dst->mean = primary->mean;
+        dst->max = primary->max;
+    }
+
+    *out_data_section_size = data_offset;
+    return 0;
+}
+
+int ternary_hessian_sidecar_write(const char *sidecar_path,
+                                  const ternary_hessian_sidecar_write_config_t *config,
+                                  const ternary_hessian_sidecar_write_entry_t *entries,
+                                  uint32_t entry_count,
+                                  uint32_t *out_crc32)
+{
+    ternary_hessian_sidecar_header_t header;
+    ternary_hessian_sidecar_entry_t *manifest = NULL;
+    uint64_t data_section_size = 0u;
+    uint32_t crc32 = 0u;
+    size_t manifest_bytes = 0u;
+    size_t header_prefix_size = offsetof(ternary_hessian_sidecar_header_t, crc32);
+    char temp_path[PATH_MAX] = {0};
+    int fd = -1;
+    int rc = -1;
+
+    if (sidecar_validate_write_inputs(sidecar_path,
+                                      config,
+                                      entries,
+                                      entry_count) != 0) {
+        return -1;
+    }
+    if (entry_count > SIZE_MAX / sizeof(*manifest)) {
+        LOG_ERROR("hessian sidecar: manifest too large for %s", sidecar_path);
+        return -1;
+    }
+
+    manifest_bytes = (size_t)entry_count * sizeof(*manifest);
+    manifest = (ternary_hessian_sidecar_entry_t *)calloc((size_t)entry_count, sizeof(*manifest));
+    if (!manifest) {
+        LOG_ERROR("hessian sidecar: manifest allocation failed for %s", sidecar_path);
+        return -1;
+    }
+    if (sidecar_prepare_manifest(entries,
+                                 entry_count,
+                                 config->sample_count,
+                                 manifest,
+                                 &data_section_size) != 0) {
+        goto cleanup;
+    }
+
+    memset(&header, 0, sizeof(header));
+    header.magic = TERNARY_HESSIAN_SIDECAR_MAGIC;
+    header.version = TERNARY_HESSIAN_SIDECAR_VERSION;
+    header.entry_count = entry_count;
+        header.sample_count = config->sample_count;
+        header.tape_crc32 = config->tape_crc32;
+    header.manifest_entry_size = sizeof(ternary_hessian_sidecar_entry_t);
+        memcpy(header.teacher_model_name,
+            config->teacher_model_name,
+            strlen(config->teacher_model_name) + 1u);
+    header.data_section_offset = (uint64_t)sizeof(header) + (uint64_t)manifest_bytes;
+    header.data_section_size = data_section_size;
+    header.reserved = 0u;
+    header.crc32 = 0u;
+
+    crc32 = io_crc32_update(0u, &header, header_prefix_size);
+    crc32 = io_crc32_update(crc32, manifest, manifest_bytes);
+    for (uint32_t entry_idx = 0; entry_idx < entry_count; ++entry_idx) {
+        const ternary_hessian_sidecar_write_entry_t *entry = &entries[entry_idx];
+
+        if (entry->alias_of_entry != TERNARY_HESSIAN_SIDECAR_NO_ALIAS) {
+            continue;
+        }
+        crc32 = io_crc32_update(crc32,
+                                entry->diagonal,
+                                (size_t)entry->vector_dim * sizeof(float));
+    }
+    header.crc32 = crc32;
+
+    fd = sidecar_open_temp_file(sidecar_path, temp_path, sizeof(temp_path));
+    if (fd < 0) {
+        goto cleanup;
+    }
+
+    if (sidecar_write_all(fd, &header, sizeof(header)) != 0 ||
+        sidecar_write_all(fd, manifest, manifest_bytes) != 0) {
+        LOG_ERROR("hessian sidecar: failed to write %s", sidecar_path);
+        goto cleanup;
+    }
+    for (uint32_t entry_idx = 0; entry_idx < entry_count; ++entry_idx) {
+        const ternary_hessian_sidecar_write_entry_t *entry = &entries[entry_idx];
+
+        if (entry->alias_of_entry != TERNARY_HESSIAN_SIDECAR_NO_ALIAS) {
+            continue;
+        }
+        if (sidecar_write_all(fd,
+                              entry->diagonal,
+                              (size_t)entry->vector_dim * sizeof(float)) != 0) {
+            LOG_ERROR("hessian sidecar: failed to write data payload for %s", entry->tensor_name);
+            goto cleanup;
+        }
+    }
+    if (fsync(fd) != 0) {
+        LOG_ERROR("hessian sidecar: fsync failed for %s: %s", sidecar_path, strerror(errno));
+        goto cleanup;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        LOG_ERROR("hessian sidecar: close failed for %s: %s", sidecar_path, strerror(errno));
+        goto cleanup;
+    }
+    fd = -1;
+    if (rename(temp_path, sidecar_path) != 0) {
+        LOG_ERROR("hessian sidecar: rename %s -> %s failed: %s",
+                  temp_path,
+                  sidecar_path,
+                  strerror(errno));
+        goto cleanup;
+    }
+
+    if (out_crc32) {
+        *out_crc32 = crc32;
+    }
+    rc = 0;
+
+cleanup:
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (rc != 0 && temp_path[0] != '\0') {
+        unlink(temp_path);
+    }
+    free(manifest);
+    return rc;
+}
 
 static int sidecar_validate_tensor_name(const char *tensor_name)
 {

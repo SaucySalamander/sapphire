@@ -9,6 +9,63 @@
 #include <stdlib.h>
 #include <string.h>
 
+int ternary_hessian_proxy_finalize_diagonal(float *inout_proxy,
+                                            uint32_t cols,
+                                            float floor,
+                                            float strength,
+                                            ternary_hessian_proxy_stats_t *out_stats)
+{
+    double mean_second_moment = 0.0;
+    float proxy_mean = 0.0f;
+    float proxy_max = 0.0f;
+
+    if (!inout_proxy || cols == 0u) {
+        return -1;
+    }
+
+    if (floor < 0.0f) {
+        floor = 0.0f;
+    }
+    if (strength < 0.0f) {
+        strength = 0.0f;
+    }
+
+    for (uint32_t col = 0; col < cols; ++col) {
+        mean_second_moment += (double)inout_proxy[col];
+    }
+
+    mean_second_moment /= (double)cols;
+    if (mean_second_moment <= 1e-12) {
+        for (uint32_t col = 0; col < cols; ++col) {
+            inout_proxy[col] = 1.0f;
+        }
+        proxy_mean = 1.0f;
+        proxy_max = 1.0f;
+    } else {
+        for (uint32_t col = 0; col < cols; ++col) {
+            float normalized = (float)((double)inout_proxy[col] / mean_second_moment);
+            float adjusted = 1.0f + strength * (normalized - 1.0f);
+
+            if (adjusted < floor) {
+                adjusted = floor;
+            }
+            inout_proxy[col] = adjusted;
+            proxy_mean += adjusted;
+            if (adjusted > proxy_max) {
+                proxy_max = adjusted;
+            }
+        }
+        proxy_mean /= (float)cols;
+    }
+
+    if (out_stats) {
+        out_stats->mean = proxy_mean;
+        out_stats->max = proxy_max;
+    }
+
+    return 0;
+}
+
 int ternary_hessian_proxy_build_diagonal(const ternary_hessian_proxy_build_request_t *request,
                                          float *out_proxy,
                                          ternary_hessian_proxy_stats_t *out_stats)
@@ -18,9 +75,6 @@ int ternary_hessian_proxy_build_diagonal(const ternary_hessian_proxy_build_reque
     uint32_t cols = 0u;
     float floor = 0.0f;
     float strength = 0.0f;
-    double mean_second_moment = 0.0;
-    float proxy_mean = 0.0f;
-    float proxy_max = 0.0f;
 
     if (!request || !out_proxy) {
         return -1;
@@ -56,39 +110,13 @@ int ternary_hessian_proxy_build_diagonal(const ternary_hessian_proxy_build_reque
 
     for (uint32_t col = 0; col < cols; ++col) {
         out_proxy[col] /= (float)sample_count;
-        mean_second_moment += (double)out_proxy[col];
     }
 
-    mean_second_moment /= (double)cols;
-    if (mean_second_moment <= 1e-12) {
-        for (uint32_t col = 0; col < cols; ++col) {
-            out_proxy[col] = 1.0f;
-        }
-        proxy_mean = 1.0f;
-        proxy_max = 1.0f;
-    } else {
-        for (uint32_t col = 0; col < cols; ++col) {
-            float normalized = (float)((double)out_proxy[col] / mean_second_moment);
-            float adjusted = 1.0f + strength * (normalized - 1.0f);
-
-            if (adjusted < floor) {
-                adjusted = floor;
-            }
-            out_proxy[col] = adjusted;
-            proxy_mean += adjusted;
-            if (adjusted > proxy_max) {
-                proxy_max = adjusted;
-            }
-        }
-        proxy_mean /= (float)cols;
-    }
-
-    if (out_stats) {
-        out_stats->mean = proxy_mean;
-        out_stats->max = proxy_max;
-    }
-
-    return 0;
+    return ternary_hessian_proxy_finalize_diagonal(out_proxy,
+                                                   cols,
+                                                   floor,
+                                                   strength,
+                                                   out_stats);
 }
 
 void ternary_hessian_proxy_cache_release(ternary_hessian_proxy_cache_t *cache)

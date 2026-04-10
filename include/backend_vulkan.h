@@ -147,7 +147,22 @@ typedef struct {
 #define PIPELINE_GEMM_W16A32        18
 #define PIPELINE_LMHEAD_DECODE_W16A32 19
 #define PIPELINE_FFN_GEGLU_W16A32   20
-#define NUM_PIPELINES               21
+#define PIPELINE_ORACLE_ACCUM_F32   21
+#define PIPELINE_ORACLE_FINALIZE_F32 22
+#define NUM_PIPELINES               23
+
+#define ORACLE_SRC_SET_NORM_BUF      0
+#define ORACLE_SRC_SET_ATTN_OUTPUT   1
+#define ORACLE_SRC_SET_FFN_GATE      2
+#define ORACLE_SRC_SET_FFN_VALUE     3
+
+typedef struct {
+    uint32_t sample_count;
+    float strength;
+    float floor;
+    void *out_buffer;
+    size_t out_size;
+} backend_vulkan_oracle_finish_config_t;
 
 /**
  * Vulkan backend session data (P11-02 + P11-03 integration).
@@ -207,6 +222,8 @@ typedef struct {
     vk_buffer_t lm_head_logits;         /* [vocab_size] - output buffer for lm_head */
     vk_buffer_t selected_token_ids;     /* [max_batch] int32 selected ids from GPU argmax */
     void *selected_token_ids_mapped;    /* Persistent map of selected_token_ids */
+    vk_buffer_t oracle_hessian_accum;   /* [capture_bytes] float accumulation buffer */
+    int oracle_hessian_active;          /* Non-zero while a tape/oracle recording run is active */
     
     vk_ring_buffer_t input_ring;        /* CPU→GPU token input ring */
     vk_ring_buffer_t output_ring;       /* GPU→CPU logits output ring */
@@ -255,6 +272,15 @@ typedef struct {
 
 int backend_vulkan_save_state(inference_session_t *session, const char *path);
 int backend_vulkan_load_state(inference_session_t *session, const char *path);
+int backend_vulkan_begin_hessian_oracle_capture(inference_session_t *session);
+int backend_vulkan_finish_hessian_oracle_capture(inference_session_t *session,
+                                                 const backend_vulkan_oracle_finish_config_t *config);
+void backend_vulkan_abort_hessian_oracle_capture(inference_session_t *session);
+int backend_vulkan_capture_last_token_activations(inference_session_t *session,
+                                                  const int *token_ids,
+                                                  int token_count,
+                                                  void *out_capture_buffer,
+                                                  size_t out_capture_size);
 
 #ifdef __cplusplus
 }

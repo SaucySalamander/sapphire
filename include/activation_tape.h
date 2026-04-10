@@ -79,6 +79,19 @@ typedef struct {
 
 typedef struct activation_tape_t activation_tape_t;
 
+typedef struct {
+    const char *output_path;
+    const char *oracle_output_path;
+    struct inference_session_t *session;
+    struct sapphire_tokenizer_t *tokenizer;
+    const struct model_spec *spec;
+    const struct calibration_corpus_t *corpus;
+    int sample_limit;
+    int max_prompt_tokens;
+    float hessian_proxy_strength;
+    float hessian_proxy_floor;
+} activation_tape_record_config_t;
+
 /* -------------------------------------------------------------------------
  * Recording API
  * -------------------------------------------------------------------------*/
@@ -88,10 +101,14 @@ typedef struct activation_tape_t activation_tape_t;
  *        to output_path.
  *
  * sample_limit ≤ 0 means use all corpus samples. Default recommended: 64.
- * Requires CPU backend. Tape is fully written and fsync'd before return.
+ * Supports CPU and Vulkan backends. When oracle_output_path is set through
+ * activation_tape_record_ex(), Vulkan recording also emits a Hessian sidecar
+ * keyed to the tape CRC in the same pass.
  *
  * @return 0 on success, -1 on error.
  */
+int activation_tape_record_ex(const activation_tape_record_config_t *config);
+
 int activation_tape_record(const char                    *output_path,
                            struct inference_session_t    *session,
                            struct sapphire_tokenizer_t   *tokenizer,
@@ -144,6 +161,13 @@ int activation_tape_get_vector(const activation_tape_t *tape,
 /** @return primary manifest entry index for tensor_name, or -1 if not found. */
 int activation_tape_entry_index(const activation_tape_t *tape,
                                 const char              *tensor_name);
+
+/** @return number of manifest entries in the tape, or 0 if tape is NULL. */
+uint32_t activation_tape_entry_count(const activation_tape_t *tape);
+
+/** @return manifest entry by index, or NULL if out of range. */
+const tape_manifest_entry_t *activation_tape_entry(const activation_tape_t *tape,
+                                                   uint32_t                 entry_idx);
 
 /** @return number of samples in the tape, or -1 if tape is NULL. */
 int activation_tape_sample_count(const activation_tape_t *tape);
