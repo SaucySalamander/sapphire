@@ -176,17 +176,19 @@ metadata cache once and sample from that cache on subsequent runs:
 ./.venv/bin/python scripts/prepare_ternary_corpus.py
 ```
 
-Example full-model conversion run:
+Example full-model conversion run for the custom 7B student:
 
 ```bash
 ./out/sapphire \
-  -m gemma-3-27b-it \
+  -m gemma-3-7b-q1.58b \
   --convert-ternary \
-  --output ./out/gemma-3-27b-it-ternary \
-  --calib-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv \
-  --validation-manifest ./configs/corpus/27b_high_signal_validation_manifest.csv \
+  --output ./out/gemma-3-7b-q1.58b-ternary \
+  --activation-tape ./data/7b-aligned.tape \
+  --hessian-sidecar ./data/7b-aligned.hsc \
+  --calibration-corpus ./corpora/calibration/fineweb_edu.txt \
   --calibration-samples 8 \
-  --validation-samples 64 \
+  --validation-corpus ./corpora/validation/gsm8k_prompts.txt \
+  --validation-samples 32 \
   --validate-every 32 \
   --kl-weight 0.05
 ```
@@ -211,7 +213,7 @@ standard `model.safetensors` or sharded `model-00001-of-NNNNN.safetensors`
 package plus tokenizer/config assets. This means partial conversion outputs can
 still be exported for inference, with missing tensors falling back to the base model.
 
-Recommended 27B mix rationale:
+Recommended calibration mix rationale:
 
 - 50% FineWeb-Edu prose to preserve language coherence.
 - 25% C/C++/Python code to preserve systems reasoning.

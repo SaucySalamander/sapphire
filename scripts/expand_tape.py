@@ -54,6 +54,67 @@ ALIGNMENT_WEIGHT_SPECS = (
 
 
 @dataclass(frozen=True)
+class StructuralMapping:
+    """Explicit student-to-teacher layer mapping from a structural TSV file."""
+    student_to_teacher: dict[int, int]
+    source_name: str
+    target_name: str
+
+    @property
+    def student_layer_count(self) -> int:
+        return len(self.student_to_teacher)
+
+
+def _parse_structural_map(path: Path) -> StructuralMapping:
+    """Parse a structural mapping TSV file.
+    
+    Expected format:
+        # comment lines start with #
+        student_layer<TAB>teacher_layer<TAB>optional_note
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"Structural map not found: {path}")
+
+    student_to_teacher: dict[int, int] = {}
+    source_name = ""
+    target_name = ""
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                # Parse metadata from comment headers
+                if line.startswith("# Source:"):
+                    source_name = line.split(":", 1)[1].strip()
+                elif line.startswith("# Target:"):
+                    target_name = line.split(":", 1)[1].strip()
+                continue
+
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+
+            try:
+                student_layer = int(parts[0].strip())
+                teacher_layer = int(parts[1].strip())
+                student_to_teacher[student_layer] = teacher_layer
+            except ValueError:
+                # Skip header or malformed rows
+                continue
+
+    if not student_to_teacher:
+        raise ValueError(f"Structural map contains no valid layer mappings: {path}")
+
+    return StructuralMapping(
+        student_to_teacher=student_to_teacher,
+        source_name=source_name,
+        target_name=target_name,
+    )
+
+
+@dataclass(frozen=True)
 class TapeHeader:
     magic: int
     version: int
@@ -374,10 +435,26 @@ def _build_alignment_entries(raw_tape: ParsedTape,
                              teacher_prefix: str,
                              student_prefix: str,
                              depth_strategy: str,
-                             width_strategy: str) -> list[AlignmentEntry]:
+                             width_strategy: str,
+                             structural_map: StructuralMapping | None = None) -> list[AlignmentEntry]:
     teacher_layer_count = raw_tape.layer_count
     student_layer_count = student_config.num_hidden_layers
     entries: list[AlignmentEntry] = []
+
+    # If a structural map is provided, validate and use it for layer counts
+    if structural_map is not None:
+        if structural_map.student_layer_count != student_layer_count:
+            raise ValueError(
+                f"Structural map defines {structural_map.student_layer_count} student layers, "
+                f"but student config has {student_layer_count} layers"
+            )
+        # Validate all referenced teacher layers exist in the tape
+        max_teacher_ref = max(structural_map.student_to_teacher.values())
+        if max_teacher_ref >= teacher_layer_count:
+            raise ValueError(
+                f"Structural map references teacher layer {max_teacher_ref}, "
+                f"but tape only contains {teacher_layer_count} layers"
+            )
 
     if teacher_layer_count <= 0 or student_layer_count <= 0:
         raise ValueError("Teacher/student layer counts must be positive")
@@ -385,10 +462,16 @@ def _build_alignment_entries(raw_tape: ParsedTape,
         raise ValueError("Teacher tape does not contain a whole number of 7-entry layers")
 
     for student_layer_idx in range(student_layer_count):
-        teacher_layer_idx = _map_teacher_layer(student_layer_idx,
-                                               teacher_layer_count,
-                                               student_layer_count,
-                                               depth_strategy)
+        # Use structural map if provided, otherwise fall back to depth_strategy
+        if structural_map is not None:
+            if student_layer_idx not in structural_map.student_to_teacher:
+                raise ValueError(f"Structural map missing entry for student layer {student_layer_idx}")
+            teacher_layer_idx = structural_map.student_to_teacher[student_layer_idx]
+        else:
+            teacher_layer_idx = _map_teacher_layer(student_layer_idx,
+                                                   teacher_layer_count,
+                                                   student_layer_count,
+                                                   depth_strategy)
         if teacher_layer_idx >= teacher_layer_count:
             raise ValueError(f"Invalid depth mapping for student layer {student_layer_idx}")
 
@@ -627,8 +710,17 @@ def expand_tape(input_tape: Path,
                 student_prefix: str,
                 depth_strategy: str,
                 width_strategy: str,
-                overwrite: bool) -> None:
+                overwrite: bool,
+                structural_map_path: Path | None = None) -> None:
     raw_tape = _parse_tape(input_tape)
+    structural_map: StructuralMapping | None = None
+    if structural_map_path is not None:
+        structural_map = _parse_structural_map(structural_map_path)
+        print(f"Using structural map: {structural_map_path}")
+        print(f"  Source: {structural_map.source_name or 'unspecified'}")
+        print(f"  Target: {structural_map.target_name or 'unspecified'}")
+        print(f"  Student layers: {structural_map.student_layer_count}")
+
     try:
         student_config = _load_model_config(student_model_dir, student_model_id)
         resolved_teacher_prefix = _normalize_prefix(teacher_prefix) if teacher_prefix else _normalize_prefix(raw_tape.prefix)
@@ -640,7 +732,8 @@ def expand_tape(input_tape: Path,
                                            resolved_teacher_prefix,
                                            resolved_student_prefix,
                                            depth_strategy,
-                                           width_strategy)
+                                           width_strategy,
+                                           structural_map)
 
         _write_alignment_manifest(manifest_out,
                                   teacher_model_id,
@@ -696,10 +789,12 @@ def main() -> int:
     parser.add_argument("--student-prefix", type=str, default="language_model.model.layers.",
                         help="Tensor prefix to write into the aligned tape")
     parser.add_argument("--depth-strategy", type=str, choices=("bucket", "repeat"), default="bucket",
-                        help="Teacher-to-student layer mapping strategy")
+                        help="Teacher-to-student layer mapping strategy (ignored if --structural-map is provided)")
     parser.add_argument("--width-strategy", type=str, choices=("auto", "interpolation", "block-replication"),
                         default="auto",
                         help="Width expansion strategy for activation vectors")
+    parser.add_argument("--structural-map", type=Path, default=None,
+                        help="Explicit student-to-teacher layer mapping TSV file (overrides --depth-strategy)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Allow overwriting existing output files")
     args = parser.parse_args()
@@ -715,7 +810,8 @@ def main() -> int:
                 args.student_prefix,
                 args.depth_strategy,
                 args.width_strategy,
-                args.overwrite)
+                args.overwrite,
+                args.structural_map)
 
     print(f"Expanded tape: {args.input_tape} -> {args.output_tape}")
     print(f"Alignment manifest: {manifest_out}")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack a clean-slate Gemma 3 7B student into safetensors shards.
+"""Pack a clean-slate Gemma 3 7B student into BF16 safetensors shards.
 
 This script expects the bootstrap layout produced by
 scripts/bootstrap_gemma3_7b_student.py:
@@ -9,8 +9,8 @@ scripts/bootstrap_gemma3_7b_student.py:
   - norm_final.bin
   - blk.<n>.<tensor>.bin
 
-It writes either a single model.safetensors file or a sharded safetensors
-package with model.safetensors.index.json.
+It writes either a single dense BF16 model.safetensors file or a sharded BF16
+safetensors package with model.safetensors.index.json.
 """
 
 from __future__ import annotations
@@ -138,7 +138,7 @@ def _build_tensor_specs(cfg: dict, include_lm_head: bool) -> list[TensorSpec]:
                 TensorSpec(
                     f"language_model.model.layers.{layer_idx}.self_attn.q_norm.weight",
                     f"blk.{layer_idx}.q_norm",
-                    (hidden_size,),
+                    (head_dim,),
                 ),
                 TensorSpec(
                     f"language_model.model.layers.{layer_idx}.self_attn.k_proj.weight",
@@ -148,7 +148,7 @@ def _build_tensor_specs(cfg: dict, include_lm_head: bool) -> list[TensorSpec]:
                 TensorSpec(
                     f"language_model.model.layers.{layer_idx}.self_attn.k_norm.weight",
                     f"blk.{layer_idx}.k_norm",
-                    (hidden_size,),
+                    (head_dim,),
                 ),
                 TensorSpec(
                     f"language_model.model.layers.{layer_idx}.self_attn.v_proj.weight",
@@ -263,7 +263,12 @@ def _write_safetensors_file(output_path: Path,
         raise FileExistsError(f"Refusing to overwrite existing file: {output_path}")
 
     header = OrderedDict()
-    header["__metadata__"] = OrderedDict([("total_size", str(total_size))])
+    header["__metadata__"] = OrderedDict(
+        [
+            ("total_size", str(total_size)),
+            ("storage_encoding", "dense_bf16"),
+        ]
+    )
 
     data_offset = 0
     for spec, tensor in tensor_items:
@@ -407,13 +412,14 @@ def pack_student(source_dir: Path, output_dir: Path, max_shard_size: int, includ
             if bin_path.is_file():
                 bin_path.unlink()
 
-    print(f"Packed {len(tensor_items)} tensors into {shard_count} safetensors file(s) at {output_dir}")
+    print(f"Packed {len(tensor_items)} tensors into {shard_count} dense BF16 safetensors file(s) at {output_dir}")
+    print("Note: this export writes dense BF16 weights for current Sapphire loaders; it does not preserve compact ternary storage.")
     if shard_count > 1:
         print(f"Wrote shard index: {output_dir / 'model.safetensors.index.json'}")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Pack a Gemma 3 7B student directory into safetensors")
+    parser = argparse.ArgumentParser(description="Pack a Gemma 3 7B student directory into dense BF16 safetensors")
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_MODEL_DIR,
                         help="Directory containing the bootstrap .bin tensors and config.json")
     parser.add_argument("--output-dir", type=Path, default=None,

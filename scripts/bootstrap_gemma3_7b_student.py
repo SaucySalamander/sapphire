@@ -71,13 +71,14 @@ def bootstrap_student(model_dir: Path, seed: int, noise_std: float, overwrite: b
     mlp_up_shape = (intermediate_size, hidden_size)
     mlp_down_shape = (hidden_size, intermediate_size)
     norm_shape = (hidden_size,)
+    qk_norm_shape = (head_dim,)
 
     for layer_idx in range(num_hidden_layers):
         _write_ones_tensor(model_dir / f"blk.{layer_idx}.norm_attn.bin", norm_shape, overwrite)
         _write_noise_tensor(model_dir / f"blk.{layer_idx}.q_proj.bin", q_shape, rng, noise_std, overwrite)
-        _write_ones_tensor(model_dir / f"blk.{layer_idx}.q_norm.bin", norm_shape, overwrite)
+        _write_ones_tensor(model_dir / f"blk.{layer_idx}.q_norm.bin", qk_norm_shape, overwrite)
         _write_noise_tensor(model_dir / f"blk.{layer_idx}.k_proj.bin", kv_shape, rng, noise_std, overwrite)
-        _write_ones_tensor(model_dir / f"blk.{layer_idx}.k_norm.bin", norm_shape, overwrite)
+        _write_ones_tensor(model_dir / f"blk.{layer_idx}.k_norm.bin", qk_norm_shape, overwrite)
         _write_noise_tensor(model_dir / f"blk.{layer_idx}.v_proj.bin", kv_shape, rng, noise_std, overwrite)
         _write_noise_tensor(model_dir / f"blk.{layer_idx}.o_proj.bin", o_shape, rng, noise_std, overwrite)
         _write_ones_tensor(model_dir / f"blk.{layer_idx}.norm_attn_post.bin", norm_shape, overwrite)

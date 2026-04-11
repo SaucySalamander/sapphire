@@ -84,6 +84,51 @@ static void gemv_bf16(float *y, const uint16_t *A, const float *x, int m, int n)
     }
 }
 
+float quantized_gemv_ternary_scalar(const void *W_row, const float *x, int block_count, int block_size) {
+    const tensor_ternary_view_t *row = (const tensor_ternary_view_t *)W_row;
+    float sum = 0.0f;
+    size_t packed_cols = 0u;
+    size_t packed_idx = 0u;
+    int col = 0;
+
+    (void)block_count;
+    (void)block_size;
+
+    if (!row || !row->packed_weights || !row->scales || row->rows != 1u || row->cols == 0u) {
+        return 0.0f;
+    }
+
+    packed_cols = row->packed_cols;
+    for (packed_idx = 0u; packed_idx < packed_cols; ++packed_idx) {
+        uint8_t packed = row->packed_weights[packed_idx];
+        for (int lane = 0; lane < 4 && col < (int)row->cols; ++lane, ++col) {
+            uint8_t code = (uint8_t)((packed >> (lane * 2)) & 0x3u);
+            if (code == 1u) {
+                sum += x[col];
+            } else if (code == 2u) {
+                sum -= x[col];
+            }
+        }
+    }
+
+    return row->scales[0] * sum;
+}
+
+static void gemv_ternary(float *y, const tensor_t *A, const float *x, int m) {
+    const tensor_ternary_view_t *view = tensor_data_ternary(A);
+    if (!view || !view->packed_weights || !view->scales) {
+        return;
+    }
+
+    for (int row = 0; row < m; ++row) {
+        tensor_ternary_view_t row_view = *view;
+        row_view.rows = 1u;
+        row_view.packed_weights = view->packed_weights + (size_t)row * view->packed_cols;
+        row_view.scales = view->scales + row;
+        y[row] = quantized_gemv_ternary_scalar(&row_view, x, 0, 0);
+    }
+}
+
 int kernel_gemm(kernel_context_t *ctx, float *Y, const tensor_t *A, const float *X, int batch_size, int out_stride) {
     if (!Y || !A || !X || batch_size <= 0) {
         LOG_ERROR("kernel_gemm invalid arguments");
@@ -141,6 +186,19 @@ int kernel_gemv(kernel_context_t *ctx, float *y, const tensor_t *A, const float 
                 return -1;
             }
             // Use the optimized and multithreaded pool implementations
+            int ret = kernel_backend_exec(ctx, A, x, y, 0, 1);
+            if (ret != 0) {
+                LOG_ERROR("kernel_backend_exec failed with code %d", ret);
+                return -1;
+            }
+            return 0;
+        }
+
+        case DTYPE_TERNARY_2BIT: {
+            if (!ctx) {
+                gemv_ternary(y, A, x, m);
+                return 0;
+            }
             int ret = kernel_backend_exec(ctx, A, x, y, 0, 1);
             if (ret != 0) {
                 LOG_ERROR("kernel_backend_exec failed with code %d", ret);
@@ -280,6 +338,7 @@ int tensor_gemv_simd_lane_count_for_dtype(tensor_dtype_t dtype) {
             return 8; // AVX2 256-bit -> 8 x 32-bit floats
         case DTYPE_Q4_0:
         case DTYPE_Q8_0:
+        case DTYPE_TERNARY_2BIT:
             return 8; // quantized kernels operate on blocks but 8 is a safe lane count
         default:
             return 1;

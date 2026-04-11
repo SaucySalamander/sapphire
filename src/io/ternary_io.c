@@ -577,6 +577,233 @@ int io_write_layer_ternary_into_dir(const char *output_dir,
     return rc;
 }
 
+static uint16_t f32_to_bf16_val(float f)
+{
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    return (uint16_t)(bits >> 16);
+}
+
+static int mold_bf16_build_header(char *buf,
+                                  size_t buf_size,
+                                  const char *tensor_name,
+                                  uint32_t rows,
+                                  uint32_t cols,
+                                  uint32_t crc32)
+{
+    size_t byte_count = (size_t)rows * (size_t)cols * sizeof(uint16_t);
+    int rc = 0;
+
+    if (cols == 1u) {
+        rc = snprintf(buf,
+                      buf_size,
+                      "{\"__metadata__\":{\"sapphire_quant\":\"mold-bf16\",\"crc32\":\"%08x\"},"
+                      "\"%s\":{\"dtype\":\"BF16\",\"shape\":[%u],\"data_offsets\":[0,%zu]}}",
+                      crc32,
+                      tensor_name,
+                      rows,
+                      byte_count);
+    } else {
+        rc = snprintf(buf,
+                      buf_size,
+                      "{\"__metadata__\":{\"sapphire_quant\":\"mold-bf16\",\"crc32\":\"%08x\"},"
+                      "\"%s\":{\"dtype\":\"BF16\",\"shape\":[%u,%u],\"data_offsets\":[0,%zu]}}",
+                      crc32,
+                      tensor_name,
+                      rows,
+                      cols,
+                      byte_count);
+    }
+
+    if (rc < 0 || (size_t)rc >= buf_size) {
+        return -1;
+    }
+    return rc;
+}
+
+static int mold_bf16_write_file(const char *output_path,
+                                const char *header,
+                                uint64_t header_len,
+                                const uint16_t *bf16_data,
+                                size_t bf16_byte_count)
+{
+    int fd = -1;
+    ssize_t wrote = 0;
+
+    fd = open(output_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: cannot open %s: %s", output_path, strerror(errno));
+        return -1;
+    }
+
+    wrote = write(fd, &header_len, sizeof(header_len));
+    if (wrote != (ssize_t)sizeof(header_len)) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: failed to write header length: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    wrote = write(fd, header, (size_t)header_len);
+    if (wrote != (ssize_t)header_len) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: failed to write header: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    wrote = write(fd, bf16_data, bf16_byte_count);
+    if (wrote != (ssize_t)bf16_byte_count) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: failed to write BF16 data: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    if (close(fd) != 0) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: close failed for %s: %s", output_path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int ternary_append_mold_manifest_entry(const char *output_dir,
+                                              const char *tensor_name,
+                                              const char *file_name,
+                                              uint32_t rows,
+                                              uint32_t cols,
+                                              uint32_t crc32)
+{
+    char *manifest_path = NULL;
+    char line[1024];
+    int fd = -1;
+    int rc = -1;
+    int n = 0;
+    ssize_t wrote = 0;
+    size_t bf16_byte_count = (size_t)rows * (size_t)cols * sizeof(uint16_t);
+
+    manifest_path = construct_safe_path(output_dir, "manifest.tsv", NULL);
+    if (!manifest_path) {
+        return -1;
+    }
+
+    fd = open(manifest_path, O_CREAT | O_APPEND | O_WRONLY, 0644);
+    if (fd < 0) {
+        LOG_ERROR("ternary manifest: cannot open %s: %s", manifest_path, strerror(errno));
+        free(manifest_path);
+        return -1;
+    }
+
+    n = snprintf(line,
+                 sizeof(line),
+                 "%s\t%s\t%u\t%u\t%zu\t%08x\tmold\n",
+                 tensor_name,
+                 file_name,
+                 rows,
+                 cols,
+                 bf16_byte_count,
+                 crc32);
+    if (n < 0 || (size_t)n >= sizeof(line)) {
+        LOG_ERROR("ternary manifest: mold line construction failed for %s", tensor_name);
+        goto cleanup;
+    }
+
+    wrote = write(fd, line, (size_t)n);
+    if (wrote != (ssize_t)n) {
+        LOG_ERROR("ternary manifest: mold write failed for %s: %s", manifest_path, strerror(errno));
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (fd >= 0 && close(fd) != 0) {
+        LOG_ERROR("ternary manifest: close failed for %s: %s", manifest_path, strerror(errno));
+        rc = -1;
+    }
+    free(manifest_path);
+    return rc;
+}
+
+int io_write_layer_molded_bf16_into_dir(const char *output_dir,
+                                        const char *tensor_name,
+                                        const float *f32_weights,
+                                        uint32_t rows,
+                                        uint32_t cols,
+                                        uint32_t *out_crc32)
+{
+    char safe_name[320];
+    char file_name[352];
+    char header[2048];
+    char *output_path = NULL;
+    uint16_t *bf16_data = NULL;
+    size_t n = 0;
+    size_t bf16_byte_count = 0;
+    uint32_t crc32 = 0;
+    uint64_t header_len = 0;
+    int rc = -1;
+    int hrc = 0;
+    size_t i = 0;
+
+    if (!output_dir || ternary_validate_tensor_name(tensor_name) != 0 ||
+        !f32_weights || rows == 0u || cols == 0u) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: invalid arguments");
+        return -1;
+    }
+    if (io_prepare_ternary_output_dir(output_dir) != 0) {
+        return -1;
+    }
+
+    ternary_sanitize_tensor_name(tensor_name, safe_name, sizeof(safe_name));
+    if (safe_name[0] == '\0') {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: failed to sanitize tensor name %s", tensor_name);
+        return -1;
+    }
+    if (snprintf(file_name, sizeof(file_name), "%s.safetensors", safe_name) < 0) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: failed to build filename for %s", tensor_name);
+        return -1;
+    }
+
+    n = (size_t)rows * (size_t)cols;
+    bf16_byte_count = n * sizeof(uint16_t);
+    bf16_data = (uint16_t *)malloc(bf16_byte_count);
+    if (!bf16_data) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: alloc failed for %s (%zu elements)", tensor_name, n);
+        return -1;
+    }
+
+    for (i = 0; i < n; ++i) {
+        bf16_data[i] = f32_to_bf16_val(f32_weights[i]);
+    }
+
+    crc32 = io_crc32_update(0u, bf16_data, bf16_byte_count);
+
+    hrc = mold_bf16_build_header(header, sizeof(header), tensor_name, rows, cols, crc32);
+    if (hrc < 0) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: header construction failed for %s", tensor_name);
+        free(bf16_data);
+        return -1;
+    }
+    header_len = (uint64_t)hrc;
+
+    output_path = construct_safe_path(output_dir, file_name, NULL);
+    if (!output_path) {
+        free(bf16_data);
+        return -1;
+    }
+
+    rc = mold_bf16_write_file(output_path, header, header_len, bf16_data, bf16_byte_count);
+    if (rc == 0) {
+        rc = ternary_append_mold_manifest_entry(output_dir, tensor_name, file_name,
+                                                rows, cols, crc32);
+    }
+    if (rc == 0) {
+        LOG_INFO("Wrote MOLD BF16 tensor %s -> %s (%zuB crc32=%08x)", tensor_name, output_path, bf16_byte_count, crc32);
+        if (out_crc32) {
+            *out_crc32 = crc32;
+        }
+    }
+
+    free(bf16_data);
+    free(output_path);
+    return rc;
+}
+
 static int load_layer_tensor_copy(const safetensors_file_t *file,
                                   const char *name,
                                   const safetensors_tensor_meta_t **out_meta,

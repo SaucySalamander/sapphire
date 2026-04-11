@@ -26,6 +26,7 @@
 #include "../include/model_spec.h"
 #include "../include/tensor_mapper.h"
 #include "../include/simple_json.h"
+#include "../include/ternary_io.h"
 
 /**
  * @brief Opaque structure managing an open Safetensors file.
@@ -448,6 +449,82 @@ tensor_t* safetensors_create_tensor_ref(safetensors_file_t *st,
     tensor_t *t = tensor_create_view(dtype, meta->ndim, (int*)meta->shape, mmap_offset);
     
     return t;
+}
+
+tensor_t* safetensors_create_ternary_tensor_ref(const safetensors_file_t *st,
+                                                const char *tensor_name,
+                                                uint32_t rows,
+                                                uint32_t cols,
+                                                size_t packed_weight_bytes,
+                                                uint32_t expected_crc32) {
+    char packed_name[320];
+    char scales_name[320];
+    const safetensors_tensor_meta_t *packed_meta = NULL;
+    const safetensors_tensor_meta_t *scales_meta = NULL;
+    const uint8_t *packed_ptr = NULL;
+    const float *scales_ptr = NULL;
+    size_t packed_cols = 0u;
+
+    if (!st || !tensor_name || rows == 0u || cols == 0u) {
+        return NULL;
+    }
+
+    if (snprintf(packed_name, sizeof(packed_name), "%s.packed", tensor_name) < 0 ||
+        snprintf(scales_name, sizeof(scales_name), "%s.scales", tensor_name) < 0) {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: name formatting failed for %s", tensor_name);
+        return NULL;
+    }
+
+    packed_meta = safetensors_get_tensor_by_name(st, packed_name);
+    scales_meta = safetensors_get_tensor_by_name(st, scales_name);
+    if (!packed_meta || !scales_meta) {
+        return NULL;
+    }
+    if (packed_meta->dtype != SAFETENSORS_U8 || scales_meta->dtype != SAFETENSORS_F32) {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: unexpected dtypes for %s", tensor_name);
+        return NULL;
+    }
+
+    packed_cols = ((size_t)cols + (TERNARY_PACKED_WEIGHTS_PER_BYTE - 1u)) / TERNARY_PACKED_WEIGHTS_PER_BYTE;
+    if (packed_meta->ndim != 2 || scales_meta->ndim != 1 ||
+        packed_meta->shape[0] != rows || packed_meta->shape[1] != packed_cols ||
+        scales_meta->shape[0] != rows) {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: shape mismatch for %s", tensor_name);
+        return NULL;
+    }
+    if (packed_meta->size_bytes != packed_weight_bytes) {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: packed byte mismatch for %s", tensor_name);
+        return NULL;
+    }
+    if (scales_meta->size_bytes != (uint64_t)rows * sizeof(float)) {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: scale byte mismatch for %s", tensor_name);
+        return NULL;
+    }
+
+    packed_ptr = (const uint8_t *)safetensors_data_ptr(st, packed_meta);
+    scales_ptr = (const float *)safetensors_data_ptr(st, scales_meta);
+    if (!packed_ptr || !scales_ptr) {
+        return NULL;
+    }
+
+    if (expected_crc32 != 0u) {
+        uint32_t actual_crc32 = io_crc32_update(0u, packed_ptr, packed_meta->size_bytes);
+        actual_crc32 = io_crc32_update(actual_crc32, scales_ptr, scales_meta->size_bytes);
+        if (actual_crc32 != expected_crc32) {
+            LOG_ERROR("safetensors_create_ternary_tensor_ref: crc mismatch for %s (expected=%08x actual=%08x)",
+                      tensor_name,
+                      expected_crc32,
+                      actual_crc32);
+            return NULL;
+        }
+    }
+
+    return tensor_create_ternary_view(rows,
+                                      cols,
+                                      packed_ptr,
+                                      packed_meta->size_bytes,
+                                      scales_ptr,
+                                      1);
 }
 
 /**

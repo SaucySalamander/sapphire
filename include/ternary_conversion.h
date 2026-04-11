@@ -17,6 +17,7 @@ typedef struct {
     const char *activation_tape_path;
     const char *hessian_sidecar_path;
     const char *teacher_model_name;
+    const char *structural_map_path;
     const char *calibration_corpus_path;
     const char *calibration_corpus_manifest_path;
     const char *validation_corpus_path;

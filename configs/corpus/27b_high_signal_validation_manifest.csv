@@ -1,3 +1,0 @@
-source,weight,quota
-corpora/validation/gsm8k_prompts.txt,1.0,32
-corpora/validation/humaneval_prompts.txt,1.0,32

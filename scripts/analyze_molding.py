@@ -17,6 +17,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 CATEGORY_COLORS = {
@@ -206,8 +207,83 @@ def single_point_bar_width(x_value: float) -> float:
     return max(1.0, magnitude * 0.02)
 
 
+def create_side_legend_axis(fig: plt.Figure,
+                            plot_right: float = 0.74,
+                            panel_left: float = 0.77,
+                            panel_width: float = 0.21) -> plt.Axes:
+    fig.subplots_adjust(left=0.08, right=plot_right, bottom=0.1, top=0.92)
+    legend_ax = fig.add_axes([panel_left, 0.1, panel_width, 0.82])
+    legend_ax.axis("off")
+    return legend_ax
+
+
+def add_side_legends(legend_ax: plt.Axes, legend_specs: list[dict[str, object]]) -> None:
+    top = 1.0
+
+    for spec in legend_specs:
+        handles = spec.get("handles")
+        if not handles:
+            continue
+
+        ncol = int(spec.get("ncol", 1))
+        fontsize = int(spec.get("fontsize", 8))
+        legend = legend_ax.legend(
+            handles=handles,
+            loc="upper left",
+            bbox_to_anchor=(0.0, top),
+            borderaxespad=0.0,
+            frameon=False,
+            fontsize=fontsize,
+            title=spec.get("title"),
+            title_fontsize=fontsize + 1,
+            ncol=ncol,
+            handlelength=2.6,
+            columnspacing=1.0,
+            labelspacing=0.45,
+        )
+        legend_ax.add_artist(legend)
+
+        rows = (len(handles) + ncol - 1) // ncol
+        top -= 0.09 + rows * 0.05
+
+
+def build_series_handles(frame_alpha_pairs: list[tuple[pd.DataFrame | None, float]],
+                         series_styles: dict[str, str | tuple[float, tuple[float, ...]]]) -> list[Line2D]:
+    handles: list[Line2D] = []
+    seen: set[str] = set()
+
+    for frame, alpha in frame_alpha_pairs:
+        if frame is None or frame.empty:
+            continue
+        for series_key, series_label, _series_frame in iter_series(frame):
+            if series_key in seen:
+                continue
+            seen.add(series_key)
+            handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color="#444444",
+                    linestyle=series_styles.get(series_key, "-"),
+                    linewidth=2.0,
+                    marker="o",
+                    markersize=5,
+                    alpha=alpha,
+                    label=series_label,
+                )
+            )
+
+    return handles
+
+
+def save_plot(fig: plt.Figure, output_path: Path) -> None:
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_convergence(primary: pd.DataFrame, compare: pd.DataFrame | None, output_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(15, 7))
+    legend_ax = create_side_legend_axis(fig)
     layers = unique_layers(primary, compare) if compare is not None else unique_layers(primary)
     series_styles = build_series_style_map(primary, compare) if compare is not None else build_series_style_map(primary)
 
@@ -231,27 +307,37 @@ def plot_convergence(primary: pd.DataFrame, compare: pd.DataFrame | None, output
                     alpha=alpha,
                     marker="o",
                     markersize=5,
-                    label=f"{series_label} layer {layer_idx}",
                 )
 
     ax.set_title("Convergence: MSE Loss vs Step")
     ax.set_xlabel("analysis step")
     ax.set_ylabel("mse_loss")
     ax.grid(True, alpha=0.28)
-    ax.legend(loc="upper right", fontsize=8, ncol=2)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160)
-    plt.close(fig)
+
+    layer_handles = [
+        Line2D([0], [0], color=plt.get_cmap("tab20")(index % 20), linewidth=2.0, marker="o", markersize=5, label=f"layer {layer_idx}")
+        for index, layer_idx in enumerate(layers)
+    ]
+    series_handles = build_series_handles(
+        [(primary, 0.92), (compare, 0.65)],
+        series_styles,
+    )
+    add_side_legends(
+        legend_ax,
+        [
+            {"title": "series", "handles": series_handles, "fontsize": 8},
+            {"title": "layers", "handles": layer_handles, "fontsize": 8, "ncol": 2 if len(layer_handles) > 10 else 1},
+        ],
+    )
+    save_plot(fig, output_path)
 
 
 def plot_sparsity(primary: pd.DataFrame, compare: pd.DataFrame | None, output_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(12, 7))
+    fig, ax = plt.subplots(figsize=(15, 7))
+    legend_ax = create_side_legend_axis(fig)
     series_styles = build_series_style_map(primary, compare) if compare is not None else build_series_style_map(primary)
 
-    series_index = 0
-
     def _stack(series_frame: pd.DataFrame, alpha: float) -> None:
-        nonlocal series_index
         grouped = normalize_probability_columns(
             grouped_mean(series_frame, ["p_neg1", "p_zero", "p_pos1"]),
             ["p_neg1", "p_zero", "p_pos1"],
@@ -290,22 +376,6 @@ def plot_sparsity(primary: pd.DataFrame, compare: pd.DataFrame | None, output_pa
         ax.plot(x, grouped["p_zero"], color=CATEGORY_COLORS["p_zero"], linestyle=series_style, alpha=alpha, linewidth=1.2, marker="o", markersize=4)
         ax.plot(x, grouped["p_pos1"], color=CATEGORY_COLORS["p_pos1"], linestyle=series_style, alpha=alpha, linewidth=1.2, marker="o", markersize=4)
 
-        label_y = 0.95 - (0.05 * series_index)
-        if label_y < 0.08:
-            label_y = 0.08
-        ax.text(
-            0.01,
-            label_y,
-            series_label,
-            transform=ax.transAxes,
-            fontsize=9,
-            color="black",
-            alpha=0.8,
-            verticalalignment="top",
-            bbox={"facecolor": "white", "alpha": 0.5, "edgecolor": "none", "pad": 2.5},
-        )
-        series_index += 1
-
     for series_key, series_label, series_frame in iter_series(primary):
         _stack(series_frame, 0.72)
     if compare is not None:
@@ -313,28 +383,29 @@ def plot_sparsity(primary: pd.DataFrame, compare: pd.DataFrame | None, output_pa
             _stack(series_frame, 0.28)
 
     category_handles = [Patch(facecolor=color, label=label) for label, color in CATEGORY_COLORS.items()]
-    category_legend = ax.legend(handles=category_handles, loc="upper left", fontsize=9, title="distribution")
-
-    if compare is not None:
-        run_handles = [
-            Patch(facecolor="#777777", alpha=0.72, label=primary.iloc[0]["run_label"]),
-            Patch(facecolor="#777777", alpha=0.28, label=compare.iloc[0]["run_label"]),
-        ]
-        ax.add_artist(category_legend)
-        ax.legend(handles=run_handles, loc="upper right", fontsize=9, title="run opacity")
+    series_handles = build_series_handles(
+        [(primary, 0.72), (compare, 0.28)],
+        series_styles,
+    )
 
     ax.set_title("Sparsity Health: p_neg1 / p_zero / p_pos1 Over Time")
     ax.set_xlabel("analysis step")
     ax.set_ylabel("probability mass")
     ax.set_ylim(0.0, 1.0)
     ax.grid(True, alpha=0.28)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160)
-    plt.close(fig)
+    add_side_legends(
+        legend_ax,
+        [
+            {"title": "series", "handles": series_handles, "fontsize": 8},
+            {"title": "distribution", "handles": category_handles, "fontsize": 8},
+        ],
+    )
+    save_plot(fig, output_path)
 
 
 def plot_efficiency(primary: pd.DataFrame, compare: pd.DataFrame | None, output_path: Path) -> None:
-    fig, ax_tps = plt.subplots(figsize=(12, 7))
+    fig, ax_tps = plt.subplots(figsize=(15, 7))
+    legend_ax = create_side_legend_axis(fig)
     ax_io = ax_tps.twinx()
     series_styles = build_series_style_map(primary, compare) if compare is not None else build_series_style_map(primary)
 
@@ -356,7 +427,6 @@ def plot_efficiency(primary: pd.DataFrame, compare: pd.DataFrame | None, output_
                 alpha=alpha,
                 marker="o",
                 markersize=5,
-                label=f"{series_label} tps",
             )
             ax_io.plot(
                 grouped.index,
@@ -367,7 +437,6 @@ def plot_efficiency(primary: pd.DataFrame, compare: pd.DataFrame | None, output_
                 alpha=alpha,
                 marker="o",
                 markersize=5,
-                label=f"{series_label} io_ms",
             )
 
     ax_tps.set_title("Efficiency: tps vs io_ms")
@@ -376,16 +445,27 @@ def plot_efficiency(primary: pd.DataFrame, compare: pd.DataFrame | None, output_
     ax_io.set_ylabel("io_ms")
     ax_tps.grid(True, alpha=0.28)
 
-    handles_tps, labels_tps = ax_tps.get_legend_handles_labels()
-    handles_io, labels_io = ax_io.get_legend_handles_labels()
-    ax_tps.legend(handles_tps + handles_io, labels_tps + labels_io, loc="upper right", fontsize=9)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160)
-    plt.close(fig)
+    metric_handles = [
+        Line2D([0], [0], color=RUN_COLORS[0], linewidth=2.2, marker="o", markersize=5, label="tps"),
+        Line2D([0], [0], color=RUN_COLORS[1], linewidth=2.2, marker="o", markersize=5, label="io_ms"),
+    ]
+    series_handles = build_series_handles(
+        [(primary, 0.92), (compare, 0.65)],
+        series_styles,
+    )
+    add_side_legends(
+        legend_ax,
+        [
+            {"title": "series", "handles": series_handles, "fontsize": 8},
+            {"title": "metrics", "handles": metric_handles, "fontsize": 8},
+        ],
+    )
+    save_plot(fig, output_path)
 
 
 def plot_stability(primary: pd.DataFrame, compare: pd.DataFrame | None, output_path: Path) -> None:
-    fig, (ax_norms, ax_saturation) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig, (ax_norms, ax_saturation) = plt.subplots(2, 1, figsize=(15, 10), sharex=True)
+    legend_ax = create_side_legend_axis(fig)
     ax_clip = ax_norms.twinx()
     ax_proxy = ax_saturation.twinx()
     series_styles = build_series_style_map(primary, compare) if compare is not None else build_series_style_map(primary)
@@ -411,7 +491,6 @@ def plot_stability(primary: pd.DataFrame, compare: pd.DataFrame | None, output_p
                 alpha=alpha,
                 marker="o",
                 markersize=4,
-                label=f"{series_label} raw_grad_norm",
             )
             ax_norms.plot(
                 grouped.index,
@@ -422,7 +501,6 @@ def plot_stability(primary: pd.DataFrame, compare: pd.DataFrame | None, output_p
                 alpha=alpha,
                 marker="s",
                 markersize=4,
-                label=f"{series_label} clipped_grad_norm",
             )
             ax_clip.plot(
                 grouped.index,
@@ -433,7 +511,6 @@ def plot_stability(primary: pd.DataFrame, compare: pd.DataFrame | None, output_p
                 alpha=alpha,
                 marker="^",
                 markersize=4,
-                label=f"{series_label} clip_scale",
             )
 
             ax_saturation.plot(
@@ -445,7 +522,6 @@ def plot_stability(primary: pd.DataFrame, compare: pd.DataFrame | None, output_p
                 alpha=alpha,
                 marker="o",
                 markersize=4,
-                label=f"{series_label} latent_saturation",
             )
             ax_proxy.plot(
                 grouped.index,
@@ -456,7 +532,6 @@ def plot_stability(primary: pd.DataFrame, compare: pd.DataFrame | None, output_p
                 alpha=alpha,
                 marker="d",
                 markersize=4,
-                label=f"{series_label} hessian_proxy_mean",
             )
             ax_proxy.plot(
                 grouped.index,
@@ -467,7 +542,6 @@ def plot_stability(primary: pd.DataFrame, compare: pd.DataFrame | None, output_p
                 alpha=alpha,
                 marker="x",
                 markersize=4,
-                label=f"{series_label} hessian_proxy_max",
             )
 
     ax_norms.set_title("Stability: Gradient Norms, Clipping, and Latent Saturation")
@@ -480,16 +554,26 @@ def plot_stability(primary: pd.DataFrame, compare: pd.DataFrame | None, output_p
     ax_proxy.set_ylabel("proxy summary")
     ax_saturation.grid(True, alpha=0.28)
 
-    handles_norms, labels_norms = ax_norms.get_legend_handles_labels()
-    handles_clip, labels_clip = ax_clip.get_legend_handles_labels()
-    handles_sat, labels_sat = ax_saturation.get_legend_handles_labels()
-    handles_proxy, labels_proxy = ax_proxy.get_legend_handles_labels()
-    ax_norms.legend(handles_norms + handles_clip, labels_norms + labels_clip, loc="upper right", fontsize=8)
-    ax_saturation.legend(handles_sat + handles_proxy, labels_sat + labels_proxy, loc="upper right", fontsize=8)
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160)
-    plt.close(fig)
+    metric_handles = [
+        Line2D([0], [0], color="#264653", linewidth=2.1, marker="o", markersize=4, label="raw_grad_norm"),
+        Line2D([0], [0], color="#e76f51", linewidth=2.1, marker="s", markersize=4, label="clipped_grad_norm"),
+        Line2D([0], [0], color="#2a9d8f", linewidth=1.8, marker="^", markersize=4, label="clip_scale"),
+        Line2D([0], [0], color="#7f5539", linewidth=2.1, marker="o", markersize=4, label="latent_saturation"),
+        Line2D([0], [0], color="#577590", linewidth=1.8, marker="d", markersize=4, label="hessian_proxy_mean"),
+        Line2D([0], [0], color="#f4a261", linewidth=1.8, marker="x", markersize=4, label="hessian_proxy_max"),
+    ]
+    series_handles = build_series_handles(
+        [(primary, 0.92), (compare, 0.65)],
+        series_styles,
+    )
+    add_side_legends(
+        legend_ax,
+        [
+            {"title": "series", "handles": series_handles, "fontsize": 8},
+            {"title": "metrics", "handles": metric_handles, "fontsize": 8},
+        ],
+    )
+    save_plot(fig, output_path)
 
 
 def write_plots(primary: pd.DataFrame, compare: pd.DataFrame | None, output_dir: Path) -> list[Path]:

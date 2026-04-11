@@ -186,6 +186,29 @@ typedef struct {
 } ternary_validation_checkpoint_t;
 
 /**
+ * @brief Write Hessian-molded F32 latent weights as a BF16 safetensors file into an output
+ * directory and append a manifest entry tagged as "mold".
+ *
+ * Used for anchor layers (embeddings, norms) that participate in the STE molding loop but
+ * must remain in BF16 rather than being packed to ternary.
+ *
+ * @param output_dir  Conversion output directory.
+ * @param tensor_name Tensor name (used as the safetensors key and manifest identifier).
+ * @param f32_weights Molded F32 weights buffer, rows * cols elements.
+ * @param rows        Row count.
+ * @param cols        Column count (use 1 for 1-D vectors).
+ * @param out_crc32   Optional CRC32 of the written BF16 payload.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int io_write_layer_molded_bf16_into_dir(const char *output_dir,
+                                        const char *tensor_name,
+                                        const float *f32_weights,
+                                        uint32_t rows,
+                                        uint32_t cols,
+                                        uint32_t *out_crc32);
+
+/**
  * @brief Append a validation checkpoint row for full-model ternary conversion.
  */
 int io_append_validation_checkpoint(const char *output_dir,

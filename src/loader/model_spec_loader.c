@@ -38,7 +38,8 @@ model_spec_t* get_model_spec(const char *model_name) {
     } else if (strcmp(model_name, "gemma-3-27b-it") == 0) {
         return &GEMMA3_27B_IT_SPEC;
     } else if (strcmp(model_name, "gemma-3-7b-it") == 0 ||
-               strcmp(model_name, "gemma-3-7b-q1.58b") == 0) {
+               strcmp(model_name, "gemma-3-7b-q1.58b") == 0 ||
+               strcmp(model_name, "gemma-3-7b-q1.58b-packed") == 0) {
         return &GEMMA3_7B_IT_SPEC;
     } else if (strcmp(model_name, "gemma-3-4b-it") == 0) {
         return &GEMMA3_4B_IT_SPEC;

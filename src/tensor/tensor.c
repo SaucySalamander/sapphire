@@ -16,6 +16,21 @@ struct tensor_t {
     int is_external;             // Flag if data is managed elsewhere (e.g. mmap)
 };
 
+static void tensor_ternary_release_payload(tensor_t *t) {
+    tensor_ternary_view_t *view = NULL;
+
+    if (!t || t->dtype != DTYPE_TERNARY_2BIT || !t->data) {
+        return;
+    }
+
+    view = (tensor_ternary_view_t *)t->data;
+    if (!t->is_external) {
+        free((void *)view->packed_weights);
+        free((void *)view->scales);
+    }
+    free(view);
+}
+
 // ============================================================================
 // Helper: Get element size for a dtype
 // ============================================================================
@@ -34,6 +49,7 @@ size_t dtype_element_size(tensor_dtype_t dtype) {
         case DTYPE_F16:   return 2;      // 16-bit float: 2 bytes per element
         case DTYPE_Q4_0:  return 1;      // 4-bit quantized: 2 elements per 1 byte (special handling)
         case DTYPE_Q8_0:  return 1;      // 8-bit quantized: 1 byte per element
+        case DTYPE_TERNARY_2BIT: return 0; // custom packed layout
         default:          return 0;
     }
 }
@@ -45,6 +61,7 @@ const char* dtype_name(tensor_dtype_t dtype) {
         case DTYPE_F16:   return "F16";
         case DTYPE_Q4_0:  return "Q4_0";
         case DTYPE_Q8_0:  return "Q8_0";
+        case DTYPE_TERNARY_2BIT: return "TERNARY_2BIT";
         default:          return "UNKNOWN";
     }
 }
@@ -101,6 +118,11 @@ tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype) {
     // Calculate total elements and required bytes
     size_t numel = shape_product(ndim, shape);
     size_t element_size = dtype_element_size(dtype);
+    if (dtype == DTYPE_TERNARY_2BIT || element_size == 0) {
+        LOG_ERROR("tensor_create unsupported custom dtype=%d", (int)dtype);
+        free(t);
+        return NULL;
+    }
     
     // For Q4_0: 2 elements per byte, so nbytes = numel / 2
     // For Q8_0: 1 element per byte, so nbytes = numel * 1
@@ -146,8 +168,73 @@ tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, v
         t->shape[i] = shape[i];
         elements *= shape[i];
     }
-    t->nbytes = elements * dtype_element_size(dtype);
+    if (dtype == DTYPE_Q4_0) {
+        t->nbytes = (elements + 1) / 2;
+    } else if (dtype == DTYPE_TERNARY_2BIT) {
+        t->nbytes = 0;
+    } else {
+        t->nbytes = elements * dtype_element_size(dtype);
+    }
     
+    return t;
+}
+
+tensor_t* tensor_create_ternary_view(uint32_t rows,
+                                     uint32_t cols,
+                                     const uint8_t *packed_weights,
+                                     size_t packed_weight_bytes,
+                                     const float *scales,
+                                     int is_external) {
+    tensor_t *t = NULL;
+    tensor_ternary_view_t *view = NULL;
+    int shape[2] = {0, 0};
+    size_t packed_cols = 0u;
+    size_t scale_bytes = (size_t)rows * sizeof(float);
+
+    if (!packed_weights || !scales || rows == 0u || cols == 0u) {
+        LOG_ERROR("tensor_create_ternary_view invalid ternary payload");
+        return NULL;
+    }
+
+    packed_cols = ((size_t)cols + 3u) / 4u;
+    if (packed_weight_bytes != (size_t)rows * packed_cols) {
+        LOG_ERROR("tensor_create_ternary_view packed byte mismatch: rows=%u cols=%u packed=%zu", rows, cols, packed_weight_bytes);
+        return NULL;
+    }
+
+    t = (tensor_t *)malloc(sizeof(tensor_t));
+    if (!t) {
+        LOG_ERROR("tensor_create_ternary_view malloc failed for tensor");
+        return NULL;
+    }
+    memset(t, 0, sizeof(*t));
+
+    view = (tensor_ternary_view_t *)malloc(sizeof(*view));
+    if (!view) {
+        LOG_ERROR("tensor_create_ternary_view malloc failed for payload");
+        free(t);
+        return NULL;
+    }
+
+    memset(view, 0, sizeof(*view));
+    view->packed_weights = packed_weights;
+    view->scales = scales;
+    view->rows = rows;
+    view->cols = cols;
+    view->packed_cols = (uint32_t)packed_cols;
+    view->packed_weight_bytes = packed_weight_bytes;
+    view->scale_bytes = scale_bytes;
+
+    shape[0] = (int)rows;
+    shape[1] = (int)cols;
+    t->data = view;
+    t->ndim = 2;
+    memcpy(t->shape, shape, sizeof(shape));
+    t->dtype = DTYPE_TERNARY_2BIT;
+    t->layout = LAYOUT_ROW_MAJOR;
+    t->nbytes = packed_weight_bytes + scale_bytes;
+    t->ref_count = 1;
+    t->is_external = is_external ? 1 : 0;
     return t;
 }
 
@@ -235,6 +322,33 @@ float tensor_get_f32(const tensor_t *t, size_t idx) {
         // Direct float access
         const float *fdata = (const float *)t->data;
         return fdata[idx];
+    } else if (t->dtype == DTYPE_TERNARY_2BIT) {
+        const tensor_ternary_view_t *view = (const tensor_ternary_view_t *)t->data;
+        size_t row = 0u;
+        size_t col = 0u;
+        size_t packed_idx = 0u;
+        uint32_t lane = 0u;
+        uint8_t packed = 0u;
+        float scale = 0.0f;
+        int8_t symbol = 0;
+
+        if (!view || !view->packed_weights || !view->scales || view->cols == 0u) {
+            return 0.0f;
+        }
+
+        row = idx / view->cols;
+        col = idx % view->cols;
+        packed_idx = row * view->packed_cols + (col / 4u);
+        lane = (uint32_t)(col % 4u);
+        packed = view->packed_weights[packed_idx];
+        scale = view->scales[row];
+
+        switch ((packed >> (lane * 2u)) & 0x3u) {
+            case 1u: symbol = 1; break;
+            case 2u: symbol = -1; break;
+            default: symbol = 0; break;
+        }
+        return scale * (float)symbol;
     } else if (t->dtype == DTYPE_Q4_0 || t->dtype == DTYPE_Q8_0) {
         // Placeholder: quantized dequantization
         // TODO: Integrate actual dequantization from Phase 1 (ggml_reader.c)
@@ -285,7 +399,9 @@ void tensor_release(tensor_t *t) {
 
     t->ref_count--;
     if (t->ref_count <= 0) {
-        if (t->data && !t->is_external) {
+        if (t->dtype == DTYPE_TERNARY_2BIT) {
+            tensor_ternary_release_payload(t);
+        } else if (t->data && !t->is_external) {
             free(t->data);
         }
         free(t);
@@ -372,6 +488,13 @@ float* tensor_data_f32(const tensor_t *t) {
 void* tensor_data_mutable(const tensor_t *t) {
     if (!t) return NULL;
     return t->data;
+}
+
+const tensor_ternary_view_t* tensor_data_ternary(const tensor_t *t) {
+    if (!t || t->dtype != DTYPE_TERNARY_2BIT) {
+        return NULL;
+    }
+    return (const tensor_ternary_view_t *)t->data;
 }
 
 tensor_dtype_t tensor_dtype(const tensor_t *t) {

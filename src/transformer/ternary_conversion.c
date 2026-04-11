@@ -9,7 +9,9 @@
 #include "activation_alignment.h"
 #include "activation_tape.h"
 #include "file_reader.h"
+#include "gemma3_270m_config.h"
 #include "inference.h"
+#include "kernels.h"
 #include "log.h"
 #include "model_reader.h"
 #include "model_spec.h"
@@ -25,6 +27,34 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+
+/* Number of tensor entries per transformer layer in the activation tape.
+ * Matches ALIGNMENT_WEIGHT_SPECS in expand_tape.py. */
+#define TAPE_TENSORS_PER_LAYER 7
+
+typedef enum {
+    STRUCTURAL_TENSOR_RULE_DIRECT = 0,
+    STRUCTURAL_TENSOR_RULE_ALIAS = 1
+} structural_tensor_rule_type_t;
+
+typedef enum {
+    STRUCTURAL_TENSOR_QUANT_MODE_UNSPECIFIED = 0,
+    STRUCTURAL_TENSOR_QUANT_MODE_TERNARY = 1,
+    STRUCTURAL_TENSOR_QUANT_MODE_PASS = 2,
+    STRUCTURAL_TENSOR_QUANT_MODE_MOLD = 3
+} structural_tensor_quant_mode_t;
+
+typedef struct {
+    char tensor_name[256];
+    char mapped_tensor_name[256];
+    structural_tensor_rule_type_t rule_type;
+    structural_tensor_quant_mode_t quant_mode;
+} structural_tensor_rule_t;
+
+typedef struct {
+    structural_tensor_rule_t *rules;
+    size_t rule_count;
+} structural_map_t;
 
 typedef struct {
     calibration_corpus_t corpus_storage;
@@ -46,6 +76,7 @@ typedef struct {
     uint32_t resume_step_index;
     ternary_hessian_proxy_cache_t hessian_proxy_cache;
     ternary_hessian_sidecar_t *hessian_sidecar;
+    structural_map_t structural_map;
 } conversion_runtime_t;
 
 static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
@@ -67,6 +98,7 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
     crc32 = io_crc32_update(crc32, config->layer_name, config->layer_name ? strlen(config->layer_name) + 1u : 0u);
     crc32 = io_crc32_update(crc32, config->activation_tape_path, config->activation_tape_path ? strlen(config->activation_tape_path) + 1u : 0u);
     crc32 = io_crc32_update(crc32, config->teacher_model_name, config->teacher_model_name ? strlen(config->teacher_model_name) + 1u : 0u);
+    crc32 = io_crc32_update(crc32, config->structural_map_path, config->structural_map_path ? strlen(config->structural_map_path) + 1u : 0u);
     crc32 = io_crc32_update(crc32, config->calibration_corpus_path, config->calibration_corpus_path ? strlen(config->calibration_corpus_path) + 1u : 0u);
     crc32 = io_crc32_update(crc32, config->calibration_corpus_manifest_path, config->calibration_corpus_manifest_path ? strlen(config->calibration_corpus_manifest_path) + 1u : 0u);
     crc32 = io_crc32_update(crc32, config->validation_corpus_path, config->validation_corpus_path ? strlen(config->validation_corpus_path) + 1u : 0u);
@@ -330,6 +362,360 @@ static int read_text_file(const char *path, char **out_text, size_t *out_size)
     *out_text = text;
     *out_size = buffer_size;
     return 0;
+}
+
+static void structural_map_release(structural_map_t *map)
+{
+    if (!map) {
+        return;
+    }
+
+    free(map->rules);
+    memset(map, 0, sizeof(*map));
+}
+
+static int text_equals_ignore_case_local(const char *lhs, const char *rhs)
+{
+    size_t idx = 0u;
+
+    if (!lhs || !rhs) {
+        return 0;
+    }
+
+    while (lhs[idx] != '\0' && rhs[idx] != '\0') {
+        char lhs_ch = lhs[idx];
+        char rhs_ch = rhs[idx];
+
+        if (lhs_ch >= 'A' && lhs_ch <= 'Z') {
+            lhs_ch = (char)(lhs_ch - 'A' + 'a');
+        }
+        if (rhs_ch >= 'A' && rhs_ch <= 'Z') {
+            rhs_ch = (char)(rhs_ch - 'A' + 'a');
+        }
+        if (lhs_ch != rhs_ch) {
+            return 0;
+        }
+        idx++;
+    }
+
+    return lhs[idx] == '\0' && rhs[idx] == '\0';
+}
+
+static int text_is_decimal_local(const char *text)
+{
+    size_t idx = 0u;
+
+    if (!text || text[0] == '\0') {
+        return 0;
+    }
+
+    for (idx = 0u; text[idx] != '\0'; ++idx) {
+        if (text[idx] < '0' || text[idx] > '9') {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static void trim_line_in_place(char *text)
+{
+    size_t len = 0u;
+
+    if (!text) {
+        return;
+    }
+
+    len = strlen(text);
+    while (len > 0u) {
+        char ch = text[len - 1u];
+        if (ch != ' ' && ch != '\t' && ch != '\r') {
+            break;
+        }
+        text[len - 1u] = '\0';
+        len--;
+    }
+}
+
+static int structural_map_rule_type_from_text(const char *text,
+                                              structural_tensor_rule_type_t *out_type)
+{
+    if (!text || !out_type) {
+        return -1;
+    }
+
+    if (text_equals_ignore_case_local(text, "direct")) {
+        *out_type = STRUCTURAL_TENSOR_RULE_DIRECT;
+        return 0;
+    }
+    if (text_equals_ignore_case_local(text, "alias")) {
+        *out_type = STRUCTURAL_TENSOR_RULE_ALIAS;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int structural_map_quant_mode_from_text(const char *text,
+                                               structural_tensor_quant_mode_t *out_mode)
+{
+    if (!text || !out_mode) {
+        return -1;
+    }
+
+    if (text_equals_ignore_case_local(text, "ternary")) {
+        *out_mode = STRUCTURAL_TENSOR_QUANT_MODE_TERNARY;
+        return 0;
+    }
+    if (text_equals_ignore_case_local(text, "pass") ||
+        text_equals_ignore_case_local(text, "bf16")) {
+        *out_mode = STRUCTURAL_TENSOR_QUANT_MODE_PASS;
+        return 0;
+    }
+    if (text_equals_ignore_case_local(text, "mold")) {
+        *out_mode = STRUCTURAL_TENSOR_QUANT_MODE_MOLD;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int structural_map_parse_rule_line(const char *line,
+                                          structural_tensor_rule_t *out_rule)
+{
+    char line_copy[1024];
+    char *fields[4];
+    size_t field_count = 0u;
+    char *saveptr = NULL;
+    char *field = NULL;
+    const char *tensor_name = NULL;
+    const char *mapped_tensor_name = NULL;
+    structural_tensor_rule_type_t rule_type;
+    structural_tensor_quant_mode_t quant_mode = STRUCTURAL_TENSOR_QUANT_MODE_UNSPECIFIED;
+
+    if (!line || !out_rule) {
+        return -1;
+    }
+
+    memset(out_rule, 0, sizeof(*out_rule));
+    if (copy_text_field_local(line_copy, sizeof(line_copy), line) != 0) {
+        return -1;
+    }
+
+    field = strtok_r(line_copy, " \t", &saveptr);
+    while (field && field_count < (sizeof(fields) / sizeof(fields[0]))) {
+        fields[field_count++] = field;
+        field = strtok_r(NULL, " \t", &saveptr);
+    }
+
+    if (field_count < 3u) {
+        return 0;
+    }
+
+    if (text_is_decimal_local(fields[0]) && text_is_decimal_local(fields[1])) {
+        return 0;
+    }
+
+    if (field_count >= 4u &&
+        structural_map_rule_type_from_text(fields[2], &rule_type) == 0 &&
+        structural_map_quant_mode_from_text(fields[3], &quant_mode) == 0) {
+        tensor_name = fields[0];
+        mapped_tensor_name = fields[1];
+    } else if (field_count == 3u &&
+               structural_map_rule_type_from_text(fields[2], &rule_type) == 0) {
+        tensor_name = fields[0];
+        mapped_tensor_name = fields[1];
+    } else if (field_count == 3u &&
+               structural_map_rule_type_from_text(fields[1], &rule_type) == 0 &&
+               structural_map_quant_mode_from_text(fields[2], &quant_mode) == 0) {
+        if (rule_type == STRUCTURAL_TENSOR_RULE_ALIAS) {
+            return -1;
+        }
+        tensor_name = fields[0];
+        mapped_tensor_name = fields[0];
+    } else {
+        return 0;
+    }
+
+    if (rule_type == STRUCTURAL_TENSOR_RULE_ALIAS &&
+        quant_mode == STRUCTURAL_TENSOR_QUANT_MODE_TERNARY) {
+        return -1;
+    }
+
+    out_rule->rule_type = rule_type;
+    out_rule->quant_mode = quant_mode;
+    if (copy_text_field_local(out_rule->tensor_name, sizeof(out_rule->tensor_name), tensor_name) != 0 ||
+        copy_text_field_local(out_rule->mapped_tensor_name, sizeof(out_rule->mapped_tensor_name), mapped_tensor_name) != 0) {
+        return -1;
+    }
+
+    return 1;
+}
+
+static int structural_pattern_matches(const char *pattern,
+                                      const char *text)
+{
+    const char *pattern_cursor = NULL;
+    const char *text_cursor = NULL;
+    const char *star = NULL;
+    const char *retry_text = NULL;
+
+    if (!pattern || !text) {
+        return 0;
+    }
+
+    pattern_cursor = pattern;
+    text_cursor = text;
+    while (*text_cursor != '\0') {
+        if (*pattern_cursor == '*') {
+            star = pattern_cursor++;
+            retry_text = text_cursor;
+            continue;
+        }
+        if (*pattern_cursor == *text_cursor) {
+            pattern_cursor++;
+            text_cursor++;
+            continue;
+        }
+        if (star) {
+            pattern_cursor = star + 1;
+            text_cursor = ++retry_text;
+            continue;
+        }
+        return 0;
+    }
+
+    while (*pattern_cursor == '*') {
+        pattern_cursor++;
+    }
+
+    return *pattern_cursor == '\0';
+}
+
+static int structural_map_append_rule(structural_map_t *map,
+                                      const structural_tensor_rule_t *rule)
+{
+    structural_tensor_rule_t *resized_rules = NULL;
+
+    if (!map || !rule) {
+        return -1;
+    }
+
+    resized_rules = (structural_tensor_rule_t *)realloc(
+        map->rules,
+        (map->rule_count + 1u) * sizeof(*map->rules)
+    );
+    if (!resized_rules) {
+        return -1;
+    }
+
+    map->rules = resized_rules;
+    map->rules[map->rule_count] = *rule;
+    map->rule_count++;
+    return 0;
+}
+
+static int structural_map_load(const char *path, structural_map_t *out_map)
+{
+    char *text = NULL;
+    size_t text_size = 0u;
+    char *cursor = NULL;
+
+    if (!path || !out_map) {
+        return -1;
+    }
+
+    memset(out_map, 0, sizeof(*out_map));
+    if (read_text_file(path, &text, &text_size) != 0) {
+        LOG_ERROR("ternary structural map: failed to read %s", path);
+        return -1;
+    }
+
+    cursor = text;
+    while (cursor && *cursor != '\0') {
+        char *line_end = strchr(cursor, '\n');
+        structural_tensor_rule_t rule;
+
+        if (line_end) {
+            *line_end = '\0';
+        }
+
+        while (*cursor == ' ' || *cursor == '\t') {
+            cursor++;
+        }
+        trim_line_in_place(cursor);
+
+        if (cursor[0] != '\0' && cursor[0] != '#') {
+            int parse_status = structural_map_parse_rule_line(cursor, &rule);
+            if (parse_status < 0) {
+                LOG_ERROR("ternary structural map: malformed rule in %s: %s", path, cursor);
+                free(text);
+                structural_map_release(out_map);
+                return -1;
+            }
+            if (parse_status > 0 && structural_map_append_rule(out_map, &rule) != 0) {
+                LOG_ERROR("ternary structural map: out of memory while parsing %s", path);
+                free(text);
+                structural_map_release(out_map);
+                return -1;
+            }
+        }
+
+        if (!line_end) {
+            break;
+        }
+        cursor = line_end + 1;
+    }
+
+    free(text);
+    LOG_INFO("ternary structural map: loaded %zu tensor rule(s) from %s", out_map->rule_count, path);
+    (void)text_size;
+    return 0;
+}
+
+static int structural_map_name_matches(const char *query_name, const char *rule_name)
+{
+    size_t query_len = 0u;
+    size_t rule_len = 0u;
+
+    if (!query_name || !rule_name) {
+        return 0;
+    }
+    if (strchr(rule_name, '*') != NULL) {
+        return structural_pattern_matches(rule_name, query_name);
+    }
+    if (strcmp(query_name, rule_name) == 0) {
+        return 1;
+    }
+
+    query_len = strlen(query_name);
+    rule_len = strlen(rule_name);
+    if (query_len >= rule_len && strcmp(query_name + (query_len - rule_len), rule_name) == 0) {
+        return 1;
+    }
+    if (rule_len >= query_len && strcmp(rule_name + (rule_len - query_len), query_name) == 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static const structural_tensor_rule_t *structural_map_find_rule(const structural_map_t *map,
+                                                                const char *tensor_name)
+{
+    size_t rule_idx = 0u;
+
+    if (!map || !tensor_name) {
+        return NULL;
+    }
+
+    for (rule_idx = 0u; rule_idx < map->rule_count; ++rule_idx) {
+        if (structural_map_name_matches(tensor_name, map->rules[rule_idx].tensor_name)) {
+            return &map->rules[rule_idx];
+        }
+    }
+
+    return NULL;
 }
 
 static int manifest_path_exists(const char *output_dir)
@@ -875,6 +1261,131 @@ static int tensor_name_is_layer_tensor(const char *tensor_name)
     return tensor_name && strstr(tensor_name, ".layers.") != NULL;
 }
 
+static int tensor_name_has_suffix(const char *tensor_name, const char *suffix)
+{
+    size_t tensor_len = 0u;
+    size_t suffix_len = 0u;
+
+    if (!tensor_name || !suffix) {
+        return 0;
+    }
+
+    tensor_len = strlen(tensor_name);
+    suffix_len = strlen(suffix);
+    if (tensor_len < suffix_len) {
+        return 0;
+    }
+
+    return strcmp(tensor_name + (tensor_len - suffix_len), suffix) == 0;
+}
+
+static int tensor_name_is_tied_embedding_tensor(const char *tensor_name)
+{
+    return tensor_name_has_suffix(tensor_name, "embed_tokens.weight");
+}
+
+static int tensor_name_is_tied_output_tensor(const char *tensor_name)
+{
+    return tensor_name_has_suffix(tensor_name, "lm_head.weight");
+}
+
+static const structural_tensor_rule_t *runtime_structural_rule_for_tensor(const conversion_runtime_t *runtime,
+                                                                          const char *tensor_name)
+{
+    if (!runtime || !tensor_name) {
+        return NULL;
+    }
+
+    return structural_map_find_rule(&runtime->structural_map, tensor_name);
+}
+
+static int structural_rule_is_pass_through(const structural_tensor_rule_t *rule)
+{
+    return rule && rule->quant_mode == STRUCTURAL_TENSOR_QUANT_MODE_PASS;
+}
+
+static int structural_rule_is_mold(const structural_tensor_rule_t *rule)
+{
+    return rule && rule->quant_mode == STRUCTURAL_TENSOR_QUANT_MODE_MOLD;
+}
+
+/**
+ * @brief Extract num_hidden_layers from the model spec's variant config.
+ *
+ * @return The number of hidden layers, or -1 if not available.
+ */
+static int spec_get_num_hidden_layers(const model_spec_t *spec)
+{
+    const gemma3_270m_config_t *cfg = NULL;
+
+    if (!spec || !spec->variant_config) {
+        return -1;
+    }
+
+    cfg = (const gemma3_270m_config_t *)spec->variant_config;
+    if (cfg->num_hidden_layers <= 0) {
+        return -1;
+    }
+
+    return cfg->num_hidden_layers;
+}
+
+/**
+ * @brief Validate that the activation tape's layer count matches the model's expected layers.
+ *
+ * This prevents buffer overflows when processing tapes with more layers than the
+ * student model config expects.
+ *
+ * @param tape The activation tape to validate.
+ * @param spec The model spec with the expected layer count.
+ * @return 0 if valid, -1 if there's a mismatch.
+ */
+static int validate_tape_layer_count(const activation_tape_t *tape,
+                                     const model_spec_t *spec)
+{
+    int expected_layers = 0;
+    uint32_t tape_entry_count = 0u;
+    int tape_layer_count = 0;
+
+    if (!tape || !spec) {
+        /* No tape to validate, or no spec to compare against */
+        return 0;
+    }
+
+    expected_layers = spec_get_num_hidden_layers(spec);
+    if (expected_layers <= 0) {
+        LOG_WARN("ternary conversion: could not determine expected layer count from model spec");
+        return 0;
+    }
+
+    tape_entry_count = activation_tape_entry_count(tape);
+    if (tape_entry_count == 0u) {
+        LOG_ERROR("ternary conversion: activation tape has no entries");
+        return -1;
+    }
+
+    /* Each layer has TAPE_TENSORS_PER_LAYER entries */
+    if ((tape_entry_count % TAPE_TENSORS_PER_LAYER) != 0u) {
+        LOG_ERROR("ternary conversion: tape entry count (%u) is not a multiple of %d tensors per layer",
+                  tape_entry_count, TAPE_TENSORS_PER_LAYER);
+        return -1;
+    }
+
+    tape_layer_count = (int)(tape_entry_count / TAPE_TENSORS_PER_LAYER);
+
+    if (tape_layer_count != expected_layers) {
+        LOG_ERROR("ternary conversion: ARCHITECTURE MISMATCH - tape contains %d layers but model expects %d layers",
+                  tape_layer_count, expected_layers);
+        LOG_ERROR("ternary conversion: ensure the activation tape was expanded with the correct structural map");
+        LOG_ERROR("ternary conversion: for 1B teacher -> 7B student, use: --structural-map configs/manifests/gemma3_7b_structural.tsv");
+        return -1;
+    }
+
+    LOG_INFO("ternary conversion: tape layer count (%d) matches model config (%d layers)",
+             tape_layer_count, expected_layers);
+    return 0;
+}
+
 static void prefetch_activation_tape_lookahead(const conversion_runtime_t *runtime,
                                                const model_spec_t *spec,
                                                int start_idx,
@@ -938,6 +1449,7 @@ static void destroy_conversion_runtime(conversion_runtime_t *runtime) {
         activation_tape_close(runtime->activation_tape);
     }
     ternary_hessian_proxy_cache_release(&runtime->hessian_proxy_cache);
+    structural_map_release(&runtime->structural_map);
     free(runtime->checkpoint_path);
     free(runtime->checkpoint_tmp_path);
     runtime->checkpoint_path = NULL;
@@ -1160,6 +1672,12 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
     }
 
     memset(out_runtime, 0, sizeof(*out_runtime));
+    if (config->structural_map_path && config->structural_map_path[0] != '\0' &&
+        structural_map_load(config->structural_map_path, &out_runtime->structural_map) != 0) {
+        destroy_conversion_runtime(out_runtime);
+        return -1;
+    }
+
     spec = get_model_spec(config->model_name);
     if (!spec) {
         LOG_ERROR("ternary conversion: failed to resolve model spec for %s", config->model_name);
@@ -1224,8 +1742,30 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
     memset(&result, 0, sizeof(result));
     memset(&layer, 0, sizeof(layer));
 
-    if (strcmp(config->layer_name, "model.embed_tokens.weight") == 0 ||
-        strcmp(config->layer_name, "lm_head.weight") == 0) {
+    {
+        const structural_tensor_rule_t *structural_rule = runtime_structural_rule_for_tensor(runtime,
+                                                                                              config->layer_name);
+        if (structural_rule_is_pass_through(structural_rule)) {
+            if (structural_rule->rule_type == STRUCTURAL_TENSOR_RULE_ALIAS) {
+                LOG_ERROR("Prompt 2 keeps PASS alias tensors in BF16; requested layer %s maps to %s",
+                          config->layer_name,
+                          structural_rule->mapped_tensor_name);
+            } else {
+                LOG_ERROR("Prompt 2 keeps PASS tensors in BF16; requested layer is excluded: %s",
+                          config->layer_name);
+            }
+            return -1;
+        }
+        if (structural_rule && structural_rule->rule_type == STRUCTURAL_TENSOR_RULE_ALIAS) {
+            LOG_ERROR("Prompt 2 skips structural alias tensors; requested layer %s maps to %s",
+                      config->layer_name,
+                      structural_rule->mapped_tensor_name);
+            return -1;
+        }
+    }
+
+    if (tensor_name_is_tied_embedding_tensor(config->layer_name) ||
+        tensor_name_is_tied_output_tensor(config->layer_name)) {
         LOG_ERROR("Prompt 2 keeps embeddings / tied output weights in BF16; requested layer is excluded: %s",
                   config->layer_name);
         return -1;
@@ -1300,6 +1840,7 @@ typedef struct {
     uint32_t *out_crc32;
     int *out_skipped_vector;
     float *out_io_ms;
+    int mold_bf16;
 } convert_tensor_job_t;
 
 typedef enum {
@@ -1351,6 +1892,40 @@ static int mmap_tensor_for_conversion(const char *model_dir,
     return -1;
 }
 
+static void store_convert_result(const convert_tensor_job_t *job,
+                                 ternary_calibration_result_t *result,
+                                 uint32_t crc32)
+{
+    if (job->out_result) {
+        *job->out_result = *result;
+        memset(result, 0, sizeof(*result));
+    }
+    if (job->out_crc32) {
+        *job->out_crc32 = crc32;
+    }
+}
+
+static int convert_vector_mold(const convert_tensor_job_t *job,
+                               const ternary_bf16_layer_map_t *map)
+{
+    float *f32_tmp = (float *)malloc((size_t)map->rows * sizeof(float));
+    int rc = 0;
+
+    if (!f32_tmp) {
+        LOG_ERROR("convert_vector_mold: alloc failed for %s", job->tensor_name);
+        return -1;
+    }
+    bf16_to_f32_vec(f32_tmp, map->bf16_weights, (int)map->rows);
+    rc = io_write_layer_molded_bf16_into_dir(job->output_dir, job->tensor_name,
+                                             f32_tmp, map->rows, 1u,
+                                             job->out_crc32);
+    free(f32_tmp);
+    if (rc == 0) {
+        LOG_INFO("Wrote MOLD BF16 vector %s (source)", job->tensor_name);
+    }
+    return rc;
+}
+
 static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     ternary_bf16_layer_map_t map;
     ternary_calibration_result_t result;
@@ -1392,6 +1967,11 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     }
 
     if (map.cols == 1u) {
+        if (job->mold_bf16) {
+            int vrc = convert_vector_mold(job, &map);
+            io_unmap_layer_bf16(&map);
+            return vrc;
+        }
         LOG_INFO("Skipping vector tensor in full conversion: %s", job->tensor_name);
         if (job->out_skipped_vector) {
             *job->out_skipped_vector = 1;
@@ -1438,6 +2018,20 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
         return -1;
     }
 
+    if (job->mold_bf16) {
+        rc = io_write_layer_molded_bf16_into_dir(job->output_dir, job->tensor_name,
+                                                 result.latent_weights,
+                                                 result.rows, result.cols,
+                                                 &crc32);
+        if (rc == 0) {
+            LOG_INFO("Molded BF16 tensor %s (crc32=%08x)", job->tensor_name, crc32);
+            store_convert_result(job, &result, crc32);
+        }
+        transformer_free_ternary_calibration_result(&result);
+        io_unmap_layer_bf16(&map);
+        return rc;
+    }
+
     layer.packed_weights = result.packed_weights;
     layer.packed_weight_bytes = result.packed_weight_bytes;
     layer.scales = result.scales;
@@ -1451,13 +2045,7 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     rc = io_write_layer_ternary_into_dir(job->output_dir, job->tensor_name, &layer, &crc32);
     if (rc == 0) {
         LOG_INFO("Converted tensor %s (crc32=%08x)", job->tensor_name, crc32);
-        if (job->out_result) {
-            *job->out_result = result;
-            memset(&result, 0, sizeof(result));
-        }
-        if (job->out_crc32) {
-            *job->out_crc32 = crc32;
-        }
+        store_convert_result(job, &result, crc32);
     }
 
     transformer_free_ternary_calibration_result(&result);
@@ -1556,6 +2144,7 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     int rc = 0;
     uint32_t converted_count = 0u;
     int use_layer_telemetry = 0;
+    int is_mold = 0;
 
     if (!task) {
         return -1;
@@ -1572,13 +2161,36 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     if (!task->tensor_name || task->tensor_name[0] == '\0') {
         return process_full_model_tensor_skip_other(task, converted_count, NULL);
     }
-    if (strcmp(task->tensor_name, "model.embed_tokens.weight") == 0) {
+    {
+        const structural_tensor_rule_t *structural_rule = runtime_structural_rule_for_tensor(task->runtime,
+                                                                                              task->tensor_name);
+        if (structural_rule && structural_rule->rule_type == STRUCTURAL_TENSOR_RULE_ALIAS) {
+            if (structural_rule_is_pass_through(structural_rule)) {
+                LOG_INFO("Skipping structural PASS alias tensor in full conversion: %s -> %s",
+                         task->tensor_name,
+                         structural_rule->mapped_tensor_name);
+                return process_full_model_tensor_skip_other(task, converted_count, NULL);
+            }
+            LOG_INFO("Skipping structural alias tensor in full conversion: %s -> %s",
+                     task->tensor_name,
+                     structural_rule->mapped_tensor_name);
+            return process_full_model_tensor_skip_other(task,
+                                                        converted_count,
+                                                        "Skipping structural alias tensor in full conversion: %s");
+        }
+        if (structural_rule_is_pass_through(structural_rule)) {
+            LOG_INFO("Skipping structural PASS tensor in full conversion: %s", task->tensor_name);
+            return process_full_model_tensor_skip_other(task, converted_count, NULL);
+        }
+        is_mold = structural_rule_is_mold(structural_rule);
+    }
+    if (!is_mold && tensor_name_is_tied_embedding_tensor(task->tensor_name)) {
         LOG_INFO("Skipping embedding tensor in full conversion: %s", task->tensor_name);
         return process_full_model_tensor_skip_other(task,
                                                     converted_count,
                                                     "Skipping embedding tensor in full conversion: %s");
     }
-    if (strcmp(task->tensor_name, "lm_head.weight") == 0) {
+    if (!is_mold && tensor_name_is_tied_output_tensor(task->tensor_name)) {
         LOG_INFO("Skipping tied output tensor in full conversion: %s", task->tensor_name);
         return process_full_model_tensor_skip_other(task,
                                                     converted_count,
@@ -1620,6 +2232,7 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     job.out_crc32 = &crc32;
     job.out_skipped_vector = &skipped_vector;
     job.out_io_ms = use_layer_telemetry ? &layer_telemetry.io_ms : NULL;
+    job.mold_bf16 = is_mold;
 
     rc = convert_tensor_to_dir(&job);
     if (rc != 0) {
@@ -1648,6 +2261,15 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
         LOG_ERROR("Full ternary conversion: failed to resolve model spec for %s", config->model_name);
         return -1;
     }
+
+    /* Validate tape layer count matches model config to prevent buffer overflow */
+    if (runtime && runtime->activation_tape) {
+        if (validate_tape_layer_count(runtime->activation_tape, spec) != 0) {
+            LOG_ERROR("Full ternary conversion: tape/model layer mismatch prevents safe conversion");
+            return -1;
+        }
+    }
+
     if (runtime) {
         start_layer = (runtime->checkpoint_state.next_layer_index > 0)
             ? (int)runtime->checkpoint_state.next_layer_index
@@ -1770,6 +2392,9 @@ static void log_conversion_config(const ternary_conversion_config_t *config)
     }
     if (config_has_text(config->teacher_model_name)) {
         LOG_INFO("  teacher_model: %s", config->teacher_model_name);
+    }
+    if (config_has_text(config->structural_map_path)) {
+        LOG_INFO("  structural_map: %s", config->structural_map_path);
     }
     if (config_has_text(config->hessian_sidecar_path)) {
         LOG_INFO("  hessian_sidecar: %s", config->hessian_sidecar_path);

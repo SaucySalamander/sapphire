@@ -13,6 +13,7 @@
  * - DTYPE_F16: 16-bit float (half precision)
  * - DTYPE_Q4_0: 4-bit quantized (from Phase 1 quantization)
  * - DTYPE_Q8_0: 8-bit quantized (from Phase 1 quantization)
+ * - DTYPE_TERNARY_2BIT: packed ternary weights with one scale per row
  */
 typedef enum {
     DTYPE_F32,     // 32-bit float
@@ -20,7 +21,18 @@ typedef enum {
     DTYPE_F16,     // 16-bit float (half precision)
     DTYPE_Q4_0,    // 4-bit quantized (Phase 1)
     DTYPE_Q8_0,    // 8-bit quantized (Phase 1)
+    DTYPE_TERNARY_2BIT, // 2-bit packed ternary symbols + row scales
 } tensor_dtype_t;
+
+typedef struct {
+    const uint8_t *packed_weights;
+    const float *scales;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t packed_cols;
+    size_t packed_weight_bytes;
+    size_t scale_bytes;
+} tensor_ternary_view_t;
 
 /**
  * @brief Memory layout strategy for tensor storage.
@@ -206,5 +218,24 @@ int tensor_ref_count(const tensor_t *t);
  * Used for memory-mapped weights.
  */
 tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, void *data);
+
+/**
+ * @brief Create an owned tensor wrapper for packed ternary weights.
+ *
+ * The returned tensor stores the logical matrix shape [rows, cols], while its
+ * backing payload points at a packed 2-bit symbol stream plus one F32 scale
+ * per row.
+ */
+tensor_t* tensor_create_ternary_view(uint32_t rows,
+                                     uint32_t cols,
+                                     const uint8_t *packed_weights,
+                                     size_t packed_weight_bytes,
+                                     const float *scales,
+                                     int is_external);
+
+/**
+ * @brief Return the packed ternary payload for a tensor, or NULL if not ternary.
+ */
+const tensor_ternary_view_t* tensor_data_ternary(const tensor_t *t);
 
 #endif // TENSOR_H

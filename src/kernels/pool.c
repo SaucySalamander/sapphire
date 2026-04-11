@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -45,6 +46,9 @@ struct sapphire_context {
     int is_gemm;
     int batch_size;
     int d_model;    // input dimension for batching stride
+    size_t ternary_packed_cols;
+    size_t ternary_row_stride_bytes;
+    const float *ternary_scales;
 
     // Parallel For Extension
     parallel_for_fn_t parallel_fn;
@@ -90,6 +94,9 @@ static void *worker_fn(void *arg) {
         int is_gemm = ctx->is_gemm;
         int batch_size = ctx->batch_size;
         int d_model = ctx->d_model;
+        size_t ternary_packed_cols = ctx->ternary_packed_cols;
+        size_t ternary_row_stride_bytes = ctx->ternary_row_stride_bytes;
+        const float *ternary_scales = ctx->ternary_scales;
         int chunk_size = ctx->chunk_size;
         parallel_for_fn_t parallel_fn = ctx->parallel_fn;
         void *parallel_arg = ctx->parallel_arg;
@@ -112,11 +119,26 @@ static void *worker_fn(void *arg) {
             for (int r = start; r < end; ++r) {
                 const char *W_base = (const char *)W;
                 const void *row_ptr = (const void *)(W_base + (size_t)r * row_stride_bytes);
+                tensor_ternary_view_t ternary_row;
                 
                 int count = blocks_per_row;
                 int b_size = 32;
                 if (row_stride_bytes == (size_t)cols * 2 || 
                     row_stride_bytes == (size_t)cols * 4) {
+                    count = cols;
+                    b_size = 1;
+                }
+
+                if (ternary_scales) {
+                    memset(&ternary_row, 0, sizeof(ternary_row));
+                    ternary_row.packed_weights = (const uint8_t *)row_ptr;
+                    ternary_row.scales = ternary_scales + r;
+                    ternary_row.rows = 1u;
+                    ternary_row.cols = (uint32_t)cols;
+                    ternary_row.packed_cols = (uint32_t)ternary_packed_cols;
+                    ternary_row.packed_weight_bytes = ternary_row_stride_bytes;
+                    ternary_row.scale_bytes = sizeof(float);
+                    row_ptr = &ternary_row;
                     count = cols;
                     b_size = 1;
                 }
@@ -284,6 +306,10 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
     int cols = tensor_shape(A)[tensor_ndim(A) - 1];
     int blocks_per_row = (cols + 31) / 32;
     size_t row_stride_bytes = 0;
+    size_t ternary_packed_cols = 0u;
+    size_t ternary_row_stride_bytes = 0u;
+    const float *ternary_scales = NULL;
+    const tensor_ternary_view_t *ternary_view = NULL;
     
     if (!W_data) return 1;
     
@@ -309,6 +335,20 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
             kernel_fn = quantized_gemv_f32_avx2;
             gemm_kernel_fn = kernel_gemm_f32_avx2;
             row_stride_bytes = (size_t)cols * 4;
+            break;
+        case DTYPE_TERNARY_2BIT:
+            ternary_view = tensor_data_ternary(A);
+            if (!ternary_view || !ternary_view->packed_weights || !ternary_view->scales ||
+                ternary_view->rows != (uint32_t)rows || ternary_view->cols != (uint32_t)cols) {
+                LOG_ERROR("kernel_backend_exec: invalid ternary tensor payload");
+                return -1;
+            }
+            kernel_fn = quantized_gemv_ternary_scalar;
+            ternary_packed_cols = ternary_view->packed_cols;
+            ternary_row_stride_bytes = ternary_packed_cols;
+            row_stride_bytes = ternary_row_stride_bytes;
+            ternary_scales = ternary_view->scales;
+            W_data = ternary_view->packed_weights;
             break;
         default:
             LOG_ERROR("kernel_backend_exec: unsupported dtype %d", (int)dtype);
@@ -340,6 +380,9 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
     ctx->cols = cols;
     ctx->blocks_per_row = blocks_per_row;
     ctx->row_stride_bytes = row_stride_bytes;
+    ctx->ternary_packed_cols = ternary_packed_cols;
+    ctx->ternary_row_stride_bytes = ternary_row_stride_bytes;
+    ctx->ternary_scales = ternary_scales;
     ctx->x = X;
     ctx->y = Y;
     ctx->x_aligned = x_aligned;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repack Sapphire ternary outputs into a loader-compatible model package."""
+"""Repack Sapphire ternary outputs into a mixed BF16 plus packed ternary model package."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ import numpy as np
 BF16_BYTES = np.dtype(np.uint16).itemsize
 DEFAULT_MAX_SHARD_SIZE = 2 * 1024**3
 TERNARY_PACKED_WEIGHTS_PER_BYTE = 4
-TERNARY_SYMBOL_LOOKUP = np.array([0.0, 1.0, -1.0, 0.0], dtype=np.float32)
 METADATA_FILES = (
     "config.json",
     "tokenizer.json",
@@ -68,17 +67,42 @@ class TernaryManifestEntry:
         return (self.rows, self.cols)
 
     @property
-    def bf16_byte_count(self) -> int:
-        return self.rows * self.cols * BF16_BYTES
+    def packed_cols(self) -> int:
+        return (self.cols + TERNARY_PACKED_WEIGHTS_PER_BYTE - 1) // TERNARY_PACKED_WEIGHTS_PER_BYTE
+
+    @property
+    def packed_shape(self) -> tuple[int, ...]:
+        return (self.rows, self.packed_cols)
+
+    @property
+    def scale_shape(self) -> tuple[int, ...]:
+        return (self.rows,)
+
+    @property
+    def scale_byte_count(self) -> int:
+        return self.rows * np.dtype("<f4").itemsize
+
+    @property
+    def stored_byte_count(self) -> int:
+        return self.packed_weight_bytes + self.scale_byte_count
+
+
+@dataclass(frozen=True)
+class OutputHeaderTensor:
+    name: str
+    shape: tuple[int, ...]
+    dtype: str
+    byte_count: int
 
 
 @dataclass(frozen=True)
 class OutputTensorItem:
-    name: str
-    shape: tuple[int, ...]
-    bf16_byte_count: int
+    logical_name: str
+    header_tensors: tuple[OutputHeaderTensor, ...]
+    stored_byte_count: int
     writer: WriteTensorData
     source_kind: str
+    manifest_entry: TernaryManifestEntry | None = None
 
 
 def _parse_shard_size(value: str) -> int:
@@ -272,7 +296,7 @@ def _payload_meta(path: Path, header: OrderedDict, tensor_name: str, suffix: str
     return meta
 
 
-def _load_ternary_payload(ternary_dir: Path, entry: TernaryManifestEntry) -> tuple[np.ndarray, np.ndarray]:
+def _load_ternary_payload_bytes(ternary_dir: Path, entry: TernaryManifestEntry) -> tuple[bytes, bytes]:
     payload_path = ternary_dir / entry.file_name
     if not payload_path.is_file():
         raise FileNotFoundError(f"Missing ternary payload: {payload_path}")
@@ -286,13 +310,12 @@ def _load_ternary_payload(ternary_dir: Path, entry: TernaryManifestEntry) -> tup
 
     packed_shape = _tensor_shape(packed_meta)
     scales_shape = _tensor_shape(scales_meta)
-    expected_packed_cols = (entry.cols + TERNARY_PACKED_WEIGHTS_PER_BYTE - 1) // TERNARY_PACKED_WEIGHTS_PER_BYTE
-    if packed_shape != (entry.rows, expected_packed_cols):
+    if packed_shape != entry.packed_shape:
         raise ValueError(
-            f"Packed payload shape mismatch for {entry.name}: expected {(entry.rows, expected_packed_cols)}, got {packed_shape}"
+            f"Packed payload shape mismatch for {entry.name}: expected {entry.packed_shape}, got {packed_shape}"
         )
-    if scales_shape != (entry.rows,):
-        raise ValueError(f"Scale payload shape mismatch for {entry.name}: expected {(entry.rows,)}, got {scales_shape}")
+    if scales_shape != entry.scale_shape:
+        raise ValueError(f"Scale payload shape mismatch for {entry.name}: expected {entry.scale_shape}, got {scales_shape}")
 
     packed_start, packed_end = _tensor_offsets(payload_path, packed_meta, data_start)
     scales_start, scales_end = _tensor_offsets(payload_path, scales_meta, data_start)
@@ -302,7 +325,7 @@ def _load_ternary_payload(ternary_dir: Path, entry: TernaryManifestEntry) -> tup
         raise ValueError(
             f"Packed byte count mismatch for {entry.name}: expected {entry.packed_weight_bytes}, got {packed_size}"
         )
-    if scales_size != entry.rows * np.dtype("<f4").itemsize:
+    if scales_size != entry.scale_byte_count:
         raise ValueError(f"Scale byte count mismatch for {entry.name}: {scales_size}")
 
     with payload_path.open("rb") as payload_file:
@@ -322,9 +345,7 @@ def _load_ternary_payload(ternary_dir: Path, entry: TernaryManifestEntry) -> tup
             f"CRC mismatch for {entry.name}: manifest={entry.crc32:08x} actual={actual_crc32:08x}"
         )
 
-    packed = np.frombuffer(packed_bytes, dtype=np.uint8).reshape(entry.rows, expected_packed_cols).copy()
-    scales = np.frombuffer(scale_bytes, dtype="<f4").astype(np.float32, copy=True)
-    return packed, scales
+    return packed_bytes, scale_bytes
 
 
 def _numpy_dtype_for_tensor(dtype: str) -> np.dtype:
@@ -372,26 +393,10 @@ def _write_ternary_tensor_data(
     output_file: BinaryIO,
     ternary_dir: Path,
     entry: TernaryManifestEntry,
-    row_batch: int = 128,
 ) -> None:
-    packed, scales = _load_ternary_payload(ternary_dir, entry)
-    packed_cols = packed.shape[1]
-
-    for row_start in range(0, entry.rows, row_batch):
-        row_end = min(entry.rows, row_start + row_batch)
-        packed_batch = packed[row_start:row_end]
-        batch_rows = row_end - row_start
-
-        dense = np.empty((batch_rows, packed_cols * TERNARY_PACKED_WEIGHTS_PER_BYTE), dtype=np.float32)
-        dense[:, 0::4] = TERNARY_SYMBOL_LOOKUP[packed_batch & 0x3]
-        dense[:, 1::4] = TERNARY_SYMBOL_LOOKUP[(packed_batch >> 2) & 0x3]
-        dense[:, 2::4] = TERNARY_SYMBOL_LOOKUP[(packed_batch >> 4) & 0x3]
-        dense[:, 3::4] = TERNARY_SYMBOL_LOOKUP[(packed_batch >> 6) & 0x3]
-        dense = dense[:, :entry.cols]
-        dense *= scales[row_start:row_end, None]
-
-        bf16_words = _float32_to_bf16_words(dense)
-        output_file.write(bf16_words.tobytes(order="C"))
+    packed_bytes, scale_bytes = _load_ternary_payload_bytes(ternary_dir, entry)
+    output_file.write(packed_bytes)
+    output_file.write(scale_bytes)
 
 
 def _make_base_writer(tensor: BaseTensorRef) -> WriteTensorData:
@@ -406,6 +411,7 @@ def _remove_existing_pack(output_dir: Path) -> None:
     candidates = [
         output_dir / "model.safetensors",
         output_dir / "model.safetensors.index.json",
+        output_dir / "manifest.tsv",
     ]
     candidates.extend(output_dir.glob("model-*.safetensors"))
 
@@ -432,13 +438,13 @@ def _pack_shards(tensor_items: list[OutputTensorItem], max_shard_size: int) -> l
     current_size = 0
 
     for tensor in tensor_items:
-        if current_shard and current_size + tensor.bf16_byte_count > max_shard_size:
+        if current_shard and current_size + tensor.stored_byte_count > max_shard_size:
             shards.append(current_shard)
             current_shard = []
             current_size = 0
 
         current_shard.append(tensor)
-        current_size += tensor.bf16_byte_count
+        current_size += tensor.stored_byte_count
 
     if current_shard:
         shards.append(current_shard)
@@ -456,18 +462,25 @@ def _write_safetensors_file(
         raise FileExistsError(f"Refusing to overwrite existing file: {output_path}")
 
     header = OrderedDict()
-    header["__metadata__"] = OrderedDict([("total_size", str(total_size))])
+    header["__metadata__"] = OrderedDict(
+        [
+            ("total_size", str(total_size)),
+            ("storage_encoding", "mixed_bf16_ternary_2bit"),
+            ("ternary_manifest", "manifest.tsv"),
+        ]
+    )
 
     data_offset = 0
     for tensor in tensor_items:
-        header[tensor.name] = OrderedDict(
-            (
-                ("dtype", "BF16"),
-                ("shape", [int(dim) for dim in tensor.shape]),
-                ("data_offsets", [data_offset, data_offset + tensor.bf16_byte_count]),
+        for header_tensor in tensor.header_tensors:
+            header[header_tensor.name] = OrderedDict(
+                (
+                    ("dtype", header_tensor.dtype),
+                    ("shape", [int(dim) for dim in header_tensor.shape]),
+                    ("data_offsets", [data_offset, data_offset + header_tensor.byte_count]),
+                )
             )
-        )
-        data_offset += tensor.bf16_byte_count
+            data_offset += header_tensor.byte_count
 
     header_bytes = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -491,6 +504,8 @@ def _ensure_output_dir_ready(output_dir: Path, overwrite: bool) -> None:
 
     if (output_dir / "model.safetensors").exists() or (output_dir / "model.safetensors.index.json").exists():
         raise FileExistsError(f"Output directory already contains a model package: {output_dir}")
+    if (output_dir / "manifest.tsv").exists():
+        raise FileExistsError(f"Output directory already contains a ternary manifest: {output_dir}")
     if any(output_dir.glob("model-*.safetensors")):
         raise FileExistsError(f"Output directory already contains sharded model weights: {output_dir}")
 
@@ -509,9 +524,16 @@ def _build_output_tensor_items(
         if entry is None:
             tensor_items.append(
                 OutputTensorItem(
-                    name=name,
-                    shape=tensor.shape,
-                    bf16_byte_count=tensor.bf16_byte_count,
+                    logical_name=name,
+                    header_tensors=(
+                        OutputHeaderTensor(
+                            name=name,
+                            shape=tensor.shape,
+                            dtype="BF16",
+                            byte_count=tensor.bf16_byte_count,
+                        ),
+                    ),
+                    stored_byte_count=tensor.bf16_byte_count,
                     writer=_make_base_writer(tensor),
                     source_kind="base",
                 )
@@ -523,11 +545,25 @@ def _build_output_tensor_items(
             raise ValueError(f"Shape mismatch for {name}: base={tensor.shape} ternary={entry.shape}")
         tensor_items.append(
             OutputTensorItem(
-                name=name,
-                shape=entry.shape,
-                bf16_byte_count=entry.bf16_byte_count,
+                logical_name=name,
+                header_tensors=(
+                    OutputHeaderTensor(
+                        name=f"{name}.packed",
+                        shape=entry.packed_shape,
+                        dtype="U8",
+                        byte_count=entry.packed_weight_bytes,
+                    ),
+                    OutputHeaderTensor(
+                        name=f"{name}.scales",
+                        shape=entry.scale_shape,
+                        dtype="F32",
+                        byte_count=entry.scale_byte_count,
+                    ),
+                ),
+                stored_byte_count=entry.stored_byte_count,
                 writer=_make_ternary_writer(ternary_dir, entry),
                 source_kind="ternary",
+                manifest_entry=entry,
             )
         )
         converted_count += 1
@@ -537,11 +573,25 @@ def _build_output_tensor_items(
             continue
         tensor_items.append(
             OutputTensorItem(
-                name=name,
-                shape=entry.shape,
-                bf16_byte_count=entry.bf16_byte_count,
+                logical_name=name,
+                header_tensors=(
+                    OutputHeaderTensor(
+                        name=f"{name}.packed",
+                        shape=entry.packed_shape,
+                        dtype="U8",
+                        byte_count=entry.packed_weight_bytes,
+                    ),
+                    OutputHeaderTensor(
+                        name=f"{name}.scales",
+                        shape=entry.scale_shape,
+                        dtype="F32",
+                        byte_count=entry.scale_byte_count,
+                    ),
+                ),
+                stored_byte_count=entry.stored_byte_count,
                 writer=_make_ternary_writer(ternary_dir, entry),
                 source_kind="ternary-extra",
+                manifest_entry=entry,
             )
         )
         converted_count += 1
@@ -549,6 +599,23 @@ def _build_output_tensor_items(
     if not tensor_items:
         raise RuntimeError("No tensors selected for repack")
     return tensor_items, converted_count, passthrough_count
+
+
+def _write_manifest(output_dir: Path,
+                    tensor_items: list[OutputTensorItem],
+                    logical_weight_map: dict[str, str]) -> None:
+    manifest_path = output_dir / "manifest.tsv"
+    with manifest_path.open("w", encoding="utf-8") as manifest_file:
+        for tensor in tensor_items:
+            entry = tensor.manifest_entry
+            if entry is None:
+                continue
+            shard_name = logical_weight_map.get(tensor.logical_name)
+            if shard_name is None:
+                raise KeyError(f"Missing shard assignment for ternary tensor {tensor.logical_name}")
+            manifest_file.write(
+                f"{tensor.logical_name}\t{shard_name}\t{entry.rows}\t{entry.cols}\t{entry.packed_weight_bytes}\t{entry.crc32:08x}\n"
+            )
 
 
 def repack_ternary_model(
@@ -572,19 +639,23 @@ def repack_ternary_model(
         manifest,
         ternary_dir,
     )
-    total_size = sum(tensor.bf16_byte_count for tensor in tensor_items)
+    total_size = sum(tensor.stored_byte_count for tensor in tensor_items)
     shards = _pack_shards(tensor_items, max_shard_size=max_shard_size)
 
     _ensure_output_dir_ready(output_dir, overwrite)
     _copy_metadata_files(base_model_dir, output_dir, overwrite=overwrite)
 
     weight_map: dict[str, str] = {}
+    logical_weight_map: dict[str, str] = {}
     shard_count = len(shards)
     if shard_count == 1:
         shard_path = output_dir / "model.safetensors"
         _write_safetensors_file(shard_path, shards[0], total_size, overwrite)
         for tensor in shards[0]:
-            weight_map[tensor.name] = shard_path.name
+            if tensor.manifest_entry is not None:
+                logical_weight_map[tensor.logical_name] = shard_path.name
+            for header_tensor in tensor.header_tensors:
+                weight_map[header_tensor.name] = shard_path.name
     else:
         shard_name_width = 5
         for shard_idx, shard in enumerate(shards, start=1):
@@ -592,24 +663,46 @@ def repack_ternary_model(
             shard_path = output_dir / shard_name
             _write_safetensors_file(shard_path, shard, total_size, overwrite)
             for tensor in shard:
-                weight_map[tensor.name] = shard_name
+                if tensor.manifest_entry is not None:
+                    logical_weight_map[tensor.logical_name] = shard_name
+                for header_tensor in tensor.header_tensors:
+                    weight_map[header_tensor.name] = shard_name
+
+        _write_manifest(output_dir, tensor_items, logical_weight_map)
 
         index_path = output_dir / "model.safetensors.index.json"
         with index_path.open("w", encoding="utf-8") as index_file:
-            json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, index_file, indent=2, sort_keys=True)
+            json.dump(
+                {
+                    "metadata": {
+                        "total_size": total_size,
+                        "storage_encoding": "mixed_bf16_ternary_2bit",
+                        "ternary_manifest": "manifest.tsv",
+                    },
+                    "weight_map": weight_map,
+                },
+                index_file,
+                indent=2,
+                sort_keys=True,
+            )
             index_file.write("\n")
+
+    if shard_count == 1:
+        _write_manifest(output_dir, tensor_items, logical_weight_map)
 
     print(
         f"Repacked {converted_count} ternary tensor(s) and {passthrough_count} passthrough tensor(s) "
-        f"into {shard_count} safetensors file(s) at {output_dir}"
+        f"into {shard_count} mixed BF16 plus ternary-2bit safetensors file(s) at {output_dir}"
     )
+    print("Note: ternary tensors remain stored as fixed 2-bit packed symbols plus F32 row scales; passthrough tensors remain BF16.")
     if shard_count > 1:
         print(f"Wrote shard index: {output_dir / 'model.safetensors.index.json'}")
+    print(f"Wrote ternary manifest: {output_dir / 'manifest.tsv'}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Repack Sapphire ternary outputs into a loader-compatible safetensors model package"
+        description="Repack Sapphire ternary outputs into a mixed BF16 plus packed ternary safetensors model package"
     )
     parser.add_argument(
         "--base-model-dir",

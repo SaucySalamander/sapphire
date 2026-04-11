@@ -45,16 +45,17 @@ static void print_help(const char* program_name) {
     printf("  -t, --temp <value>        Temperature for sampling (default: 1.0)\n");
     printf("  -n, --max-tokens <num>    Maximum tokens to generate (default: 100)\n");
     printf("  -p, --prompt <string>     Run a single prompt non-interactively and exit (echoes prompt)\n");
-    printf("  --record-tape <path>      Record a raw activation tape using --calib-manifest\n");
+    printf("  --record-tape <path>      Record a raw activation tape using --calibration-manifest\n");
     printf("  --record-hessian-sidecar <path>  Record a native Vulkan Hessian sidecar; combine with --record-tape or use with --activation-tape\n");
     printf("  --convert-ternary         Run ternary conversion mode instead of inference\n");
     printf("  --output <path>           Output file (single-layer) or output directory (full-model)\n");
     printf("  --layer <name>            Optional single-layer conversion filter\n");
     printf("  --teacher-model <name>    Optional teacher model for cross-architecture alignment\n");
+    printf("  --structural-map <path>   Optional structural TSV for alias/direct tensor resolution\n");
     printf("  --calibration-corpus <p>  Optional text corpus file or URL for tokenized STE calibration\n");
     printf("  --activation-tape <path>  Optional activation tape for tape-backed calibration\n");
     printf("  --hessian-sidecar <path>  Optional diagonal curvature sidecar keyed to --activation-tape\n");
-    printf("  --calib-manifest <p>      Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
+    printf("  --calibration-manifest <p> Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
     printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
     printf("  --ste-steps <n>          STE optimization steps per tensor (default: 3)\n");
     printf("  --max-grad-norm <value>  Global gradient norm clip for STE (default: 1.0)\n");
@@ -85,9 +86,9 @@ static void print_help(const char* program_name) {
     printf("  /help                     Show command help\n");
     printf("\nExample:\n");
     printf("  %s -m gemma3-270m-it -c 4096 -t 0.7 -n 200\n", program_name);
-    printf("  %s -m gemma-3-1b-it --record-tape ./data/1b-teacher-raw.tape --calib-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
-    printf("  %s -m gemma-3-1b-it --record-tape ./data/1b-teacher-raw.tape --record-hessian-sidecar ./data/1b-teacher.hsc --calib-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
-    printf("  %s -m gemma-3-1b-it --record-hessian-sidecar ./data/1b-teacher.hsc --activation-tape ./data/1b-teacher-raw.tape --calib-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
+    printf("  %s -m gemma-3-1b-it --record-tape ./data/1b-teacher-raw.tape --calibration-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
+    printf("  %s -m gemma-3-1b-it --record-tape ./data/1b-teacher-raw.tape --record-hessian-sidecar ./data/1b-teacher.hsc --calibration-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
+    printf("  %s -m gemma-3-1b-it --record-hessian-sidecar ./data/1b-teacher.hsc --activation-tape ./data/1b-teacher-raw.tape --calibration-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
     printf("  %s -m gemma-3-27b-it --convert-ternary --output ./out/model-ternary\n", program_name);
     printf("  %s -m gemma-3-7b-it --convert-ternary --output ./out/gemma-3-7b-it-ternary\n", program_name);
     printf("  %s -m gemma-3-270m-it --convert-ternary --layer model.layers.0.self_attn.q_proj.weight --output ./out/layer0-qproj.safetensors\n", program_name);
@@ -108,6 +109,7 @@ typedef struct {
     const char *activation_tape_path;
     const char *hessian_sidecar_path;
     const char *teacher_model_name;
+    const char *structural_map_path;
     const char *calibration_corpus_path;
     const char *calibration_corpus_manifest_path;
     int calibration_sample_limit;
@@ -145,6 +147,7 @@ static void cli_args_init(cli_args_t *args)
     args->activation_tape_path = NULL;
     args->hessian_sidecar_path = NULL;
     args->teacher_model_name = NULL;
+    args->structural_map_path = NULL;
     args->calibration_corpus_path = NULL;
     args->calibration_corpus_manifest_path = NULL;
     args->calibration_sample_limit = 4;
@@ -179,11 +182,11 @@ static int validate_record_tape_args(const cli_args_t *args)
         return -1;
     }
     if (!args->calibration_corpus_manifest_path || args->calibration_corpus_manifest_path[0] == '\0') {
-        LOG_ERROR("ERROR: --record-tape requires --calib-manifest.");
+        LOG_ERROR("ERROR: --record-tape requires --calibration-manifest.");
         return -1;
     }
     if (args->calibration_corpus_path && args->calibration_corpus_path[0] != '\0') {
-        LOG_ERROR("ERROR: --record-tape uses --calib-manifest, not --calibration-corpus.");
+        LOG_ERROR("ERROR: --record-tape uses --calibration-manifest, not --calibration-corpus.");
         return -1;
     }
     if (args->convert_ternary || args->output_path || args->layer_name ||
@@ -225,12 +228,12 @@ static int validate_record_hessian_sidecar_args(const cli_args_t *args)
     }
     if ((args->calibration_corpus_path && args->calibration_corpus_path[0] != '\0') &&
         (args->calibration_corpus_manifest_path && args->calibration_corpus_manifest_path[0] != '\0')) {
-        LOG_ERROR("ERROR: use either --calibration-corpus or --calib-manifest with --record-hessian-sidecar, not both.");
+        LOG_ERROR("ERROR: use either --calibration-corpus or --calibration-manifest with --record-hessian-sidecar, not both.");
         return -1;
     }
     if ((!args->calibration_corpus_path || args->calibration_corpus_path[0] == '\0') &&
         (!args->calibration_corpus_manifest_path || args->calibration_corpus_manifest_path[0] == '\0')) {
-        LOG_ERROR("ERROR: --record-hessian-sidecar requires --calibration-corpus or --calib-manifest.");
+        LOG_ERROR("ERROR: --record-hessian-sidecar requires --calibration-corpus or --calibration-manifest.");
         return -1;
     }
     if (args->record_tape_path || args->convert_ternary || args->output_path || args->layer_name ||
@@ -288,6 +291,10 @@ static int validate_convert_ternary_tape_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --teacher-model must not be empty.");
         return -1;
     }
+    if (args->structural_map_path && args->structural_map_path[0] == '\0') {
+        LOG_ERROR("ERROR: --structural-map must not be empty.");
+        return -1;
+    }
     if (args->teacher_model_name && !args->activation_tape_path) {
         LOG_ERROR("ERROR: --teacher-model requires --activation-tape.");
         return -1;
@@ -303,7 +310,7 @@ static int validate_convert_ternary_tape_args(const cli_args_t *args)
 static int validate_convert_ternary_corpus_args(const cli_args_t *args)
 {
     if (args->calibration_corpus_path && args->calibration_corpus_manifest_path) {
-        LOG_ERROR("ERROR: use either --calibration-corpus or --calib-manifest, not both.");
+        LOG_ERROR("ERROR: use either --calibration-corpus or --calibration-manifest, not both.");
         return -1;
     }
     if (args->validation_corpus_path && args->validation_corpus_manifest_path) {
@@ -416,6 +423,7 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.activation_tape_path = args->activation_tape_path;
     config.hessian_sidecar_path = args->hessian_sidecar_path;
     config.teacher_model_name = args->teacher_model_name;
+    config.structural_map_path = args->structural_map_path;
     config.calibration_corpus_path = args->calibration_corpus_path;
     config.calibration_corpus_manifest_path = args->calibration_corpus_manifest_path;
     config.validation_corpus_path = args->validation_corpus_path;
@@ -825,6 +833,7 @@ typedef enum {
     CLI_OPT_ACTIVATION_TAPE,
     CLI_OPT_HESSIAN_SIDECAR,
     CLI_OPT_TEACHER_MODEL,
+    CLI_OPT_STRUCTURAL_MAP,
     CLI_OPT_CALIBRATION_CORPUS,
     CLI_OPT_CALIBRATION_MANIFEST,
     CLI_OPT_CALIBRATION_SAMPLES,
@@ -867,7 +876,9 @@ static const cli_option_alias_t g_cli_option_aliases[] = {
     { "--activation-tape", CLI_OPT_ACTIVATION_TAPE },
     { "--hessian-sidecar", CLI_OPT_HESSIAN_SIDECAR },
     { "--teacher-model", CLI_OPT_TEACHER_MODEL },
+    { "--structural-map", CLI_OPT_STRUCTURAL_MAP },
     { "--calibration-corpus", CLI_OPT_CALIBRATION_CORPUS },
+    { "--calibration-manifest", CLI_OPT_CALIBRATION_MANIFEST },
     { "--calib-manifest", CLI_OPT_CALIBRATION_MANIFEST },
     { "--calibration-samples", CLI_OPT_CALIBRATION_SAMPLES },
     { "--validation-corpus", CLI_OPT_VALIDATION_CORPUS },
@@ -917,6 +928,7 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_ACTIVATION_TAPE: args->activation_tape_path = value; break;
         case CLI_OPT_HESSIAN_SIDECAR: args->hessian_sidecar_path = value; break;
         case CLI_OPT_TEACHER_MODEL: args->teacher_model_name = value; break;
+        case CLI_OPT_STRUCTURAL_MAP: args->structural_map_path = value; break;
         case CLI_OPT_CALIBRATION_CORPUS: args->calibration_corpus_path = value; break;
         case CLI_OPT_CALIBRATION_MANIFEST: args->calibration_corpus_manifest_path = value; break;
         case CLI_OPT_CALIBRATION_SAMPLES: args->calibration_sample_limit = atoi(value); break;

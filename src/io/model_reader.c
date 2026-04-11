@@ -17,6 +17,375 @@ typedef enum {
     MODEL_FORMAT_SAFETENSORS = 2
 } model_format_t;
 
+typedef struct {
+    char tensor_name[256];
+    char file_name[256];
+    uint32_t rows;
+    uint32_t cols;
+    size_t packed_weight_bytes;
+    uint32_t crc32;
+    int is_mold;
+} ternary_manifest_loader_entry_t;
+
+static tensor_t **resolve_tensor_slot_from_entry(llm_model_t *model,
+                                                 const tensor_map_entry_t *entry) {
+    int layer_idx = -1;
+
+    if (!model || !entry || !entry->internal_key || !entry->field_name) {
+        return NULL;
+    }
+
+    if (strcmp(entry->internal_key, "embedding") == 0) {
+        return &model->embedding_weight;
+    }
+    if (strcmp(entry->internal_key, "final") == 0) {
+        if (strcmp(entry->field_name, "norm_final_weight") == 0) return &model->norm_final_weight;
+        if (strcmp(entry->field_name, "lm_head_weight") == 0) return &model->lm_head_weight;
+        return NULL;
+    }
+    if (sscanf(entry->internal_key, "blk.%d", &layer_idx) != 1 ||
+        layer_idx < 0 || layer_idx >= model->num_layers) {
+        return NULL;
+    }
+
+    if (strcmp(entry->field_name, "norm_attn_weight") == 0) return &model->layers[layer_idx].norm_attn_weight;
+    if (strcmp(entry->field_name, "norm_attn_post_weight") == 0) return &model->layers[layer_idx].norm_attn_post_weight;
+    if (strcmp(entry->field_name, "q_proj_weight") == 0) return &model->layers[layer_idx].q_proj_weight;
+    if (strcmp(entry->field_name, "k_proj_weight") == 0) return &model->layers[layer_idx].k_proj_weight;
+    if (strcmp(entry->field_name, "v_proj_weight") == 0) return &model->layers[layer_idx].v_proj_weight;
+    if (strcmp(entry->field_name, "q_norm_weight") == 0) return &model->layers[layer_idx].q_norm_weight;
+    if (strcmp(entry->field_name, "k_norm_weight") == 0) return &model->layers[layer_idx].k_norm_weight;
+    if (strcmp(entry->field_name, "out_proj_weight") == 0) return &model->layers[layer_idx].out_proj_weight;
+    if (strcmp(entry->field_name, "norm_ffn_weight") == 0) return &model->layers[layer_idx].norm_ffn_weight;
+    if (strcmp(entry->field_name, "norm_ffn_post_weight") == 0) return &model->layers[layer_idx].norm_ffn_post_weight;
+    if (strcmp(entry->field_name, "up_proj_weight") == 0) return &model->layers[layer_idx].up_proj_weight;
+    if (strcmp(entry->field_name, "gate_proj_weight") == 0) return &model->layers[layer_idx].gate_proj_weight;
+    if (strcmp(entry->field_name, "down_proj_weight") == 0) return &model->layers[layer_idx].down_proj_weight;
+    return NULL;
+}
+
+static tensor_t **resolve_tensor_slot_by_name(llm_model_t *model,
+                                              const model_spec_t *model_spec,
+                                              const char *tensor_name) {
+    int i = 0;
+
+    if (!model || !model_spec || !model_spec->tensor_map || !tensor_name) {
+        return NULL;
+    }
+
+    for (i = 0; i < model_spec->tensor_map_size; ++i) {
+        const tensor_map_entry_t *entry = &model_spec->tensor_map[i];
+        if (!entry->hf_name) {
+            continue;
+        }
+        if (strcmp(entry->hf_name, tensor_name) == 0) {
+            return resolve_tensor_slot_from_entry(model, entry);
+        }
+    }
+
+    return NULL;
+}
+
+static const char *path_basename_local(const char *path) {
+    const char *last_slash = NULL;
+
+    if (!path) {
+        return NULL;
+    }
+    last_slash = strrchr(path, '/');
+    return last_slash ? (last_slash + 1) : path;
+}
+
+static int parse_manifest_line_local(char *line,
+                                     ternary_manifest_loader_entry_t *out_entry) {
+    char *fields[7] = {0};
+    char *cursor = line;
+    char *next = NULL;
+    int field_idx = 0;
+
+    if (!line || !out_entry) {
+        return -1;
+    }
+
+    while (field_idx < 7 && cursor) {
+        next = strchr(cursor, '\t');
+        if (next) {
+            *next = '\0';
+            fields[field_idx++] = cursor;
+            cursor = next + 1;
+        } else {
+            fields[field_idx++] = cursor;
+            cursor = NULL;
+        }
+    }
+    if (field_idx != 6 && field_idx != 7) {
+        return -1;
+    }
+
+    memset(out_entry, 0, sizeof(*out_entry));
+    snprintf(out_entry->tensor_name, sizeof(out_entry->tensor_name), "%s", fields[0]);
+    snprintf(out_entry->file_name, sizeof(out_entry->file_name), "%s", fields[1]);
+    out_entry->rows = (uint32_t)strtoul(fields[2], NULL, 10);
+    out_entry->cols = (uint32_t)strtoul(fields[3], NULL, 10);
+    out_entry->packed_weight_bytes = (size_t)strtoull(fields[4], NULL, 10);
+    out_entry->crc32 = (uint32_t)strtoul(fields[5], NULL, 16);
+    out_entry->is_mold = (field_idx == 7 && strncmp(fields[6], "mold", 4) == 0) ? 1 : 0;
+    return 0;
+}
+
+static int load_ternary_manifest_local(const char *model_dir,
+                                       ternary_manifest_loader_entry_t **out_entries,
+                                       int *out_count) {
+    char *manifest_path = NULL;
+    FILE *manifest_file = NULL;
+    ternary_manifest_loader_entry_t *entries = NULL;
+    char line[1024];
+    int count = 0;
+    int capacity = 0;
+
+    if (!model_dir || !out_entries || !out_count) {
+        return -1;
+    }
+
+    *out_entries = NULL;
+    *out_count = 0;
+    manifest_path = construct_safe_path(model_dir, "manifest.tsv", NULL);
+    if (!manifest_path) {
+        return -1;
+    }
+    if (access(manifest_path, F_OK) != 0) {
+        free(manifest_path);
+        return 0;
+    }
+
+    manifest_file = fopen(manifest_path, "r");
+    free(manifest_path);
+    if (!manifest_file) {
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), manifest_file) != NULL) {
+        ternary_manifest_loader_entry_t entry;
+        size_t len = strlen(line);
+
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) {
+            continue;
+        }
+        if (parse_manifest_line_local(line, &entry) != 0) {
+            fclose(manifest_file);
+            free(entries);
+            return -1;
+        }
+        if (count >= capacity) {
+            int new_capacity = capacity ? (capacity * 2) : 64;
+            ternary_manifest_loader_entry_t *new_entries = (ternary_manifest_loader_entry_t *)realloc(entries,
+                                                                                                       (size_t)new_capacity * sizeof(*entries));
+            if (!new_entries) {
+                fclose(manifest_file);
+                free(entries);
+                return -1;
+            }
+            entries = new_entries;
+            capacity = new_capacity;
+        }
+        entries[count++] = entry;
+    }
+
+    fclose(manifest_file);
+    *out_entries = entries;
+    *out_count = count;
+    return 1;
+}
+
+static int find_shard_index_by_name(char **shard_paths,
+                                    int shard_count,
+                                    const char *file_name) {
+    int i = 0;
+
+    if (!shard_paths || shard_count <= 0 || !file_name) {
+        return -1;
+    }
+
+    for (i = 0; i < shard_count; ++i) {
+        const char *base_name = path_basename_local(shard_paths[i]);
+        if (base_name && strcmp(base_name, file_name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int apply_ternary_manifest_overrides(llm_model_t *model,
+                                            const model_spec_t *model_spec,
+                                            const char *model_dir,
+                                            safetensors_file_t **handles,
+                                            char **shard_paths,
+                                            int shard_count) {
+    ternary_manifest_loader_entry_t *entries = NULL;
+    int entry_count = 0;
+    int manifest_rc = 0;
+    int i = 0;
+
+    if (!model || !model_spec || !model_dir || !handles || !shard_paths || shard_count <= 0) {
+        return -1;
+    }
+
+    manifest_rc = load_ternary_manifest_local(model_dir, &entries, &entry_count);
+    if (manifest_rc <= 0) {
+        return manifest_rc;
+    }
+
+    for (i = 0; i < entry_count; ++i) {
+        tensor_t **slot = resolve_tensor_slot_by_name(model, model_spec, entries[i].tensor_name);
+        int shard_index = -1;
+        tensor_t *tensor = NULL;
+
+        if (!slot || *slot) {
+            continue;
+        }
+
+        shard_index = find_shard_index_by_name(shard_paths, shard_count, entries[i].file_name);
+        if (shard_index < 0 || !handles[shard_index]) {
+            LOG_ERROR("Ternary manifest shard missing for %s: %s", entries[i].tensor_name, entries[i].file_name);
+            free(entries);
+            return -1;
+        }
+
+        if (entries[i].is_mold) {
+            const safetensors_tensor_meta_t *meta = safetensors_get_tensor_by_name(handles[shard_index],
+                                                                                    entries[i].tensor_name);
+            if (!meta) {
+                LOG_ERROR("MOLD manifest shard missing tensor %s in %s", entries[i].tensor_name, entries[i].file_name);
+                free(entries);
+                return -1;
+            }
+            tensor = safetensors_create_tensor_ref(handles[shard_index], meta);
+            if (!tensor) {
+                LOG_ERROR("Failed to create MOLD BF16 tensor for %s from %s", entries[i].tensor_name, entries[i].file_name);
+                free(entries);
+                return -1;
+            }
+        } else {
+            tensor = safetensors_create_ternary_tensor_ref(handles[shard_index],
+                                                           entries[i].tensor_name,
+                                                           entries[i].rows,
+                                                           entries[i].cols,
+                                                           entries[i].packed_weight_bytes,
+                                                           entries[i].crc32);
+            if (!tensor) {
+                LOG_ERROR("Failed to create ternary tensor for %s from %s", entries[i].tensor_name, entries[i].file_name);
+                free(entries);
+                return -1;
+            }
+        }
+
+        *slot = tensor;
+    }
+
+    free(entries);
+    return 1;
+}
+
+static int validate_loaded_model(const llm_model_t *model,
+                                 const model_spec_t *model_spec) {
+    int i = 0;
+
+    if (!model || !model_spec || !model_spec->tensor_map) {
+        return -1;
+    }
+
+    for (i = 0; i < model_spec->tensor_map_size; ++i) {
+        const tensor_map_entry_t *entry = &model_spec->tensor_map[i];
+        tensor_t **slot = NULL;
+
+        if (!entry->hf_name) {
+            continue;
+        }
+        slot = resolve_tensor_slot_from_entry((llm_model_t *)model, entry);
+        if (!slot) {
+            continue;
+        }
+        if (!*slot) {
+            LOG_ERROR("Missing tensor after load: %s", entry->hf_name);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int finalize_loaded_model(llm_model_t *model,
+                                 const model_spec_t *model_spec,
+                                 const char *model_dir,
+                                 safetensors_file_t **handles,
+                                 char **shard_paths,
+                                 int shard_count) {
+    if (!model || !model_spec) {
+        return -1;
+    }
+
+    if (!model->lm_head_weight && model->embedding_weight) {
+        model->lm_head_weight = model->embedding_weight;
+        tensor_ref_inc(model->lm_head_weight);
+        LOG_INFO("lm_head weight tied to embedding");
+    }
+
+    if (model_dir && handles && shard_paths && shard_count > 0) {
+        if (apply_ternary_manifest_overrides(model, model_spec, model_dir, handles, shard_paths, shard_count) < 0) {
+            return -1;
+        }
+    }
+
+    if (!model->lm_head_weight && model->embedding_weight) {
+        model->lm_head_weight = model->embedding_weight;
+        tensor_ref_inc(model->lm_head_weight);
+        LOG_INFO("lm_head weight tied to embedding");
+    }
+
+    return validate_loaded_model(model, model_spec);
+}
+
+static int skip_missing_tensor(const safetensors_file_t *st,
+                               const safetensors_tensor_meta_t *meta,
+                               llm_model_t *model) {
+    (void)st;
+    (void)meta;
+    (void)model;
+    return 0;
+}
+
+static char *duplicate_parent_dir(const char *path) {
+    const char *last_slash = NULL;
+    size_t dir_len = 0u;
+    char *dir = NULL;
+
+    if (!path) {
+        return NULL;
+    }
+
+    last_slash = strrchr(path, '/');
+    if (!last_slash) {
+        dir = (char *)malloc(2u);
+        if (!dir) {
+            return NULL;
+        }
+        strcpy(dir, ".");
+        return dir;
+    }
+
+    dir_len = (size_t)(last_slash - path);
+    dir = (char *)malloc(dir_len + 1u);
+    if (!dir) {
+        return NULL;
+    }
+    memcpy(dir, path, dir_len);
+    dir[dir_len] = '\0';
+    return dir;
+}
+
 
 /**
  * @brief Load a model from Safetensors file
@@ -75,11 +444,11 @@ static llm_model_t* load_model_safetensors(const model_spec_t *model_spec,
     }
     memset(model->layers, 0, num_layers * sizeof(model_layer_weights_t));
     model->num_layers = num_layers;
-    int rc = safetensors_map_all_tensors_with_table(st, 
-                                                     model_spec->tensor_map,
-                                                     model_spec->tensor_map_size,
-                                                     NULL,  // No dynamic handler
-                                                     model);
+    int rc = safetensors_map_all_tensors_with_table(st,
+                                                    model_spec->tensor_map,
+                                                    model_spec->tensor_map_size,
+                                                    skip_missing_tensor,
+                                                    model);
     
     if (rc != 0) {
         LOG_ERROR("Failed to map tensors");
@@ -89,11 +458,33 @@ static llm_model_t* load_model_safetensors(const model_spec_t *model_spec,
         return NULL;
     }
     
-    LOG_INFO("✓ Successfully loaded all tensors from %s", safetensors_path);
-    
     // Store the safetensors file handle for cleanup in llm_model_destroy()
     // The file must remain open since tensors are zero-copy references into mmapped memory
     model->safetensors_handle = st;
+
+    {
+        char *model_dir = duplicate_parent_dir(safetensors_path);
+        safetensors_file_t *handles[1] = { st };
+        char *paths[1] = { (char *)safetensors_path };
+
+        if (!model_dir) {
+            LOG_ERROR("Failed to derive model directory for %s", safetensors_path);
+            free(model->layers);
+            free(model);
+            safetensors_close(st);
+            return NULL;
+        }
+        if (finalize_loaded_model(model, model_spec, model_dir, handles, paths, 1) != 0) {
+            free(model_dir);
+            free(model->layers);
+            free(model);
+            safetensors_close(st);
+            return NULL;
+        }
+        free(model_dir);
+    }
+
+    LOG_INFO("Successfully loaded all tensors from %s", safetensors_path);
     
     return model;
 }
@@ -161,51 +552,6 @@ oom:
 }
 
 /**
- * @brief Dynamic handler used during sharded loading.
- *
- * Each shard only contains a subset of the full tensor map.  Tensors absent
- * from the current shard will be present in another shard, so we silently
- * skip them here.  The lm_head weight-tie and any truly fatal misses are
- * resolved in a post-pass after all shards have been loaded.
- */
-static int shard_skip_missing(const safetensors_file_t *st,
-                              const safetensors_tensor_meta_t *meta,
-                              llm_model_t *model) {
-    (void)st; (void)meta; (void)model;
-    return 0; /* silently skip — tensor lives in another shard */
-}
-
-/**
- * @brief Post-pass validation after all shards have been mapped.
- *
- * Applies lm_head weight-tying when the tensor was absent from every shard
- * (tied-embedding models), and verifies that mandatory top-level tensors are
- * present.  Returns 0 on success, -1 on fatal missing tensor.
- */
-static int resolve_post_shard(llm_model_t *model) {
-    /* Weight-tied lm_head: share embedding tensor */
-    if (!model->lm_head_weight && model->embedding_weight) {
-        model->lm_head_weight = model->embedding_weight;
-        tensor_ref_inc(model->lm_head_weight);
-        LOG_INFO("lm_head weight tied to embedding");
-    }
-
-    if (!model->embedding_weight) {
-        LOG_ERROR("resolve_post_shard: embedding_weight missing after all shards");
-        return -1;
-    }
-    if (!model->norm_final_weight) {
-        LOG_ERROR("resolve_post_shard: norm_final_weight missing after all shards");
-        return -1;
-    }
-    if (!model->lm_head_weight) {
-        LOG_ERROR("resolve_post_shard: lm_head_weight missing after all shards");
-        return -1;
-    }
-    return 0;
-}
-
-/**
  * @brief Load a sharded safetensors model by mapping all shards in order.
  *
  * Opens each shard file (sorted lexicographically), mmaps it, and maps
@@ -262,7 +608,7 @@ static llm_model_t *load_model_sharded(const model_spec_t *model_spec,
             st,
             model_spec->tensor_map,
             model_spec->tensor_map_size,
-            shard_skip_missing,
+            skip_missing_tensor,
             model);
         if (rc != 0) {
             LOG_ERROR("Failed to map tensors from shard: %s", shard_paths[s]);
@@ -270,18 +616,23 @@ static llm_model_t *load_model_sharded(const model_spec_t *model_spec,
         }
     }
 
-    for (int i = 0; i < shard_count; i++) free(shard_paths[i]);
-    free(shard_paths);
-    shard_paths = NULL;
     int loaded_shard_count = shard_count;
-    shard_count = 0;
 
-    /* Post-pass: weight-tie lm_head and verify mandatory tensors */
-    if (resolve_post_shard(model) != 0) {
+    if (finalize_loaded_model(model,
+                              model_spec,
+                              model_dir,
+                              (safetensors_file_t **)model->safetensors_shard_handles,
+                              shard_paths,
+                              loaded_shard_count) != 0) {
         goto fail_shards;
     }
 
-    LOG_INFO("\u2713 All %d shards loaded successfully", loaded_shard_count);
+    for (int i = 0; i < shard_count; i++) free(shard_paths[i]);
+    free(shard_paths);
+    shard_paths = NULL;
+    shard_count = 0;
+
+    LOG_INFO("All %d shards loaded successfully", loaded_shard_count);
     return model;
 
 fail_shards:

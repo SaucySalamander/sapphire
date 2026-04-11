@@ -29,12 +29,14 @@ import numpy as np
 
 from expand_tape import (
     TAPE_NO_ALIAS,
+    StructuralMapping,
     _build_alignment_entries,
     _default_student_id,
     _default_student_model_dir,
     _default_teacher_id,
     _load_model_config,
     _normalize_prefix,
+    _parse_structural_map,
     _parse_tape,
     _resolve_width_strategy,
     _resample_vector,
@@ -335,10 +337,19 @@ def expand_hessian_sidecar(input_tape: Path,
                           teacher_prefix: str | None,
                           student_prefix: str,
                           depth_strategy: str,
-                          width_strategy: str) -> int:
+                          width_strategy: str,
+                          structural_map_path: Path | None = None) -> int:
     raw_tape = _parse_tape(input_tape)
     raw_sidecar = _parse_sidecar(input_sidecar)
     aligned_tape_view = _parse_tape(aligned_tape)
+
+    structural_map: StructuralMapping | None = None
+    if structural_map_path is not None:
+        structural_map = _parse_structural_map(structural_map_path)
+        print(f"Using structural map: {structural_map_path}")
+        print(f"  Source: {structural_map.source_name or 'unspecified'}")
+        print(f"  Target: {structural_map.target_name or 'unspecified'}")
+        print(f"  Student layers: {structural_map.student_layer_count}")
 
     try:
         student_config = _load_model_config(student_model_dir, student_model_id)
@@ -351,7 +362,8 @@ def expand_hessian_sidecar(input_tape: Path,
                                                      resolved_teacher_prefix,
                                                      resolved_student_prefix,
                                                      depth_strategy,
-                                                     width_strategy)
+                                                     width_strategy,
+                                                     structural_map)
 
         raw_tape_crc32 = _compute_file_crc32(input_tape)
         if raw_sidecar.header.tape_crc32 != raw_tape_crc32:
@@ -407,10 +419,12 @@ def main() -> int:
     parser.add_argument("--student-prefix", type=str, default="language_model.model.layers.",
                         help="Tensor prefix expected in the aligned student tape")
     parser.add_argument("--depth-strategy", type=str, choices=("bucket", "repeat"), default="bucket",
-                        help="Teacher-to-student layer mapping strategy")
+                        help="Teacher-to-student layer mapping strategy (ignored if --structural-map is provided)")
     parser.add_argument("--width-strategy", type=str, choices=("auto", "interpolation", "block-replication"),
                         default="auto",
                         help="Width expansion strategy for Hessian diagonals")
+    parser.add_argument("--structural-map", type=Path, default=None,
+                        help="Explicit student-to-teacher layer mapping TSV file (overrides --depth-strategy)")
     args = parser.parse_args()
 
     crc32 = expand_hessian_sidecar(args.input_tape,
@@ -423,7 +437,8 @@ def main() -> int:
                                    args.teacher_prefix,
                                    args.student_prefix,
                                    args.depth_strategy,
-                                   args.width_strategy)
+                                   args.width_strategy,
+                                   args.structural_map)
 
     print(f"Expanded Hessian sidecar: {args.input_sidecar} -> {args.output_sidecar} (crc32={crc32:08x})")
     return 0

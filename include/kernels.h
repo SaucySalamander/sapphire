@@ -121,6 +121,9 @@ float quantized_gemv_q8_0_unaligned(const void *W_row, const float *x, int block
 float quantized_gemv_bf16_avx2(const void *W_row, const float *x, int block_count, int block_size);
 float quantized_gemv_bf16_scalar(const void *W_row, const float *x, int block_count, int block_size);
 
+// Packed ternary kernels
+float quantized_gemv_ternary_scalar(const void *W_row, const float *x, int block_count, int block_size);
+
 // F32 kernels
 float quantized_gemv_f32_avx2(const void *W_row, const float *x, int block_count, int block_size);
 float quantized_gemv_f32_scalar(const void *W_row, const float *x, int block_count, int block_size);

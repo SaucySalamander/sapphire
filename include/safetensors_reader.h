@@ -139,6 +139,13 @@ const safetensors_tensor_meta_t* safetensors_get_tensor_by_name(
 tensor_t* safetensors_create_tensor_ref(safetensors_file_t *st,
                                         const safetensors_tensor_meta_t *meta);
 
+tensor_t* safetensors_create_ternary_tensor_ref(const safetensors_file_t *st,
+                                                const char *tensor_name,
+                                                uint32_t rows,
+                                                uint32_t cols,
+                                                size_t packed_weight_bytes,
+                                                uint32_t expected_crc32);
+
 /**
  * @brief Load a Safetensors tensor into a freshly allocated tensor_t.
  *

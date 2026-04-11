@@ -352,6 +352,47 @@ static void qk_norm_apply(float* data, const float* scale, int head_dim, int num
     }
 }
 
+static const float* collapse_key_norm_from_query_groups(layer_buffers_t buf,
+                                                        const float* raw,
+                                                        const gemma3_270m_config_t* config,
+                                                        int head_dim,
+                                                        int layer_idx,
+                                                        int k_norm_len) {
+        static int warned_query_width_k_norm = 0;
+        float* k_scale_ptr = buf.ffn_value_buf;
+        int group_size = 0;
+
+        if (!raw || !config || !k_scale_ptr || config->num_key_value_heads <= 0) {
+            return NULL;
+        }
+
+        if (config->num_attention_heads <= 0 ||
+            (config->num_attention_heads % config->num_key_value_heads) != 0) {
+            return NULL;
+        }
+
+        group_size = config->num_attention_heads / config->num_key_value_heads;
+        for (int kv_head_idx = 0; kv_head_idx < config->num_key_value_heads; ++kv_head_idx) {
+            for (int dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                float accum = 0.0f;
+                for (int group_idx = 0; group_idx < group_size; ++group_idx) {
+                    int q_head_idx = kv_head_idx * group_size + group_idx;
+                    accum += raw[q_head_idx * head_dim + dim_idx];
+                }
+                k_scale_ptr[kv_head_idx * head_dim + dim_idx] = accum / (float)group_size;
+            }
+        }
+
+        if (!warned_query_width_k_norm) {
+            LOG_WARN("Layer %d k_norm len=%d matches query width; collapsing query-head gamma to %d KV heads for compatibility",
+                     layer_idx,
+                     k_norm_len,
+                     config->num_key_value_heads);
+            warned_query_width_k_norm = 1;
+        }
+        return k_scale_ptr;
+}
+
 static const float* load_query_vector(layer_buffers_t buf, const model_layer_weights_t* layer,
                                  const gemma3_270m_config_t* config, int head_dim, int layer_idx) {
         int q_norm_len = tensor_shape(layer->q_norm_weight)[0];
@@ -380,6 +421,7 @@ static const float* load_key_vector(layer_buffers_t buf, const model_layer_weigh
         int k_norm_len = tensor_shape(layer->k_norm_weight)[0];
         const float* raw = get_norm_weights(layer->k_norm_weight, buf.weight_scratch, k_norm_len);
         int expected_k = config->num_key_value_heads * head_dim;
+        int expected_q = config->num_attention_heads * head_dim;
         if (k_norm_len == expected_k) {
             return raw;
         } else if (k_norm_len == head_dim) {
@@ -389,6 +431,8 @@ static const float* load_key_vector(layer_buffers_t buf, const model_layer_weigh
                  memcpy(k_scale_ptr + h * head_dim, raw, head_dim * sizeof(float));
             }
             return k_scale_ptr;
+        } else if (k_norm_len == expected_q) {
+            return collapse_key_norm_from_query_groups(buf, raw, config, head_dim, layer_idx, k_norm_len);
         } else {
             LOG_WARN("Layer %d k_norm len=%d expected=%d; disabling QK-Norm for K", layer_idx, k_norm_len, expected_k);
             return NULL;
