@@ -61,6 +61,7 @@ class TernaryManifestEntry:
     cols: int
     packed_weight_bytes: int
     crc32: int
+    kind: str = "ternary"
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -84,6 +85,8 @@ class TernaryManifestEntry:
 
     @property
     def stored_byte_count(self) -> int:
+        if self.kind == "mold":
+            return self.packed_weight_bytes
         return self.packed_weight_bytes + self.scale_byte_count
 
 
@@ -271,10 +274,16 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
             if not line:
                 continue
             parts = line.split("\t")
-            if len(parts) != 6:
+            if len(parts) == 6:
+                name, file_name, rows, cols, packed_bytes, crc32 = parts
+                kind = "ternary"
+            elif len(parts) == 7:
+                name, file_name, rows, cols, packed_bytes, crc32, kind = parts
+                if kind not in {"mold"}:
+                    raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
+            else:
                 raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
 
-            name, file_name, rows, cols, packed_bytes, crc32 = parts
             entries[name] = TernaryManifestEntry(
                 name=name,
                 file_name=file_name,
@@ -282,6 +291,7 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
                 cols=int(cols),
                 packed_weight_bytes=int(packed_bytes),
                 crc32=int(crc32, 16),
+                kind=kind,
             )
 
     if not entries:
@@ -407,6 +417,48 @@ def _make_ternary_writer(ternary_dir: Path, entry: TernaryManifestEntry) -> Writ
     return lambda output_file: _write_ternary_tensor_data(output_file, ternary_dir, entry)
 
 
+def _load_mold_bf16_bytes(ternary_dir: Path, entry: TernaryManifestEntry) -> bytes:
+    payload_path = ternary_dir / entry.file_name
+    if not payload_path.is_file():
+        raise FileNotFoundError(f"Missing mold payload: {payload_path}")
+
+    header, data_start = _read_safetensors_header(payload_path)
+    meta = header.get(entry.name)
+    if not isinstance(meta, dict):
+        raise KeyError(f"Missing {entry.name} in {payload_path}")
+    if meta.get("dtype") != "BF16":
+        raise ValueError(f"Unexpected mold dtype in {payload_path}: {meta.get('dtype')}")
+
+    start, end = _tensor_offsets(payload_path, meta, data_start)
+    size = end - start
+    if size != entry.packed_weight_bytes:
+        raise ValueError(
+            f"Mold byte count mismatch for {entry.name}: expected {entry.packed_weight_bytes}, got {size}"
+        )
+
+    with payload_path.open("rb") as payload_file:
+        payload_file.seek(start)
+        data = payload_file.read(size)
+        if len(data) != size:
+            raise ValueError(f"Truncated mold payload for {entry.name}: {payload_path}")
+
+    actual_crc32 = zlib.crc32(data) & 0xFFFFFFFF
+    if actual_crc32 != entry.crc32:
+        raise ValueError(
+            f"CRC mismatch for {entry.name}: manifest={entry.crc32:08x} actual={actual_crc32:08x}"
+        )
+    return data
+
+
+def _write_mold_bf16_data(output_file: BinaryIO, ternary_dir: Path, entry: TernaryManifestEntry) -> None:
+    data = _load_mold_bf16_bytes(ternary_dir, entry)
+    output_file.write(data)
+
+
+def _make_mold_writer(ternary_dir: Path, entry: TernaryManifestEntry) -> WriteTensorData:
+    return lambda output_file: _write_mold_bf16_data(output_file, ternary_dir, entry)
+
+
 def _remove_existing_pack(output_dir: Path) -> None:
     candidates = [
         output_dir / "model.safetensors",
@@ -514,10 +566,11 @@ def _build_output_tensor_items(
     base_tensors: OrderedDict[str, BaseTensorRef],
     manifest: OrderedDict[str, TernaryManifestEntry],
     ternary_dir: Path,
-) -> tuple[list[OutputTensorItem], int, int]:
+) -> tuple[list[OutputTensorItem], int, int, int]:
     tensor_items: list[OutputTensorItem] = []
     converted_count = 0
     passthrough_count = 0
+    mold_count = 0
 
     for name, tensor in base_tensors.items():
         entry = manifest.get(name)
@@ -539,6 +592,26 @@ def _build_output_tensor_items(
                 )
             )
             passthrough_count += 1
+            continue
+
+        if entry.kind == "mold":
+            tensor_items.append(
+                OutputTensorItem(
+                    logical_name=name,
+                    header_tensors=(
+                        OutputHeaderTensor(
+                            name=name,
+                            shape=tensor.shape,
+                            dtype="BF16",
+                            byte_count=entry.packed_weight_bytes,
+                        ),
+                    ),
+                    stored_byte_count=entry.packed_weight_bytes,
+                    writer=_make_mold_writer(ternary_dir, entry),
+                    source_kind="mold",
+                )
+            )
+            mold_count += 1
             continue
 
         if tensor.shape != entry.shape:
@@ -571,6 +644,27 @@ def _build_output_tensor_items(
     for name, entry in manifest.items():
         if name in base_tensors:
             continue
+        if entry.kind == "mold":
+            shape = (entry.rows,) if entry.cols == 1 else (entry.rows, entry.cols)
+            tensor_items.append(
+                OutputTensorItem(
+                    logical_name=name,
+                    header_tensors=(
+                        OutputHeaderTensor(
+                            name=name,
+                            shape=shape,
+                            dtype="BF16",
+                            byte_count=entry.packed_weight_bytes,
+                        ),
+                    ),
+                    stored_byte_count=entry.packed_weight_bytes,
+                    writer=_make_mold_writer(ternary_dir, entry),
+                    source_kind="mold",
+                )
+            )
+            mold_count += 1
+            continue
+
         tensor_items.append(
             OutputTensorItem(
                 logical_name=name,
@@ -598,7 +692,7 @@ def _build_output_tensor_items(
 
     if not tensor_items:
         raise RuntimeError("No tensors selected for repack")
-    return tensor_items, converted_count, passthrough_count
+    return tensor_items, converted_count, passthrough_count, mold_count
 
 
 def _write_manifest(output_dir: Path,
@@ -634,7 +728,7 @@ def repack_ternary_model(
 
     manifest = _read_manifest(ternary_dir)
     base_tensors = _collect_base_tensors(base_model_dir)
-    tensor_items, converted_count, passthrough_count = _build_output_tensor_items(
+    tensor_items, converted_count, passthrough_count, mold_count = _build_output_tensor_items(
         base_tensors,
         manifest,
         ternary_dir,
@@ -691,10 +785,11 @@ def repack_ternary_model(
         _write_manifest(output_dir, tensor_items, logical_weight_map)
 
     print(
-        f"Repacked {converted_count} ternary tensor(s) and {passthrough_count} passthrough tensor(s) "
+        f"Repacked {converted_count} ternary tensor(s), {mold_count} mold BF16 tensor(s), "
+        f"and {passthrough_count} passthrough tensor(s) "
         f"into {shard_count} mixed BF16 plus ternary-2bit safetensors file(s) at {output_dir}"
     )
-    print("Note: ternary tensors remain stored as fixed 2-bit packed symbols plus F32 row scales; passthrough tensors remain BF16.")
+    print("Note: ternary tensors remain stored as fixed 2-bit packed symbols plus F32 row scales; mold and passthrough tensors are stored as BF16.")
     if shard_count > 1:
         print(f"Wrote shard index: {output_dir / 'model.safetensors.index.json'}")
     print(f"Wrote ternary manifest: {output_dir / 'manifest.tsv'}")

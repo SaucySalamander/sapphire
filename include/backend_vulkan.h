@@ -29,6 +29,7 @@ extern "C" {
 #endif
 
 typedef struct inference_session_t inference_session_t;
+typedef struct sapphire_tracy_vk_context_t sapphire_tracy_vk_context_t;
 
 /* ========================================================================
  * P11-04 Pipeline Enumeration
@@ -233,6 +234,7 @@ typedef struct {
     size_t num_pipelines;               /* Number of pipelines */
     
     VkCommandBuffer cmd_buffer;         /* Command buffer for forward pass */
+    sapphire_tracy_vk_context_t *tracy_vk_context; /* Optional Tracy GPU profiling context */
     
     /* Persistent Transfer Resources (Fix for GPU context loss / resource thrashing) */
     VkCommandBuffer transfer_cmd;       /* Dedicated command buffer for embeddings upload */

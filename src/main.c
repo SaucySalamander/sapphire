@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -17,6 +18,7 @@
 #include "tokenizer.h"
 #include "utils.h"
 #include "log.h"
+#include "tracy_profile.h"
 
 #define MAX_PROMPT_LENGTH 1024
 #define MAX_TOKENS_GENERATE 100
@@ -58,6 +60,7 @@ static void print_help(const char* program_name) {
     printf("  --calibration-manifest <p> Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
     printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
     printf("  --ste-steps <n>          STE optimization steps per tensor (default: 3)\n");
+    printf("  --progressive-calib      Run 3-stage progressive molding (layers 0-5, 6-12, then full model)\n");
     printf("  --max-grad-norm <value>  Global gradient norm clip for STE (default: 1.0)\n");
     printf("  --disable-hessian-proxy  Disable tape-derived diagonal Hessian proxying\n");
     printf("  --hessian-proxy-strength <value>  Diagonal Hessian proxy strength (default: 1.0)\n");
@@ -95,6 +98,28 @@ static void print_help(const char* program_name) {
     printf("\n");
 }
 
+#if !defined(SAPPHIRE_ENABLE_TRACY)
+static int is_truthy_env_value(const char *value)
+{
+    return value && value[0] != '\0' &&
+           (strcmp(value, "1") == 0 ||
+            strcasecmp(value, "true") == 0 ||
+            strcasecmp(value, "yes") == 0 ||
+            strcasecmp(value, "on") == 0);
+}
+
+static void warn_if_tracy_env_is_ignored(void)
+{
+    const char *tracy_env = getenv("SAPPHIRE_TRACY");
+
+    if (!is_truthy_env_value(tracy_env)) {
+        return;
+    }
+
+    LOG_WARN("SAPPHIRE_TRACY=1 is set, but this binary was built without Tracy support. Rebuild with make bin SAPPHIRE_ENABLE_TRACY=1.");
+}
+#endif
+
 typedef struct {
     const char *model_name;
     int context_len;
@@ -119,6 +144,7 @@ typedef struct {
     int checkpoint_every_n_layers;
     int validate_every_n;
     int ste_steps;
+    int progressive_calib;
     float kl_weight;
     int disable_hessian_proxy;
     float hessian_proxy_strength;
@@ -157,6 +183,7 @@ static void cli_args_init(cli_args_t *args)
     args->checkpoint_every_n_layers = 1;
     args->validate_every_n = 0;
     args->ste_steps = 3;
+    args->progressive_calib = 0;
     args->kl_weight = 0.05f;
     args->disable_hessian_proxy = 0;
     args->hessian_proxy_strength = 1.0f;
@@ -263,6 +290,14 @@ static int validate_convert_ternary_mode_args(const cli_args_t *args)
     }
     if (args->save_state_path || args->load_state_path) {
         LOG_ERROR("ERROR: session state flags are not valid in --convert-ternary mode.");
+        return -1;
+    }
+    if (args->progressive_calib && args->layer_name) {
+        LOG_ERROR("ERROR: --progressive-calib is only supported for full-model ternary conversion.");
+        return -1;
+    }
+    if (args->progressive_calib && (!args->activation_tape_path || args->activation_tape_path[0] == '\0')) {
+        LOG_ERROR("ERROR: --progressive-calib requires --activation-tape so staged calibration can reuse teacher activation statistics.");
         return -1;
     }
 
@@ -411,11 +446,15 @@ static int validate_cli_args(const cli_args_t *args)
 static int run_ternary_conversion_mode(const cli_args_t *args)
 {
     ternary_conversion_config_t config;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "run_ternary_conversion_mode");
 
     if (!args) {
         LOG_ERROR("ternary conversion mode: args is NULL");
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
+
+    sapphire_tracy_zone_text(&tracy_zone, args->model_name, args->model_name ? strlen(args->model_name) : 0u);
 
     config.model_name = args->model_name;
     config.output_path = args->output_path;
@@ -434,12 +473,15 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.checkpoint_every_n_layers = args->checkpoint_every_n_layers;
     config.validate_every_n = args->validate_every_n;
     config.ste_steps = args->ste_steps;
+    config.progressive_calib = args->progressive_calib;
     config.kl_weight = args->kl_weight;
     config.disable_hessian_proxy = args->disable_hessian_proxy;
     config.hessian_proxy_strength = args->hessian_proxy_strength;
     config.hessian_proxy_floor = args->hessian_proxy_floor;
     config.max_grad_norm = args->max_grad_norm;
-    return transformer_run_ternary_conversion(&config);
+    int rc = transformer_run_ternary_conversion(&config);
+    sapphire_tracy_zone_end(&tracy_zone);
+    return rc;
 }
 
 static int load_record_hessian_corpus(const cli_args_t *args,
@@ -547,11 +589,15 @@ static int run_record_tape_mode(const cli_args_t *args)
     int backend_type = -1;
     int signal_handlers_installed = 0;
     int rc = -1;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "run_record_tape_mode");
 
     if (!args || !args->record_tape_path || !args->model_name) {
         LOG_ERROR("record-tape mode: invalid arguments");
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
+
+    sapphire_tracy_zone_text(&tracy_zone, args->record_tape_path, strlen(args->record_tape_path));
 
     memset(&corpus, 0, sizeof(corpus));
     activation_tape_clear_stop_request();
@@ -598,12 +644,18 @@ static int run_record_tape_mode(const cli_args_t *args)
         goto cleanup;
     }
 
-    if (calibration_corpus_load_manifest(args->calibration_corpus_manifest_path,
-                                         INT_MAX,
-                                         &corpus) != 0) {
-        LOG_ERROR("record-tape: failed to load calibration manifest %s",
-                  args->calibration_corpus_manifest_path);
-        goto cleanup;
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(load_manifest_zone, "record_tape_load_manifest");
+
+        if (calibration_corpus_load_manifest(args->calibration_corpus_manifest_path,
+                                             INT_MAX,
+                                             &corpus) != 0) {
+            sapphire_tracy_zone_end(&load_manifest_zone);
+            LOG_ERROR("record-tape: failed to load calibration manifest %s",
+                      args->calibration_corpus_manifest_path);
+            goto cleanup;
+        }
+        sapphire_tracy_zone_end(&load_manifest_zone);
     }
 
     memset(&record_config, 0, sizeof(record_config));
@@ -618,7 +670,11 @@ static int run_record_tape_mode(const cli_args_t *args)
     record_config.hessian_proxy_strength = args->hessian_proxy_strength;
     record_config.hessian_proxy_floor = args->hessian_proxy_floor;
 
-    rc = activation_tape_record_ex(&record_config);
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(record_zone, "activation_tape_record");
+        rc = activation_tape_record_ex(&record_config);
+        sapphire_tracy_zone_end(&record_zone);
+    }
     if (rc == 0 && activation_tape_stop_requested()) {
         LOG_WARN("record-tape: interrupted; partial tape saved to %s", args->record_tape_path);
     } else if (rc == 0) {
@@ -634,6 +690,7 @@ cleanup:
         restore_record_tape_signal_handlers(&old_sigint, &old_sigterm);
     }
     activation_tape_clear_stop_request();
+    sapphire_tracy_zone_end(&tracy_zone);
     return rc;
 }
 
@@ -643,13 +700,18 @@ static int run_record_hessian_sidecar_mode(const cli_args_t *args)
     calibration_corpus_t corpus;
     activation_tape_t *tape = NULL;
     int rc = -1;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "run_record_hessian_sidecar_mode");
 
     if (!args || !args->record_hessian_sidecar_path || !args->model_name) {
         LOG_ERROR("record-hessian-sidecar mode: invalid arguments");
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
 
     memset(&corpus, 0, sizeof(corpus));
+    sapphire_tracy_zone_text(&tracy_zone,
+                             args->record_hessian_sidecar_path,
+                             strlen(args->record_hessian_sidecar_path));
 
     LOG_INFO("Recording Hessian sidecar to %s", args->record_hessian_sidecar_path);
 
@@ -666,22 +728,35 @@ static int run_record_hessian_sidecar_mode(const cli_args_t *args)
         goto cleanup;
     }
 
-    tape = activation_tape_open(args->activation_tape_path);
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(open_tape_zone, "record_hessian_open_tape");
+        tape = activation_tape_open(args->activation_tape_path);
+        sapphire_tracy_zone_end(&open_tape_zone);
+    }
     if (!tape) {
         LOG_ERROR("record-hessian-sidecar: failed to open activation tape %s", args->activation_tape_path);
         goto cleanup;
     }
-    if (load_record_hessian_corpus(args, &corpus) != 0) {
-        LOG_ERROR("record-hessian-sidecar: failed to load calibration corpus input");
-        goto cleanup;
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(load_corpus_zone, "record_hessian_load_corpus");
+        if (load_record_hessian_corpus(args, &corpus) != 0) {
+            sapphire_tracy_zone_end(&load_corpus_zone);
+            LOG_ERROR("record-hessian-sidecar: failed to load calibration corpus input");
+            goto cleanup;
+        }
+        sapphire_tracy_zone_end(&load_corpus_zone);
     }
 
-    rc = ternary_record_hessian_sidecar_vulkan(args->record_hessian_sidecar_path,
-                                               ctx,
-                                               &corpus,
-                                               tape,
-                                               args->hessian_proxy_strength,
-                                               args->hessian_proxy_floor);
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(record_zone, "record_hessian_sidecar");
+        rc = ternary_record_hessian_sidecar_vulkan(args->record_hessian_sidecar_path,
+                                                   ctx,
+                                                   &corpus,
+                                                   tape,
+                                                   args->hessian_proxy_strength,
+                                                   args->hessian_proxy_floor);
+        sapphire_tracy_zone_end(&record_zone);
+    }
     if (rc == 0) {
         LOG_INFO("record-hessian-sidecar: completed %s", args->record_hessian_sidecar_path);
     }
@@ -694,6 +769,7 @@ cleanup:
     if (ctx) {
         destroy_inference_context(ctx);
     }
+    sapphire_tracy_zone_end(&tracy_zone);
     return rc;
 }
 
@@ -843,6 +919,7 @@ typedef enum {
     CLI_OPT_CHECKPOINT_EVERY,
     CLI_OPT_VALIDATE_EVERY,
     CLI_OPT_STE_STEPS,
+    CLI_OPT_PROGRESSIVE_CALIB,
     CLI_OPT_MAX_GRAD_NORM,
     CLI_OPT_KL_WEIGHT,
     CLI_OPT_DISABLE_HESSIAN_PROXY,
@@ -887,6 +964,7 @@ static const cli_option_alias_t g_cli_option_aliases[] = {
     { "--checkpoint-every", CLI_OPT_CHECKPOINT_EVERY },
     { "--validate-every", CLI_OPT_VALIDATE_EVERY },
     { "--ste-steps", CLI_OPT_STE_STEPS },
+    { "--progressive-calib", CLI_OPT_PROGRESSIVE_CALIB },
     { "--max-grad-norm", CLI_OPT_MAX_GRAD_NORM },
     { "--kl-weight", CLI_OPT_KL_WEIGHT },
     { "--disable-hessian-proxy", CLI_OPT_DISABLE_HESSIAN_PROXY },
@@ -965,6 +1043,10 @@ static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
             args->disable_hessian_proxy = 1;
             continue;
         }
+        if (option == CLI_OPT_PROGRESSIVE_CALIB) {
+            args->progressive_calib = 1;
+            continue;
+        }
         if (option == CLI_OPT_UNKNOWN || i + 1 >= argc) {
             continue;
         }
@@ -1034,8 +1116,11 @@ static int interactive_loop(inference_context_t* ctx) {
                                        &should_exit);
             if (should_exit) break;
         } else {
+            SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "interactive_request");
+
             // Perform inference
             printf("\n[Generating response...]\n");
+            sapphire_tracy_plot_i64("interactive.prompt_chars", (int64_t)strlen(prompt));
 
             int result = perform_inference(ctx, prompt, output, sizeof(output));
 
@@ -1047,6 +1132,8 @@ static int interactive_loop(inference_context_t* ctx) {
             } else {
                 printf("Inference failed\n");
             }
+
+            sapphire_tracy_zone_end(&tracy_zone);
         }
     }
 
@@ -1078,6 +1165,9 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
     char *heap_buf = NULL;
     char *output = NULL;
     int use_heap = 0;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "one_shot_inference");
+
+    sapphire_tracy_zone_value(&tracy_zone, (uint64_t)output_size);
 
     if (output_size <= BUFFER_SIZE) {
         output = stack_buf;
@@ -1085,6 +1175,7 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
         heap_buf = (char *)malloc((size_t)output_size);
         if (!heap_buf) {
             LOG_ERROR("One-shot inference: failed to allocate output buffer of size %d", output_size);
+            sapphire_tracy_zone_end(&tracy_zone);
             return -1;
         }
         use_heap = 1;
@@ -1112,6 +1203,7 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
     }
 
     if (use_heap) free(heap_buf);
+    sapphire_tracy_zone_end(&tracy_zone);
     return rc;
 }
 
@@ -1126,6 +1218,8 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
  *         failure, or runtime errors).
  */
 int main(int argc, char* argv[]) {
+    sapphire_tracy_name_thread("main");
+
     // Check for help first
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -1144,6 +1238,10 @@ int main(int argc, char* argv[]) {
     }
 
     log_set_level_from_env("SAPPHIRE_LOG_LEVEL");
+
+#if !defined(SAPPHIRE_ENABLE_TRACY)
+    warn_if_tracy_env_is_ignored();
+#endif
 
     printf("================================================================================\n");
     printf("                      SAPPHIRE INFERENCE ENGINE (v1.0)\n");

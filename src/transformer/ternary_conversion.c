@@ -19,7 +19,9 @@
 #include "ternary_calibration.h"
 #include "ternary_io.h"
 #include "ternary_hessian_sidecar.h"
+#include "tracy_profile.h"
 #include "ternary_validation.h"
+#include "transformer.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -31,6 +33,36 @@
 /* Number of tensor entries per transformer layer in the activation tape.
  * Matches ALIGNMENT_WEIGHT_SPECS in expand_tape.py. */
 #define TAPE_TENSORS_PER_LAYER 7
+#define PROGRESSIVE_CALIB_STAGE_COUNT 5u
+#define PROGRESSIVE_CALIB_STAGE1_LAST_LAYER 5u
+#define PROGRESSIVE_CALIB_STAGE2_HOLD_LAST_LAYER 10u
+#define PROGRESSIVE_CALIB_STAGE2_RAMP_FIRST_LAYER 11u
+#define PROGRESSIVE_CALIB_STAGE2_LAST_LAYER 15u
+#define PROGRESSIVE_CALIB_STAGE2_TARGET_KL_WEIGHT 0.20f
+#define PROGRESSIVE_CALIB_STAGE3_TARGET_KL_WEIGHT 0.20f
+#define PROGRESSIVE_CALIB_STAGE2_KL_TEMPERATURE 2.0f
+#define PROGRESSIVE_CALIB_STAGE3_BLOCK1_LAST_LAYER 9u
+#define PROGRESSIVE_CALIB_STAGE3_BLOCK2_LAST_LAYER 19u
+#define PROGRESSIVE_CALIB_STAGE3_BLOCK3_LAST_LAYER 27u
+#define PROGRESSIVE_CALIB_STAGE3_LR_SCALE 0.50f
+#define PROGRESSIVE_RESIDUAL_CORRECTION_MAX_SAMPLES 2
+#define PROGRESSIVE_RESIDUAL_CORRECTION_MIN_VARIANCE_RATIO 0.85f
+#define PROGRESSIVE_RESIDUAL_CORRECTION_MAX_SCALE 1.10f
+#define PROGRESSIVE_CALIB_SCHEDULE_VERSION 4u
+
+typedef enum {
+    PROGRESSIVE_CALIB_STAGE_DISABLED = 0,
+    PROGRESSIVE_CALIB_STAGE_EARLY = 1,
+    PROGRESSIVE_CALIB_STAGE_MID = 2,
+    PROGRESSIVE_CALIB_STAGE_FULL_BLOCK1 = 3,
+    PROGRESSIVE_CALIB_STAGE_FULL_BLOCK2 = 4,
+    PROGRESSIVE_CALIB_STAGE_FULL_BLOCK3 = 5
+} progressive_calib_stage_t;
+
+typedef struct {
+    float kl_weight;
+    float kl_temperature;
+} progressive_distillation_schedule_t;
 
 typedef enum {
     STRUCTURAL_TENSOR_RULE_DIRECT = 0,
@@ -84,6 +116,7 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
 {
     uint32_t crc32 = 0u;
     int ste_steps = 3;
+    const uint32_t schedule_version = PROGRESSIVE_CALIB_SCHEDULE_VERSION;
 
     if (!config) {
         return 0u;
@@ -109,6 +142,8 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
     crc32 = io_crc32_update(crc32, &config->checkpoint_every_n_layers, sizeof(config->checkpoint_every_n_layers));
     crc32 = io_crc32_update(crc32, &config->validate_every_n, sizeof(config->validate_every_n));
     crc32 = io_crc32_update(crc32, &ste_steps, sizeof(ste_steps));
+    crc32 = io_crc32_update(crc32, &config->progressive_calib, sizeof(config->progressive_calib));
+    crc32 = io_crc32_update(crc32, &schedule_version, sizeof(schedule_version));
     crc32 = io_crc32_update(crc32, &config->kl_weight, sizeof(config->kl_weight));
     crc32 = io_crc32_update(crc32, &config->disable_hessian_proxy, sizeof(config->disable_hessian_proxy));
     crc32 = io_crc32_update(crc32, &config->hessian_proxy_strength, sizeof(config->hessian_proxy_strength));
@@ -117,6 +152,266 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
     crc32 = io_crc32_update(crc32, config->hessian_sidecar_path, config->hessian_sidecar_path ? strlen(config->hessian_sidecar_path) + 1u : 0u);
     crc32 = io_crc32_update(crc32, &hessian_sidecar_crc32, sizeof(hessian_sidecar_crc32));
     return crc32;
+}
+
+static uint32_t conversion_stage_pass_count(const ternary_conversion_config_t *config)
+{
+    return (config && config->progressive_calib) ? PROGRESSIVE_CALIB_STAGE_COUNT : 1u;
+}
+
+static uint32_t conversion_total_progress_steps(const ternary_conversion_config_t *config,
+                                                const model_spec_t *spec)
+{
+    if (!spec || spec->tensor_map_size <= 0) {
+        return 0u;
+    }
+
+    return (uint32_t)spec->tensor_map_size * conversion_stage_pass_count(config);
+}
+
+static int conversion_try_parse_layer_index(const char *tensor_name,
+                                            uint32_t *out_layer_index)
+{
+    const char *cursor = NULL;
+
+    if (!tensor_name || !out_layer_index) {
+        return 0;
+    }
+
+    *out_layer_index = 0u;
+    cursor = strstr(tensor_name, ".layers.");
+    if (cursor) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(cursor + 8, &end, 10);
+
+        if (end != cursor + 8 && parsed <= 0xFFFFFFFFul) {
+            *out_layer_index = (uint32_t)parsed;
+            return 1;
+        }
+    }
+
+    cursor = strstr(tensor_name, "blk.");
+    if (cursor) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(cursor + 4, &end, 10);
+
+        if (end != cursor + 4 && parsed <= 0xFFFFFFFFul) {
+            *out_layer_index = (uint32_t)parsed;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static progressive_calib_stage_t progressive_calib_stage_from_progress_index(const ternary_conversion_config_t *config,
+                                                                             const model_spec_t *spec,
+                                                                             int progress_index)
+{
+    int stage_idx = 0;
+
+    if (!config || !config->progressive_calib || !spec || spec->tensor_map_size <= 0 || progress_index < 0) {
+        return PROGRESSIVE_CALIB_STAGE_DISABLED;
+    }
+
+    stage_idx = progress_index / spec->tensor_map_size;
+    if (stage_idx <= 0) {
+        return PROGRESSIVE_CALIB_STAGE_EARLY;
+    }
+    if (stage_idx == 1) {
+        return PROGRESSIVE_CALIB_STAGE_MID;
+    }
+    if (stage_idx == 2) {
+        return PROGRESSIVE_CALIB_STAGE_FULL_BLOCK1;
+    }
+    if (stage_idx == 3) {
+        return PROGRESSIVE_CALIB_STAGE_FULL_BLOCK2;
+    }
+
+    return PROGRESSIVE_CALIB_STAGE_FULL_BLOCK3;
+}
+
+static const char *progressive_calib_stage_name(progressive_calib_stage_t stage)
+{
+    switch (stage) {
+    case PROGRESSIVE_CALIB_STAGE_EARLY:
+        return "stage-1 (layers 0-5)";
+    case PROGRESSIVE_CALIB_STAGE_MID:
+        return "stage-2 (layers 6-15)";
+    case PROGRESSIVE_CALIB_STAGE_FULL_BLOCK1:
+        return "stage-3a (layers 0-9)";
+    case PROGRESSIVE_CALIB_STAGE_FULL_BLOCK2:
+        return "stage-3b (layers 10-19)";
+    case PROGRESSIVE_CALIB_STAGE_FULL_BLOCK3:
+        return "stage-3c (layers 20-27 + shared tensors)";
+    default:
+        return "disabled";
+    }
+}
+
+static int progressive_calib_stage_is_stage3(progressive_calib_stage_t stage)
+{
+    return stage == PROGRESSIVE_CALIB_STAGE_FULL_BLOCK1 ||
+           stage == PROGRESSIVE_CALIB_STAGE_FULL_BLOCK2 ||
+           stage == PROGRESSIVE_CALIB_STAGE_FULL_BLOCK3;
+}
+
+static int progressive_calib_stage_uses_activation_a8(progressive_calib_stage_t stage)
+{
+    return stage == PROGRESSIVE_CALIB_STAGE_MID ||
+           progressive_calib_stage_is_stage3(stage);
+}
+
+static int conversion_tracy_end_status(sapphire_tracy_zone_t *zone, int status)
+{
+    sapphire_tracy_zone_end(zone);
+    return status;
+}
+
+static void conversion_tracy_zone_text_if_present(const sapphire_tracy_zone_t *zone,
+                                                  const char *text)
+{
+    if (!zone || !text || text[0] == '\0') {
+        return;
+    }
+
+    sapphire_tracy_zone_text(zone, text, strlen(text));
+}
+
+static void conversion_tracy_plot_layer_index(int has_layer_index, uint32_t layer_index)
+{
+    if (!has_layer_index) {
+        return;
+    }
+
+    sapphire_tracy_plot_i64("conversion.layer_index", (int64_t)layer_index);
+}
+
+static void conversion_tracy_emit_stage_marker(progressive_calib_stage_t stage)
+{
+    const char *stage_name = progressive_calib_stage_name(stage);
+
+    sapphire_tracy_plot_i64("conversion.progressive_stage", (int64_t)stage);
+    if (stage_name && stage_name[0] != '\0') {
+        sapphire_tracy_message(stage_name, strlen(stage_name));
+    }
+}
+
+static void conversion_tracy_plot_checkpoint(const ternary_student_update_checkpoint_t *checkpoint)
+{
+    if (!checkpoint) {
+        return;
+    }
+
+    sapphire_tracy_plot_i64("conversion.converted_tensors",
+                            (int64_t)checkpoint->converted_tensor_count);
+    sapphire_tracy_plot_i64("conversion.checkpoint_next_progress",
+                            (int64_t)checkpoint->next_layer_index);
+}
+
+static int progressive_calib_stage_uses_residual_recenter(progressive_calib_stage_t stage)
+{
+    return stage == PROGRESSIVE_CALIB_STAGE_MID;
+}
+
+static progressive_distillation_schedule_t progressive_calib_distillation_schedule(
+    const ternary_conversion_config_t *config,
+    progressive_calib_stage_t stage,
+    int has_layer_index,
+    uint32_t layer_index)
+{
+    progressive_distillation_schedule_t schedule;
+    float base_kl_weight = 0.05f;
+
+    if (config && config->kl_weight >= 0.0f) {
+        base_kl_weight = config->kl_weight;
+    }
+
+    schedule.kl_weight = base_kl_weight;
+    schedule.kl_temperature = 1.0f;
+
+    if (!config || !config->progressive_calib || !has_layer_index) {
+        return schedule;
+    }
+
+    if (stage == PROGRESSIVE_CALIB_STAGE_MID) {
+        float target_kl_weight = base_kl_weight;
+
+        if (target_kl_weight < PROGRESSIVE_CALIB_STAGE2_TARGET_KL_WEIGHT) {
+            target_kl_weight = PROGRESSIVE_CALIB_STAGE2_TARGET_KL_WEIGHT;
+        }
+        schedule.kl_temperature = PROGRESSIVE_CALIB_STAGE2_KL_TEMPERATURE;
+        if (layer_index >= PROGRESSIVE_CALIB_STAGE2_RAMP_FIRST_LAYER) {
+            float progress = (float)(layer_index - PROGRESSIVE_CALIB_STAGE2_RAMP_FIRST_LAYER)
+                / (float)(PROGRESSIVE_CALIB_STAGE2_LAST_LAYER - PROGRESSIVE_CALIB_STAGE2_RAMP_FIRST_LAYER);
+            if (progress < 0.0f) {
+                progress = 0.0f;
+            }
+            if (progress > 1.0f) {
+                progress = 1.0f;
+            }
+            schedule.kl_weight = base_kl_weight +
+                (target_kl_weight - base_kl_weight) * progress;
+        }
+        return schedule;
+    }
+
+    if (progressive_calib_stage_is_stage3(stage)) {
+        schedule.kl_weight = base_kl_weight;
+        if (schedule.kl_weight < PROGRESSIVE_CALIB_STAGE3_TARGET_KL_WEIGHT) {
+            schedule.kl_weight = PROGRESSIVE_CALIB_STAGE3_TARGET_KL_WEIGHT;
+        }
+    }
+
+    return schedule;
+}
+
+static int progressive_calib_stage_allows_tensor(progressive_calib_stage_t stage,
+                                                 const char *tensor_name)
+{
+    uint32_t layer_index = 0u;
+
+    if (stage == PROGRESSIVE_CALIB_STAGE_DISABLED) {
+        return 1;
+    }
+    if (!conversion_try_parse_layer_index(tensor_name, &layer_index)) {
+        return stage == PROGRESSIVE_CALIB_STAGE_FULL_BLOCK3;
+    }
+    if (stage == PROGRESSIVE_CALIB_STAGE_EARLY) {
+        return layer_index <= PROGRESSIVE_CALIB_STAGE1_LAST_LAYER;
+    }
+    if (stage == PROGRESSIVE_CALIB_STAGE_MID) {
+        return layer_index > PROGRESSIVE_CALIB_STAGE1_LAST_LAYER &&
+               layer_index <= PROGRESSIVE_CALIB_STAGE2_LAST_LAYER;
+    }
+    if (stage == PROGRESSIVE_CALIB_STAGE_FULL_BLOCK1) {
+        return layer_index <= PROGRESSIVE_CALIB_STAGE3_BLOCK1_LAST_LAYER;
+    }
+    if (stage == PROGRESSIVE_CALIB_STAGE_FULL_BLOCK2) {
+        return layer_index > PROGRESSIVE_CALIB_STAGE3_BLOCK1_LAST_LAYER &&
+               layer_index <= PROGRESSIVE_CALIB_STAGE3_BLOCK2_LAST_LAYER;
+    }
+    if (stage == PROGRESSIVE_CALIB_STAGE_FULL_BLOCK3) {
+        return layer_index > PROGRESSIVE_CALIB_STAGE3_BLOCK2_LAST_LAYER &&
+               layer_index <= PROGRESSIVE_CALIB_STAGE3_BLOCK3_LAST_LAYER;
+    }
+
+    return 0;
+}
+
+static int conversion_tensor_index_from_progress(const ternary_conversion_config_t *config,
+                                                 const model_spec_t *spec,
+                                                 int progress_index)
+{
+    if (!spec || spec->tensor_map_size <= 0 || progress_index < 0) {
+        return -1;
+    }
+
+    if (config && config->progressive_calib) {
+        return progress_index % spec->tensor_map_size;
+    }
+
+    return progress_index;
 }
 
 static float telemetry_elapsed_ms(const struct timespec *start,
@@ -850,6 +1145,14 @@ static int resume_validation_from_manifest(const ternary_conversion_config_t *co
     }
 
     if (replayed != (int)runtime->checkpoint_state.converted_tensor_count) {
+        if (config->progressive_calib) {
+            LOG_INFO("student update: progressive calib replayed %d manifest tensors while checkpoint tracks %u staged conversions",
+                     replayed,
+                     runtime->checkpoint_state.converted_tensor_count);
+            runtime->validation_state.last_reported_count = replayed;
+            free(manifest_text);
+            return 0;
+        }
         LOG_ERROR("student update: manifest replay count mismatch (checkpoint=%u replayed=%d)",
                   runtime->checkpoint_state.converted_tensor_count,
                   replayed);
@@ -1033,9 +1336,7 @@ static int init_checkpoint_state(const ternary_conversion_config_t *config,
         return -1;
     }
 
-    total_layer_count = (runtime->model_spec->tensor_map_size > 0)
-        ? (uint32_t)runtime->model_spec->tensor_map_size
-        : 0u;
+    total_layer_count = conversion_total_progress_steps(config, runtime->model_spec);
     config_hash = config_resume_hash(config,
                                      runtime->hessian_sidecar ? runtime->hessian_sidecar_crc32 : 0u);
     seed_checkpoint_state_defaults(config, runtime, total_layer_count, config_hash);
@@ -1074,10 +1375,13 @@ static int write_student_checkpoint(const ternary_conversion_config_t *config,
     ternary_student_update_checkpoint_t checkpoint;
     const char *effective_alignment_manifest_path = NULL;
     const char *effective_alignment_tape_path = NULL;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "write_student_checkpoint");
 
     if (!config || !runtime || !runtime->checkpoint_path) {
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
+
+    conversion_tracy_zone_text_if_present(&tracy_zone, runtime->checkpoint_path);
 
     effective_alignment_manifest_path = runtime->alignment_manifest_path
         ? runtime->alignment_manifest_path
@@ -1103,18 +1407,23 @@ static int write_student_checkpoint(const ternary_conversion_config_t *config,
     if (effective_alignment_manifest_path && effective_alignment_manifest_path[0] != '\0') {
         if (ternary_student_checkpoint_compute_manifest_crc32(effective_alignment_manifest_path,
                                                               &checkpoint.alignment_manifest_crc32) != 0) {
-            return -1;
+            return conversion_tracy_end_status(&tracy_zone, -1);
         }
     }
     if (effective_alignment_tape_path && effective_alignment_tape_path[0] != '\0' && runtime->activation_tape) {
         if (ternary_student_checkpoint_compute_tape_provenance_hash(&checkpoint,
                                                                     runtime->activation_tape,
                                                                     &checkpoint.alignment_tape_provenance_hash) != 0) {
-            return -1;
+            return conversion_tracy_end_status(&tracy_zone, -1);
         }
     }
 
-    return ternary_student_checkpoint_write_atomic(runtime->checkpoint_path, &checkpoint);
+    int rc = ternary_student_checkpoint_write_atomic(runtime->checkpoint_path, &checkpoint);
+    if (rc == 0) {
+        conversion_tracy_plot_checkpoint(&checkpoint);
+    }
+
+    return conversion_tracy_end_status(&tracy_zone, rc);
 }
 
 static int prepare_teacher_student_alignment(const ternary_conversion_config_t *config,
@@ -1127,29 +1436,32 @@ static int prepare_teacher_student_alignment(const ternary_conversion_config_t *
     const model_spec_t *teacher_spec = NULL;
     const activation_tape_t *teacher_tape = NULL;
     int rc = -1;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "prepare_teacher_student_alignment");
 
     if (!config || !runtime) {
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
+    conversion_tracy_zone_text_if_present(&tracy_zone, config->teacher_model_name);
+
     if (!config->teacher_model_name || config->teacher_model_name[0] == '\0') {
-        return 0;
+        return conversion_tracy_end_status(&tracy_zone, 0);
     }
 
     if (config->layer_name && config->layer_name[0] != '\0') {
         LOG_ERROR("ternary alignment: --teacher-model requires full-model conversion");
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
     if (!runtime->activation_tape) {
         LOG_ERROR("ternary alignment: --teacher-model requires --activation-tape");
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     teacher_tape = runtime->activation_tape;
     teacher_spec = get_model_spec(config->teacher_model_name);
     if (!teacher_spec) {
         LOG_ERROR("ternary alignment: failed to resolve teacher spec for %s", config->teacher_model_name);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     memset(&request, 0, sizeof(request));
@@ -1163,7 +1475,7 @@ static int prepare_teacher_student_alignment(const ternary_conversion_config_t *
                                               config->output_path,
                                               &aligned_tape_path,
                                               &aligned_manifest_path) != 0) {
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     aligned_tape = activation_tape_open(aligned_tape_path);
@@ -1197,7 +1509,7 @@ alignment_cleanup:
     if (aligned_tape) {
         activation_tape_close(aligned_tape);
     }
-    return rc;
+    return conversion_tracy_end_status(&tracy_zone, rc);
 }
 
 static int load_runtime_corpus(const char *manifest_path,
@@ -1236,6 +1548,8 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
         ? config->calibration_sample_limit
         : 4;
     ste_config.kl_weight = (config && config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f;
+    ste_config.kl_temperature = 1.0f;
+    ste_config.simulate_activation_a8 = 0;
     ste_config.use_hessian_proxy = (!config || !config->disable_hessian_proxy) ? 1 : 0;
     ste_config.hessian_proxy_strength = (config && config->hessian_proxy_strength >= 0.0f)
         ? config->hessian_proxy_strength
@@ -1476,11 +1790,14 @@ static void init_conversion_validation(const ternary_conversion_config_t *config
     const char *validation_manifest = NULL;
     const char *validation_source = NULL;
     int validation_samples = 0;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "init_conversion_validation");
 
     if (!config || !runtime || !runtime->activation_ctx) {
+        sapphire_tracy_zone_end(&tracy_zone);
         return;
     }
     if (config->validate_every_n <= 0) {
+        sapphire_tracy_zone_end(&tracy_zone);
         return;
     }
 
@@ -1500,10 +1817,12 @@ static void init_conversion_validation(const ternary_conversion_config_t *config
     validation_samples = (config->validation_sample_limit > 0)
         ? config->validation_sample_limit
         : ((config->calibration_sample_limit > 0) ? config->calibration_sample_limit : 4);
+    sapphire_tracy_plot_i64("validation.sample_count", validation_samples);
 
     if ((!validation_manifest || validation_manifest[0] == '\0') &&
         (!validation_source || validation_source[0] == '\0')) {
         LOG_WARN("ternary validation: disabled because no validation corpus was provided");
+        sapphire_tracy_zone_end(&tracy_zone);
         return;
     }
     if (load_runtime_corpus(validation_manifest,
@@ -1512,6 +1831,7 @@ static void init_conversion_validation(const ternary_conversion_config_t *config
                             &runtime->validation_corpus_storage) != 0) {
         LOG_WARN("ternary validation: failed to load held-out corpus; disabling checkpoints");
         memset(&runtime->validation_corpus_storage, 0, sizeof(runtime->validation_corpus_storage));
+        sapphire_tracy_zone_end(&tracy_zone);
         return;
     }
 
@@ -1527,55 +1847,63 @@ static void init_conversion_validation(const ternary_conversion_config_t *config
         LOG_WARN("ternary validation: failed to initialize checkpoint state; disabling checkpoints");
         ternary_validation_destroy(&runtime->validation_state);
     }
+
+    sapphire_tracy_zone_end(&tracy_zone);
 }
 
 static int open_runtime_activation_tape(const ternary_conversion_config_t *config,
                                         conversion_runtime_t *runtime)
 {
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "open_activation_tape");
     if (!config || !runtime) {
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
+    conversion_tracy_zone_text_if_present(&tracy_zone, config->activation_tape_path);
+
     if (!config->activation_tape_path || config->activation_tape_path[0] == '\0') {
-        return 0;
+        return conversion_tracy_end_status(&tracy_zone, 0);
     }
 
     runtime->activation_tape = activation_tape_open(config->activation_tape_path);
     if (!runtime->activation_tape) {
         LOG_ERROR("ternary conversion: failed to open activation tape %s", config->activation_tape_path);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
     runtime->activation_tape_hash = activation_tape_crc32(runtime->activation_tape);
-    return 0;
+    return conversion_tracy_end_status(&tracy_zone, 0);
 }
 
 static int open_runtime_hessian_sidecar(const ternary_conversion_config_t *config,
                                         conversion_runtime_t *runtime)
 {
     const char *sidecar_teacher_name = NULL;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "open_hessian_sidecar");
 
     if (!config || !runtime) {
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
+    conversion_tracy_zone_text_if_present(&tracy_zone, config->hessian_sidecar_path);
+
     if (!config->hessian_sidecar_path || config->hessian_sidecar_path[0] == '\0') {
-        return 0;
+        return conversion_tracy_end_status(&tracy_zone, 0);
     }
     if (!runtime->activation_tape) {
         LOG_ERROR("ternary conversion: --hessian-sidecar requires --activation-tape");
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     runtime->hessian_sidecar = ternary_hessian_sidecar_open(config->hessian_sidecar_path);
     if (!runtime->hessian_sidecar) {
         LOG_ERROR("ternary conversion: failed to open Hessian sidecar %s", config->hessian_sidecar_path);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     runtime->hessian_sidecar_crc32 = ternary_hessian_sidecar_crc32(runtime->hessian_sidecar);
     if (activation_tape_crc32(runtime->activation_tape) != ternary_hessian_sidecar_tape_crc32(runtime->hessian_sidecar)) {
         LOG_ERROR("ternary conversion: Hessian sidecar tape CRC mismatch for %s", config->hessian_sidecar_path);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     sidecar_teacher_name = ternary_hessian_sidecar_teacher_model_name(runtime->hessian_sidecar);
@@ -1584,10 +1912,10 @@ static int open_runtime_hessian_sidecar(const ternary_conversion_config_t *confi
         LOG_ERROR("ternary conversion: Hessian sidecar teacher model mismatch (config=%s sidecar=%s)",
                   config->teacher_model_name,
                   sidecar_teacher_name);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
-    return 0;
+    return conversion_tracy_end_status(&tracy_zone, 0);
 }
 
 static void attach_runtime_activation_context(conversion_runtime_t *runtime)
@@ -1621,30 +1949,76 @@ static int attach_runtime_tokenizer_fallback(const char *model_dir,
 static int load_runtime_corpus_if_needed(const ternary_conversion_config_t *config,
                                          conversion_runtime_t *runtime)
 {
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "load_calibration_corpus");
     if (!config || !runtime) {
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     if ((!config->calibration_corpus_manifest_path || config->calibration_corpus_manifest_path[0] == '\0') &&
         (!config->calibration_corpus_path || config->calibration_corpus_path[0] == '\0')) {
-        return 0;
+        return conversion_tracy_end_status(&tracy_zone, 0);
     }
+
+    conversion_tracy_zone_text_if_present(&tracy_zone,
+                                          config->calibration_corpus_manifest_path ? config->calibration_corpus_manifest_path : config->calibration_corpus_path);
 
     if (load_runtime_corpus(config->calibration_corpus_manifest_path,
                             config->calibration_corpus_path,
                             config->calibration_sample_limit,
                             &runtime->corpus_storage) != 0) {
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     runtime->calibration_corpus.sample_texts = (const char *const *)runtime->corpus_storage.samples;
     runtime->calibration_corpus.sample_count = runtime->corpus_storage.sample_count;
-    return 0;
+    return conversion_tracy_end_status(&tracy_zone, 0);
+}
+
+static int prepare_conversion_output_path(const ternary_conversion_config_t *config)
+{
+    const char *slash = NULL;
+    char *parent_dir = NULL;
+    size_t parent_len = 0u;
+    int rc = 0;
+
+    if (!config || !config->output_path || config->output_path[0] == '\0') {
+        return -1;
+    }
+    if (!config->layer_name || config->layer_name[0] == '\0') {
+        return io_prepare_ternary_output_dir(config->output_path);
+    }
+
+    slash = strrchr(config->output_path, '/');
+    if (!slash) {
+        return 0;
+    }
+
+    parent_len = (size_t)(slash - config->output_path);
+    if (parent_len == 0u) {
+        return 0;
+    }
+
+    parent_dir = (char *)malloc(parent_len + 1u);
+    if (!parent_dir) {
+        LOG_ERROR("ternary conversion: failed to allocate output parent directory path");
+        return -1;
+    }
+
+    memcpy(parent_dir, config->output_path, parent_len);
+    parent_dir[parent_len] = '\0';
+    rc = io_prepare_ternary_output_dir(parent_dir);
+    free(parent_dir);
+    return rc;
 }
 
 static int finalize_conversion_runtime_state(const ternary_conversion_config_t *config,
                                              conversion_runtime_t *runtime)
 {
+    if (config && config->layer_name && config->layer_name[0] != '\0') {
+        runtime->resume_step_index = 0u;
+        return 0;
+    }
+
     if (prepare_teacher_student_alignment(config, runtime) != 0) {
         return -1;
     }
@@ -1665,34 +2039,37 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
                                    const char *model_dir,
                                    conversion_runtime_t *out_runtime) {
     model_spec_t *spec = NULL;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "init_conversion_runtime");
 
     if (!config || !model_dir || !out_runtime) {
         LOG_ERROR("init_conversion_runtime: invalid arguments");
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
+
+    conversion_tracy_zone_text_if_present(&tracy_zone, config->model_name);
 
     memset(out_runtime, 0, sizeof(*out_runtime));
     if (config->structural_map_path && config->structural_map_path[0] != '\0' &&
         structural_map_load(config->structural_map_path, &out_runtime->structural_map) != 0) {
         destroy_conversion_runtime(out_runtime);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     spec = get_model_spec(config->model_name);
     if (!spec) {
         LOG_ERROR("ternary conversion: failed to resolve model spec for %s", config->model_name);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
     if (config->output_path && config->output_path[0] != '\0' &&
-        io_prepare_ternary_output_dir(config->output_path) != 0) {
-        LOG_ERROR("ternary conversion: failed to prepare output directory %s", config->output_path);
-        return -1;
+        prepare_conversion_output_path(config) != 0) {
+        LOG_ERROR("ternary conversion: failed to prepare output path %s", config->output_path);
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     if (open_runtime_activation_tape(config, out_runtime) != 0 ||
         open_runtime_hessian_sidecar(config, out_runtime) != 0) {
         destroy_conversion_runtime(out_runtime);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     out_runtime->activation_ctx = create_inference_context(0.0f,
@@ -1705,7 +2082,7 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
         LOG_WARN("ternary conversion: failed to initialize activation replay context; using tokenized fallback vectors");
         if (attach_runtime_tokenizer_fallback(model_dir, spec, out_runtime) != 0) {
             destroy_conversion_runtime(out_runtime);
-            return -1;
+            return conversion_tracy_end_status(&tracy_zone, -1);
         }
         if ((!config->calibration_corpus_manifest_path || config->calibration_corpus_manifest_path[0] == '\0') &&
             (!config->calibration_corpus_path || config->calibration_corpus_path[0] == '\0')) {
@@ -1716,10 +2093,10 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
     if (load_runtime_corpus_if_needed(config, out_runtime) != 0 ||
         finalize_conversion_runtime_state(config, out_runtime) != 0) {
         destroy_conversion_runtime(out_runtime);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
-    return 0;
+    return conversion_tracy_end_status(&tracy_zone, 0);
 }
 
 static int mmap_tensor_for_conversion(const char *model_dir,
@@ -1737,6 +2114,17 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
     transformer_ste_config_t ste_config;
     uint32_t crc32 = 0;
     int rc = -1;
+    uint32_t layer_index = 0u;
+    int has_layer_index = 0;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "run_single_layer_conversion");
+
+    if (!config) {
+        return conversion_tracy_end_status(&tracy_zone, -1);
+    }
+
+    conversion_tracy_zone_text_if_present(&tracy_zone, config->layer_name);
+    has_layer_index = conversion_try_parse_layer_index(config->layer_name, &layer_index);
+    conversion_tracy_plot_layer_index(has_layer_index, layer_index);
 
     memset(&map, 0, sizeof(map));
     memset(&result, 0, sizeof(result));
@@ -1754,13 +2142,13 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
                 LOG_ERROR("Prompt 2 keeps PASS tensors in BF16; requested layer is excluded: %s",
                           config->layer_name);
             }
-            return -1;
+            return conversion_tracy_end_status(&tracy_zone, -1);
         }
         if (structural_rule && structural_rule->rule_type == STRUCTURAL_TENSOR_RULE_ALIAS) {
             LOG_ERROR("Prompt 2 skips structural alias tensors; requested layer %s maps to %s",
                       config->layer_name,
                       structural_rule->mapped_tensor_name);
-            return -1;
+            return conversion_tracy_end_status(&tracy_zone, -1);
         }
     }
 
@@ -1768,11 +2156,11 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
         tensor_name_is_tied_output_tensor(config->layer_name)) {
         LOG_ERROR("Prompt 2 keeps embeddings / tied output weights in BF16; requested layer is excluded: %s",
                   config->layer_name);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     if (mmap_tensor_for_conversion(model_dir, model_path, config->layer_name, &map) != 0) {
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     ste_config = default_runtime_ste_config(config);
@@ -1803,7 +2191,7 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
                                                   } : NULL,
                                                   &result) != 0) {
         io_unmap_layer_bf16(&map);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     layer.packed_weights = result.packed_weights;
@@ -1819,11 +2207,12 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
     rc = io_write_layer_ternary(config->output_path, config->layer_name, &layer, &crc32);
     if (rc == 0) {
         LOG_INFO("Ternary conversion complete for %s (crc32=%08x)", config->layer_name, crc32);
+        sapphire_tracy_plot_i64("conversion.converted_tensors", 1);
     }
 
     transformer_free_ternary_calibration_result(&result);
     io_unmap_layer_bf16(&map);
-    return rc;
+    return conversion_tracy_end_status(&tracy_zone, rc);
 }
 
 typedef struct {
@@ -1841,6 +2230,7 @@ typedef struct {
     int *out_skipped_vector;
     float *out_io_ms;
     int mold_bf16;
+    progressive_calib_stage_t progressive_stage;
 } convert_tensor_job_t;
 
 typedef enum {
@@ -1857,6 +2247,8 @@ typedef struct {
     const char *model_dir;
     const char *model_path;
     int layer_index;
+    uint32_t progress_index;
+    progressive_calib_stage_t progressive_stage;
     const char *tensor_name;
     int *last_prefetched_entry_idx;
 } full_model_tensor_task_t;
@@ -1905,10 +2297,239 @@ static void store_convert_result(const convert_tensor_job_t *job,
     }
 }
 
+static int replace_tensor_suffix(const char *tensor_name,
+                                 const char *suffix,
+                                 const char *replacement,
+                                 char *out_name,
+                                 size_t out_name_size)
+{
+    size_t tensor_name_len = 0u;
+    size_t suffix_len = 0u;
+    size_t replacement_len = 0u;
+
+    if (!tensor_name || !suffix || !replacement || !out_name || out_name_size == 0u) {
+        return 0;
+    }
+
+    tensor_name_len = strlen(tensor_name);
+    suffix_len = strlen(suffix);
+    replacement_len = strlen(replacement);
+    if (tensor_name_len < suffix_len ||
+        strcmp(tensor_name + (tensor_name_len - suffix_len), suffix) != 0 ||
+        tensor_name_len - suffix_len + replacement_len + 1u > out_name_size) {
+        return 0;
+    }
+
+    memcpy(out_name, tensor_name, tensor_name_len - suffix_len);
+    memcpy(out_name + (tensor_name_len - suffix_len), replacement, replacement_len + 1u);
+    return 1;
+}
+
+static int norm_residual_probe_tensor_name(const char *norm_tensor_name,
+                                           char *out_name,
+                                           size_t out_name_size)
+{
+    if (replace_tensor_suffix(norm_tensor_name,
+                              "input_layernorm.weight",
+                              "self_attn.q_proj.weight",
+                              out_name,
+                              out_name_size)) {
+        return 1;
+    }
+    if (replace_tensor_suffix(norm_tensor_name,
+                              "post_attention_layernorm.weight",
+                              "mlp.gate_proj.weight",
+                              out_name,
+                              out_name_size)) {
+        return 1;
+    }
+    if (replace_tensor_suffix(norm_tensor_name,
+                              "pre_feedforward_layernorm.weight",
+                              "mlp.gate_proj.weight",
+                              out_name,
+                              out_name_size)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static float activation_vector_variance(const float *vector, uint32_t vector_dim)
+{
+    double mean = 0.0;
+    double mean_sq = 0.0;
+
+    if (!vector || vector_dim == 0u) {
+        return 0.0f;
+    }
+
+    for (uint32_t idx = 0; idx < vector_dim; ++idx) {
+        double value = vector[idx];
+        mean += value;
+        mean_sq += value * value;
+    }
+
+    mean /= (double)vector_dim;
+    mean_sq /= (double)vector_dim;
+    if (mean_sq <= mean * mean) {
+        return 0.0f;
+    }
+    return (float)(mean_sq - mean * mean);
+}
+
+static int mean_tape_activation_variance(const activation_tape_t *tape,
+                                         const char *tensor_name,
+                                         int sample_count,
+                                         float *scratch_vector,
+                                         float *out_variance)
+{
+    float variance_sum = 0.0f;
+
+    if (!tape || !tensor_name || sample_count <= 0 || !scratch_vector || !out_variance) {
+        return -1;
+    }
+
+    for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+        if (activation_tape_get_vector(tape, tensor_name, sample_idx, scratch_vector) != 0) {
+            return -1;
+        }
+        variance_sum += activation_vector_variance(scratch_vector,
+                                                   activation_tape_vector_dim(tape, tensor_name));
+    }
+
+    *out_variance = variance_sum / (float)sample_count;
+    return 0;
+}
+
+static int mean_student_activation_variance(const ternary_calibration_corpus_t *corpus,
+                                            const char *tensor_name,
+                                            int sample_count,
+                                            uint32_t vector_dim,
+                                            float *scratch_vector,
+                                            float *out_variance)
+{
+    float variance_sum = 0.0f;
+
+    if (!corpus || !corpus->session || !corpus->tokenizer || !corpus->model_spec ||
+        !corpus->sample_texts || corpus->sample_count <= 0 || !tensor_name ||
+        sample_count <= 0 || vector_dim == 0u || !scratch_vector || !out_variance) {
+        return -1;
+    }
+
+    for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+        transformer_activation_capture_request_t activation_request;
+
+        memset(&activation_request, 0, sizeof(activation_request));
+        activation_request.spec = corpus->model_spec;
+        activation_request.text = corpus->sample_texts[sample_idx % corpus->sample_count];
+        activation_request.tensor_name = tensor_name;
+        activation_request.out_vector = scratch_vector;
+        activation_request.out_dim = vector_dim;
+        if (sapphire_collect_tensor_activation(corpus->session,
+                                              corpus->tokenizer,
+                                              &activation_request) != 0) {
+            return -1;
+        }
+        variance_sum += activation_vector_variance(scratch_vector, vector_dim);
+    }
+
+    *out_variance = variance_sum / (float)sample_count;
+    return 0;
+}
+
+static float compute_norm_residual_correction(const convert_tensor_job_t *job)
+{
+    char probe_tensor_name[256];
+    uint32_t vector_dim = 0u;
+    float teacher_variance = 0.0f;
+    float student_variance = 0.0f;
+    float *teacher_vector = NULL;
+    float *student_vector = NULL;
+    float correction = 1.0f;
+    int tape_samples = 0;
+    int sample_count = 0;
+
+    if (!job || !progressive_calib_stage_uses_residual_recenter(job->progressive_stage) ||
+        !job->tensor_name || !job->activation_tape || !job->calibration_corpus) {
+        return 1.0f;
+    }
+    if (!norm_residual_probe_tensor_name(job->tensor_name,
+                                         probe_tensor_name,
+                                         sizeof(probe_tensor_name))) {
+        return 1.0f;
+    }
+
+    vector_dim = activation_tape_vector_dim(job->activation_tape, probe_tensor_name);
+    tape_samples = activation_tape_sample_count(job->activation_tape);
+    if (vector_dim == 0u || tape_samples <= 0 || !job->calibration_corpus->sample_texts ||
+        job->calibration_corpus->sample_count <= 0) {
+        return 1.0f;
+    }
+
+    sample_count = tape_samples;
+    if (sample_count > job->calibration_corpus->sample_count) {
+        sample_count = job->calibration_corpus->sample_count;
+    }
+    if (sample_count > PROGRESSIVE_RESIDUAL_CORRECTION_MAX_SAMPLES) {
+        sample_count = PROGRESSIVE_RESIDUAL_CORRECTION_MAX_SAMPLES;
+    }
+    if (sample_count <= 0) {
+        return 1.0f;
+    }
+
+    teacher_vector = (float *)malloc((size_t)vector_dim * sizeof(float));
+    student_vector = (float *)malloc((size_t)vector_dim * sizeof(float));
+    if (!teacher_vector || !student_vector) {
+        free(teacher_vector);
+        free(student_vector);
+        return 1.0f;
+    }
+
+    if (mean_tape_activation_variance(job->activation_tape,
+                                      probe_tensor_name,
+                                      sample_count,
+                                      teacher_vector,
+                                      &teacher_variance) != 0 ||
+        mean_student_activation_variance(job->calibration_corpus,
+                                         probe_tensor_name,
+                                         sample_count,
+                                         vector_dim,
+                                         student_vector,
+                                         &student_variance) != 0) {
+        free(teacher_vector);
+        free(student_vector);
+        return 1.0f;
+    }
+
+    free(teacher_vector);
+    free(student_vector);
+    if (teacher_variance <= 1e-12f || student_variance <= 1e-12f ||
+        (student_variance / teacher_variance) >= PROGRESSIVE_RESIDUAL_CORRECTION_MIN_VARIANCE_RATIO) {
+        return 1.0f;
+    }
+
+    correction = sqrtf(teacher_variance / student_variance);
+    if (correction < 1.0f) {
+        correction = 1.0f;
+    }
+    if (correction > PROGRESSIVE_RESIDUAL_CORRECTION_MAX_SCALE) {
+        correction = PROGRESSIVE_RESIDUAL_CORRECTION_MAX_SCALE;
+    }
+    LOG_INFO("Residual re-center: tensor=%s probe=%s teacher_var=%.6f student_var=%.6f correction=%.4f samples=%d",
+             job->tensor_name,
+             probe_tensor_name,
+             (double)teacher_variance,
+             (double)student_variance,
+             (double)correction,
+             sample_count);
+    return correction;
+}
+
 static int convert_vector_mold(const convert_tensor_job_t *job,
                                const ternary_bf16_layer_map_t *map)
 {
     float *f32_tmp = (float *)malloc((size_t)map->rows * sizeof(float));
+    float residual_correction = 1.0f;
     int rc = 0;
 
     if (!f32_tmp) {
@@ -1916,12 +2537,20 @@ static int convert_vector_mold(const convert_tensor_job_t *job,
         return -1;
     }
     bf16_to_f32_vec(f32_tmp, map->bf16_weights, (int)map->rows);
+    residual_correction = compute_norm_residual_correction(job);
+    if (residual_correction != 1.0f) {
+        for (uint32_t row = 0; row < map->rows; ++row) {
+            f32_tmp[row] *= residual_correction;
+        }
+    }
     rc = io_write_layer_molded_bf16_into_dir(job->output_dir, job->tensor_name,
                                              f32_tmp, map->rows, 1u,
                                              job->out_crc32);
     free(f32_tmp);
     if (rc == 0) {
-        LOG_INFO("Wrote MOLD BF16 vector %s (source)", job->tensor_name);
+        LOG_INFO("Wrote MOLD BF16 vector %s (source, residual_correction=%.4f)",
+                 job->tensor_name,
+                 (double)residual_correction);
     }
     return rc;
 }
@@ -2063,7 +2692,7 @@ static int process_full_model_tensor_skip_other(const full_model_tensor_task_t *
 
     if (student_checkpoint_progress(task->config,
                                     task->runtime,
-                                    (uint32_t)(task->layer_index + 1),
+                                    task->progress_index + 1u,
                                     converted_count,
                                     0) != 0) {
         LOG_WARN("student update: checkpoint write failed after layer %d", task->layer_index);
@@ -2079,7 +2708,7 @@ static int process_full_model_tensor_skipped_vector(const full_model_tensor_task
     transformer_free_ternary_calibration_result(result);
     if (student_checkpoint_progress(task->config,
                                     task->runtime,
-                                    (uint32_t)(task->layer_index + 1),
+                                    task->progress_index + 1u,
                                     converted_count,
                                     0) != 0) {
         LOG_WARN("student update: checkpoint write failed after skipped vector %s", task->tensor_name);
@@ -2096,7 +2725,7 @@ static int process_full_model_tensor_failed(const full_model_tensor_task_t *task
     transformer_free_ternary_calibration_result(result);
     if (student_checkpoint_progress(task->config,
                                     task->runtime,
-                                    (uint32_t)task->layer_index,
+                                    task->progress_index,
                                     converted_count,
                                     1) != 0) {
         LOG_WARN("student update: checkpoint write failed while handling tensor failure at %s", task->tensor_name);
@@ -2123,10 +2752,116 @@ static int process_full_model_tensor_complete(const full_model_tensor_task_t *ta
     transformer_free_ternary_calibration_result(result);
     if (student_checkpoint_progress(task->config,
                                     task->runtime,
-                                    (uint32_t)(task->layer_index + 1),
+                                    task->progress_index + 1u,
                                     converted_count + 1u,
                                     0) != 0) {
         LOG_WARN("student update: checkpoint write failed after tensor %s", task->tensor_name);
+    }
+
+    return FULL_MODEL_TENSOR_STATUS_CONVERTED;
+}
+
+static int prepare_full_model_layer_ste_config(const full_model_tensor_task_t *task,
+                                               uint32_t layer_index,
+                                               int has_layer_index,
+                                               transformer_ste_config_t *out_ste_config,
+                                               ternary_telemetry_t *out_telemetry)
+{
+    progressive_distillation_schedule_t distillation_schedule;
+
+    if (!task || !task->runtime || !task->runtime->activation_tape ||
+        !tensor_name_is_layer_tensor(task->tensor_name) || !out_ste_config || !out_telemetry) {
+        return 0;
+    }
+
+    *out_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
+    distillation_schedule = progressive_calib_distillation_schedule(task->config,
+                                                                   task->progressive_stage,
+                                                                   has_layer_index,
+                                                                   layer_index);
+    out_ste_config->kl_weight = distillation_schedule.kl_weight;
+    out_ste_config->kl_temperature = distillation_schedule.kl_temperature;
+    out_ste_config->simulate_activation_a8 = progressive_calib_stage_uses_activation_a8(task->progressive_stage);
+    if (progressive_calib_stage_is_stage3(task->progressive_stage)) {
+        out_ste_config->learning_rate *= PROGRESSIVE_CALIB_STAGE3_LR_SCALE;
+    }
+    out_ste_config->hessian_sidecar_path = task->config->hessian_sidecar_path;
+    out_ste_config->hessian_sidecar_crc32 = task->runtime->hessian_sidecar_crc32;
+    if (task->config->progressive_calib && has_layer_index) {
+        LOG_INFO("Progressive distillation: tensor=%s stage=%s layer=%u kl_weight=%.4f kl_temp=%.2f lr=%.4f a8=%u",
+                 task->tensor_name,
+                 progressive_calib_stage_name(task->progressive_stage),
+                 layer_index,
+                 (double)out_ste_config->kl_weight,
+                 (double)out_ste_config->kl_temperature,
+             (double)out_ste_config->learning_rate,
+             (unsigned)out_ste_config->simulate_activation_a8);
+    }
+    telemetry_prepare_layer_context(out_telemetry, task->runtime, task->layer_index);
+    out_ste_config->telemetry = out_telemetry;
+    prefetch_activation_tape_lookahead(task->runtime,
+                                       task->spec,
+                                       task->layer_index,
+                                       2,
+                                       task->last_prefetched_entry_idx,
+                                       &out_telemetry->io_ms);
+    return 1;
+}
+
+static int classify_full_model_tensor(const full_model_tensor_task_t *task,
+                                      uint32_t converted_count,
+                                      int *out_is_mold)
+{
+    const structural_tensor_rule_t *structural_rule = NULL;
+
+    if (!task || !out_is_mold) {
+        return -1;
+    }
+
+    *out_is_mold = 0;
+    if (!task->tensor_name || task->tensor_name[0] == '\0') {
+        return process_full_model_tensor_skip_other(task, converted_count, NULL);
+    }
+    if (task->progressive_stage != PROGRESSIVE_CALIB_STAGE_DISABLED &&
+        !progressive_calib_stage_allows_tensor(task->progressive_stage, task->tensor_name)) {
+        LOG_INFO("Progressive calib %s: freezing tensor outside active window: %s",
+                 progressive_calib_stage_name(task->progressive_stage),
+                 task->tensor_name);
+        return process_full_model_tensor_skip_other(task, converted_count, NULL);
+    }
+
+    structural_rule = runtime_structural_rule_for_tensor(task->runtime, task->tensor_name);
+    if (structural_rule && structural_rule->rule_type == STRUCTURAL_TENSOR_RULE_ALIAS) {
+        if (structural_rule_is_pass_through(structural_rule)) {
+            LOG_INFO("Skipping structural PASS alias tensor in full conversion: %s -> %s",
+                     task->tensor_name,
+                     structural_rule->mapped_tensor_name);
+            return process_full_model_tensor_skip_other(task, converted_count, NULL);
+        }
+        LOG_INFO("Skipping structural alias tensor in full conversion: %s -> %s",
+                 task->tensor_name,
+                 structural_rule->mapped_tensor_name);
+        return process_full_model_tensor_skip_other(task,
+                                                    converted_count,
+                                                    "Skipping structural alias tensor in full conversion: %s");
+    }
+    if (structural_rule_is_pass_through(structural_rule)) {
+        LOG_INFO("Skipping structural PASS tensor in full conversion: %s", task->tensor_name);
+        return process_full_model_tensor_skip_other(task, converted_count, NULL);
+    }
+
+    *out_is_mold = structural_rule_is_mold(structural_rule);
+    if (!*out_is_mold && tensor_name_is_tied_embedding_tensor(task->tensor_name)) {
+        LOG_INFO("Skipping embedding tensor in full conversion: %s", task->tensor_name);
+        return process_full_model_tensor_skip_other(task,
+                                                    converted_count,
+                                                    "Skipping embedding tensor in full conversion: %s");
+    }
+    if (!*out_is_mold && tensor_name_is_tied_output_tensor(task->tensor_name)) {
+        LOG_INFO("Skipping tied output tensor in full conversion: %s", task->tensor_name);
+        return process_full_model_tensor_skip_other(task,
+                                                    converted_count,
+                                                    "Skipping tied output tensor in full conversion: %s");
     }
 
     return FULL_MODEL_TENSOR_STATUS_CONVERTED;
@@ -2145,72 +2880,39 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     uint32_t converted_count = 0u;
     int use_layer_telemetry = 0;
     int is_mold = 0;
+    uint32_t layer_index = 0u;
+    int has_layer_index = 0;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "process_full_model_tensor");
 
-    if (!task) {
-        return -1;
+    if (!task || !task->config) {
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
+
+    conversion_tracy_zone_text_if_present(&tracy_zone, task->tensor_name);
+    sapphire_tracy_plot_i64("conversion.progress_index", (int64_t)task->progress_index);
 
     if (task->runtime) {
         converted_count = task->runtime->checkpoint_state.converted_tensor_count;
     }
+    sapphire_tracy_plot_i64("conversion.converted_tensors", (int64_t)converted_count);
 
     memset(&result, 0, sizeof(result));
     memset(&layer_telemetry, 0, sizeof(layer_telemetry));
     memset(&layer_ste_config, 0, sizeof(layer_ste_config));
 
-    if (!task->tensor_name || task->tensor_name[0] == '\0') {
-        return process_full_model_tensor_skip_other(task, converted_count, NULL);
-    }
-    {
-        const structural_tensor_rule_t *structural_rule = runtime_structural_rule_for_tensor(task->runtime,
-                                                                                              task->tensor_name);
-        if (structural_rule && structural_rule->rule_type == STRUCTURAL_TENSOR_RULE_ALIAS) {
-            if (structural_rule_is_pass_through(structural_rule)) {
-                LOG_INFO("Skipping structural PASS alias tensor in full conversion: %s -> %s",
-                         task->tensor_name,
-                         structural_rule->mapped_tensor_name);
-                return process_full_model_tensor_skip_other(task, converted_count, NULL);
-            }
-            LOG_INFO("Skipping structural alias tensor in full conversion: %s -> %s",
-                     task->tensor_name,
-                     structural_rule->mapped_tensor_name);
-            return process_full_model_tensor_skip_other(task,
-                                                        converted_count,
-                                                        "Skipping structural alias tensor in full conversion: %s");
-        }
-        if (structural_rule_is_pass_through(structural_rule)) {
-            LOG_INFO("Skipping structural PASS tensor in full conversion: %s", task->tensor_name);
-            return process_full_model_tensor_skip_other(task, converted_count, NULL);
-        }
-        is_mold = structural_rule_is_mold(structural_rule);
-    }
-    if (!is_mold && tensor_name_is_tied_embedding_tensor(task->tensor_name)) {
-        LOG_INFO("Skipping embedding tensor in full conversion: %s", task->tensor_name);
-        return process_full_model_tensor_skip_other(task,
-                                                    converted_count,
-                                                    "Skipping embedding tensor in full conversion: %s");
-    }
-    if (!is_mold && tensor_name_is_tied_output_tensor(task->tensor_name)) {
-        LOG_INFO("Skipping tied output tensor in full conversion: %s", task->tensor_name);
-        return process_full_model_tensor_skip_other(task,
-                                                    converted_count,
-                                                    "Skipping tied output tensor in full conversion: %s");
+    rc = classify_full_model_tensor(task, converted_count, &is_mold);
+    if (rc != FULL_MODEL_TENSOR_STATUS_CONVERTED) {
+        return conversion_tracy_end_status(&tracy_zone, rc);
     }
 
-    if (task->runtime && task->runtime->activation_tape && tensor_name_is_layer_tensor(task->tensor_name)) {
-        use_layer_telemetry = 1;
-        layer_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
-        layer_ste_config.hessian_sidecar_path = task->config->hessian_sidecar_path;
-        layer_ste_config.hessian_sidecar_crc32 = task->runtime->hessian_sidecar_crc32;
-        telemetry_prepare_layer_context(&layer_telemetry, task->runtime, task->layer_index);
-        layer_ste_config.telemetry = &layer_telemetry;
-        prefetch_activation_tape_lookahead(task->runtime,
-                                           task->spec,
-                                           task->layer_index,
-                                           2,
-                                           task->last_prefetched_entry_idx,
-                                           &layer_telemetry.io_ms);
-    }
+    has_layer_index = conversion_try_parse_layer_index(task->tensor_name, &layer_index);
+    conversion_tracy_plot_layer_index(has_layer_index, layer_index);
+
+    use_layer_telemetry = prepare_full_model_layer_ste_config(task,
+                                                              layer_index,
+                                                              has_layer_index,
+                                                              &layer_ste_config,
+                                                              &layer_telemetry);
 
     memset(&active_corpus, 0, sizeof(active_corpus));
     if (task->runtime) {
@@ -2233,17 +2935,21 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     job.out_skipped_vector = &skipped_vector;
     job.out_io_ms = use_layer_telemetry ? &layer_telemetry.io_ms : NULL;
     job.mold_bf16 = is_mold;
+    job.progressive_stage = task->progressive_stage;
 
     rc = convert_tensor_to_dir(&job);
     if (rc != 0) {
-        return process_full_model_tensor_failed(task, &result, converted_count);
+        return conversion_tracy_end_status(&tracy_zone,
+                                           process_full_model_tensor_failed(task, &result, converted_count));
     }
 
     if (skipped_vector) {
-        return process_full_model_tensor_skipped_vector(task, &result, converted_count);
+        return conversion_tracy_end_status(&tracy_zone,
+                                           process_full_model_tensor_skipped_vector(task, &result, converted_count));
     }
 
-    return process_full_model_tensor_complete(task, &result, converted_count, crc32);
+    return conversion_tracy_end_status(&tracy_zone,
+                                       process_full_model_tensor_complete(task, &result, converted_count, crc32));
 }
 
 static int run_full_model_conversion(const ternary_conversion_config_t *config,
@@ -2254,41 +2960,78 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
     transformer_ste_config_t ste_config;
     int converted = 0;
     int skipped_vectors = 0;
-    int start_layer = 0;
+    int start_progress = 0;
+    int total_progress_steps = 0;
+    progressive_calib_stage_t logged_stage = PROGRESSIVE_CALIB_STAGE_DISABLED;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "run_full_model_conversion");
+
+    if (!config) {
+        return conversion_tracy_end_status(&tracy_zone, -1);
+    }
+
+    conversion_tracy_zone_text_if_present(&tracy_zone, config->model_name);
 
     spec = runtime ? runtime->model_spec : get_model_spec(config->model_name);
     if (!spec || !spec->tensor_map || spec->tensor_map_size <= 0) {
         LOG_ERROR("Full ternary conversion: failed to resolve model spec for %s", config->model_name);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     /* Validate tape layer count matches model config to prevent buffer overflow */
     if (runtime && runtime->activation_tape) {
         if (validate_tape_layer_count(runtime->activation_tape, spec) != 0) {
             LOG_ERROR("Full ternary conversion: tape/model layer mismatch prevents safe conversion");
-            return -1;
+            return conversion_tracy_end_status(&tracy_zone, -1);
         }
     }
 
+    total_progress_steps = (int)conversion_total_progress_steps(config, spec);
+    if (total_progress_steps <= 0) {
+        LOG_ERROR("Full ternary conversion: no tensor progress steps available for %s", config->model_name);
+        return conversion_tracy_end_status(&tracy_zone, -1);
+    }
+    sapphire_tracy_plot_i64("conversion.total_progress_steps", (int64_t)total_progress_steps);
+
     if (runtime) {
-        start_layer = (runtime->checkpoint_state.next_layer_index > 0)
+        start_progress = (runtime->checkpoint_state.next_layer_index > 0)
             ? (int)runtime->checkpoint_state.next_layer_index
             : 0;
         converted = (int)runtime->checkpoint_state.converted_tensor_count;
         if (converted > 0) {
-            LOG_INFO("student update: resuming from layer %d with %d converted tensors", start_layer, converted);
+            LOG_INFO("student update: resuming from progress step %d with %d converted tensors",
+                     start_progress,
+                     converted);
         }
     }
+    sapphire_tracy_plot_i64("conversion.progress_index", (int64_t)start_progress);
+    sapphire_tracy_plot_i64("conversion.converted_tensors", (int64_t)converted);
     ste_config = default_runtime_ste_config(config);
     ste_config.hessian_sidecar_path = config->hessian_sidecar_path;
     ste_config.hessian_sidecar_crc32 = runtime ? runtime->hessian_sidecar_crc32 : 0u;
 
     int last_prefetched_entry_idx = -1;
 
-    for (int i = start_layer; i < spec->tensor_map_size; ++i) {
-        const char *tensor_name = spec->tensor_map[i].hf_name;
+    for (int progress_idx = start_progress; progress_idx < total_progress_steps; ++progress_idx) {
+        int tensor_index = conversion_tensor_index_from_progress(config, spec, progress_idx);
+        progressive_calib_stage_t stage = progressive_calib_stage_from_progress_index(config, spec, progress_idx);
+        const char *tensor_name = NULL;
         full_model_tensor_task_t task;
         int status = 0;
+
+        if (tensor_index < 0 || tensor_index >= spec->tensor_map_size) {
+            LOG_ERROR("Full ternary conversion: invalid tensor index %d at progress step %d",
+                      tensor_index,
+                      progress_idx);
+            return conversion_tracy_end_status(&tracy_zone, -1);
+        }
+        tensor_name = spec->tensor_map[tensor_index].hf_name;
+        if (config->progressive_calib && stage != logged_stage) {
+            LOG_INFO("Progressive calib: starting %s", progressive_calib_stage_name(stage));
+            conversion_tracy_emit_stage_marker(stage);
+            logged_stage = stage;
+        }
+
+        sapphire_tracy_plot_i64("conversion.progress_index", (int64_t)progress_idx);
 
         memset(&task, 0, sizeof(task));
         task.config = config;
@@ -2297,18 +3040,21 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
         task.ste_config = &ste_config;
         task.model_dir = model_dir;
         task.model_path = model_path;
-        task.layer_index = i;
+        task.layer_index = tensor_index;
+        task.progress_index = (uint32_t)progress_idx;
+        task.progressive_stage = stage;
         task.tensor_name = tensor_name;
         task.last_prefetched_entry_idx = &last_prefetched_entry_idx;
         status = process_full_model_tensor(&task);
 
         if (status < 0) {
-            return -1;
+            return conversion_tracy_end_status(&tracy_zone, -1);
         }
         if (status == FULL_MODEL_TENSOR_STATUS_SKIPPED_VECTOR) {
             skipped_vectors++;
         } else if (status == FULL_MODEL_TENSOR_STATUS_CONVERTED) {
             converted++;
+            sapphire_tracy_plot_i64("conversion.converted_tensors", (int64_t)converted);
         }
     }
 
@@ -2330,7 +3076,7 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
 
     LOG_INFO("Full ternary conversion summary: converted=%d skipped_vectors=%d",
              converted, skipped_vectors);
-    return (converted > 0) ? 0 : -1;
+    return conversion_tracy_end_status(&tracy_zone, (converted > 0) ? 0 : -1);
 }
 
 static int config_has_text(const char *value)
@@ -2376,9 +3122,18 @@ static void log_conversion_config(const ternary_conversion_config_t *config)
     LOG_INFO("  calibration_samples: %d",
              (config->calibration_sample_limit > 0) ? config->calibration_sample_limit : 4);
     LOG_INFO("  ste_steps: %d", (config->ste_steps > 0) ? config->ste_steps : 3);
+    LOG_INFO("  progressive_calib: %s", config->progressive_calib ? "enabled" : "disabled");
     LOG_INFO("  max_grad_norm: %.4f", (double)((config->max_grad_norm > 0.0f) ? config->max_grad_norm : 1.0f));
     LOG_INFO("  validate_every: %d", config->validate_every_n);
     LOG_INFO("  kl_weight: %.4f", (double)((config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f));
+    if (config->progressive_calib) {
+        LOG_INFO("  progressive_kl: stage2 layers 6-10 hold, 11-15 ramp to %.4f, stage3 %.4f, stage2 temp=%.2f",
+                 (double)PROGRESSIVE_CALIB_STAGE2_TARGET_KL_WEIGHT,
+                 (double)PROGRESSIVE_CALIB_STAGE3_TARGET_KL_WEIGHT,
+                 (double)PROGRESSIVE_CALIB_STAGE2_KL_TEMPERATURE);
+        LOG_INFO("  progressive_stage3: blocks 0-9, 10-19, 20-27+shared with lr_scale=%.2f",
+                 (double)PROGRESSIVE_CALIB_STAGE3_LR_SCALE);
+    }
     LOG_INFO("  hessian_proxy: %s", config->disable_hessian_proxy ? "disabled" : "activation-diagonal");
     LOG_INFO("  hessian_proxy_strength: %.4f",
              (double)((config->hessian_proxy_strength >= 0.0f) ? config->hessian_proxy_strength : 1.0f));
@@ -2421,32 +3176,35 @@ int transformer_run_ternary_conversion(const ternary_conversion_config_t *config
     char *model_dir = NULL;
     char *model_path = NULL;
     int rc = -1;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "transformer_run_ternary_conversion");
 
     if (!config || !config->model_name || !config->output_path) {
         LOG_ERROR("ternary conversion: invalid configuration");
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
+
+    conversion_tracy_zone_text_if_present(&tracy_zone, config->model_name);
 
     log_conversion_config(config);
 
     model_dir = construct_safe_path("./models", config->model_name, NULL);
     if (!model_dir) {
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
     if (init_conversion_runtime(config, model_dir, &runtime) != 0) {
         free(model_dir);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
     model_path = construct_safe_path(model_dir, "model.safetensors", NULL);
     if (!model_path) {
         destroy_conversion_runtime(&runtime);
         free(model_dir);
-        return -1;
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
     rc = run_requested_conversion(config, model_dir, model_path, &runtime);
     free(model_path);
     free(model_dir);
     destroy_conversion_runtime(&runtime);
-    return rc;
+    return conversion_tracy_end_status(&tracy_zone, rc);
 }

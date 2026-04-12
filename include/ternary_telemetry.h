@@ -31,9 +31,14 @@ typedef struct {
     float p_zero;
     float p_pos1;
     float gamma_scale;
+    float gamma_scale_min;
+    float gamma_scale_max;
+    float gamma_floor_fraction;
     float hessian_proxy_mean;
     float hessian_proxy_max;
     uint32_t hessian_proxy_source;
+    float effective_learning_rate;
+    float effective_hessian_scale;
     float io_ms;
     float compute_ms;
     uint32_t config_hash;
@@ -51,6 +56,8 @@ void ternary_telemetry_writer_close(ternary_telemetry_writer_t *writer);
 
 int telemetry_dump_step(ternary_telemetry_writer_t *writer,
                         const ternary_telemetry_t *telemetry);
+
+void ternary_telemetry_print_pass_stdout(const ternary_telemetry_t *telemetry);
 
 #ifdef __cplusplus
 }

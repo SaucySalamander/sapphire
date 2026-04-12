@@ -26,6 +26,7 @@
 #include "../include/kernels.h"
 #include "../include/transformer.h"
 #include "../include/utils.h"
+#include "../include/tracy_profile.h"
 
 /* Forward declarations of external functions from inference.c */
 extern void lm_head(inference_session_t* session, const float* hidden, float* logits);
@@ -314,6 +315,10 @@ static int cpu_forward_batch(inference_session_t* session, const int* token_ids,
         return -1;
     }
 
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "cpu_forward_batch");
+    sapphire_tracy_zone_value(&tracy_zone, (uint64_t)batch_size);
+    sapphire_tracy_plot_i64("cpu.forward_batch_size", batch_size);
+
     backend_cpu_session_data_t* cpu_data = (backend_cpu_session_data_t*)session->backend_data;
     const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
 
@@ -324,11 +329,18 @@ static int cpu_forward_batch(inference_session_t* session, const int* token_ids,
             chunk_size = max_batch_chunk;
         }
 
+        SAPPHIRE_TRACY_ZONE_SCOPE(chunk_zone, "cpu_forward_batch_chunk");
+        sapphire_tracy_zone_value(&chunk_zone, (uint64_t)chunk_size);
+        sapphire_tracy_plot_i64("cpu.forward_chunk_size", chunk_size);
+
         // 1. Embedding lookup
         sapphire_embed_lookup_batch(session, token_ids + processed, chunk_size, cpu_data->scratch_buffer);
 
         // 2. Transformer layers with layer-type dispatch
         for (int l = 0; l < config->num_hidden_layers; l++) {
+            SAPPHIRE_TRACY_ZONE_SCOPE(layer_zone, "cpu_forward_batch_layer");
+            sapphire_tracy_zone_value(&layer_zone, (uint64_t)l);
+
             sapphire_layer_config_t* layer_cfg = &session->layer_configs[l];
             bool is_global = layer_cfg->config.attention.is_global;
             const float* f_cos = is_global ? cpu_data->rope_freqs_cos_global : cpu_data->rope_freqs_cos_local;
@@ -343,6 +355,8 @@ static int cpu_forward_batch(inference_session_t* session, const int* token_ids,
                     sapphire_transformer_layer(session, l, start_pos + processed + b, cpu_data->scratch_buffer + b * config->hidden_size, (transformer_rope_t){f_cos, f_sin});
                 }
             }
+
+            sapphire_tracy_zone_end(&layer_zone);
         }
 
         // 3. Final norm & LM Head (for the last token in the batch)
@@ -350,7 +364,11 @@ static int cpu_forward_batch(inference_session_t* session, const int* token_ids,
             const float* last_hidden = cpu_data->scratch_buffer + (chunk_size - 1) * config->hidden_size;
             lm_head(session, (float*)last_hidden, logits);
         }
+
+        sapphire_tracy_zone_end(&chunk_zone);
     }
+
+    sapphire_tracy_zone_end(&tracy_zone);
 
     return 0;
 }

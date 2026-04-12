@@ -13,6 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define ORACLE_EARLY_LAYER_COUNT             6
+#define ORACLE_EARLY_LAYER_SENSITIVITY_BOOST 1.8f
+#define ORACLE_EARLY_LAYER_GAMMA_FLOOR       0.08f
+
 size_t ternary_hessian_oracle_capture_bytes(const gemma3_270m_config_t *cfg)
 {
     uint64_t per_layer_bytes = 0u;
@@ -145,6 +149,49 @@ static int oracle_build_prompt_tokens(const inference_context_t *ctx,
     }
 
     return token_count;
+}
+
+static void oracle_protect_early_layer_diagonals(const gemma3_270m_config_t *cfg,
+                                                 float *diagonal_capture_buffer)
+{
+    int protected_layers = 0;
+
+    if (!cfg || !diagonal_capture_buffer || cfg->num_hidden_layers <= 0) {
+        return;
+    }
+
+    protected_layers = cfg->num_hidden_layers;
+    if (protected_layers > ORACLE_EARLY_LAYER_COUNT) {
+        protected_layers = ORACLE_EARLY_LAYER_COUNT;
+    }
+
+    for (int layer_idx = 0; layer_idx < protected_layers; ++layer_idx) {
+        for (capture_target_t target = CAPTURE_TARGET_QKV_INPUT;
+             target <= CAPTURE_TARGET_DOWN_INPUT;
+             target = (capture_target_t)((int)target + 1)) {
+            size_t capture_offset = 0u;
+            uint32_t vector_dim = 0u;
+            float *diagonal = NULL;
+
+            if (ternary_hessian_oracle_capture_view(cfg,
+                                                    layer_idx,
+                                                    target,
+                                                    &capture_offset,
+                                                    &vector_dim) != 0) {
+                continue;
+            }
+
+            diagonal = diagonal_capture_buffer + (capture_offset / sizeof(float));
+            for (uint32_t dim_idx = 0; dim_idx < vector_dim; ++dim_idx) {
+                float adjusted = 1.0f + (diagonal[dim_idx] - 1.0f) * ORACLE_EARLY_LAYER_SENSITIVITY_BOOST;
+
+                if (adjusted < ORACLE_EARLY_LAYER_GAMMA_FLOOR) {
+                    adjusted = ORACLE_EARLY_LAYER_GAMMA_FLOOR;
+                }
+                diagonal[dim_idx] = adjusted;
+            }
+        }
+    }
 }
 
 int ternary_hessian_oracle_write_sidecar(const ternary_hessian_oracle_write_request_t *request)
@@ -339,6 +386,7 @@ int ternary_record_hessian_sidecar_vulkan(const char *output_path,
         }
     }
     oracle_began = 0;
+    oracle_protect_early_layer_diagonals(cfg, oracle_buffer);
 
     {
         const ternary_hessian_oracle_write_request_t write_request = {

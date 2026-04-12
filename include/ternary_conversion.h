@@ -28,6 +28,7 @@ typedef struct {
     int checkpoint_every_n_layers;
     int validate_every_n;
     int ste_steps;
+    int progressive_calib;
     float kl_weight;
     int disable_hessian_proxy;
     float hessian_proxy_strength;

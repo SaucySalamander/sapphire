@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#include "../../include/tracy_profile.h"
+
 struct sapphire_context {
     int num_threads;
     int chunk_size;
@@ -25,6 +27,7 @@ struct sapphire_context {
     // Task-based synchronization
     atomic_int task_id;          // Incremented by main thread to start new work
     atomic_int threads_done;     // Incremented by workers when they finish a task
+    atomic_int worker_name_index;
     
     // Work queue state
     atomic_int next_row;
@@ -67,6 +70,11 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
 static void *worker_fn(void *arg) {
     kernel_context_t *ctx = (kernel_context_t*)arg;
     int my_last_task_id = 0;
+    int worker_index = atomic_fetch_add(&ctx->worker_name_index, 1);
+    char worker_name[32];
+
+    snprintf(worker_name, sizeof(worker_name), "cpu-worker-%d", worker_index);
+    sapphire_tracy_name_thread(worker_name);
     
     while (!atomic_load(&ctx->shutdown_flag)) {
         // 1. Wait for a new task_id
@@ -221,6 +229,7 @@ kernel_context_t *kernel_ctx_create(int num_threads, int chunk_size) {
     atomic_store(&ctx->shutdown_flag, 0);
     atomic_store(&ctx->task_id, 0);
     atomic_store(&ctx->threads_done, 0);
+    atomic_store(&ctx->worker_name_index, 0);
     
     LOG_DEBUG("Created kernel context with %d threads, chunk_size=%d", num_threads, chunk_size);
     return ctx;
@@ -344,6 +353,7 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
                 return -1;
             }
             kernel_fn = quantized_gemv_ternary_scalar;
+            gemm_kernel_fn = kernel_gemm_ternary_scalar;
             ternary_packed_cols = ternary_view->packed_cols;
             ternary_row_stride_bytes = ternary_packed_cols;
             row_stride_bytes = ternary_row_stride_bytes;

@@ -131,6 +131,7 @@ float quantized_gemv_f32_scalar(const void *W_row, const float *x, int block_cou
 // Batched kernels (GEMM)
 void kernel_gemm_f32_avx2(const gemm_args_t* args);
 void kernel_gemm_bf16_avx2(const gemm_args_t* args);
+void kernel_gemm_ternary_scalar(const gemm_args_t* args);
 
 // ============================================================================
 // HIGH-LEVEL TENSOR OPERATIONS (Thread-safe, dtype-aware)

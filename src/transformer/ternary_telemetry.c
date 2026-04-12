@@ -69,6 +69,19 @@ int ternary_telemetry_writer_init(ternary_telemetry_writer_t *writer,
     return 0;
 }
 
+void ternary_telemetry_print_pass_stdout(const ternary_telemetry_t *telemetry)
+{
+    if (!telemetry) {
+        return;
+    }
+
+    printf("calibration_pass layer_idx=%u gamma_scale=%.9g reconstruction_mse=%.9g\n",
+           telemetry->layer_idx,
+           (double)telemetry->gamma_scale,
+           (double)telemetry->mse_loss);
+    fflush(stdout);
+}
+
 void ternary_telemetry_writer_close(ternary_telemetry_writer_t *writer)
 {
     if (!writer) {
@@ -95,8 +108,13 @@ int telemetry_dump_step(ternary_telemetry_writer_t *writer,
     char p_zero_buf[32];
     char p_pos1_buf[32];
     char gamma_scale_buf[32];
+    char gamma_scale_min_buf[32];
+    char gamma_scale_max_buf[32];
+    char gamma_floor_fraction_buf[32];
     char hessian_proxy_mean_buf[32];
     char hessian_proxy_max_buf[32];
+    char effective_learning_rate_buf[32];
+    char effective_hessian_scale_buf[32];
     char io_ms_buf[32];
     char compute_ms_buf[32];
     const char *mse_loss_text = NULL;
@@ -109,8 +127,13 @@ int telemetry_dump_step(ternary_telemetry_writer_t *writer,
     const char *p_zero_text = NULL;
     const char *p_pos1_text = NULL;
     const char *gamma_scale_text = NULL;
+    const char *gamma_scale_min_text = NULL;
+    const char *gamma_scale_max_text = NULL;
+    const char *gamma_floor_fraction_text = NULL;
     const char *hessian_proxy_mean_text = NULL;
     const char *hessian_proxy_max_text = NULL;
+    const char *effective_learning_rate_text = NULL;
+    const char *effective_hessian_scale_text = NULL;
     const char *io_ms_text = NULL;
     const char *compute_ms_text = NULL;
     int written = 0;
@@ -130,18 +153,33 @@ int telemetry_dump_step(ternary_telemetry_writer_t *writer,
     p_zero_text = telemetry_format_float(p_zero_buf, sizeof(p_zero_buf), telemetry->p_zero);
     p_pos1_text = telemetry_format_float(p_pos1_buf, sizeof(p_pos1_buf), telemetry->p_pos1);
     gamma_scale_text = telemetry_format_float(gamma_scale_buf, sizeof(gamma_scale_buf), telemetry->gamma_scale);
+    gamma_scale_min_text = telemetry_format_float(gamma_scale_min_buf,
+                                                  sizeof(gamma_scale_min_buf),
+                                                  telemetry->gamma_scale_min);
+    gamma_scale_max_text = telemetry_format_float(gamma_scale_max_buf,
+                                                  sizeof(gamma_scale_max_buf),
+                                                  telemetry->gamma_scale_max);
+    gamma_floor_fraction_text = telemetry_format_float(gamma_floor_fraction_buf,
+                                                       sizeof(gamma_floor_fraction_buf),
+                                                       telemetry->gamma_floor_fraction);
     hessian_proxy_mean_text = telemetry_format_float(hessian_proxy_mean_buf,
                                                      sizeof(hessian_proxy_mean_buf),
                                                      telemetry->hessian_proxy_mean);
     hessian_proxy_max_text = telemetry_format_float(hessian_proxy_max_buf,
                                                     sizeof(hessian_proxy_max_buf),
                                                     telemetry->hessian_proxy_max);
+    effective_learning_rate_text = telemetry_format_float(effective_learning_rate_buf,
+                                                          sizeof(effective_learning_rate_buf),
+                                                          telemetry->effective_learning_rate);
+    effective_hessian_scale_text = telemetry_format_float(effective_hessian_scale_buf,
+                                                          sizeof(effective_hessian_scale_buf),
+                                                          telemetry->effective_hessian_scale);
     io_ms_text = telemetry_format_float(io_ms_buf, sizeof(io_ms_buf), telemetry->io_ms);
     compute_ms_text = telemetry_format_float(compute_ms_buf, sizeof(compute_ms_buf), telemetry->compute_ms);
 
     written = snprintf(line,
                        sizeof(line),
-                       "{\"config_hash\":%u,\"resume_step_idx\":%u,\"layer_idx\":%u,\"step_idx\":%u,\"tape_hash\":%u,\"student_checkpoint_hash\":%u,\"mse_loss\":%s,\"grad_norm\":%s,\"raw_grad_norm\":%s,\"clipped_grad_norm\":%s,\"clip_scale\":%s,\"latent_saturation\":%s,\"p_neg1\":%s,\"p_zero\":%s,\"p_pos1\":%s,\"gamma_scale\":%s,\"hessian_proxy_mean\":%s,\"hessian_proxy_max\":%s,\"hessian_proxy_source\":%u,\"io_ms\":%s,\"compute_ms\":%s}\n",
+                       "{\"config_hash\":%u,\"resume_step_idx\":%u,\"layer_idx\":%u,\"step_idx\":%u,\"tape_hash\":%u,\"student_checkpoint_hash\":%u,\"mse_loss\":%s,\"grad_norm\":%s,\"raw_grad_norm\":%s,\"clipped_grad_norm\":%s,\"clip_scale\":%s,\"latent_saturation\":%s,\"p_neg1\":%s,\"p_zero\":%s,\"p_pos1\":%s,\"gamma_scale\":%s,\"gamma_scale_min\":%s,\"gamma_scale_max\":%s,\"gamma_floor_fraction\":%s,\"hessian_proxy_mean\":%s,\"hessian_proxy_max\":%s,\"hessian_proxy_source\":%u,\"effective_learning_rate\":%s,\"effective_hessian_scale\":%s,\"io_ms\":%s,\"compute_ms\":%s}\n",
                        telemetry->config_hash,
                        telemetry->resume_step_idx,
                        telemetry->layer_idx,
@@ -158,9 +196,14 @@ int telemetry_dump_step(ternary_telemetry_writer_t *writer,
                        p_zero_text,
                        p_pos1_text,
                        gamma_scale_text,
+                       gamma_scale_min_text,
+                       gamma_scale_max_text,
+                       gamma_floor_fraction_text,
                        hessian_proxy_mean_text,
                        hessian_proxy_max_text,
                        telemetry->hessian_proxy_source,
+                       effective_learning_rate_text,
+                       effective_hessian_scale_text,
                        io_ms_text,
                        compute_ms_text);
     if (written < 0 || (size_t)written >= sizeof(line)) {

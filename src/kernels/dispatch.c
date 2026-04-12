@@ -114,6 +114,23 @@ float quantized_gemv_ternary_scalar(const void *W_row, const float *x, int block
     return row->scales[0] * sum;
 }
 
+void kernel_gemm_ternary_scalar(const gemm_args_t *args) {
+    const tensor_ternary_view_t *row = (const tensor_ternary_view_t *)args->w_row;
+    const float *X = args->X;
+    float *Y = args->Y;
+    int batch = args->batch_size;
+    int cols = args->d_model;
+    int out_stride = args->out_stride;
+
+    if (!row || !row->packed_weights || !row->scales || row->rows != 1u || row->cols == 0u) {
+        return;
+    }
+
+    for (int t = 0; t < batch; ++t) {
+        Y[(size_t)t * out_stride] = quantized_gemv_ternary_scalar(row, X + (size_t)t * cols, 0, 0);
+    }
+}
+
 static void gemv_ternary(float *y, const tensor_t *A, const float *x, int m) {
     const tensor_ternary_view_t *view = tensor_data_ternary(A);
     if (!view || !view->packed_weights || !view->scales) {

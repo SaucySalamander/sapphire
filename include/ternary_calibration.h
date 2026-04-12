@@ -33,6 +33,8 @@ typedef struct {
     float clip_value;
     int calibration_samples;
     float kl_weight;
+    float kl_temperature;
+    int simulate_activation_a8;
     int use_hessian_proxy;
     float hessian_proxy_strength;
     float hessian_proxy_floor;

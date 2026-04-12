@@ -12,6 +12,7 @@
 #include "tensor.h"
 #include "ternary_io.h"
 #include "tokenizer.h"
+#include "tracy_profile.h"
 
 #include <float.h>
 #include <math.h>
@@ -25,6 +26,22 @@ struct ternary_validation_patch {
     tensor_t *proxy_tensor;
     uint32_t crc32;
 };
+
+static int validation_tracy_end_status(sapphire_tracy_zone_t *zone, int status)
+{
+    sapphire_tracy_zone_end(zone);
+    return status;
+}
+
+static void validation_tracy_zone_text_if_present(const sapphire_tracy_zone_t *zone,
+                                                  const char *text)
+{
+    if (!zone || !text || text[0] == '\0') {
+        return;
+    }
+
+    sapphire_tracy_zone_text(zone, text, strlen(text));
+}
 
 static int token_argmax(const float *logits, int vocab_size) {
     int best_idx = 0;
@@ -342,6 +359,55 @@ int ternary_validation_capture_proxy_record(inference_context_t *ctx,
     return make_proxy_record(ctx, tensor_name, result, 0u, out_record) > 0 ? 0 : -1;
 }
 
+static ternary_validation_patch_t *find_patch_for_tensor(ternary_validation_state_t *state,
+                                                         const char *tensor_name)
+{
+    if (!state || !tensor_name) {
+        return NULL;
+    }
+
+    for (int patch_idx = 0; patch_idx < state->patch_count; ++patch_idx) {
+        if (strcmp(state->patches[patch_idx].tensor_name, tensor_name) == 0) {
+            return &state->patches[patch_idx];
+        }
+    }
+
+    return NULL;
+}
+
+static int store_validation_patch_record(ternary_validation_state_t *state,
+                                         const ternary_validation_patch_record_t *record)
+{
+    ternary_validation_patch_t *patch = NULL;
+
+    if (!state || !record) {
+        return -1;
+    }
+
+    patch = find_patch_for_tensor(state, record->tensor_name);
+    if (patch) {
+        patch->slot = record->slot;
+        tensor_release(patch->proxy_tensor);
+        patch->proxy_tensor = record->proxy_tensor;
+        patch->crc32 = record->crc32;
+        return 0;
+    }
+
+    if (state->patch_count >= state->patch_capacity) {
+        LOG_ERROR("Validation patch table exhausted");
+        return -1;
+    }
+
+    patch = &state->patches[state->patch_count++];
+    memset(patch, 0, sizeof(*patch));
+    memcpy(patch->tensor_name, record->tensor_name, strlen(record->tensor_name) + 1u);
+    patch->slot = record->slot;
+    patch->original_tensor = record->original_tensor;
+    patch->proxy_tensor = record->proxy_tensor;
+    patch->crc32 = record->crc32;
+    return 0;
+}
+
 int ternary_validation_apply_proxy_from_payload(ternary_validation_state_t *state,
                                                 const char *tensor_name,
                                                 const ternary_layer_payload_t *payload,
@@ -349,7 +415,6 @@ int ternary_validation_apply_proxy_from_payload(ternary_validation_state_t *stat
                                                 int converted_count)
 {
     ternary_validation_patch_record_t record;
-    ternary_validation_patch_t *patch = NULL;
     int rc = 0;
 
     if (!state || !tensor_name || !payload || !state->ctx || !state->ctx->spec || !state->ctx->spec->llm_model) {
@@ -363,22 +428,13 @@ int ternary_validation_apply_proxy_from_payload(ternary_validation_state_t *stat
     if (rc <= 0) {
         return rc;
     }
-    if (state->patch_count >= state->patch_capacity) {
-        LOG_ERROR("Validation patch table exhausted");
+    if (store_validation_patch_record(state, &record) != 0) {
         if (record.slot) {
             *record.slot = record.original_tensor;
         }
         tensor_release(record.proxy_tensor);
         return -1;
     }
-
-    patch = &state->patches[state->patch_count++];
-    memset(patch, 0, sizeof(*patch));
-    memcpy(patch->tensor_name, record.tensor_name, strlen(record.tensor_name) + 1u);
-    patch->slot = record.slot;
-    patch->original_tensor = record.original_tensor;
-    patch->proxy_tensor = record.proxy_tensor;
-    patch->crc32 = record.crc32;
 
     memcpy(state->last_tensor_name, tensor_name, strlen(tensor_name) + 1u);
     state->last_crc32 = crc32;
@@ -425,15 +481,19 @@ static int run_checkpoint(ternary_validation_state_t *state, int converted_count
     float current_mean_nll = 0.0f;
     float baseline_mean_nll = 0.0f;
     float top1_hits = 0.0f;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "run_validation_checkpoint");
 
     if (!state || !state->ctx || !state->ctx->spec || !state->config.output_dir ||
         state->config.sample_count <= 0 || state->last_tensor_name[0] == '\0') {
-        return 0;
+        return validation_tracy_end_status(&tracy_zone, 0);
     }
+
+    validation_tracy_zone_text_if_present(&tracy_zone, state->last_tensor_name);
+    sapphire_tracy_plot_i64("validation.converted_tensors", (int64_t)converted_count);
 
     config = (gemma3_270m_config_t *)state->ctx->spec->variant_config;
     if (!config) {
-        return -1;
+        return validation_tracy_end_status(&tracy_zone, -1);
     }
 
     for (int s = 0; s < state->config.sample_count; ++s) {
@@ -446,7 +506,7 @@ static int run_checkpoint(ternary_validation_state_t *state, int converted_count
                                    state->current_logits + (size_t)s * config->vocab_size,
                                    &sample_mean_nll,
                                    &sample_top1) != 0) {
-            return -1;
+            return validation_tracy_end_status(&tracy_zone, -1);
         }
 
         kl = compute_logits_kl(state->baseline_probs,
@@ -482,8 +542,14 @@ static int run_checkpoint(ternary_validation_state_t *state, int converted_count
     checkpoint.sample_count = state->config.sample_count;
 
     if (io_append_validation_checkpoint(state->config.output_dir, &checkpoint) != 0) {
-        return -1;
+        return validation_tracy_end_status(&tracy_zone, -1);
     }
+
+    sapphire_tracy_plot_f64("validation.mean_kl", mean_kl);
+    sapphire_tracy_plot_f64("validation.max_kl", max_kl);
+    sapphire_tracy_plot_f64("validation.top1_agreement", top1_hits);
+    sapphire_tracy_plot_f64("validation.current_mean_nll", current_mean_nll);
+    sapphire_tracy_plot_f64("validation.baseline_mean_nll", baseline_mean_nll);
 
     state->last_reported_count = converted_count;
     LOG_INFO("Validation checkpoint: converted=%d tensor=%s mean_kl=%.6f top1=%.3f ppl=%.3f",
@@ -492,24 +558,28 @@ static int run_checkpoint(ternary_validation_state_t *state, int converted_count
              mean_kl,
              top1_hits,
              expf(current_mean_nll));
-    return 0;
+    return validation_tracy_end_status(&tracy_zone, 0);
 }
 
 int ternary_validation_init(ternary_validation_state_t *state,
                             const ternary_validation_config_t *config,
                             inference_context_t *ctx) {
     const gemma3_270m_config_t *model_config = NULL;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "ternary_validation_init");
 
     if (!state || !config || !ctx || !ctx->spec || !ctx->session || !ctx->tokenizer) {
-        return -1;
+        return validation_tracy_end_status(&tracy_zone, -1);
     }
 
     memset(state, 0, sizeof(*state));
     state->config = *config;
     state->ctx = ctx;
+    validation_tracy_zone_text_if_present(&tracy_zone, config->output_dir);
+    sapphire_tracy_plot_i64("validation.sample_count", (int64_t)config->sample_count);
+    sapphire_tracy_plot_i64("validation.validate_every_n", (int64_t)config->validate_every_n);
     model_config = (gemma3_270m_config_t *)ctx->spec->variant_config;
     if (!model_config || config->sample_count <= 0) {
-        return 0;
+        return validation_tracy_end_status(&tracy_zone, 0);
     }
 
     state->baseline_logits = (float *)malloc((size_t)config->sample_count * model_config->vocab_size * sizeof(float));
@@ -524,7 +594,7 @@ int ternary_validation_init(ternary_validation_state_t *state,
     if (!state->baseline_logits || !state->current_logits || !state->baseline_probs || !state->current_probs ||
         !state->baseline_mean_nll || !state->baseline_top1 || !state->patches) {
         ternary_validation_destroy(state);
-        return -1;
+        return validation_tracy_end_status(&tracy_zone, -1);
     }
 
     for (int s = 0; s < config->sample_count; ++s) {
@@ -534,14 +604,14 @@ int ternary_validation_init(ternary_validation_state_t *state,
                                    &state->baseline_mean_nll[s],
                                    &state->baseline_top1[s]) != 0) {
             ternary_validation_destroy(state);
-            return -1;
+            return validation_tracy_end_status(&tracy_zone, -1);
         }
     }
 
     LOG_INFO("Validation baseline initialized: prompts=%d validate_every=%d",
              config->sample_count,
              config->validate_every_n);
-    return 0;
+    return validation_tracy_end_status(&tracy_zone, 0);
 }
 
 int ternary_validation_apply_proxy(ternary_validation_state_t *state,
@@ -550,7 +620,6 @@ int ternary_validation_apply_proxy(ternary_validation_state_t *state,
                                    uint32_t crc32,
                                    int converted_count) {
     ternary_validation_patch_record_t record;
-    ternary_validation_patch_t *patch = NULL;
     int rc = 0;
 
     if (!state || !tensor_name || !result || !state->ctx || !state->ctx->spec || !state->ctx->spec->llm_model) {
@@ -564,22 +633,13 @@ int ternary_validation_apply_proxy(ternary_validation_state_t *state,
     if (rc <= 0) {
         return rc;
     }
-    if (state->patch_count >= state->patch_capacity) {
-        LOG_ERROR("Validation patch table exhausted");
+    if (store_validation_patch_record(state, &record) != 0) {
         if (record.slot) {
             *record.slot = record.original_tensor;
         }
         tensor_release(record.proxy_tensor);
         return -1;
     }
-
-    patch = &state->patches[state->patch_count++];
-    memset(patch, 0, sizeof(*patch));
-    memcpy(patch->tensor_name, record.tensor_name, strlen(record.tensor_name) + 1u);
-    patch->slot = record.slot;
-    patch->original_tensor = record.original_tensor;
-    patch->proxy_tensor = record.proxy_tensor;
-    patch->crc32 = record.crc32;
 
     memcpy(state->last_tensor_name, tensor_name, strlen(tensor_name) + 1u);
     state->last_crc32 = crc32;
@@ -594,13 +654,16 @@ int ternary_validation_apply_proxy(ternary_validation_state_t *state,
 
 int ternary_validation_finish(ternary_validation_state_t *state,
                               int converted_count) {
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "ternary_validation_finish");
+
     if (!state || state->config.sample_count <= 0 || converted_count <= 0) {
-        return 0;
+        return validation_tracy_end_status(&tracy_zone, 0);
     }
+    sapphire_tracy_plot_i64("validation.converted_tensors", (int64_t)converted_count);
     if (state->last_reported_count == converted_count) {
-        return 0;
+        return validation_tracy_end_status(&tracy_zone, 0);
     }
-    return run_checkpoint(state, converted_count);
+    return validation_tracy_end_status(&tracy_zone, run_checkpoint(state, converted_count));
 }
 
 void ternary_validation_destroy(ternary_validation_state_t *state) {

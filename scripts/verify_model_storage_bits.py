@@ -145,12 +145,23 @@ def _read_manifest(artifact_dir: Path) -> OrderedDict[str, TernaryManifestEntry]
                 continue
 
             parts = line.split("\t")
-            if len(parts) != 6:
+            if len(parts) == 6:
+                name, file_name, rows, cols, packed_bytes, crc32 = parts
+                kind = "ternary"
+            elif len(parts) == 7:
+                name, file_name, rows, cols, packed_bytes, crc32, kind = parts
+                if kind not in {"mold"}:
+                    raise ValueError(
+                        f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}"
+                    )
+            else:
                 raise ValueError(
                     f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}"
                 )
 
-            name, file_name, rows, cols, packed_bytes, crc32 = parts
+            if kind == "mold":
+                continue
+
             entry = TernaryManifestEntry(
                 name=name,
                 file_name=file_name,

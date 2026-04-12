@@ -18,7 +18,7 @@ docs/
 data/
 corpora/
 configs/
-
+traces/
 
 # Object and library files
 *.tape
@@ -32,6 +32,8 @@ configs/
 *.exe
 *.lo
 *.la
+*.spv
+*.tracy
 
 # Coverage, profiling and sanitizer outputs
 *.gcno
