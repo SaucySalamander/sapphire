@@ -106,6 +106,7 @@ typedef struct {
     uint32_t activation_tape_hash;
     uint32_t hessian_sidecar_crc32;
     uint32_t resume_step_index;
+    ternary_bf16_io_cache_t bf16_io_cache;
     ternary_hessian_proxy_cache_t hessian_proxy_cache;
     ternary_hessian_sidecar_t *hessian_sidecar;
     structural_map_t structural_map;
@@ -115,6 +116,11 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
                                    uint32_t hessian_sidecar_crc32)
 {
     uint32_t crc32 = 0u;
+    float early_stop_divergence_ratio = 1.25f;
+    float early_stop_min_delta = 1e-4f;
+    int early_stop_patience = 6;
+    int kl_sample_count = 4;
+    int kl_update_interval = 4;
     int ste_steps = 3;
     const uint32_t schedule_version = PROGRESSIVE_CALIB_SCHEDULE_VERSION;
 
@@ -124,6 +130,21 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
 
     if (config->ste_steps > 0) {
         ste_steps = config->ste_steps;
+    }
+    if (config->kl_update_interval > 0) {
+        kl_update_interval = config->kl_update_interval;
+    }
+    if (config->kl_sample_count > 0) {
+        kl_sample_count = config->kl_sample_count;
+    }
+    if (config->early_stop_patience >= 0) {
+        early_stop_patience = config->early_stop_patience;
+    }
+    if (config->early_stop_min_delta >= 0.0f) {
+        early_stop_min_delta = config->early_stop_min_delta;
+    }
+    if (config->early_stop_divergence_ratio >= 0.0f) {
+        early_stop_divergence_ratio = config->early_stop_divergence_ratio;
     }
 
     crc32 = io_crc32_update(crc32, config->model_name, strlen(config->model_name) + 1u);
@@ -145,6 +166,11 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
     crc32 = io_crc32_update(crc32, &config->progressive_calib, sizeof(config->progressive_calib));
     crc32 = io_crc32_update(crc32, &schedule_version, sizeof(schedule_version));
     crc32 = io_crc32_update(crc32, &config->kl_weight, sizeof(config->kl_weight));
+    crc32 = io_crc32_update(crc32, &kl_update_interval, sizeof(kl_update_interval));
+    crc32 = io_crc32_update(crc32, &kl_sample_count, sizeof(kl_sample_count));
+    crc32 = io_crc32_update(crc32, &early_stop_patience, sizeof(early_stop_patience));
+    crc32 = io_crc32_update(crc32, &early_stop_min_delta, sizeof(early_stop_min_delta));
+    crc32 = io_crc32_update(crc32, &early_stop_divergence_ratio, sizeof(early_stop_divergence_ratio));
     crc32 = io_crc32_update(crc32, &config->disable_hessian_proxy, sizeof(config->disable_hessian_proxy));
     crc32 = io_crc32_update(crc32, &config->hessian_proxy_strength, sizeof(config->hessian_proxy_strength));
     crc32 = io_crc32_update(crc32, &config->hessian_proxy_floor, sizeof(config->hessian_proxy_floor));
@@ -1549,6 +1575,21 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
         : 4;
     ste_config.kl_weight = (config && config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f;
     ste_config.kl_temperature = 1.0f;
+    ste_config.kl_update_interval = (config && config->kl_update_interval > 0)
+        ? config->kl_update_interval
+        : 4;
+    ste_config.kl_sample_count = (config && config->kl_sample_count > 0)
+        ? config->kl_sample_count
+        : 4;
+    ste_config.early_stop_patience = (config && config->early_stop_patience >= 0)
+        ? config->early_stop_patience
+        : 6;
+    ste_config.early_stop_min_delta = (config && config->early_stop_min_delta >= 0.0f)
+        ? config->early_stop_min_delta
+        : 1e-4f;
+    ste_config.early_stop_divergence_ratio = (config && config->early_stop_divergence_ratio >= 0.0f)
+        ? config->early_stop_divergence_ratio
+        : 1.25f;
     ste_config.simulate_activation_a8 = 0;
     ste_config.use_hessian_proxy = (!config || !config->disable_hessian_proxy) ? 1 : 0;
     ste_config.hessian_proxy_strength = (config && config->hessian_proxy_strength >= 0.0f)
@@ -1762,6 +1803,7 @@ static void destroy_conversion_runtime(conversion_runtime_t *runtime) {
     if (runtime->activation_tape) {
         activation_tape_close(runtime->activation_tape);
     }
+    io_release_bf16_io_cache(&runtime->bf16_io_cache);
     ternary_hessian_proxy_cache_release(&runtime->hessian_proxy_cache);
     structural_map_release(&runtime->structural_map);
     free(runtime->checkpoint_path);
@@ -1838,6 +1880,7 @@ static void init_conversion_validation(const ternary_conversion_config_t *config
     memset(&validation_config, 0, sizeof(validation_config));
     validation_config.validate_every_n = config->validate_every_n;
     validation_config.output_dir = config->output_path;
+    validation_config.telemetry_path = default_runtime_ste_config(config).telemetry_path;
     validation_config.sample_texts = (const char *const *)runtime->validation_corpus_storage.samples;
     validation_config.sample_count = runtime->validation_corpus_storage.sample_count;
 
@@ -2101,6 +2144,7 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
 
 static int mmap_tensor_for_conversion(const char *model_dir,
                                       const char *model_path,
+                                      ternary_bf16_io_cache_t *bf16_io_cache,
                                       const char *tensor_name,
                                       ternary_bf16_layer_map_t *out_map);
 
@@ -2159,7 +2203,7 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
         return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
-    if (mmap_tensor_for_conversion(model_dir, model_path, config->layer_name, &map) != 0) {
+    if (mmap_tensor_for_conversion(model_dir, model_path, NULL, config->layer_name, &map) != 0) {
         return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
@@ -2222,6 +2266,7 @@ typedef struct {
     const char *tensor_name;
     const activation_tape_t *activation_tape;
     const ternary_hessian_sidecar_t *hessian_sidecar;
+    ternary_bf16_io_cache_t *bf16_io_cache;
     ternary_hessian_proxy_cache_t *hessian_proxy_cache;
     const transformer_ste_config_t *ste_config;
     const ternary_calibration_corpus_t *calibration_corpus;
@@ -2255,11 +2300,13 @@ typedef struct {
 
 static int mmap_tensor_for_conversion(const char *model_dir,
                                       const char *model_path,
+                                      ternary_bf16_io_cache_t *bf16_io_cache,
                                       const char *tensor_name,
                                       ternary_bf16_layer_map_t *out_map);
 
 static int mmap_tensor_for_conversion(const char *model_dir,
                                       const char *model_path,
+                                      ternary_bf16_io_cache_t *bf16_io_cache,
                                       const char *tensor_name,
                                       ternary_bf16_layer_map_t *out_map)
 {
@@ -2274,6 +2321,9 @@ static int mmap_tensor_for_conversion(const char *model_dir,
     }
 
     if (model_dir && model_dir[0] != '\0') {
+        if (bf16_io_cache) {
+            return io_mmap_layer_bf16_sharded_cached(model_dir, tensor_name, bf16_io_cache, out_map);
+        }
         return io_mmap_layer_bf16_sharded(model_dir, tensor_name, out_map);
     }
 
@@ -2588,7 +2638,11 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     if (measure_io && clock_gettime(CLOCK_MONOTONIC, &load_start) != 0) {
         measure_io = 0;
     }
-    if (mmap_tensor_for_conversion(job->model_dir, job->model_path, job->tensor_name, &map) != 0) {
+    if (mmap_tensor_for_conversion(job->model_dir,
+                                   job->model_path,
+                                   job->bf16_io_cache,
+                                   job->tensor_name,
+                                   &map) != 0) {
         return -1;
     }
     if (measure_io && clock_gettime(CLOCK_MONOTONIC, &load_end) == 0) {
@@ -2927,6 +2981,7 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     job.tensor_name = task->tensor_name;
     job.activation_tape = task->runtime ? task->runtime->activation_tape : NULL;
     job.hessian_sidecar = task->runtime ? task->runtime->hessian_sidecar : NULL;
+    job.bf16_io_cache = task->runtime ? &task->runtime->bf16_io_cache : NULL;
     job.hessian_proxy_cache = task->runtime ? &task->runtime->hessian_proxy_cache : NULL;
     job.ste_config = use_layer_telemetry ? &layer_ste_config : task->ste_config;
     job.calibration_corpus = task->runtime ? &active_corpus : NULL;
@@ -3126,6 +3181,12 @@ static void log_conversion_config(const ternary_conversion_config_t *config)
     LOG_INFO("  max_grad_norm: %.4f", (double)((config->max_grad_norm > 0.0f) ? config->max_grad_norm : 1.0f));
     LOG_INFO("  validate_every: %d", config->validate_every_n);
     LOG_INFO("  kl_weight: %.4f", (double)((config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f));
+    LOG_INFO("  kl_update_freq: %d", (config->kl_update_interval > 0) ? config->kl_update_interval : 4);
+    LOG_INFO("  kl_samples: %d", (config->kl_sample_count > 0) ? config->kl_sample_count : 4);
+    LOG_INFO("  ste_early_stop: patience=%d delta=%.4f divergence=%.2f",
+             (config->early_stop_patience >= 0) ? config->early_stop_patience : 6,
+             (double)((config->early_stop_min_delta >= 0.0f) ? config->early_stop_min_delta : 1e-4f),
+             (double)((config->early_stop_divergence_ratio >= 0.0f) ? config->early_stop_divergence_ratio : 1.25f));
     if (config->progressive_calib) {
         LOG_INFO("  progressive_kl: stage2 layers 6-10 hold, 11-15 ramp to %.4f, stage3 %.4f, stage2 temp=%.2f",
                  (double)PROGRESSIVE_CALIB_STAGE2_TARGET_KL_WEIGHT,

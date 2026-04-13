@@ -37,8 +37,18 @@ typedef struct {
     size_t weight_bytes;
     uint32_t rows;
     uint32_t cols;
+    int close_file_on_unmap;
     char tensor_name[256];
 } ternary_bf16_layer_map_t;
+
+typedef struct {
+    char *model_dir;
+    char *index_json;
+    size_t index_json_len;
+    char *current_shard_path;
+    char current_shard_name[128];
+    safetensors_file_t *current_shard_file;
+} ternary_bf16_io_cache_t;
 
 /**
  * @brief Ternary layer payload prepared for safetensors serialization.
@@ -111,6 +121,13 @@ char *io_resolve_shard_path(const char *model_dir, const char *tensor_name);
 int io_mmap_layer_bf16_sharded(const char *model_dir,
                                 const char *tensor_name,
                                 ternary_bf16_layer_map_t *out_map);
+
+int io_mmap_layer_bf16_sharded_cached(const char *model_dir,
+                                      const char *tensor_name,
+                                      ternary_bf16_io_cache_t *cache,
+                                      ternary_bf16_layer_map_t *out_map);
+
+void io_release_bf16_io_cache(ternary_bf16_io_cache_t *cache);
 
 /**
  * @brief Incremental CRC32 helper for non-ECC staging validation.

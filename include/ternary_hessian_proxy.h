@@ -8,6 +8,8 @@
 
 #include <stdint.h>
 
+typedef struct sapphire_context kernel_context_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -38,6 +40,7 @@ typedef struct {
     uint32_t cols;
     float floor;
     float strength;
+    kernel_context_t *parallel_ctx;
 } ternary_hessian_proxy_build_request_t;
 
 int ternary_hessian_proxy_build_diagonal(const ternary_hessian_proxy_build_request_t *request,

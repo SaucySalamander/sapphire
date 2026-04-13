@@ -71,6 +71,11 @@ static void print_help(const char* program_name) {
     printf("  --checkpoint-every <n>    Persist student checkpoints every N converted tensors\n");
     printf("  --validate-every <n>      Run checkpoint validation every N converted tensors\n");
     printf("  --kl-weight <value>       Optional KL distillation weight (default: 0.05)\n");
+    printf("  --kl-update-freq <n>      Recompute KL sample weights every N STE steps (default: 4)\n");
+    printf("  --kl-samples <n>          Distinct prompts used to compute KL weights (default: 4)\n");
+    printf("  --ste-early-stop-patience <n>  Plateau patience in STE steps (default: 6, 0 disables)\n");
+    printf("  --ste-early-stop-delta <value> Minimum loss improvement for plateau detection (default: 0.0001)\n");
+    printf("  --ste-early-stop-divergence <value>  Divergence ratio over best loss (default: 1.25, 0 disables)\n");
     printf("  --save-state <path>       Save session state to .sapphire file before exit\n");
     printf("  --load-state <path>       Load session state from .sapphire file at startup\n");
     printf("  -h, --help                Show this help message\n");
@@ -146,6 +151,11 @@ typedef struct {
     int ste_steps;
     int progressive_calib;
     float kl_weight;
+    int kl_update_interval;
+    int kl_sample_count;
+    int early_stop_patience;
+    float early_stop_min_delta;
+    float early_stop_divergence_ratio;
     int disable_hessian_proxy;
     float hessian_proxy_strength;
     float hessian_proxy_floor;
@@ -185,6 +195,11 @@ static void cli_args_init(cli_args_t *args)
     args->ste_steps = 3;
     args->progressive_calib = 0;
     args->kl_weight = 0.05f;
+    args->kl_update_interval = 4;
+    args->kl_sample_count = 4;
+    args->early_stop_patience = 6;
+    args->early_stop_min_delta = 1e-4f;
+    args->early_stop_divergence_ratio = 1.25f;
     args->disable_hessian_proxy = 0;
     args->hessian_proxy_strength = 1.0f;
     args->hessian_proxy_floor = 0.05f;
@@ -373,6 +388,26 @@ static int validate_convert_ternary_numeric_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --kl-weight must be >= 0.");
         return -1;
     }
+    if (args->kl_update_interval <= 0) {
+        LOG_ERROR("ERROR: --kl-update-freq must be > 0.");
+        return -1;
+    }
+    if (args->kl_sample_count <= 0) {
+        LOG_ERROR("ERROR: --kl-samples must be > 0.");
+        return -1;
+    }
+    if (args->early_stop_patience < 0) {
+        LOG_ERROR("ERROR: --ste-early-stop-patience must be >= 0.");
+        return -1;
+    }
+    if (args->early_stop_min_delta < 0.0f) {
+        LOG_ERROR("ERROR: --ste-early-stop-delta must be >= 0.");
+        return -1;
+    }
+    if (args->early_stop_divergence_ratio < 0.0f) {
+        LOG_ERROR("ERROR: --ste-early-stop-divergence must be >= 0.");
+        return -1;
+    }
     if (args->hessian_proxy_strength < 0.0f) {
         LOG_ERROR("ERROR: --hessian-proxy-strength must be >= 0.");
         return -1;
@@ -475,6 +510,11 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.ste_steps = args->ste_steps;
     config.progressive_calib = args->progressive_calib;
     config.kl_weight = args->kl_weight;
+    config.kl_update_interval = args->kl_update_interval;
+    config.kl_sample_count = args->kl_sample_count;
+    config.early_stop_patience = args->early_stop_patience;
+    config.early_stop_min_delta = args->early_stop_min_delta;
+    config.early_stop_divergence_ratio = args->early_stop_divergence_ratio;
     config.disable_hessian_proxy = args->disable_hessian_proxy;
     config.hessian_proxy_strength = args->hessian_proxy_strength;
     config.hessian_proxy_floor = args->hessian_proxy_floor;
@@ -922,6 +962,11 @@ typedef enum {
     CLI_OPT_PROGRESSIVE_CALIB,
     CLI_OPT_MAX_GRAD_NORM,
     CLI_OPT_KL_WEIGHT,
+    CLI_OPT_KL_UPDATE_FREQ,
+    CLI_OPT_KL_SAMPLES,
+    CLI_OPT_STE_EARLY_STOP_PATIENCE,
+    CLI_OPT_STE_EARLY_STOP_DELTA,
+    CLI_OPT_STE_EARLY_STOP_DIVERGENCE,
     CLI_OPT_DISABLE_HESSIAN_PROXY,
     CLI_OPT_HESSIAN_PROXY_STRENGTH,
     CLI_OPT_HESSIAN_PROXY_FLOOR,
@@ -967,6 +1012,12 @@ static const cli_option_alias_t g_cli_option_aliases[] = {
     { "--progressive-calib", CLI_OPT_PROGRESSIVE_CALIB },
     { "--max-grad-norm", CLI_OPT_MAX_GRAD_NORM },
     { "--kl-weight", CLI_OPT_KL_WEIGHT },
+    { "--kl-update-freq", CLI_OPT_KL_UPDATE_FREQ },
+    { "--kl-update-every", CLI_OPT_KL_UPDATE_FREQ },
+    { "--kl-samples", CLI_OPT_KL_SAMPLES },
+    { "--ste-early-stop-patience", CLI_OPT_STE_EARLY_STOP_PATIENCE },
+    { "--ste-early-stop-delta", CLI_OPT_STE_EARLY_STOP_DELTA },
+    { "--ste-early-stop-divergence", CLI_OPT_STE_EARLY_STOP_DIVERGENCE },
     { "--disable-hessian-proxy", CLI_OPT_DISABLE_HESSIAN_PROXY },
     { "--hessian-proxy-strength", CLI_OPT_HESSIAN_PROXY_STRENGTH },
     { "--hessian-proxy-floor", CLI_OPT_HESSIAN_PROXY_FLOOR },
@@ -1018,6 +1069,11 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_STE_STEPS: args->ste_steps = atoi(value); break;
         case CLI_OPT_MAX_GRAD_NORM: args->max_grad_norm = (float)atof(value); break;
         case CLI_OPT_KL_WEIGHT: args->kl_weight = (float)atof(value); break;
+        case CLI_OPT_KL_UPDATE_FREQ: args->kl_update_interval = atoi(value); break;
+        case CLI_OPT_KL_SAMPLES: args->kl_sample_count = atoi(value); break;
+        case CLI_OPT_STE_EARLY_STOP_PATIENCE: args->early_stop_patience = atoi(value); break;
+        case CLI_OPT_STE_EARLY_STOP_DELTA: args->early_stop_min_delta = (float)atof(value); break;
+        case CLI_OPT_STE_EARLY_STOP_DIVERGENCE: args->early_stop_divergence_ratio = (float)atof(value); break;
         case CLI_OPT_HESSIAN_PROXY_STRENGTH: args->hessian_proxy_strength = (float)atof(value); break;
         case CLI_OPT_HESSIAN_PROXY_FLOOR: args->hessian_proxy_floor = (float)atof(value); break;
         case CLI_OPT_SAVE_STATE: args->save_state_path = value; break;

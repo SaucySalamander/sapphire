@@ -10,6 +10,7 @@
 
 #include "inference.h"
 #include "ternary_calibration.h"
+#include "ternary_telemetry.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,6 +19,7 @@ extern "C" {
 typedef struct {
     int validate_every_n;
     const char *output_dir;
+    const char *telemetry_path;
     const char *const *sample_texts;
     int sample_count;
 } ternary_validation_config_t;
@@ -50,6 +52,8 @@ typedef struct ternary_validation_state {
     uint32_t last_crc32;
     char last_tensor_name[256];
     int last_reported_count;
+    int telemetry_enabled;
+    ternary_telemetry_writer_t telemetry_writer;
 } ternary_validation_state_t;
 
 int ternary_validation_init(ternary_validation_state_t *state,

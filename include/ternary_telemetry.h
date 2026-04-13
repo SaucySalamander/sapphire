@@ -45,6 +45,18 @@ typedef struct {
 } ternary_telemetry_t;
 
 typedef struct {
+    int converted_count;
+    const char *tensor_name;
+    uint32_t crc32;
+    float baseline_mean_nll;
+    float current_mean_nll;
+    float mean_kl;
+    float max_kl;
+    float top1_agreement;
+    int sample_count;
+} ternary_validation_telemetry_t;
+
+typedef struct {
     FILE *stream;
     char path[TERNARY_TELEMETRY_PATH_MAX];
 } ternary_telemetry_writer_t;
@@ -56,6 +68,9 @@ void ternary_telemetry_writer_close(ternary_telemetry_writer_t *writer);
 
 int telemetry_dump_step(ternary_telemetry_writer_t *writer,
                         const ternary_telemetry_t *telemetry);
+
+int telemetry_dump_validation_checkpoint(ternary_telemetry_writer_t *writer,
+                                         const ternary_validation_telemetry_t *telemetry);
 
 void ternary_telemetry_print_pass_stdout(const ternary_telemetry_t *telemetry);
 

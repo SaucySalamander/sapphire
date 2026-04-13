@@ -43,6 +43,28 @@ static void validation_tracy_zone_text_if_present(const sapphire_tracy_zone_t *z
     sapphire_tracy_zone_text(zone, text, strlen(text));
 }
 
+static int validation_append_telemetry_checkpoint(ternary_validation_state_t *state,
+                                                  const ternary_validation_checkpoint_t *checkpoint)
+{
+    ternary_validation_telemetry_t telemetry;
+
+    if (!state || !checkpoint || !state->telemetry_enabled) {
+        return 0;
+    }
+
+    memset(&telemetry, 0, sizeof(telemetry));
+    telemetry.converted_count = checkpoint->converted_count;
+    telemetry.tensor_name = checkpoint->tensor_name;
+    telemetry.crc32 = checkpoint->crc32;
+    telemetry.baseline_mean_nll = checkpoint->baseline_mean_nll;
+    telemetry.current_mean_nll = checkpoint->current_mean_nll;
+    telemetry.mean_kl = checkpoint->mean_kl;
+    telemetry.max_kl = checkpoint->max_kl;
+    telemetry.top1_agreement = checkpoint->top1_agreement;
+    telemetry.sample_count = checkpoint->sample_count;
+    return telemetry_dump_validation_checkpoint(&state->telemetry_writer, &telemetry);
+}
+
 static int token_argmax(const float *logits, int vocab_size) {
     int best_idx = 0;
     float best_val = logits[0];
@@ -544,6 +566,9 @@ static int run_checkpoint(ternary_validation_state_t *state, int converted_count
     if (io_append_validation_checkpoint(state->config.output_dir, &checkpoint) != 0) {
         return validation_tracy_end_status(&tracy_zone, -1);
     }
+    if (validation_append_telemetry_checkpoint(state, &checkpoint) != 0) {
+        LOG_WARN("validation telemetry: failed to append checkpoint for %s", state->last_tensor_name);
+    }
 
     sapphire_tracy_plot_f64("validation.mean_kl", mean_kl);
     sapphire_tracy_plot_f64("validation.max_kl", max_kl);
@@ -574,6 +599,13 @@ int ternary_validation_init(ternary_validation_state_t *state,
     memset(state, 0, sizeof(*state));
     state->config = *config;
     state->ctx = ctx;
+    if (config->telemetry_path && config->telemetry_path[0] != '\0') {
+        if (ternary_telemetry_writer_init(&state->telemetry_writer, config->telemetry_path) == 0) {
+            state->telemetry_enabled = 1;
+        } else {
+            LOG_WARN("validation telemetry: disabled for %s", config->telemetry_path);
+        }
+    }
     validation_tracy_zone_text_if_present(&tracy_zone, config->output_dir);
     sapphire_tracy_plot_i64("validation.sample_count", (int64_t)config->sample_count);
     sapphire_tracy_plot_i64("validation.validate_every_n", (int64_t)config->validate_every_n);
@@ -669,6 +701,10 @@ int ternary_validation_finish(ternary_validation_state_t *state,
 void ternary_validation_destroy(ternary_validation_state_t *state) {
     if (!state) {
         return;
+    }
+
+    if (state->telemetry_enabled) {
+        ternary_telemetry_writer_close(&state->telemetry_writer);
     }
 
     for (int i = state->patch_count - 1; i >= 0; --i) {

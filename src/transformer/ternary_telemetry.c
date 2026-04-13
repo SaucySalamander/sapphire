@@ -179,7 +179,7 @@ int telemetry_dump_step(ternary_telemetry_writer_t *writer,
 
     written = snprintf(line,
                        sizeof(line),
-                       "{\"config_hash\":%u,\"resume_step_idx\":%u,\"layer_idx\":%u,\"step_idx\":%u,\"tape_hash\":%u,\"student_checkpoint_hash\":%u,\"mse_loss\":%s,\"grad_norm\":%s,\"raw_grad_norm\":%s,\"clipped_grad_norm\":%s,\"clip_scale\":%s,\"latent_saturation\":%s,\"p_neg1\":%s,\"p_zero\":%s,\"p_pos1\":%s,\"gamma_scale\":%s,\"gamma_scale_min\":%s,\"gamma_scale_max\":%s,\"gamma_floor_fraction\":%s,\"hessian_proxy_mean\":%s,\"hessian_proxy_max\":%s,\"hessian_proxy_source\":%u,\"effective_learning_rate\":%s,\"effective_hessian_scale\":%s,\"io_ms\":%s,\"compute_ms\":%s}\n",
+                       "{\"record_type\":\"calibration_step\",\"config_hash\":%u,\"resume_step_idx\":%u,\"layer_idx\":%u,\"step_idx\":%u,\"tape_hash\":%u,\"student_checkpoint_hash\":%u,\"mse_loss\":%s,\"grad_norm\":%s,\"raw_grad_norm\":%s,\"clipped_grad_norm\":%s,\"clip_scale\":%s,\"latent_saturation\":%s,\"p_neg1\":%s,\"p_zero\":%s,\"p_pos1\":%s,\"gamma_scale\":%s,\"gamma_scale_min\":%s,\"gamma_scale_max\":%s,\"gamma_floor_fraction\":%s,\"hessian_proxy_mean\":%s,\"hessian_proxy_max\":%s,\"hessian_proxy_source\":%u,\"effective_learning_rate\":%s,\"effective_hessian_scale\":%s,\"io_ms\":%s,\"compute_ms\":%s}\n",
                        telemetry->config_hash,
                        telemetry->resume_step_idx,
                        telemetry->layer_idx,
@@ -214,6 +214,77 @@ int telemetry_dump_step(ternary_telemetry_writer_t *writer,
     bytes_written = fwrite(line, 1u, (size_t)written, writer->stream);
     if (bytes_written != (size_t)written) {
         LOG_ERROR("telemetry: write failed for %s", writer->path);
+        return -1;
+    }
+
+    return 0;
+}
+
+int telemetry_dump_validation_checkpoint(ternary_telemetry_writer_t *writer,
+                                         const ternary_validation_telemetry_t *telemetry)
+{
+    char line[1024];
+    char baseline_mean_nll_buf[32];
+    char current_mean_nll_buf[32];
+    char baseline_ppl_buf[32];
+    char current_ppl_buf[32];
+    char mean_kl_buf[32];
+    char max_kl_buf[32];
+    char top1_agreement_buf[32];
+    const char *baseline_mean_nll_text = NULL;
+    const char *current_mean_nll_text = NULL;
+    const char *baseline_ppl_text = NULL;
+    const char *current_ppl_text = NULL;
+    const char *mean_kl_text = NULL;
+    const char *max_kl_text = NULL;
+    const char *top1_agreement_text = NULL;
+    int written = 0;
+    size_t bytes_written = 0u;
+
+    if (!writer || !writer->stream || !telemetry || !telemetry->tensor_name) {
+        return -1;
+    }
+
+    baseline_mean_nll_text = telemetry_format_float(baseline_mean_nll_buf,
+                                                    sizeof(baseline_mean_nll_buf),
+                                                    telemetry->baseline_mean_nll);
+    current_mean_nll_text = telemetry_format_float(current_mean_nll_buf,
+                                                   sizeof(current_mean_nll_buf),
+                                                   telemetry->current_mean_nll);
+    baseline_ppl_text = telemetry_format_float(baseline_ppl_buf,
+                                               sizeof(baseline_ppl_buf),
+                                               expf(telemetry->baseline_mean_nll));
+    current_ppl_text = telemetry_format_float(current_ppl_buf,
+                                              sizeof(current_ppl_buf),
+                                              expf(telemetry->current_mean_nll));
+    mean_kl_text = telemetry_format_float(mean_kl_buf, sizeof(mean_kl_buf), telemetry->mean_kl);
+    max_kl_text = telemetry_format_float(max_kl_buf, sizeof(max_kl_buf), telemetry->max_kl);
+    top1_agreement_text = telemetry_format_float(top1_agreement_buf,
+                                                 sizeof(top1_agreement_buf),
+                                                 telemetry->top1_agreement);
+
+    written = snprintf(line,
+                       sizeof(line),
+                       "{\"record_type\":\"validation_checkpoint\",\"converted_count\":%d,\"tensor_name\":\"%s\",\"crc32\":%u,\"baseline_mean_nll\":%s,\"current_mean_nll\":%s,\"baseline_ppl\":%s,\"current_ppl\":%s,\"mean_kl\":%s,\"max_kl\":%s,\"top1_agreement\":%s,\"sample_count\":%d}\n",
+                       telemetry->converted_count,
+                       telemetry->tensor_name,
+                       telemetry->crc32,
+                       baseline_mean_nll_text,
+                       current_mean_nll_text,
+                       baseline_ppl_text,
+                       current_ppl_text,
+                       mean_kl_text,
+                       max_kl_text,
+                       top1_agreement_text,
+                       telemetry->sample_count);
+    if (written < 0 || (size_t)written >= sizeof(line)) {
+        LOG_ERROR("telemetry: validation line too long for %s", writer->path);
+        return -1;
+    }
+
+    bytes_written = fwrite(line, 1u, (size_t)written, writer->stream);
+    if (bytes_written != (size_t)written) {
+        LOG_ERROR("telemetry: validation write failed for %s", writer->path);
         return -1;
     }
 

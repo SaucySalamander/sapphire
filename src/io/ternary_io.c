@@ -58,6 +58,11 @@ static const uint32_t g_crc32_table[256] = {
     0xB3667A2Eu, 0xC4614AB8u, 0x5D681B02u, 0x2A6F2B94u, 0xB40BBE37u, 0xC30C8EA1u, 0x5A05DF1Bu, 0x2D02EF8Du
 };
 
+static int io_map_layer_bf16_from_file(safetensors_file_t *file,
+                                       const char *tensor_name,
+                                       ternary_bf16_layer_map_t *out_map,
+                                       int close_file_on_unmap);
+
 static int ternary_validate_tensor_name(const char *tensor_name) {
     if (!tensor_name || tensor_name[0] == '\0') {
         LOG_ERROR("ternary I/O: tensor name is NULL or empty");
@@ -342,9 +347,7 @@ int io_mmap_layer_bf16(const char *safetensors_path,
                        const char *tensor_name,
                        ternary_bf16_layer_map_t *out_map) {
     safetensors_file_t *file = NULL;
-    const safetensors_tensor_meta_t *meta = NULL;
-    const void *raw_ptr = NULL;
-    size_t weight_count = 0;
+    int rc = -1;
 
     if (!safetensors_path || !out_map || ternary_validate_tensor_name(tensor_name) != 0) {
         LOG_ERROR("io_mmap_layer_bf16: invalid arguments");
@@ -359,26 +362,45 @@ int io_mmap_layer_bf16(const char *safetensors_path,
         return -1;
     }
 
+    rc = io_map_layer_bf16_from_file(file, tensor_name, out_map, 1);
+    if (rc != 0) {
+        safetensors_close(file);
+    }
+    return rc;
+}
+
+static int io_map_layer_bf16_from_file(safetensors_file_t *file,
+                                       const char *tensor_name,
+                                       ternary_bf16_layer_map_t *out_map,
+                                       int close_file_on_unmap)
+{
+    const safetensors_tensor_meta_t *meta = NULL;
+    const void *raw_ptr = NULL;
+    size_t weight_count = 0;
+
+    if (!file || !out_map || ternary_validate_tensor_name(tensor_name) != 0) {
+        LOG_ERROR("io_map_layer_bf16_from_file: invalid arguments");
+        return -1;
+    }
+
+    memset(out_map, 0, sizeof(*out_map));
+
     meta = safetensors_get_tensor_by_name(file, tensor_name);
     if (!meta) {
         LOG_ERROR("io_mmap_layer_bf16: tensor not found: %s", tensor_name);
-        safetensors_close(file);
         return -1;
     }
     if (meta->dtype != SAFETENSORS_BF16) {
         LOG_ERROR("io_mmap_layer_bf16: tensor %s has dtype=%d, expected BF16",
                   tensor_name, (int)meta->dtype);
-        safetensors_close(file);
         return -1;
     }
     if (ternary_get_matrix_shape(meta, &out_map->rows, &out_map->cols, &weight_count) != 0) {
-        safetensors_close(file);
         return -1;
     }
 
     raw_ptr = safetensors_data_ptr(file, meta);
     if (!raw_ptr) {
-        safetensors_close(file);
         return -1;
     }
 
@@ -386,6 +408,7 @@ int io_mmap_layer_bf16(const char *safetensors_path,
     out_map->bf16_weights = (const uint16_t *)raw_ptr;
     out_map->weight_count = weight_count;
     out_map->weight_bytes = meta->size_bytes;
+    out_map->close_file_on_unmap = close_file_on_unmap;
     memcpy(out_map->tensor_name, tensor_name, strlen(tensor_name) + 1u);
 
     LOG_INFO("Mapped BF16 layer tensor %s: rows=%u cols=%u bytes=%zu",
@@ -397,7 +420,7 @@ void io_unmap_layer_bf16(ternary_bf16_layer_map_t *map) {
     if (!map) {
         return;
     }
-    if (map->file) {
+    if (map->file && map->close_file_on_unmap) {
         safetensors_close(map->file);
     }
     memset(map, 0, sizeof(*map));
@@ -949,6 +972,106 @@ void io_free_layer_ternary_payload(ternary_layer_payload_t *payload) {
 #define SHARD_FILENAME_MAX   128u
 #define SHARD_KEY_MAX        320
 
+static void io_reset_bf16_io_cache(ternary_bf16_io_cache_t *cache)
+{
+    if (!cache) {
+        return;
+    }
+
+    memset(cache, 0, sizeof(*cache));
+}
+
+void io_release_bf16_io_cache(ternary_bf16_io_cache_t *cache)
+{
+    if (!cache) {
+        return;
+    }
+
+    if (cache->current_shard_file) {
+        safetensors_close(cache->current_shard_file);
+    }
+    free(cache->current_shard_path);
+    free(cache->index_json);
+    free(cache->model_dir);
+    io_reset_bf16_io_cache(cache);
+}
+
+static int io_prepare_bf16_io_cache(const char *model_dir,
+                                    ternary_bf16_io_cache_t *cache)
+{
+    char *index_path = NULL;
+    char *index_json = NULL;
+    char *model_dir_copy = NULL;
+    size_t index_json_len = 0u;
+    size_t model_dir_len = 0u;
+
+    if (!model_dir || !cache) {
+        return -1;
+    }
+    if (cache->index_json && cache->model_dir && strcmp(cache->model_dir, model_dir) == 0) {
+        return 0;
+    }
+
+    io_release_bf16_io_cache(cache);
+    model_dir_len = strlen(model_dir);
+    model_dir_copy = (char *)malloc(model_dir_len + 1u);
+    if (!model_dir_copy) {
+        return -1;
+    }
+    memcpy(model_dir_copy, model_dir, model_dir_len + 1u);
+
+    index_path = construct_safe_path(model_dir, SHARD_INDEX_FILENAME, NULL);
+    if (!index_path) {
+        free(model_dir_copy);
+        return -1;
+    }
+    if (file_read_json(index_path, &index_json, &index_json_len) != 0) {
+        free(index_path);
+        free(model_dir_copy);
+        return -1;
+    }
+    free(index_path);
+
+    cache->model_dir = model_dir_copy;
+    cache->index_json = index_json;
+    cache->index_json_len = index_json_len;
+    return 0;
+}
+
+static int io_open_cached_bf16_shard(ternary_bf16_io_cache_t *cache,
+                                     const char *shard_name)
+{
+    safetensors_file_t *file = NULL;
+    char *shard_path = NULL;
+
+    if (!cache || !cache->model_dir || !shard_name || shard_name[0] == '\0') {
+        return -1;
+    }
+    if (cache->current_shard_file && strcmp(cache->current_shard_name, shard_name) == 0) {
+        return 0;
+    }
+
+    shard_path = construct_safe_path(cache->model_dir, shard_name, NULL);
+    if (!shard_path) {
+        return -1;
+    }
+    file = safetensors_open(shard_path);
+    if (!file) {
+        free(shard_path);
+        return -1;
+    }
+
+    if (cache->current_shard_file) {
+        safetensors_close(cache->current_shard_file);
+    }
+    free(cache->current_shard_path);
+
+    cache->current_shard_file = file;
+    cache->current_shard_path = shard_path;
+    memcpy(cache->current_shard_name, shard_name, strlen(shard_name) + 1u);
+    return 0;
+}
+
 /**
  * Walk model.safetensors.index.json (already loaded into `json`) and copy the
  * shard filename for `tensor_name` into out_shard.  Returns 0 on success.
@@ -1075,4 +1198,34 @@ int io_mmap_layer_bf16_sharded(const char *model_dir,
     rc = io_mmap_layer_bf16(shard_path, tensor_name, out_map);
     free(shard_path);
     return rc;
+}
+
+int io_mmap_layer_bf16_sharded_cached(const char *model_dir,
+                                      const char *tensor_name,
+                                      ternary_bf16_io_cache_t *cache,
+                                      ternary_bf16_layer_map_t *out_map)
+{
+    char shard_filename[SHARD_FILENAME_MAX];
+
+    if (!model_dir || !cache || !out_map || ternary_validate_tensor_name(tensor_name) != 0) {
+        LOG_ERROR("io_mmap_layer_bf16_sharded_cached: invalid arguments");
+        return -1;
+    }
+    if (io_prepare_bf16_io_cache(model_dir, cache) != 0) {
+        return -1;
+    }
+
+    shard_filename[0] = '\0';
+    if (resolve_shard_filename(cache->index_json,
+                               cache->index_json_len,
+                               tensor_name,
+                               shard_filename,
+                               sizeof(shard_filename)) != 0) {
+        return -1;
+    }
+    if (io_open_cached_bf16_shard(cache, shard_filename) != 0) {
+        return -1;
+    }
+
+    return io_map_layer_bf16_from_file(cache->current_shard_file, tensor_name, out_map, 0);
 }

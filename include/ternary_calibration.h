@@ -34,6 +34,11 @@ typedef struct {
     int calibration_samples;
     float kl_weight;
     float kl_temperature;
+    int kl_update_interval;
+    int kl_sample_count;
+    int early_stop_patience;
+    float early_stop_min_delta;
+    float early_stop_divergence_ratio;
     int simulate_activation_a8;
     int use_hessian_proxy;
     float hessian_proxy_strength;

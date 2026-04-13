@@ -30,6 +30,11 @@ typedef struct {
     int ste_steps;
     int progressive_calib;
     float kl_weight;
+    int kl_update_interval;
+    int kl_sample_count;
+    int early_stop_patience;
+    float early_stop_min_delta;
+    float early_stop_divergence_ratio;
     int disable_hessian_proxy;
     float hessian_proxy_strength;
     float hessian_proxy_floor;

@@ -17,6 +17,7 @@
 #include "transformer.h"
 #include "tensor.h"
 
+#include <immintrin.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,12 @@
 #define STE_EARLY_LAYER_PROXY_CAP                6.0f
 #define STE_GAMMA_FLOOR_EPSILON                  1e-5f
 #define STE_A8_QUANT_MAX                         127.0f
+#define STE_MAX_CALIBRATION_SAMPLES              16
+#define STE_DEFAULT_KL_SAMPLE_COUNT              4
+#define STE_DEFAULT_EARLY_STOP_PATIENCE          6
+#define STE_DEFAULT_EARLY_STOP_MIN_DELTA         1e-4f
+#define STE_DEFAULT_EARLY_STOP_DIVERGENCE_RATIO  1.25f
+#define STE_EARLY_STOP_MIN_STEPS                 8u
 
 static const char *g_calibration_docs[] = {
     "A careful systems design balances latency, memory locality, and correctness under constrained hardware budgets.",
@@ -73,6 +80,11 @@ static transformer_ste_config_t default_ste_config(void) {
     config.calibration_samples = 4;
     config.kl_weight = 0.05f;
     config.kl_temperature = 1.0f;
+    config.kl_update_interval = 4;
+    config.kl_sample_count = STE_DEFAULT_KL_SAMPLE_COUNT;
+    config.early_stop_patience = STE_DEFAULT_EARLY_STOP_PATIENCE;
+    config.early_stop_min_delta = STE_DEFAULT_EARLY_STOP_MIN_DELTA;
+    config.early_stop_divergence_ratio = STE_DEFAULT_EARLY_STOP_DIVERGENCE_RATIO;
     config.simulate_activation_a8 = 0;
     config.use_hessian_proxy = 1;
     config.hessian_proxy_strength = 1.0f;
@@ -88,11 +100,25 @@ static transformer_ste_config_t default_ste_config(void) {
     return config;
 }
 
-static void normalize_ste_config(transformer_ste_config_t *config) {
-    if (!config) {
-        return;
-    }
+static double hsum_m256d(__m256d value)
+{
+    double lanes[4];
 
+    _mm256_storeu_pd(lanes, value);
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3];
+}
+
+static float hsum_m256(__m256 value)
+{
+    float lanes[8];
+
+    _mm256_storeu_ps(lanes, value);
+    return lanes[0] + lanes[1] + lanes[2] + lanes[3] +
+           lanes[4] + lanes[5] + lanes[6] + lanes[7];
+}
+
+static void normalize_ste_training_config(transformer_ste_config_t *config)
+{
     if (config->ste_steps <= 0) config->ste_steps = 1;
     if (config->learning_rate <= 0.0f) config->learning_rate = 0.05f;
     if (config->zero_threshold < 0.0f) config->zero_threshold = 0.05f;
@@ -103,10 +129,30 @@ static void normalize_ste_config(transformer_ste_config_t *config) {
         config->zero_occupancy_floor = 0.75f;
     }
     if (config->clip_value <= 0.0f) config->clip_value = 1.0f;
+}
+
+static void normalize_ste_distillation_config(transformer_ste_config_t *config)
+{
     if (config->calibration_samples <= 0) config->calibration_samples = 4;
-    if (config->calibration_samples > 16) config->calibration_samples = 16;
+    if (config->calibration_samples > STE_MAX_CALIBRATION_SAMPLES) {
+        config->calibration_samples = STE_MAX_CALIBRATION_SAMPLES;
+    }
     if (config->kl_weight < 0.0f) config->kl_weight = 0.0f;
     if (config->kl_temperature <= 0.0f) config->kl_temperature = 1.0f;
+    if (config->kl_update_interval <= 0) config->kl_update_interval = 4;
+    if (config->kl_sample_count <= 0) config->kl_sample_count = STE_DEFAULT_KL_SAMPLE_COUNT;
+    if (config->kl_sample_count > STE_MAX_CALIBRATION_SAMPLES) {
+        config->kl_sample_count = STE_MAX_CALIBRATION_SAMPLES;
+    }
+    if (config->early_stop_patience < 0) config->early_stop_patience = STE_DEFAULT_EARLY_STOP_PATIENCE;
+    if (config->early_stop_min_delta < 0.0f) config->early_stop_min_delta = STE_DEFAULT_EARLY_STOP_MIN_DELTA;
+    if (config->early_stop_divergence_ratio < 0.0f) {
+        config->early_stop_divergence_ratio = STE_DEFAULT_EARLY_STOP_DIVERGENCE_RATIO;
+    }
+}
+
+static void normalize_ste_runtime_config(transformer_ste_config_t *config)
+{
     config->simulate_activation_a8 = config->simulate_activation_a8 ? 1 : 0;
     config->use_hessian_proxy = config->use_hessian_proxy ? 1 : 0;
     if (config->hessian_proxy_strength < 0.0f) config->hessian_proxy_strength = 1.0f;
@@ -115,6 +161,16 @@ static void normalize_ste_config(transformer_ste_config_t *config) {
     if (config->adam_beta2 < 0.0f || config->adam_beta2 >= 1.0f) config->adam_beta2 = 0.95f;
     if (config->adam_epsilon <= 0.0f) config->adam_epsilon = 1e-8f;
     if (config->telemetry_interval <= 0) config->telemetry_interval = 10;
+}
+
+static void normalize_ste_config(transformer_ste_config_t *config) {
+    if (!config) {
+        return;
+    }
+
+    normalize_ste_training_config(config);
+    normalize_ste_distillation_config(config);
+    normalize_ste_runtime_config(config);
 }
 
 static size_t ternary_packed_bytes(uint32_t rows, uint32_t cols) {
@@ -250,14 +306,29 @@ static float ste_compute_teacher_abs_mean(const float *calibration_vectors,
                                           uint32_t cols)
 {
     double abs_sum = 0.0;
+    const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+    __m256d abs_sum_lo = _mm256_setzero_pd();
+    __m256d abs_sum_hi = _mm256_setzero_pd();
     size_t value_count = 0u;
+    size_t value_idx = 0u;
 
     if (!calibration_vectors || sample_count <= 0 || cols == 0u) {
         return 0.0f;
     }
 
     value_count = (size_t)sample_count * cols;
-    for (size_t value_idx = 0u; value_idx < value_count; ++value_idx) {
+    for (; value_idx + 8u <= value_count; value_idx += 8u) {
+        __m256 values = _mm256_loadu_ps(calibration_vectors + value_idx);
+        __m256 abs_values = _mm256_and_ps(values, abs_mask);
+        __m128 low = _mm256_castps256_ps128(abs_values);
+        __m128 high = _mm256_extractf128_ps(abs_values, 1);
+
+        abs_sum_lo = _mm256_add_pd(abs_sum_lo, _mm256_cvtps_pd(low));
+        abs_sum_hi = _mm256_add_pd(abs_sum_hi, _mm256_cvtps_pd(high));
+    }
+
+    abs_sum = hsum_m256d(abs_sum_lo) + hsum_m256d(abs_sum_hi);
+    for (; value_idx < value_count; ++value_idx) {
         abs_sum += fabs((double)calibration_vectors[value_idx]);
     }
 
@@ -1080,12 +1151,21 @@ static void ste_accumulate_row_gradients(const float *latent_row,
 static float compute_gradient_norm(const float *gradient, size_t weight_count)
 {
     double sumsq = 0.0;
+    __m256 acc = _mm256_setzero_ps();
+    size_t weight_idx = 0u;
 
     if (!gradient || weight_count == 0u) {
         return 0.0f;
     }
 
-    for (size_t weight_idx = 0; weight_idx < weight_count; ++weight_idx) {
+    for (; weight_idx + 8u <= weight_count; weight_idx += 8u) {
+        __m256 grad = _mm256_loadu_ps(gradient + weight_idx);
+
+        acc = _mm256_fmadd_ps(grad, grad, acc);
+    }
+
+    sumsq = (double)hsum_m256(acc);
+    for (; weight_idx < weight_count; ++weight_idx) {
         double grad = (double)gradient[weight_idx];
 
         sumsq += grad * grad;
@@ -1135,6 +1215,7 @@ static float apply_adam_updates(float *latent,
     float one_minus_beta1 = 0.0f;
     float one_minus_beta2 = 0.0f;
     size_t saturated_count = 0u;
+    size_t weight_idx = 0u;
 
     if (!latent || !gradient || !first_moment || !second_moment || !context || weight_count == 0u) {
         return 0.0f;
@@ -1149,7 +1230,51 @@ static float apply_adam_updates(float *latent,
     one_minus_beta1 = 1.0f - beta1;
     one_minus_beta2 = 1.0f - beta2;
 
-    for (size_t weight_idx = 0; weight_idx < weight_count; ++weight_idx) {
+    {
+        const __m256 beta1_vec = _mm256_set1_ps(beta1);
+        const __m256 beta2_vec = _mm256_set1_ps(beta2);
+        const __m256 one_minus_beta1_vec = _mm256_set1_ps(one_minus_beta1);
+        const __m256 one_minus_beta2_vec = _mm256_set1_ps(one_minus_beta2);
+        const __m256 inv_beta1_correction_vec = _mm256_set1_ps(inv_beta1_correction);
+        const __m256 inv_beta2_correction_vec = _mm256_set1_ps(inv_beta2_correction);
+        const __m256 learning_rate_vec = _mm256_set1_ps(context->learning_rate);
+        const __m256 epsilon_vec = _mm256_set1_ps(context->epsilon);
+        const __m256 clip_vec = _mm256_set1_ps(context->clip_value);
+        const __m256 neg_clip_vec = _mm256_set1_ps(-context->clip_value);
+        const __m256 saturation_limit_vec = _mm256_set1_ps(context->clip_value - 1e-6f);
+        const __m256 abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+
+        for (; weight_idx + 8u <= weight_count; weight_idx += 8u) {
+            __m256 grad = _mm256_loadu_ps(gradient + weight_idx);
+            __m256 first_prev = _mm256_loadu_ps(first_moment + weight_idx);
+            __m256 second_prev = _mm256_loadu_ps(second_moment + weight_idx);
+            __m256 latent_vec = _mm256_loadu_ps(latent + weight_idx);
+            __m256 first = _mm256_fmadd_ps(one_minus_beta1_vec,
+                                           grad,
+                                           _mm256_mul_ps(beta1_vec, first_prev));
+            __m256 grad_sq = _mm256_mul_ps(grad, grad);
+            __m256 second = _mm256_fmadd_ps(one_minus_beta2_vec,
+                                            grad_sq,
+                                            _mm256_mul_ps(beta2_vec, second_prev));
+            __m256 first_hat = _mm256_mul_ps(first, inv_beta1_correction_vec);
+            __m256 second_hat = _mm256_mul_ps(second, inv_beta2_correction_vec);
+            __m256 denom = _mm256_add_ps(_mm256_sqrt_ps(second_hat), epsilon_vec);
+            __m256 update = _mm256_mul_ps(learning_rate_vec, _mm256_div_ps(first_hat, denom));
+            __m256 clipped_latent = _mm256_sub_ps(latent_vec, update);
+
+            clipped_latent = _mm256_max_ps(clipped_latent, neg_clip_vec);
+            clipped_latent = _mm256_min_ps(clipped_latent, clip_vec);
+            _mm256_storeu_ps(first_moment + weight_idx, first);
+            _mm256_storeu_ps(second_moment + weight_idx, second);
+            _mm256_storeu_ps(latent + weight_idx, clipped_latent);
+
+            __m256 abs_latent = _mm256_and_ps(clipped_latent, abs_mask);
+            __m256 saturation_mask = _mm256_cmp_ps(abs_latent, saturation_limit_vec, _CMP_GE_OQ);
+            saturated_count += (size_t)__builtin_popcount((unsigned)_mm256_movemask_ps(saturation_mask));
+        }
+    }
+
+    for (; weight_idx < weight_count; ++weight_idx) {
         float grad = gradient[weight_idx];
         float first = beta1 * first_moment[weight_idx] + one_minus_beta1 * grad;
         float second = beta2 * second_moment[weight_idx] + one_minus_beta2 * grad * grad;
@@ -1319,6 +1444,13 @@ static float compute_logits_kl(const float *reference_logits,
 }
 
 typedef struct {
+    float *reference_logits;
+    int sample_count;
+    int vocab_size;
+    int ready;
+} distillation_reference_cache_t;
+
+typedef struct {
     const int8_t *ternary;
     const float *scales;
     uint32_t rows;
@@ -1327,6 +1459,8 @@ typedef struct {
     const ternary_calibration_corpus_t *corpus;
     float *out_sample_weights;
     int sample_count;
+    int kl_sample_count;
+    distillation_reference_cache_t *reference_cache;
 } distillation_weight_request_t;
 
 typedef struct {
@@ -1343,12 +1477,367 @@ typedef struct {
     float kl_temperature;
 } distillation_runtime_t;
 
+typedef struct {
+    tensor_t **slot;
+    tensor_t *original_tensor;
+    tensor_t *proxy_tensor;
+    float *reference_logits;
+    float *proxy_logits;
+    float *reference_probs;
+    float *proxy_probs;
+} distillation_runtime_buffers_t;
+
+static int populate_reference_logits(const distillation_runtime_t *runtime,
+                                     const char *sample_text,
+                                     float *out_reference_logits);
+
 static float compute_sample_distillation_weight(const distillation_runtime_t *runtime,
-                                                const char *sample_text) {
-    float kl = 0.0f;
+                                                const float *reference_logits,
+                                                const char *sample_text);
+
+static void distillation_reference_cache_reset(distillation_reference_cache_t *cache)
+{
+    if (!cache) {
+        return;
+    }
+
+    memset(cache, 0, sizeof(*cache));
+}
+
+static void distillation_reference_cache_release(distillation_reference_cache_t *cache)
+{
+    if (!cache) {
+        return;
+    }
+
+    free(cache->reference_logits);
+    distillation_reference_cache_reset(cache);
+}
+
+static int distillation_reference_cache_prepare(distillation_reference_cache_t *cache,
+                                                int sample_count,
+                                                int vocab_size)
+{
+    size_t cache_size = 0u;
+
+    if (!cache || sample_count <= 0 || vocab_size <= 0) {
+        return -1;
+    }
+    if (cache->reference_logits && cache->sample_count == sample_count && cache->vocab_size == vocab_size) {
+        return 0;
+    }
+
+    cache_size = (size_t)sample_count * (size_t)vocab_size * sizeof(float);
+    free(cache->reference_logits);
+    cache->reference_logits = (float *)malloc(cache_size);
+    if (!cache->reference_logits) {
+        distillation_reference_cache_reset(cache);
+        return -1;
+    }
+
+    cache->sample_count = sample_count;
+    cache->vocab_size = vocab_size;
+    cache->ready = 0;
+    return 0;
+}
+
+static float *distillation_reference_cache_sample_logits(const distillation_reference_cache_t *cache,
+                                                         int sample_index)
+{
+    if (!cache || !cache->reference_logits || sample_index < 0 || sample_index >= cache->sample_count) {
+        return NULL;
+    }
+
+    return cache->reference_logits + ((size_t)sample_index * (size_t)cache->vocab_size);
+}
+
+static int distillation_effective_sample_count(const distillation_weight_request_t *request)
+{
+    int effective_sample_count = 0;
+
+    if (!request || request->sample_count <= 0) {
+        return 0;
+    }
+
+    effective_sample_count = request->sample_count;
+    if (request->kl_sample_count > 0 && request->kl_sample_count < effective_sample_count) {
+        effective_sample_count = request->kl_sample_count;
+    }
+    if (request->corpus && request->corpus->sample_count > 0 && request->corpus->sample_count < effective_sample_count) {
+        effective_sample_count = request->corpus->sample_count;
+    }
+
+    return effective_sample_count;
+}
+
+static const char *distillation_sample_text(const ternary_calibration_corpus_t *corpus,
+                                            int sample_index)
+{
+    if (!corpus || !corpus->sample_texts || corpus->sample_count <= 0 || sample_index < 0) {
+        return NULL;
+    }
+
+    return corpus->sample_texts[sample_index % corpus->sample_count];
+}
+
+static int distillation_request_enabled(const distillation_weight_request_t *request,
+                                        int effective_sample_count)
+{
+    const transformer_ste_config_t *config = request ? request->config : NULL;
+    const ternary_calibration_corpus_t *corpus = request ? request->corpus : NULL;
+
+    if (!request || !request->out_sample_weights || request->sample_count <= 0 || effective_sample_count <= 0) {
+        return 0;
+    }
+    if (!config || config->kl_weight <= 0.0f) {
+        return 0;
+    }
+    if (!corpus || !corpus->session || !corpus->tokenizer || !corpus->model_spec ||
+        !corpus->tensor_name || !corpus->sample_texts || corpus->sample_count <= 0) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static void distillation_runtime_buffers_reset(distillation_runtime_buffers_t *buffers)
+{
+    if (!buffers) {
+        return;
+    }
+
+    memset(buffers, 0, sizeof(*buffers));
+}
+
+static void distillation_runtime_buffers_release(distillation_runtime_buffers_t *buffers)
+{
+    if (!buffers) {
+        return;
+    }
+
+    if (buffers->slot) {
+        *buffers->slot = buffers->original_tensor;
+    }
+    free(buffers->reference_logits);
+    free(buffers->proxy_logits);
+    free(buffers->reference_probs);
+    free(buffers->proxy_probs);
+    tensor_release(buffers->proxy_tensor);
+    distillation_runtime_buffers_reset(buffers);
+}
+
+static int distillation_alloc_runtime_buffers(distillation_runtime_buffers_t *buffers,
+                                              int vocab_size)
+{
+    size_t logits_size = 0u;
+
+    if (!buffers || vocab_size <= 0) {
+        return -1;
+    }
+
+    logits_size = (size_t)vocab_size * sizeof(float);
+    buffers->reference_logits = (float *)malloc(logits_size);
+    buffers->proxy_logits = (float *)malloc(logits_size);
+    buffers->reference_probs = (float *)malloc(logits_size);
+    buffers->proxy_probs = (float *)malloc(logits_size);
+    if (!buffers->reference_logits || !buffers->proxy_logits ||
+        !buffers->reference_probs || !buffers->proxy_probs) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int distillation_prepare_runtime(const distillation_weight_request_t *request,
+                                        distillation_runtime_t *runtime,
+                                        distillation_runtime_buffers_t *buffers)
+{
+    const ternary_calibration_corpus_t *corpus = request ? request->corpus : NULL;
+    llm_model_t *model = NULL;
+    const gemma3_270m_config_t *model_config = NULL;
+
+    if (!request || !runtime || !buffers || !corpus || !corpus->model_spec) {
+        return -1;
+    }
+
+    distillation_runtime_buffers_reset(buffers);
+    model = (llm_model_t *)corpus->model_spec->llm_model;
+    model_config = (gemma3_270m_config_t *)corpus->model_spec->variant_config;
+    if (!model || !model_config) {
+        return -1;
+    }
+
+    buffers->slot = resolve_tensor_slot(model, corpus->model_spec, corpus->tensor_name);
+    if (!buffers->slot || !*buffers->slot) {
+        return -1;
+    }
+
+    buffers->original_tensor = *buffers->slot;
+    buffers->proxy_tensor = build_proxy_tensor_from_ternary(request->ternary,
+                                                            request->scales,
+                                                            request->rows,
+                                                            request->cols);
+    if (!buffers->proxy_tensor) {
+        distillation_runtime_buffers_release(buffers);
+        return -1;
+    }
+    if (distillation_alloc_runtime_buffers(buffers, model_config->vocab_size) != 0) {
+        distillation_runtime_buffers_release(buffers);
+        return -1;
+    }
+
+    memset(runtime, 0, sizeof(*runtime));
+    runtime->corpus = corpus;
+    runtime->slot = buffers->slot;
+    runtime->original_tensor = buffers->original_tensor;
+    runtime->proxy_tensor = buffers->proxy_tensor;
+    runtime->model_config = model_config;
+    runtime->reference_logits = buffers->reference_logits;
+    runtime->proxy_logits = buffers->proxy_logits;
+    runtime->reference_probs = buffers->reference_probs;
+    runtime->proxy_probs = buffers->proxy_probs;
+    runtime->kl_weight = request->config->kl_weight;
+    runtime->kl_temperature = request->config->kl_temperature;
+    return 0;
+}
+
+static distillation_reference_cache_t *distillation_prepare_reference_cache_state(
+    distillation_reference_cache_t *cache,
+    const distillation_runtime_t *runtime,
+    int effective_sample_count)
+{
+    if (!cache || !runtime || !runtime->model_config) {
+        return NULL;
+    }
+    if (distillation_reference_cache_prepare(cache,
+                                             effective_sample_count,
+                                             runtime->model_config->vocab_size) != 0) {
+        LOG_WARN("KL distillation: failed to allocate dense reference cache for %s",
+                 runtime->corpus ? runtime->corpus->tensor_name : "<unknown>");
+        return NULL;
+    }
+
+    return cache;
+}
+
+static distillation_reference_cache_t *distillation_warm_reference_cache(
+    distillation_reference_cache_t *cache,
+    const distillation_runtime_t *runtime,
+    int effective_sample_count)
+{
+    if (!cache || !runtime || cache->ready) {
+        return cache;
+    }
+
+    for (int sample_idx = 0; sample_idx < effective_sample_count; ++sample_idx) {
+        const char *sample_text = distillation_sample_text(runtime->corpus, sample_idx);
+        float *cached_reference_logits = distillation_reference_cache_sample_logits(cache, sample_idx);
+
+        if (!sample_text || !cached_reference_logits ||
+            populate_reference_logits(runtime, sample_text, cached_reference_logits) != 0) {
+            distillation_reference_cache_release(cache);
+            return NULL;
+        }
+    }
+
+    cache->ready = 1;
+    return cache;
+}
+
+static distillation_reference_cache_t *distillation_prepare_reference_cache_runtime(
+    distillation_reference_cache_t *cache,
+    const distillation_runtime_t *runtime,
+    int effective_sample_count)
+{
+    cache = distillation_prepare_reference_cache_state(cache, runtime, effective_sample_count);
+    return distillation_warm_reference_cache(cache, runtime, effective_sample_count);
+}
+
+static const float *distillation_resolve_reference_logits(const distillation_runtime_t *runtime,
+                                                          const distillation_reference_cache_t *cache,
+                                                          int sample_index)
+{
+    const char *sample_text = distillation_sample_text(runtime ? runtime->corpus : NULL, sample_index);
+    const float *cached_reference_logits = NULL;
 
     if (!runtime || !sample_text) {
-        return 1.0f;
+        return NULL;
+    }
+    if (cache) {
+        cached_reference_logits = distillation_reference_cache_sample_logits(cache, sample_index);
+    }
+    if (cached_reference_logits) {
+        return cached_reference_logits;
+    }
+    if (populate_reference_logits(runtime, sample_text, runtime->reference_logits) != 0) {
+        return NULL;
+    }
+
+    return runtime->reference_logits;
+}
+
+static void distillation_compute_unique_sample_weights(const distillation_runtime_t *runtime,
+                                                       const distillation_reference_cache_t *cache,
+                                                       int effective_sample_count,
+                                                       float *unique_sample_weights)
+{
+    for (int sample_idx = 0; sample_idx < effective_sample_count; ++sample_idx) {
+        const char *sample_text = distillation_sample_text(runtime ? runtime->corpus : NULL, sample_idx);
+        const float *reference_logits = distillation_resolve_reference_logits(runtime, cache, sample_idx);
+
+        if (!sample_text || !reference_logits) {
+            unique_sample_weights[sample_idx] = 1.0f;
+            continue;
+        }
+
+        unique_sample_weights[sample_idx] = compute_sample_distillation_weight(runtime,
+                                                                               reference_logits,
+                                                                               sample_text);
+    }
+}
+
+static void distillation_expand_sample_weights(const float *unique_sample_weights,
+                                               int effective_sample_count,
+                                               float *out_sample_weights,
+                                               int sample_count)
+{
+    if (!unique_sample_weights || !out_sample_weights || effective_sample_count <= 0) {
+        return;
+    }
+
+    for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+        out_sample_weights[sample_idx] = unique_sample_weights[sample_idx % effective_sample_count];
+    }
+}
+
+static void distillation_log_sample_weights(const distillation_weight_request_t *request,
+                                            int effective_sample_count)
+{
+    float avg_weight = 0.0f;
+
+    if (!request || !request->out_sample_weights || request->sample_count <= 0 ||
+        !request->config || !request->corpus) {
+        return;
+    }
+
+    for (int sample_idx = 0; sample_idx < request->sample_count; ++sample_idx) {
+        avg_weight += request->out_sample_weights[sample_idx];
+    }
+    avg_weight /= (float)request->sample_count;
+    LOG_INFO("Computed KL distillation weights: tensor=%s samples=%d kl_samples=%d temp=%.2f avg_weight=%.4f",
+             request->corpus->tensor_name,
+             request->sample_count,
+             effective_sample_count,
+             (double)request->config->kl_temperature,
+             (double)avg_weight);
+}
+
+static int populate_reference_logits(const distillation_runtime_t *runtime,
+                                     const char *sample_text,
+                                     float *out_reference_logits)
+{
+    if (!runtime || !sample_text || !out_reference_logits) {
+        return -1;
     }
 
     *runtime->slot = runtime->original_tensor;
@@ -1356,8 +1845,22 @@ static float compute_sample_distillation_weight(const distillation_runtime_t *ru
                           runtime->corpus->tokenizer,
                           runtime->corpus->model_spec,
                           sample_text,
-                          runtime->reference_logits,
+                          out_reference_logits,
                           runtime->model_config->vocab_size) != 0) {
+        *runtime->slot = runtime->original_tensor;
+        return -1;
+    }
+
+    *runtime->slot = runtime->original_tensor;
+    return 0;
+}
+
+static float compute_sample_distillation_weight(const distillation_runtime_t *runtime,
+                                                const float *reference_logits,
+                                                const char *sample_text) {
+    float kl = 0.0f;
+
+    if (!runtime || !reference_logits || !sample_text) {
         return 1.0f;
     }
 
@@ -1373,7 +1876,7 @@ static float compute_sample_distillation_weight(const distillation_runtime_t *ru
     }
     *runtime->slot = runtime->original_tensor;
 
-    kl = compute_logits_kl(runtime->reference_logits,
+    kl = compute_logits_kl(reference_logits,
                            runtime->proxy_logits,
                            runtime->reference_probs,
                            runtime->proxy_probs,
@@ -1386,101 +1889,41 @@ static float compute_sample_distillation_weight(const distillation_runtime_t *ru
 
 static void compute_distillation_sample_weights(const distillation_weight_request_t *request) {
     distillation_runtime_t runtime;
-    llm_model_t *model = NULL;
-    tensor_t **slot = NULL;
-    tensor_t *original_tensor = NULL;
-    tensor_t *proxy_tensor = NULL;
-    const gemma3_270m_config_t *model_config = NULL;
-    float *reference_logits = NULL;
-    float *proxy_logits = NULL;
-    float *reference_probs = NULL;
-    float *proxy_probs = NULL;
-    const transformer_ste_config_t *config = request ? request->config : NULL;
-    const ternary_calibration_corpus_t *corpus = request ? request->corpus : NULL;
-    float *out_sample_weights = request ? request->out_sample_weights : NULL;
-    int sample_count = request ? request->sample_count : 0;
-
-    for (int s = 0; s < sample_count; ++s) {
-        out_sample_weights[s] = 1.0f;
-    }
-
-    if (!config || config->kl_weight <= 0.0f || !corpus || !corpus->session ||
-        !corpus->tokenizer || !corpus->model_spec || !corpus->tensor_name ||
-        !corpus->sample_texts || corpus->sample_count <= 0 || sample_count <= 0) {
-        return;
-    }
-
-    model = (llm_model_t *)corpus->model_spec->llm_model;
-    model_config = (gemma3_270m_config_t *)corpus->model_spec->variant_config;
-    if (!model || !model_config) {
-        return;
-    }
-
-    slot = resolve_tensor_slot(model, corpus->model_spec, corpus->tensor_name);
-    if (!slot || !*slot) {
-        return;
-    }
-    original_tensor = *slot;
-    proxy_tensor = build_proxy_tensor_from_ternary(request->ternary,
-                                                   request->scales,
-                                                   request->rows,
-                                                   request->cols);
-    if (!proxy_tensor) {
-        return;
-    }
-
-    reference_logits = (float *)malloc((size_t)model_config->vocab_size * sizeof(float));
-    proxy_logits = (float *)malloc((size_t)model_config->vocab_size * sizeof(float));
-    reference_probs = (float *)malloc((size_t)model_config->vocab_size * sizeof(float));
-    proxy_probs = (float *)malloc((size_t)model_config->vocab_size * sizeof(float));
-    if (!reference_logits || !proxy_logits || !reference_probs || !proxy_probs) {
-        goto cleanup;
-    }
+    distillation_runtime_buffers_t buffers;
+    distillation_reference_cache_t *reference_cache = request ? request->reference_cache : NULL;
+    int effective_sample_count = distillation_effective_sample_count(request);
+    float unique_sample_weights[STE_MAX_CALIBRATION_SAMPLES];
 
     memset(&runtime, 0, sizeof(runtime));
-    runtime.corpus = corpus;
-    runtime.slot = slot;
-    runtime.original_tensor = original_tensor;
-    runtime.proxy_tensor = proxy_tensor;
-    runtime.model_config = model_config;
-    runtime.reference_logits = reference_logits;
-    runtime.proxy_logits = proxy_logits;
-    runtime.reference_probs = reference_probs;
-    runtime.proxy_probs = proxy_probs;
-    runtime.kl_weight = config->kl_weight;
-    runtime.kl_temperature = config->kl_temperature;
-
-    for (int s = 0; s < sample_count; ++s) {
-        const char *sample_text = corpus->sample_texts[s % corpus->sample_count];
-        out_sample_weights[s] = compute_sample_distillation_weight(&runtime, sample_text);
+    distillation_runtime_buffers_reset(&buffers);
+    if (request && request->out_sample_weights && request->sample_count > 0) {
+        ste_fill_unit_sample_weights(request->out_sample_weights, request->sample_count);
+    }
+    if (!distillation_request_enabled(request, effective_sample_count)) {
+        return;
+    }
+    if (distillation_prepare_runtime(request, &runtime, &buffers) != 0) {
+        return;
     }
 
-    {
-        float avg_weight = 0.0f;
-        for (int s = 0; s < sample_count; ++s) {
-            avg_weight += out_sample_weights[s];
-        }
-        avg_weight /= (float)sample_count;
-        LOG_INFO("Computed KL distillation weights: tensor=%s samples=%d temp=%.2f avg_weight=%.4f",
-                 corpus->tensor_name,
-                 sample_count,
-                 (double)config->kl_temperature,
-                 (double)avg_weight);
-    }
-
-cleanup:
-    if (slot) {
-        *slot = original_tensor;
-    }
-    free(reference_logits);
-    free(proxy_logits);
-    free(reference_probs);
-    free(proxy_probs);
-    tensor_release(proxy_tensor);
+    reference_cache = distillation_prepare_reference_cache_runtime(reference_cache,
+                                                                   &runtime,
+                                                                   effective_sample_count);
+    distillation_compute_unique_sample_weights(&runtime,
+                                               reference_cache,
+                                               effective_sample_count,
+                                               unique_sample_weights);
+    distillation_expand_sample_weights(unique_sample_weights,
+                                       effective_sample_count,
+                                       request->out_sample_weights,
+                                       request->sample_count);
+    distillation_log_sample_weights(request, effective_sample_count);
+    distillation_runtime_buffers_release(&buffers);
 }
 
 typedef struct {
     float *latent;
+    float *best_latent;
     float *first_moment;
     float *second_moment;
     float *gradient;
@@ -1490,9 +1933,14 @@ typedef struct {
     uint32_t rows;
     uint32_t cols;
     const transformer_ste_config_t *config;
+    const char *tensor_name;
     const float *calibration_vectors;
     const ternary_calibration_corpus_t *corpus;
     const float *hessian_proxy;
+    distillation_reference_cache_t *distillation_reference_cache;
+    float *distillation_sample_weights;
+    int *distillation_sample_weight_count;
+    uint32_t *distillation_sample_weight_step;
     ternary_hessian_proxy_stats_t hessian_proxy_stats;
     ternary_hessian_proxy_source_t hessian_proxy_source;
     ste_layer_schedule_t layer_schedule;
@@ -1513,6 +1961,7 @@ typedef struct {
     const float *calibration_vectors;
     int sample_count;
     uint32_t cols;
+    kernel_context_t *parallel_ctx;
 } hessian_proxy_request_t;
 
 typedef struct {
@@ -1558,11 +2007,40 @@ static void ste_build_step_schedule(const ste_calibration_context_t *context,
     }
 }
 
+static int ste_should_refresh_distillation_weights(const ste_calibration_context_t *context,
+                                                   uint32_t step_index,
+                                                   int sample_count)
+{
+    int update_interval = 4;
+
+    if (!context || !context->config) {
+        return 0;
+    }
+
+    if (context->config->kl_update_interval > 0) {
+        update_interval = context->config->kl_update_interval;
+    }
+
+    if (!context->distillation_sample_weights ||
+        !context->distillation_sample_weight_count ||
+        !context->distillation_sample_weight_step ||
+        *context->distillation_sample_weight_count != sample_count ||
+        *context->distillation_sample_weight_step == 0u) {
+        return 1;
+    }
+
+    if (update_interval <= 1) {
+        return 1;
+    }
+
+    return step_index == 1u || (((step_index - 1u) % (uint32_t)update_interval) == 0u);
+}
+
 static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_context_t *context,
                                                      uint32_t step_index,
                                                      ste_step_schedule_t *out_step_schedule)
 {
-    float sample_weights[16];
+    float sample_weights[STE_MAX_CALIBRATION_SAMPLES];
     ste_gradient_accum_context_t gradient_context;
     ste_optimizer_context_t optimizer_context;
     distillation_weight_request_t distillation_request;
@@ -1580,8 +2058,8 @@ static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_conte
     }
 
     sample_count = context->config->calibration_samples;
-    if (sample_count > (int)(sizeof(sample_weights) / sizeof(sample_weights[0]))) {
-        sample_count = (int)(sizeof(sample_weights) / sizeof(sample_weights[0]));
+    if (sample_count > STE_MAX_CALIBRATION_SAMPLES) {
+        sample_count = STE_MAX_CALIBRATION_SAMPLES;
     }
     weight_count = (size_t)context->rows * context->cols;
     ste_fill_unit_sample_weights(sample_weights, sample_count);
@@ -1601,16 +2079,33 @@ static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_conte
     });
 
     if (context->config->kl_weight > 0.0f) {
-        memset(&distillation_request, 0, sizeof(distillation_request));
-        distillation_request.ternary = context->ternary;
-        distillation_request.scales = context->scales;
-        distillation_request.rows = context->rows;
-        distillation_request.cols = context->cols;
-        distillation_request.config = context->config;
-        distillation_request.corpus = context->corpus;
-        distillation_request.out_sample_weights = sample_weights;
-        distillation_request.sample_count = sample_count;
-        compute_distillation_sample_weights(&distillation_request);
+        if (ste_should_refresh_distillation_weights(context, step_index, sample_count)) {
+            memset(&distillation_request, 0, sizeof(distillation_request));
+            distillation_request.ternary = context->ternary;
+            distillation_request.scales = context->scales;
+            distillation_request.rows = context->rows;
+            distillation_request.cols = context->cols;
+            distillation_request.config = context->config;
+            distillation_request.corpus = context->corpus;
+            distillation_request.out_sample_weights = sample_weights;
+            distillation_request.sample_count = sample_count;
+            distillation_request.kl_sample_count = context->config->kl_sample_count;
+            distillation_request.reference_cache = context->distillation_reference_cache;
+            compute_distillation_sample_weights(&distillation_request);
+            if (context->distillation_sample_weights &&
+                context->distillation_sample_weight_count &&
+                context->distillation_sample_weight_step) {
+                memcpy(context->distillation_sample_weights,
+                       sample_weights,
+                       (size_t)sample_count * sizeof(sample_weights[0]));
+                *context->distillation_sample_weight_count = sample_count;
+                *context->distillation_sample_weight_step = step_index;
+            }
+        } else if (context->distillation_sample_weights) {
+            memcpy(sample_weights,
+                   context->distillation_sample_weights,
+                   (size_t)sample_count * sizeof(sample_weights[0]));
+        }
     }
 
     memset(context->gradient, 0, weight_count * sizeof(float));
@@ -1887,6 +2382,7 @@ static int prepare_hessian_proxy(const hessian_proxy_request_t *request,
     build_request.cols = request->cols;
     build_request.floor = request->config->hessian_proxy_floor;
     build_request.strength = request->config->hessian_proxy_strength;
+    build_request.parallel_ctx = request->parallel_ctx;
 
     if (ternary_hessian_proxy_build_diagonal(&build_request, proxy_buffer, &result->stats) != 0) {
         if (result->owned_proxy) {
@@ -1951,15 +2447,108 @@ static int pack_ternary_2bit(const int8_t *ternary,
     return 0;
 }
 
+typedef enum {
+    STE_EARLY_STOP_REASON_NONE = 0,
+    STE_EARLY_STOP_REASON_PLATEAU = 1,
+    STE_EARLY_STOP_REASON_DIVERGENCE = 2
+} ste_early_stop_reason_t;
+
+typedef struct {
+    float best_loss;
+    float previous_loss;
+    uint32_t best_step;
+    uint32_t plateau_steps;
+} ste_early_stop_state_t;
+
+static int ste_early_stop_enabled(const ste_calibration_context_t *context)
+{
+    return context && context->config && context->best_latent &&
+        context->config->early_stop_patience > 0 &&
+        context->config->ste_steps > (int)STE_EARLY_STOP_MIN_STEPS;
+}
+
+static const char *ste_early_stop_reason_name(ste_early_stop_reason_t reason)
+{
+    switch (reason) {
+        case STE_EARLY_STOP_REASON_PLATEAU: return "plateau";
+        case STE_EARLY_STOP_REASON_DIVERGENCE: return "divergence";
+        default: return "none";
+    }
+}
+
+static ste_early_stop_reason_t ste_update_early_stop_state(const ste_calibration_context_t *context,
+                                                           uint32_t step_index,
+                                                           float current_loss,
+                                                           ste_early_stop_state_t *state)
+{
+    float min_delta = 0.0f;
+    float divergence_ratio = 0.0f;
+    size_t weight_count = 0u;
+
+    if (!ste_early_stop_enabled(context) || !state) {
+        return STE_EARLY_STOP_REASON_NONE;
+    }
+
+    min_delta = context->config->early_stop_min_delta;
+    divergence_ratio = context->config->early_stop_divergence_ratio;
+    weight_count = (size_t)context->rows * context->cols;
+
+    if (state->best_step == 0u || current_loss + min_delta < state->best_loss) {
+        state->best_loss = current_loss;
+        state->best_step = step_index;
+        state->plateau_steps = 0u;
+        memcpy(context->best_latent, context->latent, weight_count * sizeof(float));
+    } else {
+        state->plateau_steps++;
+    }
+
+    if (step_index < STE_EARLY_STOP_MIN_STEPS) {
+        state->previous_loss = current_loss;
+        return STE_EARLY_STOP_REASON_NONE;
+    }
+    if (divergence_ratio > 1.0f &&
+        state->best_loss > 1e-12f &&
+        current_loss > state->best_loss * divergence_ratio &&
+        current_loss > state->previous_loss + min_delta) {
+        state->previous_loss = current_loss;
+        return STE_EARLY_STOP_REASON_DIVERGENCE;
+    }
+    if (state->plateau_steps >= (uint32_t)context->config->early_stop_patience) {
+        state->previous_loss = current_loss;
+        return STE_EARLY_STOP_REASON_PLATEAU;
+    }
+
+    state->previous_loss = current_loss;
+    return STE_EARLY_STOP_REASON_NONE;
+}
+
+static void ste_restore_best_latent(const ste_calibration_context_t *context,
+                                    const ste_early_stop_state_t *state)
+{
+    size_t weight_count = 0u;
+
+    if (!ste_early_stop_enabled(context) || !state || state->best_step == 0u) {
+        return;
+    }
+
+    weight_count = (size_t)context->rows * context->cols;
+    memcpy(context->latent, context->best_latent, weight_count * sizeof(float));
+}
+
 static int run_ste_calibration_steps(const ste_calibration_context_t *context,
                                      ternary_calibration_result_t *out_result,
                                      ste_telemetry_runtime_t *telemetry_runtime)
 {
+    ste_early_stop_state_t early_stop_state;
     size_t packed_bytes = 0u;
 
     if (!context || !out_result) {
         return -1;
     }
+
+    memset(&early_stop_state, 0, sizeof(early_stop_state));
+    early_stop_state.best_loss = INFINITY;
+    early_stop_state.previous_loss = INFINITY;
 
     packed_bytes = ternary_packed_bytes(context->rows, context->cols);
     for (int step = 0; step < context->config->ste_steps; ++step) {
@@ -1968,6 +2557,8 @@ static int run_ste_calibration_steps(const ste_calibration_context_t *context,
         struct timespec step_start;
         struct timespec step_end;
         ste_telemetry_step_t telemetry_step;
+        float current_loss = 0.0f;
+        ste_early_stop_reason_t stop_reason = STE_EARLY_STOP_REASON_NONE;
 
         memset(&step_schedule, 0, sizeof(step_schedule));
 
@@ -1978,13 +2569,20 @@ static int run_ste_calibration_steps(const ste_calibration_context_t *context,
         step_metrics = ste_calibrate_with_samples(context,
                               (uint32_t)(step + 1),
                               &step_schedule);
+        current_loss = (context->rows > 0u) ? (step_metrics.mse_sum / (float)context->rows) : 0.0f;
+        stop_reason = ste_update_early_stop_state(context,
+                                                  (uint32_t)(step + 1),
+                                                  current_loss,
+                                                  &early_stop_state);
 
         if (telemetry_runtime && telemetry_runtime->enabled) {
             (void)clock_gettime(CLOCK_MONOTONIC, &step_end);
             memset(&telemetry_step, 0, sizeof(telemetry_step));
             telemetry_step.step_idx = (uint32_t)step;
-            telemetry_step.total_steps = (uint32_t)context->config->ste_steps;
-            telemetry_step.mse_loss = (context->rows > 0u) ? (step_metrics.mse_sum / (float)context->rows) : 0.0f;
+            telemetry_step.total_steps = (stop_reason != STE_EARLY_STOP_REASON_NONE)
+                ? (uint32_t)(step + 1)
+                : (uint32_t)context->config->ste_steps;
+            telemetry_step.mse_loss = current_loss;
             telemetry_step.raw_grad_norm = step_metrics.raw_grad_norm;
             telemetry_step.clipped_grad_norm = step_metrics.clipped_grad_norm;
             telemetry_step.clip_scale = step_metrics.clip_scale;
@@ -2008,19 +2606,36 @@ static int run_ste_calibration_steps(const ste_calibration_context_t *context,
                 LOG_WARN("telemetry: failed to pack step snapshot");
             }
         }
+
+        if (stop_reason != STE_EARLY_STOP_REASON_NONE) {
+            LOG_INFO("STE early stop: tensor=%s step=%u reason=%s best_step=%u best_loss=%.6f current_loss=%.6f",
+                     context->tensor_name ? context->tensor_name : "<unknown>",
+                     (uint32_t)(step + 1),
+                     ste_early_stop_reason_name(stop_reason),
+                     early_stop_state.best_step,
+                     (double)early_stop_state.best_loss,
+                     (double)current_loss);
+            break;
+        }
     }
 
+    ste_restore_best_latent(context, &early_stop_state);
     return 0;
 }
 
 typedef struct {
+    float *best_latent;
     float *first_moment;
     float *second_moment;
     float *gradient;
     float *calibration_vectors;
     float *scale_floor;
+    float distillation_sample_weights[STE_MAX_CALIBRATION_SAMPLES];
+    distillation_reference_cache_t distillation_reference_cache;
     float teacher_abs_mean;
     int actual_sample_count;
+    int distillation_sample_weight_count;
+    uint32_t distillation_sample_weight_step;
     hessian_proxy_result_t hessian_proxy;
     ste_layer_schedule_t layer_schedule;
 } ste_calibration_workspace_t;
@@ -2042,8 +2657,9 @@ typedef struct {
     uint32_t rows;
     uint32_t cols;
     const transformer_ste_config_t *config;
+    const char *tensor_name;
     const ternary_calibration_corpus_t *corpus;
-    const ste_calibration_workspace_t *workspace;
+    ste_calibration_workspace_t *workspace;
 } ste_calibration_context_request_t;
 
 typedef struct {
@@ -2090,7 +2706,9 @@ static void ste_calibration_workspace_release(ste_calibration_workspace_t *works
     free(workspace->gradient);
     free(workspace->calibration_vectors);
     free(workspace->scale_floor);
+    free(workspace->best_latent);
     free(workspace->hessian_proxy.owned_proxy);
+    distillation_reference_cache_release(&workspace->distillation_reference_cache);
     ste_calibration_workspace_reset(workspace);
 }
 
@@ -2182,6 +2800,10 @@ static int ste_prepare_workspace(const ste_calibration_workspace_request_t *requ
     }
 
     ste_calibration_workspace_reset(workspace);
+    if (request->config->early_stop_patience > 0 &&
+        request->config->ste_steps > (int)STE_EARLY_STOP_MIN_STEPS) {
+        workspace->best_latent = (float *)malloc(request->weight_count * sizeof(float));
+    }
     workspace->first_moment = (float *)calloc(request->weight_count, sizeof(float));
     workspace->second_moment = (float *)calloc(request->weight_count, sizeof(float));
     workspace->gradient = (float *)malloc(request->weight_count * sizeof(float));
@@ -2204,6 +2826,12 @@ static int ste_prepare_workspace(const ste_calibration_workspace_request_t *requ
         (workspace->layer_schedule.early_layer_warmup && !workspace->scale_floor)) {
         ste_calibration_workspace_release(workspace);
         return -1;
+    }
+    if (!workspace->best_latent &&
+        request->config->early_stop_patience > 0 &&
+        request->config->ste_steps > (int)STE_EARLY_STOP_MIN_STEPS) {
+        LOG_WARN("STE early stop disabled for tensor=%s: failed to allocate best-latent buffer",
+                 resolve_calibration_tensor_name(request->corpus, request->tape_context));
     }
     if (workspace->scale_floor &&
         ste_build_scale_floor(&(ste_scale_floor_request_t){
@@ -2234,6 +2862,9 @@ static int ste_prepare_workspace(const ste_calibration_workspace_request_t *requ
     proxy_request.calibration_vectors = workspace->calibration_vectors;
     proxy_request.sample_count = workspace->actual_sample_count;
     proxy_request.cols = request->cols;
+    proxy_request.parallel_ctx = (request->corpus && request->corpus->session)
+        ? request->corpus->session->gemv_ctx
+        : NULL;
     if (prepare_hessian_proxy(&proxy_request, &workspace->hessian_proxy) != 0) {
         ste_calibration_workspace_release(workspace);
         return -1;
@@ -2269,6 +2900,7 @@ static void ste_init_calibration_context(ste_calibration_context_t *context,
 
     memset(context, 0, sizeof(*context));
     context->latent = request->result->latent_weights;
+    context->best_latent = request->workspace->best_latent;
     context->first_moment = request->workspace->first_moment;
     context->second_moment = request->workspace->second_moment;
     context->gradient = request->workspace->gradient;
@@ -2278,9 +2910,16 @@ static void ste_init_calibration_context(ste_calibration_context_t *context,
     context->rows = request->rows;
     context->cols = request->cols;
     context->config = request->config;
+    context->tensor_name = request->tensor_name;
     context->calibration_vectors = request->workspace->calibration_vectors;
     context->corpus = request->corpus;
     context->hessian_proxy = request->workspace->hessian_proxy.proxy;
+    context->distillation_reference_cache = &request->workspace->distillation_reference_cache;
+    context->distillation_sample_weights = request->workspace->distillation_sample_weights;
+    context->distillation_sample_weight_count =
+        &request->workspace->distillation_sample_weight_count;
+    context->distillation_sample_weight_step =
+        &request->workspace->distillation_sample_weight_step;
     context->hessian_proxy_stats = request->workspace->hessian_proxy.stats;
     context->hessian_proxy_source = request->workspace->hessian_proxy.source;
     context->layer_schedule = request->workspace->layer_schedule;
@@ -2394,6 +3033,7 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
     context_request.rows = rows;
     context_request.cols = cols;
     context_request.config = &effective_config;
+    context_request.tensor_name = tensor_name;
     context_request.corpus = corpus;
     context_request.workspace = &workspace;
     ste_init_calibration_context(&calibration_context, &context_request);
