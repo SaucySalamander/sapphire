@@ -185,8 +185,22 @@ static void parse_sapphire_feature_flags(const char *json,
         offsetof(gemma3_270m_config_t, sapphire_ffn_down_proj_input_rmsnorm),
         FIELD_BOOL
     };
+    int value_idx = -1;
+    char buf[64];
 
     parse_bool_field(json, tokens, nt, cfg, &DOWN_PROJ_INPUT_RMSNORM_FIELD);
+
+    value_idx = sjson_find_key(json, tokens, nt, 0, "sapphire_mixed_precision_anchors");
+    if (value_idx >= 0) {
+        int len = tokens[value_idx].end - tokens[value_idx].start;
+        cfg->sapphire_mixed_precision_anchors =
+            (len == 4 && strncmp(json + tokens[value_idx].start, "true", 4) == 0) ? 1 : 0;
+    }
+
+    value_idx = sjson_find_key(json, tokens, nt, 0, "sapphire_anchor_budget_ppm");
+    if (value_idx >= 0 && sjson_token_to_str(json, &tokens[value_idx], buf, sizeof(buf)) == 0) {
+        cfg->sapphire_anchor_budget_ppm = (uint32_t)strtoul(buf, NULL, 10);
+    }
 }
 
 /* Helper to populate all standard numeric, string, and boolean fields via tables */

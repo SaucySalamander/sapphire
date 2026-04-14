@@ -53,6 +53,8 @@ typedef struct gemma3_config {
     float rope_scaling;               /* nullable */
     float rope_theta;
     int sapphire_ffn_down_proj_input_rmsnorm;
+    int sapphire_mixed_precision_anchors;  /* Model uses ternary+BF16 anchor hybrid */
+    uint32_t sapphire_anchor_budget_ppm;   /* Anchor budget in parts-per-million */
     int sliding_window;
     const char *torch_dtype;
     const char *transformers_version;

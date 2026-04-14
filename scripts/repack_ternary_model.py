@@ -35,6 +35,9 @@ METADATA_FILES = (
     "README.md",
 )
 CONFIG_OVERRIDE_FILE = "sapphire_config_overrides.json"
+ANCHOR_MAGIC = 0x414E4331
+ANCHOR_VERSION = 1
+ANCHOR_METADATA_STRUCT = struct.Struct("<IIIIIIIIIfffII")
 
 
 WriteTensorData = Callable[[BinaryIO], None]
@@ -65,6 +68,8 @@ class TernaryManifestEntry:
     kind: str = "ternary"
     groups_per_row: int = 1
     scale_group_size: int = 0
+    anchor_file_name: str | None = None
+    anchor_count: int = 0
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -333,9 +338,22 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
             if len(parts) == 6:
                 name, file_name, rows, cols, packed_bytes, crc32 = parts
                 kind = "ternary"
+                anchor_file_name = None
+                anchor_count = 0
             elif len(parts) == 7:
                 name, file_name, rows, cols, packed_bytes, crc32, kind = parts
                 if kind not in {"mold"}:
+                    raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
+                anchor_file_name = None
+                anchor_count = 0
+            elif len(parts) == 8:
+                name, anchor_file_name, rows, cols, packed_bytes, crc32, kind, anchor_count = parts
+                if kind != "anchor":
+                    raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
+                file_name = ""
+            elif len(parts) == 9:
+                name, file_name, rows, cols, packed_bytes, crc32, kind, anchor_file_name, anchor_count = parts
+                if kind != "anchor":
                     raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
             else:
                 raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
@@ -348,20 +366,84 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
                 packed_weight_bytes=int(packed_bytes),
                 crc32=int(crc32, 16),
                 kind=kind,
+                anchor_file_name=anchor_file_name,
+                anchor_count=int(anchor_count),
             )
-            if kind == "ternary":
-                payload_path = ternary_dir / file_name
-                entry.groups_per_row, entry.scale_group_size = _read_ternary_payload_layout(
-                    payload_path,
-                    name,
-                    entry.rows,
-                    entry.cols,
-                )
-            entries[name] = entry
+            existing = entries.get(name)
+            if existing is None:
+                entries[name] = entry
+            else:
+                if existing.kind == "mold" or entry.kind == "mold":
+                    raise ValueError(f"Duplicate mold manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
+                if entry.file_name:
+                    if existing.file_name and existing.file_name != entry.file_name:
+                        raise ValueError(f"Conflicting bulk payload for {name} at {manifest_path}:{line_number}")
+                    existing.file_name = entry.file_name
+                    existing.crc32 = entry.crc32
+                    existing.packed_weight_bytes = entry.packed_weight_bytes
+                if entry.anchor_file_name:
+                    if existing.anchor_file_name and existing.anchor_file_name != entry.anchor_file_name:
+                        raise ValueError(f"Conflicting anchor payload for {name} at {manifest_path}:{line_number}")
+                    existing.anchor_file_name = entry.anchor_file_name
+                    existing.anchor_count = entry.anchor_count
+                if entry.kind == "anchor" or existing.kind == "anchor":
+                    existing.kind = "anchor"
+
+    for entry in entries.values():
+        if entry.kind in {"ternary", "anchor"}:
+            if not entry.file_name:
+                raise ValueError(f"Missing ternary bulk payload for {entry.name} in {manifest_path}")
+            payload_path = ternary_dir / entry.file_name
+            entry.groups_per_row, entry.scale_group_size = _read_ternary_payload_layout(
+                payload_path,
+                entry.name,
+                entry.rows,
+                entry.cols,
+            )
+        if entry.kind == "anchor":
+            if not entry.anchor_file_name or entry.anchor_count <= 0:
+                raise ValueError(f"Missing anchor payload metadata for {entry.name} in {manifest_path}")
 
     if not entries:
         raise RuntimeError(f"No ternary tensors found in {manifest_path}")
     return entries
+
+
+def _read_anchor_budget_ppm(ternary_dir: Path, entry: TernaryManifestEntry) -> int:
+    if entry.kind != "anchor" or not entry.anchor_file_name:
+        return 0
+
+    anchor_path = ternary_dir / entry.anchor_file_name
+    if not anchor_path.is_file():
+        raise FileNotFoundError(f"Missing anchor payload: {anchor_path}")
+
+    with anchor_path.open("rb") as anchor_file:
+        header = anchor_file.read(ANCHOR_METADATA_STRUCT.size)
+    if len(header) != ANCHOR_METADATA_STRUCT.size:
+        raise ValueError(f"Truncated anchor payload header: {anchor_path}")
+
+    (
+        magic,
+        version,
+        rows,
+        cols,
+        anchor_count,
+        _scale_group_size,
+        _groups_per_row,
+        _saliency_mode,
+        budget_ppm,
+        _saliency_cutoff,
+        _anchor_value_rms,
+        _bulk_gamma_mean,
+        _max_row_nnz,
+        _crc32,
+    ) = ANCHOR_METADATA_STRUCT.unpack(header)
+
+    if magic != ANCHOR_MAGIC or version != ANCHOR_VERSION:
+        raise ValueError(f"Invalid anchor payload header: {anchor_path}")
+    if rows != entry.rows or cols != entry.cols or anchor_count != entry.anchor_count:
+        raise ValueError(f"Anchor payload metadata mismatch for {entry.name}: {anchor_path}")
+    return int(budget_ppm)
 
 
 def _payload_meta(path: Path, header: OrderedDict, tensor_name: str, suffix: str) -> dict:
@@ -562,6 +644,42 @@ def _load_config_overrides(ternary_dir: Path) -> OrderedDict[str, object]:
     return OrderedDict(overrides.items())
 
 
+def _augment_anchor_config_overrides(overrides: OrderedDict[str, object],
+                                     manifest: OrderedDict[str, TernaryManifestEntry],
+                                     ternary_dir: Path) -> OrderedDict[str, object]:
+    budgets: set[int] = set()
+
+    if not any(entry.kind == "anchor" for entry in manifest.values()):
+        return overrides
+
+    if "sapphire_mixed_precision_anchors" in overrides:
+        if not bool(overrides["sapphire_mixed_precision_anchors"]):
+            raise ValueError("Config overrides disable sapphire_mixed_precision_anchors for an anchor-bearing artifact")
+    else:
+        overrides["sapphire_mixed_precision_anchors"] = True
+
+    for entry in manifest.values():
+        if entry.kind != "anchor":
+            continue
+        budget_ppm = _read_anchor_budget_ppm(ternary_dir, entry)
+        if budget_ppm > 0:
+            budgets.add(budget_ppm)
+
+    if len(budgets) > 1:
+        raise ValueError(f"Inconsistent anchor budgets in manifest: {sorted(budgets)}")
+    if budgets:
+        budget_ppm = next(iter(budgets))
+        if "sapphire_anchor_budget_ppm" in overrides:
+            if int(overrides["sapphire_anchor_budget_ppm"]) != budget_ppm:
+                raise ValueError(
+                    "Config override sapphire_anchor_budget_ppm does not match anchor payload metadata"
+                )
+        else:
+            overrides["sapphire_anchor_budget_ppm"] = budget_ppm
+
+    return overrides
+
+
 def _apply_config_overrides(output_dir: Path, overrides: OrderedDict[str, object]) -> None:
     config_path = output_dir / "config.json"
     config = OrderedDict()
@@ -578,6 +696,27 @@ def _apply_config_overrides(output_dir: Path, overrides: OrderedDict[str, object
     with config_path.open("w", encoding="utf-8") as config_file:
         json.dump(config, config_file, indent=2, ensure_ascii=False)
         config_file.write("\n")
+
+
+def _copy_anchor_sidecars(ternary_dir: Path,
+                          output_dir: Path,
+                          manifest: OrderedDict[str, TernaryManifestEntry],
+                          overwrite: bool) -> None:
+    copied: set[str] = set()
+
+    for entry in manifest.values():
+        if entry.kind != "anchor" or not entry.anchor_file_name or entry.anchor_file_name in copied:
+            continue
+
+        source_path = ternary_dir / entry.anchor_file_name
+        destination_path = output_dir / entry.anchor_file_name
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Missing anchor payload: {source_path}")
+        if destination_path.exists() and not overwrite:
+            raise FileExistsError(f"Refusing to overwrite existing file: {destination_path}")
+
+        shutil.copy2(source_path, destination_path)
+        copied.add(entry.anchor_file_name)
 
 
 def _pack_shards(tensor_items: list[OutputTensorItem], max_shard_size: int) -> list[list[OutputTensorItem]]:
@@ -734,7 +873,7 @@ def _build_output_tensor_items(
                 ),
                 stored_byte_count=entry.stored_byte_count,
                 writer=_make_ternary_writer(ternary_dir, entry),
-                source_kind="ternary",
+                source_kind="anchor" if entry.kind == "anchor" else "ternary",
                 manifest_entry=entry,
                 metadata_entries=(
                     (f"{name}.groups_per_row", entry.groups_per_row),
@@ -787,7 +926,7 @@ def _build_output_tensor_items(
                 ),
                 stored_byte_count=entry.stored_byte_count,
                 writer=_make_ternary_writer(ternary_dir, entry),
-                source_kind="ternary-extra",
+                source_kind="anchor-extra" if entry.kind == "anchor" else "ternary-extra",
                 manifest_entry=entry,
                 metadata_entries=(
                     (f"{name}.groups_per_row", entry.groups_per_row),
@@ -814,9 +953,16 @@ def _write_manifest(output_dir: Path,
             shard_name = logical_weight_map.get(tensor.logical_name)
             if shard_name is None:
                 raise KeyError(f"Missing shard assignment for ternary tensor {tensor.logical_name}")
-            manifest_file.write(
-                f"{tensor.logical_name}\t{shard_name}\t{entry.rows}\t{entry.cols}\t{entry.packed_weight_bytes}\t{entry.crc32:08x}\n"
-            )
+            if entry.kind == "anchor":
+                if not entry.anchor_file_name or entry.anchor_count <= 0:
+                    raise ValueError(f"Missing anchor manifest metadata for {tensor.logical_name}")
+                manifest_file.write(
+                    f"{tensor.logical_name}\t{shard_name}\t{entry.rows}\t{entry.cols}\t{entry.packed_weight_bytes}\t{entry.crc32:08x}\tanchor\t{entry.anchor_file_name}\t{entry.anchor_count}\n"
+                )
+            else:
+                manifest_file.write(
+                    f"{tensor.logical_name}\t{shard_name}\t{entry.rows}\t{entry.cols}\t{entry.packed_weight_bytes}\t{entry.crc32:08x}\n"
+                )
 
 
 def repack_ternary_model(
@@ -845,7 +991,13 @@ def repack_ternary_model(
 
     _ensure_output_dir_ready(output_dir, overwrite)
     _copy_metadata_files(base_model_dir, output_dir, overwrite=overwrite)
-    _apply_config_overrides(output_dir, _load_config_overrides(ternary_dir))
+    config_overrides = _augment_anchor_config_overrides(
+        _load_config_overrides(ternary_dir),
+        manifest,
+        ternary_dir,
+    )
+    _apply_config_overrides(output_dir, config_overrides)
+    _copy_anchor_sidecars(ternary_dir, output_dir, manifest, overwrite=overwrite)
 
     weight_map: dict[str, str] = {}
     logical_weight_map: dict[str, str] = {}

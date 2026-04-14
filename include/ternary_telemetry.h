@@ -43,6 +43,16 @@ typedef struct {
     float io_ms;
     float compute_ms;
     uint32_t config_hash;
+    /* Mixed-precision anchor mode telemetry (Prompt 06) */
+    uint32_t use_anchor_mode;
+    uint32_t anchor_count;
+    uint32_t anchor_budget_ppm;
+    uint32_t anchor_saliency_mode;
+    float anchor_saliency_cutoff;
+    float anchor_value_rms;
+    float bulk_gamma_mean;              /* Gamma computed over ternary bulk only */
+    float anchor_contribution_norm;     /* L2 norm of anchor contribution */
+    float bulk_contribution_norm;       /* L2 norm of ternary bulk contribution */
 } ternary_telemetry_t;
 
 typedef struct {

@@ -30,6 +30,10 @@ typedef struct {
     uint32_t alignment_manifest_crc32;
     uint32_t alignment_tape_provenance_hash;
     uint32_t hessian_sidecar_crc32;
+    /* Mixed-precision anchor mode fields */
+    uint32_t use_anchor_mode;
+    uint32_t anchor_budget_ppm;
+    uint32_t anchor_saliency_mode;
     char model_name[TERNARY_STUDENT_CHECKPOINT_MODEL_MAX];
     char teacher_model_name[TERNARY_STUDENT_CHECKPOINT_MODEL_MAX];
     char output_dir[TERNARY_STUDENT_CHECKPOINT_PATH_MAX];

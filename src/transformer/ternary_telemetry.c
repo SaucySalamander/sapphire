@@ -75,15 +75,29 @@ void ternary_telemetry_print_pass_stdout(const ternary_telemetry_t *telemetry)
         return;
     }
 
-    printf("calibration_pass layer_idx=%u gamma_scale=%.9g reconstruction_mse=%.9g raw_grad_norm=%.9g clipped_grad_norm=%.9g clip_scale=%.9g latent_saturation=%.9g hessian_active_max=%.9g\n",
-           telemetry->layer_idx,
-           (double)telemetry->gamma_scale,
-           (double)telemetry->mse_loss,
-           (double)telemetry->raw_grad_norm,
-           (double)telemetry->clipped_grad_norm,
-           (double)telemetry->clip_scale,
-           (double)telemetry->latent_saturation,
-           (double)telemetry->hessian_proxy_active_max);
+    if (telemetry->use_anchor_mode) {
+        printf("calibration_pass layer_idx=%u gamma_scale=%.9g bulk_gamma_mean=%.9g anchors=%u reconstruction_mse=%.9g raw_grad_norm=%.9g clipped_grad_norm=%.9g clip_scale=%.9g latent_saturation=%.9g hessian_active_max=%.9g\n",
+               telemetry->layer_idx,
+               (double)telemetry->gamma_scale,
+               (double)telemetry->bulk_gamma_mean,
+               telemetry->anchor_count,
+               (double)telemetry->mse_loss,
+               (double)telemetry->raw_grad_norm,
+               (double)telemetry->clipped_grad_norm,
+               (double)telemetry->clip_scale,
+               (double)telemetry->latent_saturation,
+               (double)telemetry->hessian_proxy_active_max);
+    } else {
+        printf("calibration_pass layer_idx=%u gamma_scale=%.9g reconstruction_mse=%.9g raw_grad_norm=%.9g clipped_grad_norm=%.9g clip_scale=%.9g latent_saturation=%.9g hessian_active_max=%.9g\n",
+               telemetry->layer_idx,
+               (double)telemetry->gamma_scale,
+               (double)telemetry->mse_loss,
+               (double)telemetry->raw_grad_norm,
+               (double)telemetry->clipped_grad_norm,
+               (double)telemetry->clip_scale,
+               (double)telemetry->latent_saturation,
+               (double)telemetry->hessian_proxy_active_max);
+    }
     fflush(stdout);
 }
 
@@ -147,6 +161,11 @@ static int telemetry_format_step_line(const ternary_telemetry_t *telemetry,
     char effective_hessian_scale_buf[32];
     char io_ms_buf[32];
     char compute_ms_buf[32];
+    char anchor_saliency_cutoff_buf[32];
+    char anchor_value_rms_buf[32];
+    char bulk_gamma_mean_buf[32];
+    char anchor_contribution_norm_buf[32];
+    char bulk_contribution_norm_buf[32];
     int written = 0;
 
     if (!telemetry || !line || line_size == 0u) {
@@ -155,7 +174,7 @@ static int telemetry_format_step_line(const ternary_telemetry_t *telemetry,
 
     written = snprintf(line,
                        line_size,
-                       "{\"record_type\":\"calibration_step\",\"config_hash\":%u,\"resume_step_idx\":%u,\"layer_idx\":%u,\"step_idx\":%u,\"tape_hash\":%u,\"student_checkpoint_hash\":%u,\"mse_loss\":%s,\"grad_norm\":%s,\"raw_grad_norm\":%s,\"clipped_grad_norm\":%s,\"clip_scale\":%s,\"latent_saturation\":%s,\"p_neg1\":%s,\"p_zero\":%s,\"p_pos1\":%s,\"gamma_scale\":%s,\"gamma_scale_min\":%s,\"gamma_scale_max\":%s,\"gamma_floor_fraction\":%s,\"hessian_proxy_mean\":%s,\"hessian_proxy_max\":%s,\"hessian_proxy_active_max\":%s,\"hessian_proxy_source\":%u,\"effective_learning_rate\":%s,\"effective_hessian_scale\":%s,\"io_ms\":%s,\"compute_ms\":%s}\n",
+                       "{\"record_type\":\"calibration_step\",\"config_hash\":%u,\"resume_step_idx\":%u,\"layer_idx\":%u,\"step_idx\":%u,\"tape_hash\":%u,\"student_checkpoint_hash\":%u,\"mse_loss\":%s,\"grad_norm\":%s,\"raw_grad_norm\":%s,\"clipped_grad_norm\":%s,\"clip_scale\":%s,\"latent_saturation\":%s,\"p_neg1\":%s,\"p_zero\":%s,\"p_pos1\":%s,\"gamma_scale\":%s,\"gamma_scale_min\":%s,\"gamma_scale_max\":%s,\"gamma_floor_fraction\":%s,\"hessian_proxy_mean\":%s,\"hessian_proxy_max\":%s,\"hessian_proxy_active_max\":%s,\"hessian_proxy_source\":%u,\"effective_learning_rate\":%s,\"effective_hessian_scale\":%s,\"io_ms\":%s,\"compute_ms\":%s,\"use_anchor_mode\":%u,\"anchor_count\":%u,\"anchor_budget_ppm\":%u,\"anchor_saliency_mode\":%u,\"anchor_saliency_cutoff\":%s,\"anchor_value_rms\":%s,\"bulk_gamma_mean\":%s,\"anchor_contribution_norm\":%s,\"bulk_contribution_norm\":%s}\n",
                        telemetry->config_hash,
                        telemetry->resume_step_idx,
                        telemetry->layer_idx,
@@ -188,7 +207,26 @@ static int telemetry_format_step_line(const ternary_telemetry_t *telemetry,
                                               sizeof(effective_hessian_scale_buf),
                                               telemetry->effective_hessian_scale),
                        telemetry_format_float(io_ms_buf, sizeof(io_ms_buf), telemetry->io_ms),
-                       telemetry_format_float(compute_ms_buf, sizeof(compute_ms_buf), telemetry->compute_ms));
+                       telemetry_format_float(compute_ms_buf, sizeof(compute_ms_buf), telemetry->compute_ms),
+                       telemetry->use_anchor_mode,
+                       telemetry->anchor_count,
+                       telemetry->anchor_budget_ppm,
+                       telemetry->anchor_saliency_mode,
+                       telemetry_format_float(anchor_saliency_cutoff_buf,
+                                              sizeof(anchor_saliency_cutoff_buf),
+                                              telemetry->anchor_saliency_cutoff),
+                       telemetry_format_float(anchor_value_rms_buf,
+                                              sizeof(anchor_value_rms_buf),
+                                              telemetry->anchor_value_rms),
+                       telemetry_format_float(bulk_gamma_mean_buf,
+                                              sizeof(bulk_gamma_mean_buf),
+                                              telemetry->bulk_gamma_mean),
+                       telemetry_format_float(anchor_contribution_norm_buf,
+                                              sizeof(anchor_contribution_norm_buf),
+                                              telemetry->anchor_contribution_norm),
+                       telemetry_format_float(bulk_contribution_norm_buf,
+                                              sizeof(bulk_contribution_norm_buf),
+                                              telemetry->bulk_contribution_norm));
     if (written < 0 || (size_t)written >= line_size) {
         return -1;
     }
@@ -199,7 +237,7 @@ static int telemetry_format_step_line(const ternary_telemetry_t *telemetry,
 int telemetry_dump_step(ternary_telemetry_writer_t *writer,
                         const ternary_telemetry_t *telemetry)
 {
-    char line[1024];
+    char line[1536];
     int written = 0;
 
     if (!writer || !writer->stream || !telemetry) {

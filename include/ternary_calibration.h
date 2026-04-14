@@ -13,6 +13,9 @@
 #include "ternary_hessian_proxy.h"
 #include "ternary_telemetry.h"
 
+/* Forward declaration for anchor types */
+typedef struct ternary_anchor_entry_t ternary_anchor_entry_t;
+
 typedef struct sapphire_tokenizer_t sapphire_tokenizer_t;
 typedef struct model_spec model_spec_t;
 typedef struct inference_session_t inference_session_t;
@@ -52,6 +55,14 @@ typedef struct {
     const char *hessian_sidecar_path;
     uint32_t hessian_sidecar_crc32;
     ternary_telemetry_t *telemetry;
+    /* Anchor mode configuration (Prompt 03) */
+    int use_anchor_mode;              /* Enable hybrid ternary+anchor */
+    uint32_t anchor_budget_ppm;       /* Anchor budget in parts-per-million */
+    int anchor_saliency_mode;         /* 0=none, 1=weight*hessian, 2=hessian, 3=weight */
+    float anchor_learning_rate_mult;  /* LR multiplier for anchor values vs bulk */
+    const ternary_anchor_entry_t *protected_anchor_entries; /* Internal STE freeze mask */
+    const uint32_t *protected_anchor_row_offsets;           /* Internal STE freeze mask */
+    uint32_t protected_anchor_count;                        /* Internal STE freeze mask */
 } transformer_ste_config_t;
 
 typedef struct {
@@ -86,6 +97,13 @@ typedef struct {
     uint32_t rows;
     uint32_t cols;
     uint32_t scale_group_size;
+    /* Anchor mode outputs (NULL if not in anchor mode) */
+    ternary_anchor_entry_t *anchor_entries;  /* Sorted by (row, col) */
+    uint32_t *anchor_row_offsets;            /* CSR-like row offsets (rows+1) */
+    uint32_t anchor_count;
+    float anchor_saliency_cutoff;
+    float anchor_value_rms;
+    float bulk_gamma_mean;                   /* Mean gamma for ternary bulk only */
 } ternary_calibration_result_t;
 
 int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
@@ -101,6 +119,27 @@ int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
                                     const transformer_ste_config_t *config,
                                     const ternary_calibration_corpus_t *corpus,
                                     ternary_calibration_result_t *out_result);
+
+/**
+ * @brief Calibrate a layer in hybrid anchor mode.
+ *
+ * Protected anchor coordinates bypass ternary quantization and are stored as BF16.
+ * The ternary bulk's gamma is computed excluding anchor positions.
+ *
+ * @param bf16_weights  Original BF16 weights [rows x cols]
+ * @param rows          Number of rows
+ * @param cols          Number of columns
+ * @param config        STE configuration (must have use_anchor_mode=1)
+ * @param source        Calibration source (tape, sidecar, etc.)
+ * @param out_result    Output calibration result with anchors
+ * @return 0 on success, -1 on error
+ */
+int transformer_calibrate_layer_ste_hybrid(const uint16_t *bf16_weights,
+                                           uint32_t rows,
+                                           uint32_t cols,
+                                           const transformer_ste_config_t *config,
+                                           const ternary_calibration_source_t *source,
+                                           ternary_calibration_result_t *out_result);
 
 void transformer_free_ternary_calibration_result(ternary_calibration_result_t *result);
 

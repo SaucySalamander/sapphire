@@ -1510,6 +1510,11 @@ static const gemma3_270m_config_t *vulkan_session_config_or_null(const model_spe
         LOG_ERROR("Vulkan backend does not yet support models with sapphire_ffn_down_proj_input_rmsnorm enabled");
         return NULL;
     }
+    /* Guard for mixed-precision anchor tensors (Prompt 07) */
+    if (cfg->sapphire_mixed_precision_anchors) {
+        LOG_ERROR("Vulkan backend does not yet support models with mixed-precision anchor tensors (sapphire_mixed_precision_anchors enabled)");
+        return NULL;
+    }
 
     return cfg;
 }

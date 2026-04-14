@@ -73,6 +73,10 @@ static float bf16_to_f32_scalar(uint16_t value) {
     return bits.f32;
 }
 
+static float hybrid_compute_anchor_contribution_norm(uint32_t anchor_count,
+                                                     float anchor_value_rms);
+static float hybrid_compute_bulk_contribution_norm(const ternary_calibration_result_t *result);
+
 static transformer_ste_config_t default_ste_config(void) {
     transformer_ste_config_t config;
     config.ste_steps = 3;
@@ -104,6 +108,13 @@ static transformer_ste_config_t default_ste_config(void) {
     config.hessian_sidecar_path = NULL;
     config.hessian_sidecar_crc32 = 0u;
     config.telemetry = NULL;
+    config.use_anchor_mode = 0;
+    config.anchor_budget_ppm = 0u;
+    config.anchor_saliency_mode = 0;
+    config.anchor_learning_rate_mult = 1.0f;
+    config.protected_anchor_entries = NULL;
+    config.protected_anchor_row_offsets = NULL;
+    config.protected_anchor_count = 0u;
     return config;
 }
 
@@ -785,6 +796,7 @@ static int ste_emit_telemetry_step(ste_telemetry_runtime_t *runtime,
     telemetry.gamma_scale_min = scale_stats.min;
     telemetry.gamma_scale_max = scale_stats.max;
     telemetry.gamma_floor_fraction = scale_stats.floor_fraction;
+    telemetry.bulk_gamma_mean = scale_stats.mean;
     {
         ternary_distribution_stats_t distribution_stats;
 
@@ -797,6 +809,9 @@ static int ste_emit_telemetry_step(ste_telemetry_runtime_t *runtime,
         telemetry.p_zero = distribution_stats.p_zero;
         telemetry.p_pos1 = distribution_stats.p_pos1;
     }
+    telemetry.anchor_contribution_norm = hybrid_compute_anchor_contribution_norm(telemetry.anchor_count,
+                                                                                 telemetry.anchor_value_rms);
+    telemetry.bulk_contribution_norm = hybrid_compute_bulk_contribution_norm(result);
     telemetry.effective_learning_rate = step->effective_learning_rate;
     telemetry.effective_hessian_scale = step->effective_hessian_scale;
     telemetry.hessian_proxy_active_max = telemetry_compute_active_hessian_proxy_max(telemetry.hessian_proxy_max,
@@ -1228,6 +1243,24 @@ typedef struct {
     uint32_t scale_group_size;
     float zero_threshold;
 } ste_quantize_rows_request_t;
+
+static void hybrid_mask_protected_coordinates(float *latent_weights,
+                                              uint32_t rows,
+                                              uint32_t cols,
+                                              const ternary_anchor_entry_t *entries,
+                                              uint32_t anchor_count);
+
+static void hybrid_zero_protected_gradient_row(float *gradient_row,
+                                               uint32_t row,
+                                               const ternary_anchor_entry_t *entries,
+                                               const uint32_t *row_offsets);
+
+static void hybrid_mask_protected_bf16_weights(uint16_t *masked_weights,
+                                               const uint16_t *source_weights,
+                                               uint32_t rows,
+                                               uint32_t cols,
+                                               const ternary_anchor_entry_t *entries,
+                                               uint32_t anchor_count);
 
 static void quantize_all_rows(const ste_quantize_rows_request_t *request)
 {
@@ -2208,6 +2241,9 @@ typedef struct {
     ste_layer_schedule_t layer_schedule;
     float learning_rate_scale;
     float minimum_learning_rate_scale;
+    const ternary_anchor_entry_t *protected_anchor_entries;
+    const uint32_t *protected_anchor_row_offsets;
+    uint32_t protected_anchor_count;
 } ste_calibration_context_t;
 
 static int ste_low_energy_hessian_ramp_active(const ste_calibration_context_t *context,
@@ -2422,6 +2458,14 @@ static void ste_quantize_context_latent(const ste_calibration_context_t *context
         return;
     }
 
+    if (context->protected_anchor_entries && context->protected_anchor_count > 0u) {
+        hybrid_mask_protected_coordinates(context->latent,
+                                          context->rows,
+                                          context->cols,
+                                          context->protected_anchor_entries,
+                                          context->protected_anchor_count);
+    }
+
     quantize_all_rows(&(ste_quantize_rows_request_t){
         .latent = context->latent,
         .ternary = context->ternary,
@@ -2538,6 +2582,12 @@ static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_conte
                                      context->scale_group_size,
                                      context->gradient + row_base,
                                      &gradient_context);
+        if (context->protected_anchor_entries && context->protected_anchor_row_offsets) {
+            hybrid_zero_protected_gradient_row(context->gradient + row_base,
+                                               r,
+                                               context->protected_anchor_entries,
+                                               context->protected_anchor_row_offsets);
+        }
     }
 
     metrics.clip_scale = clip_tensor_gradients(context->gradient,
@@ -2560,6 +2610,14 @@ static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_conte
                                                    context->second_moment,
                                                    weight_count,
                                                    &optimizer_context);
+
+    if (context->protected_anchor_entries && context->protected_anchor_count > 0u) {
+        hybrid_mask_protected_coordinates(context->latent,
+                                          context->rows,
+                                          context->cols,
+                                          context->protected_anchor_entries,
+                                          context->protected_anchor_count);
+    }
 
     ste_quantize_context_latent(context);
 
@@ -3028,6 +3086,13 @@ static int run_ste_calibration_steps(ste_calibration_context_t *context,
     }
 
     ste_restore_best_latent(context, &early_stop_state);
+    if (context->protected_anchor_entries && context->protected_anchor_count > 0u) {
+        hybrid_mask_protected_coordinates(context->latent,
+                                          context->rows,
+                                          context->cols,
+                                          context->protected_anchor_entries,
+                                          context->protected_anchor_count);
+    }
     return 0;
 }
 
@@ -3470,6 +3535,9 @@ static void ste_init_calibration_context(ste_calibration_context_t *context,
     context->layer_schedule = request->workspace->layer_schedule;
     context->learning_rate_scale = 1.0f;
     context->minimum_learning_rate_scale = STE_LOW_ENERGY_AUTO_DECAY_MIN_SCALE;
+    context->protected_anchor_entries = request->config->protected_anchor_entries;
+    context->protected_anchor_row_offsets = request->config->protected_anchor_row_offsets;
+    context->protected_anchor_count = request->config->protected_anchor_count;
 }
 
 static int ste_prepare_telemetry_runtime(ste_telemetry_runtime_t *runtime,
@@ -3514,6 +3582,9 @@ void transformer_free_ternary_calibration_result(ternary_calibration_result_t *r
     free(result->ternary_weights);
     free(result->packed_weights);
     free(result->scales);
+    /* Free anchor-mode outputs */
+    free(result->anchor_entries);
+    free(result->anchor_row_offsets);
     memset(result, 0, sizeof(*result));
 }
 
@@ -3598,6 +3669,14 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
         goto cleanup;
     }
 
+    if (effective_config.protected_anchor_entries && effective_config.protected_anchor_count > 0u) {
+        hybrid_mask_protected_coordinates(out_result->latent_weights,
+                                          rows,
+                                          cols,
+                                          effective_config.protected_anchor_entries,
+                                          effective_config.protected_anchor_count);
+    }
+
     quantize_all_rows(&(ste_quantize_rows_request_t){
         .latent = out_result->latent_weights,
         .ternary = out_result->ternary_weights,
@@ -3662,4 +3741,268 @@ int transformer_calibrate_layer_ste(const uint16_t *bf16_weights,
                                                      config,
                                                      &source,
                                                      out_result);
+}
+
+/* =========================================================================
+ * Hybrid STE Calibration with BF16 Anchors
+ *
+ * Implements Prompt 03: protected coordinates bypass ternary quantization,
+ * gamma is computed excluding anchor positions.
+ * ========================================================================= */
+
+#include "ternary_anchor.h"
+
+/**
+ * @brief Mask out protected coordinates in the latent weights before ternary quantization.
+ *
+ * Sets protected coordinates to zero so they don't affect gamma computation or
+ * ternary symbol selection.
+ */
+static void hybrid_mask_protected_coordinates(float *latent_weights,
+                                              uint32_t rows,
+                                              uint32_t cols,
+                                              const ternary_anchor_entry_t *entries,
+                                              uint32_t anchor_count) {
+    if (!latent_weights || !entries || anchor_count == 0) {
+        return;
+    }
+    
+    for (uint32_t i = 0; i < anchor_count; ++i) {
+        uint32_t r = entries[i].row;
+        uint32_t c = entries[i].col;
+        if (r < rows && c < cols) {
+            latent_weights[(size_t)r * cols + c] = 0.0f;
+        }
+    }
+}
+
+static void hybrid_zero_protected_gradient_row(float *gradient_row,
+                                               uint32_t row,
+                                               const ternary_anchor_entry_t *entries,
+                                               const uint32_t *row_offsets) {
+    uint32_t start = 0u;
+    uint32_t end = 0u;
+
+    if (!gradient_row || !entries || !row_offsets) {
+        return;
+    }
+
+    start = row_offsets[row];
+    end = row_offsets[row + 1];
+    for (uint32_t idx = start; idx < end; ++idx) {
+        gradient_row[entries[idx].col] = 0.0f;
+    }
+}
+
+static void hybrid_mask_protected_bf16_weights(uint16_t *masked_weights,
+                                               const uint16_t *source_weights,
+                                               uint32_t rows,
+                                               uint32_t cols,
+                                               const ternary_anchor_entry_t *entries,
+                                               uint32_t anchor_count) {
+    size_t weight_count = 0u;
+
+    if (!masked_weights || !source_weights) {
+        return;
+    }
+
+    weight_count = (size_t)rows * (size_t)cols;
+    memcpy(masked_weights, source_weights, weight_count * sizeof(uint16_t));
+    for (uint32_t idx = 0; idx < anchor_count; ++idx) {
+        uint32_t row = entries[idx].row;
+        uint32_t col = entries[idx].col;
+
+        if (row < rows && col < cols) {
+            masked_weights[(size_t)row * cols + col] = 0u;
+        }
+    }
+}
+
+/**
+ * @brief Compute gamma (scale) statistics excluding protected anchor positions.
+ */
+static float hybrid_compute_bulk_gamma_mean(const float *scales, size_t scale_count) {
+    double sum = 0.0;
+    
+    if (!scales || scale_count == 0) {
+        return 0.0f;
+    }
+    
+    for (size_t i = 0; i < scale_count; ++i) {
+        sum += scales[i];
+    }
+    
+    return (float)(sum / (double)scale_count);
+}
+
+static float hybrid_compute_anchor_contribution_norm(uint32_t anchor_count,
+                                                     float anchor_value_rms) {
+    if (anchor_count == 0u || anchor_value_rms <= 0.0f) {
+        return 0.0f;
+    }
+
+    return anchor_value_rms * sqrtf((float)anchor_count);
+}
+
+static float hybrid_compute_bulk_contribution_norm(const ternary_calibration_result_t *result) {
+    uint32_t groups_per_row = 0u;
+    double sum_sq = 0.0;
+
+    if (!result || !result->scales || !result->ternary_weights || result->scale_group_size == 0u) {
+        return 0.0f;
+    }
+
+    groups_per_row = ternary_groups_per_row(result->cols, result->scale_group_size);
+    if (groups_per_row == 0u || result->scale_count < (size_t)result->rows * groups_per_row) {
+        return 0.0f;
+    }
+
+    for (uint32_t row = 0; row < result->rows; ++row) {
+        const int8_t *ternary_row = result->ternary_weights + (size_t)row * result->cols;
+        const float *scale_row = result->scales + (size_t)row * groups_per_row;
+
+        for (uint32_t col = 0; col < result->cols; ++col) {
+            if (ternary_row[col] != 0) {
+                float scale = scale_row[col / result->scale_group_size];
+                sum_sq += (double)scale * (double)scale;
+            }
+        }
+    }
+
+    return (float)sqrt(sum_sq);
+}
+
+static void hybrid_seed_telemetry(ternary_telemetry_t *telemetry,
+                                  const ternary_anchor_config_t *anchor_config,
+                                  const ternary_anchor_selection_t *anchor_selection) {
+    if (!telemetry || !anchor_config || !anchor_selection) {
+        return;
+    }
+
+    telemetry->use_anchor_mode = 1u;
+    telemetry->anchor_count = anchor_selection->anchor_count;
+    telemetry->anchor_budget_ppm = anchor_config->budget_ppm;
+    telemetry->anchor_saliency_mode = (uint32_t)anchor_config->saliency_mode;
+    telemetry->anchor_saliency_cutoff = anchor_selection->saliency_cutoff;
+    telemetry->anchor_value_rms = anchor_selection->anchor_value_rms;
+    telemetry->anchor_contribution_norm = hybrid_compute_anchor_contribution_norm(anchor_selection->anchor_count,
+                                                                                  anchor_selection->anchor_value_rms);
+}
+
+int transformer_calibrate_layer_ste_hybrid(const uint16_t *bf16_weights,
+                                           uint32_t rows,
+                                           uint32_t cols,
+                                           const transformer_ste_config_t *config,
+                                           const ternary_calibration_source_t *source,
+                                           ternary_calibration_result_t *out_result) {
+    ternary_anchor_config_t anchor_config;
+    ternary_anchor_selection_t anchor_selection;
+    ternary_telemetry_t hybrid_telemetry;
+    const float *hessian_diag = NULL;
+    transformer_ste_config_t effective_config;
+    uint16_t *masked_bf16_weights = NULL;
+    int status = -1;
+    
+    if (!bf16_weights || !out_result || !config || rows == 0 || cols == 0) {
+        LOG_ERROR("transformer_calibrate_layer_ste_hybrid: invalid arguments");
+        return -1;
+    }
+    
+    if (!config->use_anchor_mode) {
+        LOG_ERROR("transformer_calibrate_layer_ste_hybrid: use_anchor_mode not enabled");
+        return -1;
+    }
+    
+    memset(&anchor_selection, 0, sizeof(anchor_selection));
+    memset(out_result, 0, sizeof(*out_result));
+    
+    /* Get Hessian diagonal for saliency computation */
+    if (source && source->sidecar && source->tape_context && source->tape_context->tensor_name) {
+        hessian_diag = ternary_hessian_sidecar_diagonal(source->sidecar,
+                                                        source->tape_context->tensor_name);
+        if (!hessian_diag) {
+            LOG_WARN("transformer_calibrate_layer_ste_hybrid: Hessian not found for %s, using weight-only saliency",
+                     source->tape_context->tensor_name);
+        }
+    }
+    
+    /* Configure anchor selection */
+    anchor_config = ternary_anchor_default_config();
+    anchor_config.budget_ppm = config->anchor_budget_ppm > 0 ? config->anchor_budget_ppm : 1000;
+    anchor_config.saliency_mode = (ternary_anchor_saliency_mode_t)config->anchor_saliency_mode;
+    
+    /* Fall back to weight-only if Hessian not available */
+    if (!hessian_diag && anchor_config.saliency_mode == TERNARY_ANCHOR_SALIENCY_WEIGHT_TIMES_HESSIAN) {
+        anchor_config.saliency_mode = TERNARY_ANCHOR_SALIENCY_WEIGHT_ONLY;
+        LOG_INFO("transformer_calibrate_layer_ste_hybrid: falling back to weight-only saliency");
+    }
+    
+    /* Select anchor coordinates */
+    if (ternary_anchor_select(bf16_weights, rows, cols, hessian_diag, &anchor_config, &anchor_selection) != 0) {
+        LOG_ERROR("transformer_calibrate_layer_ste_hybrid: anchor selection failed");
+        return -1;
+    }
+    
+    LOG_INFO("transformer_calibrate_layer_ste_hybrid: selected %u anchors (budget_ppm=%u cutoff=%.6e)",
+             anchor_selection.anchor_count,
+             anchor_config.budget_ppm,
+             anchor_selection.saliency_cutoff);
+    
+    /* Run standard STE calibration first */
+    effective_config = *config;
+    effective_config.use_anchor_mode = 0; /* Disable for inner call */
+    effective_config.protected_anchor_entries = anchor_selection.entries;
+    effective_config.protected_anchor_row_offsets = anchor_selection.row_offsets;
+    effective_config.protected_anchor_count = anchor_selection.anchor_count;
+    hybrid_telemetry = config->telemetry ? *config->telemetry : (ternary_telemetry_t){0};
+    hybrid_seed_telemetry(&hybrid_telemetry, &anchor_config, &anchor_selection);
+    effective_config.telemetry = &hybrid_telemetry;
+
+    masked_bf16_weights = (uint16_t *)malloc((size_t)rows * (size_t)cols * sizeof(uint16_t));
+    if (!masked_bf16_weights) {
+        LOG_ERROR("transformer_calibrate_layer_ste_hybrid: failed to allocate masked BF16 buffer");
+        goto cleanup;
+    }
+    hybrid_mask_protected_bf16_weights(masked_bf16_weights,
+                                       bf16_weights,
+                                       rows,
+                                       cols,
+                                       anchor_selection.entries,
+                                       anchor_selection.anchor_count);
+    
+    if (transformer_calibrate_layer_ste_with_tape(masked_bf16_weights, rows, cols,
+                                                   &effective_config, source, out_result) != 0) {
+        LOG_ERROR("transformer_calibrate_layer_ste_hybrid: base STE calibration failed");
+        goto cleanup;
+    }
+    
+    /* Mask protected coordinates in latent weights */
+    hybrid_mask_protected_coordinates(out_result->latent_weights, rows, cols,
+                                      anchor_selection.entries, anchor_selection.anchor_count);
+    
+    /* Transfer anchor ownership to result */
+    out_result->anchor_entries = anchor_selection.entries;
+    out_result->anchor_row_offsets = anchor_selection.row_offsets;
+    out_result->anchor_count = anchor_selection.anchor_count;
+    out_result->anchor_saliency_cutoff = anchor_selection.saliency_cutoff;
+    out_result->anchor_value_rms = anchor_selection.anchor_value_rms;
+    out_result->bulk_gamma_mean = hybrid_compute_bulk_gamma_mean(out_result->scales, out_result->scale_count);
+    
+    anchor_selection.entries = NULL;     /* Transferred */
+    anchor_selection.row_offsets = NULL;
+    
+    LOG_INFO("transformer_calibrate_layer_ste_hybrid: completed with %u anchors, bulk_gamma_mean=%.6f",
+             out_result->anchor_count, out_result->bulk_gamma_mean);
+    
+    status = 0;
+    
+cleanup:
+    ternary_anchor_selection_free(&anchor_selection);
+    free(masked_bf16_weights);
+    
+    if (status != 0) {
+        transformer_free_ternary_calibration_result(out_result);
+    }
+    
+    return status;
 }

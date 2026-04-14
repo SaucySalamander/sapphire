@@ -124,6 +124,11 @@ float quantized_gemv_bf16_scalar(const void *W_row, const float *x, int block_co
 // Packed ternary kernels
 float quantized_gemv_ternary_scalar(const void *W_row, const float *x, int block_count, int block_size);
 
+// Hybrid ternary + BF16 anchor kernels (AVX2)
+float quantized_gemv_ternary_hybrid_avx2(const void *W_row, const float *x, int block_count, int block_size);
+void gemv_ternary_hybrid_avx2(float *y, const tensor_t *A, const float *x, int m);
+void kernel_gemm_ternary_hybrid_avx2(const gemm_args_t *args);
+
 // F32 kernels
 float quantized_gemv_f32_avx2(const void *W_row, const float *x, int block_count, int block_size);
 float quantized_gemv_f32_scalar(const void *W_row, const float *x, int block_count, int block_size);

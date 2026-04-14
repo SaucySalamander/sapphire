@@ -6,6 +6,8 @@
 #ifndef TERNARY_CONVERSION_H
 #define TERNARY_CONVERSION_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,6 +42,11 @@ typedef struct {
     float hessian_proxy_strength;
     float hessian_proxy_floor;
     float max_grad_norm;
+    /* Mixed-precision anchor mode (Prompt 05) */
+    int use_anchor_mode;              /* Enable hybrid ternary+anchor format */
+    uint32_t anchor_budget_ppm;       /* Anchor budget in parts-per-million (default: 1000 = 0.1%) */
+    int anchor_saliency_mode;         /* 0=none, 1=weight*hessian, 2=hessian, 3=weight */
+    const char *anchor_tensor_pattern; /* Optional pattern to match tensors for anchoring (e.g. "down_proj") */
 } ternary_conversion_config_t;
 
 int transformer_run_ternary_conversion(const ternary_conversion_config_t *config);

@@ -1,6 +1,7 @@
 #include "llm_model.h"
 #include "model_spec.h"
 #include "safetensors_reader.h"
+#include "ternary_anchor.h"
 #include "gemma3_config.h"
 #include "tensor_mapper.h"
 #include <stdlib.h>
@@ -17,14 +18,22 @@ typedef enum {
     MODEL_FORMAT_SAFETENSORS = 2
 } model_format_t;
 
+typedef enum {
+    TERNARY_MANIFEST_KIND_TERNARY = 0,
+    TERNARY_MANIFEST_KIND_MOLD = 1,
+    TERNARY_MANIFEST_KIND_ANCHOR = 2
+} ternary_manifest_loader_kind_t;
+
 typedef struct {
     char tensor_name[256];
-    char file_name[256];
+    char bulk_file_name[256];
+    char anchor_file_name[256];
     uint32_t rows;
     uint32_t cols;
     size_t packed_weight_bytes;
     uint32_t crc32;
-    int is_mold;
+    uint32_t anchor_count;
+    ternary_manifest_loader_kind_t kind;
 } ternary_manifest_loader_entry_t;
 
 static tensor_t **resolve_tensor_slot_from_entry(llm_model_t *model,
@@ -98,7 +107,7 @@ static const char *path_basename_local(const char *path) {
 
 static int parse_manifest_line_local(char *line,
                                      ternary_manifest_loader_entry_t *out_entry) {
-    char *fields[7] = {0};
+    char *fields[9] = {0};
     char *cursor = line;
     char *next = NULL;
     int field_idx = 0;
@@ -107,7 +116,7 @@ static int parse_manifest_line_local(char *line,
         return -1;
     }
 
-    while (field_idx < 7 && cursor) {
+    while (field_idx < 9 && cursor) {
         next = strchr(cursor, '\t');
         if (next) {
             *next = '\0';
@@ -118,18 +127,177 @@ static int parse_manifest_line_local(char *line,
             cursor = NULL;
         }
     }
-    if (field_idx != 6 && field_idx != 7) {
+    if (field_idx != 6 && field_idx != 7 && field_idx != 8 && field_idx != 9) {
         return -1;
     }
 
     memset(out_entry, 0, sizeof(*out_entry));
     snprintf(out_entry->tensor_name, sizeof(out_entry->tensor_name), "%s", fields[0]);
-    snprintf(out_entry->file_name, sizeof(out_entry->file_name), "%s", fields[1]);
     out_entry->rows = (uint32_t)strtoul(fields[2], NULL, 10);
     out_entry->cols = (uint32_t)strtoul(fields[3], NULL, 10);
     out_entry->packed_weight_bytes = (size_t)strtoull(fields[4], NULL, 10);
     out_entry->crc32 = (uint32_t)strtoul(fields[5], NULL, 16);
-    out_entry->is_mold = (field_idx == 7 && strncmp(fields[6], "mold", 4) == 0) ? 1 : 0;
+
+    if (field_idx == 6) {
+        snprintf(out_entry->bulk_file_name, sizeof(out_entry->bulk_file_name), "%s", fields[1]);
+        out_entry->kind = TERNARY_MANIFEST_KIND_TERNARY;
+        return 0;
+    }
+
+    if (field_idx == 7 && strcmp(fields[6], "mold") == 0) {
+        snprintf(out_entry->bulk_file_name, sizeof(out_entry->bulk_file_name), "%s", fields[1]);
+        out_entry->kind = TERNARY_MANIFEST_KIND_MOLD;
+        return 0;
+    }
+
+    if (strcmp(fields[6], "anchor") != 0) {
+        return -1;
+    }
+
+    out_entry->kind = TERNARY_MANIFEST_KIND_ANCHOR;
+    if (field_idx == 8) {
+        snprintf(out_entry->anchor_file_name, sizeof(out_entry->anchor_file_name), "%s", fields[1]);
+        out_entry->anchor_count = (uint32_t)strtoul(fields[7], NULL, 10);
+        return 0;
+    }
+    if (field_idx == 9) {
+        snprintf(out_entry->bulk_file_name, sizeof(out_entry->bulk_file_name), "%s", fields[1]);
+        snprintf(out_entry->anchor_file_name, sizeof(out_entry->anchor_file_name), "%s", fields[7]);
+        out_entry->anchor_count = (uint32_t)strtoul(fields[8], NULL, 10);
+        return 0;
+    }
+    return 0;
+}
+
+static ternary_manifest_loader_entry_t *find_manifest_entry_local(ternary_manifest_loader_entry_t *entries,
+                                                                  int count,
+                                                                  const char *tensor_name) {
+    int i = 0;
+
+    if (!entries || count <= 0 || !tensor_name) {
+        return NULL;
+    }
+
+    for (i = 0; i < count; ++i) {
+        if (strcmp(entries[i].tensor_name, tensor_name) == 0) {
+            return &entries[i];
+        }
+    }
+    return NULL;
+}
+
+static int merge_manifest_shape_local(ternary_manifest_loader_entry_t *dst,
+                                      const ternary_manifest_loader_entry_t *src) {
+    if (!dst || !src) {
+        return -1;
+    }
+    if ((dst->rows != 0u && src->rows != 0u && dst->rows != src->rows) ||
+        (dst->cols != 0u && src->cols != 0u && dst->cols != src->cols)) {
+        return -1;
+    }
+    if (dst->rows == 0u) dst->rows = src->rows;
+    if (dst->cols == 0u) dst->cols = src->cols;
+    return 0;
+}
+
+static int merge_manifest_bulk_local(ternary_manifest_loader_entry_t *dst,
+                                     const ternary_manifest_loader_entry_t *src) {
+    if (!dst || !src) {
+        return -1;
+    }
+    if (src->packed_weight_bytes != 0u) {
+        if (dst->packed_weight_bytes != 0u && dst->packed_weight_bytes != src->packed_weight_bytes) {
+            return -1;
+        }
+        dst->packed_weight_bytes = src->packed_weight_bytes;
+    }
+    if (src->kind != TERNARY_MANIFEST_KIND_ANCHOR || src->bulk_file_name[0] != '\0') {
+        if (src->crc32 != 0u) {
+            if (dst->crc32 != 0u && dst->crc32 != src->crc32) {
+                return -1;
+            }
+            dst->crc32 = src->crc32;
+        }
+    }
+    if (src->bulk_file_name[0] != '\0') {
+        if (dst->bulk_file_name[0] != '\0' && strcmp(dst->bulk_file_name, src->bulk_file_name) != 0) {
+            return -1;
+        }
+        snprintf(dst->bulk_file_name, sizeof(dst->bulk_file_name), "%s", src->bulk_file_name);
+    }
+    return 0;
+}
+
+static int merge_manifest_anchor_local(ternary_manifest_loader_entry_t *dst,
+                                       const ternary_manifest_loader_entry_t *src) {
+    if (!dst || !src) {
+        return -1;
+    }
+    if (src->anchor_file_name[0] != '\0') {
+        if (dst->anchor_file_name[0] != '\0' && strcmp(dst->anchor_file_name, src->anchor_file_name) != 0) {
+            return -1;
+        }
+        snprintf(dst->anchor_file_name, sizeof(dst->anchor_file_name), "%s", src->anchor_file_name);
+    }
+    if (src->anchor_count != 0u) {
+        if (dst->anchor_count != 0u && dst->anchor_count != src->anchor_count) {
+            return -1;
+        }
+        dst->anchor_count = src->anchor_count;
+    }
+    return 0;
+}
+
+static int merge_manifest_kind_local(ternary_manifest_loader_entry_t *dst,
+                                     const ternary_manifest_loader_entry_t *src) {
+    if (!dst || !src) {
+        return -1;
+    }
+    if (dst->kind == TERNARY_MANIFEST_KIND_MOLD || src->kind == TERNARY_MANIFEST_KIND_MOLD) {
+        if (dst->kind != src->kind) {
+            return -1;
+        }
+        dst->kind = TERNARY_MANIFEST_KIND_MOLD;
+        return 0;
+    }
+    if (dst->kind == TERNARY_MANIFEST_KIND_ANCHOR || src->kind == TERNARY_MANIFEST_KIND_ANCHOR) {
+        dst->kind = TERNARY_MANIFEST_KIND_ANCHOR;
+        return 0;
+    }
+
+    dst->kind = TERNARY_MANIFEST_KIND_TERNARY;
+    return 0;
+}
+
+static int merge_manifest_entry_local(ternary_manifest_loader_entry_t *dst,
+                                      const ternary_manifest_loader_entry_t *src) {
+    if (!dst || !src || strcmp(dst->tensor_name, src->tensor_name) != 0) {
+        return -1;
+    }
+    if (merge_manifest_shape_local(dst, src) != 0 ||
+        merge_manifest_bulk_local(dst, src) != 0 ||
+        merge_manifest_anchor_local(dst, src) != 0 ||
+        merge_manifest_kind_local(dst, src) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int validate_manifest_entry_local(const ternary_manifest_loader_entry_t *entry) {
+    if (!entry || entry->tensor_name[0] == '\0' || entry->rows == 0u || entry->cols == 0u) {
+        return -1;
+    }
+    if (entry->kind == TERNARY_MANIFEST_KIND_MOLD) {
+        return (entry->bulk_file_name[0] != '\0') ? 0 : -1;
+    }
+    if (entry->bulk_file_name[0] == '\0' || entry->packed_weight_bytes == 0u) {
+        return -1;
+    }
+    if (entry->kind == TERNARY_MANIFEST_KIND_ANCHOR) {
+        if (entry->anchor_file_name[0] == '\0' || entry->anchor_count == 0u) {
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -166,6 +334,7 @@ static int load_ternary_manifest_local(const char *model_dir,
 
     while (fgets(line, sizeof(line), manifest_file) != NULL) {
         ternary_manifest_loader_entry_t entry;
+        ternary_manifest_loader_entry_t *existing = NULL;
         size_t len = strlen(line);
 
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
@@ -178,6 +347,15 @@ static int load_ternary_manifest_local(const char *model_dir,
             fclose(manifest_file);
             free(entries);
             return -1;
+        }
+        existing = find_manifest_entry_local(entries, count, entry.tensor_name);
+        if (existing) {
+            if (merge_manifest_entry_local(existing, &entry) != 0) {
+                fclose(manifest_file);
+                free(entries);
+                return -1;
+            }
+            continue;
         }
         if (count >= capacity) {
             int new_capacity = capacity ? (capacity * 2) : 64;
@@ -195,6 +373,12 @@ static int load_ternary_manifest_local(const char *model_dir,
     }
 
     fclose(manifest_file);
+    for (int i = 0; i < count; ++i) {
+        if (validate_manifest_entry_local(&entries[i]) != 0) {
+            free(entries);
+            return -1;
+        }
+    }
     *out_entries = entries;
     *out_count = count;
     return 1;
@@ -216,6 +400,83 @@ static int find_shard_index_by_name(char **shard_paths,
         }
     }
     return -1;
+}
+
+static tensor_t *create_hybrid_tensor_from_manifest_entry(const ternary_manifest_loader_entry_t *entry,
+                                                          const char *model_dir,
+                                                          const safetensors_file_t *bulk_handle) {
+    tensor_t *bulk_tensor = NULL;
+    tensor_t *hybrid_tensor = NULL;
+    const tensor_ternary_view_t *bulk_view = NULL;
+    tensor_hybrid_payload_t payload;
+    ternary_anchor_view_t anchor_view;
+    char *anchor_path = NULL;
+
+    if (!entry || !model_dir || !bulk_handle || entry->kind != TERNARY_MANIFEST_KIND_ANCHOR) {
+        return NULL;
+    }
+
+    memset(&payload, 0, sizeof(payload));
+    memset(&anchor_view, 0, sizeof(anchor_view));
+
+    bulk_tensor = safetensors_create_ternary_tensor_ref(bulk_handle,
+                                                        entry->tensor_name,
+                                                        entry->rows,
+                                                        entry->cols,
+                                                        entry->packed_weight_bytes,
+                                                        entry->crc32);
+    if (!bulk_tensor) {
+        return NULL;
+    }
+    bulk_view = tensor_data_ternary(bulk_tensor);
+    if (!bulk_view) {
+        tensor_release(bulk_tensor);
+        return NULL;
+    }
+
+    anchor_path = construct_safe_path(model_dir, entry->anchor_file_name, NULL);
+    if (!anchor_path) {
+        tensor_release(bulk_tensor);
+        return NULL;
+    }
+    if (ternary_anchor_load(anchor_path, &anchor_view) != 0) {
+        free(anchor_path);
+        tensor_release(bulk_tensor);
+        return NULL;
+    }
+    free(anchor_path);
+    anchor_path = NULL;
+
+    if (anchor_view.rows != entry->rows || anchor_view.cols != entry->cols ||
+        anchor_view.anchor_count != entry->anchor_count) {
+        ternary_anchor_view_release(&anchor_view);
+        tensor_release(bulk_tensor);
+        return NULL;
+    }
+
+    payload.bulk.packed_weights = bulk_view->packed_weights;
+    payload.bulk.packed_weight_bytes = bulk_view->packed_weight_bytes;
+    payload.bulk.scales = bulk_view->scales;
+    payload.bulk.scale_count = bulk_view->scale_count;
+    payload.bulk.scale_group_size = bulk_view->scale_group_size;
+    payload.anchor_entries = anchor_view.entries;
+    payload.anchor_row_offsets = anchor_view.row_offsets;
+    payload.anchor_count = anchor_view.anchor_count;
+    payload.owns_anchor_memory = 1;
+
+    hybrid_tensor = tensor_create_hybrid_view(entry->rows,
+                                              entry->cols,
+                                              &payload,
+                                              1);
+    if (!hybrid_tensor) {
+        ternary_anchor_view_release(&anchor_view);
+        tensor_release(bulk_tensor);
+        return NULL;
+    }
+
+    anchor_view.owns_memory = 0;
+    tensor_release(bulk_tensor);
+    return hybrid_tensor;
 }
 
 static int apply_ternary_manifest_overrides(llm_model_t *model,
@@ -247,24 +508,42 @@ static int apply_ternary_manifest_overrides(llm_model_t *model,
             continue;
         }
 
-        shard_index = find_shard_index_by_name(shard_paths, shard_count, entries[i].file_name);
+        shard_index = find_shard_index_by_name(shard_paths, shard_count, entries[i].bulk_file_name);
         if (shard_index < 0 || !handles[shard_index]) {
-            LOG_ERROR("Ternary manifest shard missing for %s: %s", entries[i].tensor_name, entries[i].file_name);
+            LOG_ERROR("Ternary manifest shard missing for %s: %s",
+                      entries[i].tensor_name,
+                      entries[i].bulk_file_name);
             free(entries);
             return -1;
         }
 
-        if (entries[i].is_mold) {
+        if (entries[i].kind == TERNARY_MANIFEST_KIND_MOLD) {
             const safetensors_tensor_meta_t *meta = safetensors_get_tensor_by_name(handles[shard_index],
                                                                                     entries[i].tensor_name);
             if (!meta) {
-                LOG_ERROR("MOLD manifest shard missing tensor %s in %s", entries[i].tensor_name, entries[i].file_name);
+                LOG_ERROR("MOLD manifest shard missing tensor %s in %s",
+                          entries[i].tensor_name,
+                          entries[i].bulk_file_name);
                 free(entries);
                 return -1;
             }
             tensor = safetensors_create_tensor_ref(handles[shard_index], meta);
             if (!tensor) {
-                LOG_ERROR("Failed to create MOLD BF16 tensor for %s from %s", entries[i].tensor_name, entries[i].file_name);
+                LOG_ERROR("Failed to create MOLD BF16 tensor for %s from %s",
+                          entries[i].tensor_name,
+                          entries[i].bulk_file_name);
+                free(entries);
+                return -1;
+            }
+        } else if (entries[i].kind == TERNARY_MANIFEST_KIND_ANCHOR) {
+            tensor = create_hybrid_tensor_from_manifest_entry(&entries[i],
+                                                             model_dir,
+                                                             handles[shard_index]);
+            if (!tensor) {
+                LOG_ERROR("Failed to create hybrid tensor for %s from %s + %s",
+                          entries[i].tensor_name,
+                          entries[i].bulk_file_name,
+                          entries[i].anchor_file_name);
                 free(entries);
                 return -1;
             }
@@ -276,7 +555,9 @@ static int apply_ternary_manifest_overrides(llm_model_t *model,
                                                            entries[i].packed_weight_bytes,
                                                            entries[i].crc32);
             if (!tensor) {
-                LOG_ERROR("Failed to create ternary tensor for %s from %s", entries[i].tensor_name, entries[i].file_name);
+                LOG_ERROR("Failed to create ternary tensor for %s from %s",
+                          entries[i].tensor_name,
+                          entries[i].bulk_file_name);
                 free(entries);
                 return -1;
             }

@@ -60,6 +60,9 @@ static void print_help(const char* program_name) {
     printf("  --calibration-manifest <p> Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
     printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
     printf("  --ste-steps <n>          STE optimization steps per tensor (default: 3)\n");
+    printf("  --anchor-mode            Enable hybrid ternary + BF16 anchor output (single-layer only)\n");
+    printf("  --anchor-budget-ppm <n>  Anchor budget in ppm (default: 1000 = 0.1%%)\n");
+    printf("  --anchor-saliency-mode <n> Anchor saliency: 0=none 1=weight*hessian 2=hessian 3=weight\n");
     printf("  --progressive-calib      Run 3-stage progressive molding (layers 0-5, 6-12, then full model)\n");
     printf("  --max-grad-norm <value>  Global gradient norm clip for STE (default: 1.0)\n");
     printf("  --student-down-proj-rmsnorm  Enable a student-only weightless RMSNorm before FFN down_proj during conversion\n");
@@ -162,6 +165,9 @@ typedef struct {
     float hessian_proxy_strength;
     float hessian_proxy_floor;
     float max_grad_norm;
+    int use_anchor_mode;
+    uint32_t anchor_budget_ppm;
+    int anchor_saliency_mode;
     const char *save_state_path;
     const char *load_state_path;
 } cli_args_t;
@@ -207,6 +213,9 @@ static void cli_args_init(cli_args_t *args)
     args->hessian_proxy_strength = 1.0f;
     args->hessian_proxy_floor = 0.05f;
     args->max_grad_norm = 1.0f;
+    args->use_anchor_mode = 0;
+    args->anchor_budget_ppm = 1000u;
+    args->anchor_saliency_mode = 1;
     args->save_state_path = NULL;
     args->load_state_path = NULL;
 }
@@ -323,6 +332,10 @@ static int validate_convert_ternary_mode_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --progressive-calib requires --activation-tape so staged calibration can reuse teacher activation statistics.");
         return -1;
     }
+    if (args->use_anchor_mode && !args->layer_name) {
+        LOG_ERROR("ERROR: --anchor-mode currently supports single-layer ternary conversion only; use --layer.");
+        return -1;
+    }
 
     return 0;
 }
@@ -428,6 +441,14 @@ static int validate_convert_ternary_numeric_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --max-grad-norm must be > 0.");
         return -1;
     }
+    if (args->anchor_budget_ppm == 0u) {
+        LOG_ERROR("ERROR: --anchor-budget-ppm must be > 0.");
+        return -1;
+    }
+    if (args->anchor_saliency_mode < 0 || args->anchor_saliency_mode > 3) {
+        LOG_ERROR("ERROR: --anchor-saliency-mode must be one of 0, 1, 2, or 3.");
+        return -1;
+    }
     if (args->validation_sample_limit < 0) {
         LOG_ERROR("ERROR: --validation-samples must be >= 0.");
         return -1;
@@ -528,6 +549,10 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.hessian_proxy_strength = args->hessian_proxy_strength;
     config.hessian_proxy_floor = args->hessian_proxy_floor;
     config.max_grad_norm = args->max_grad_norm;
+    config.use_anchor_mode = args->use_anchor_mode;
+    config.anchor_budget_ppm = args->anchor_budget_ppm;
+    config.anchor_saliency_mode = args->anchor_saliency_mode;
+    config.anchor_tensor_pattern = NULL;
     int rc = transformer_run_ternary_conversion(&config);
     sapphire_tracy_zone_end(&tracy_zone);
     return rc;
@@ -969,6 +994,9 @@ typedef enum {
     CLI_OPT_VALIDATE_EVERY,
     CLI_OPT_STE_STEPS,
     CLI_OPT_PROGRESSIVE_CALIB,
+    CLI_OPT_ANCHOR_MODE,
+    CLI_OPT_ANCHOR_BUDGET_PPM,
+    CLI_OPT_ANCHOR_SALIENCY_MODE,
     CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM,
     CLI_OPT_MAX_GRAD_NORM,
     CLI_OPT_KL_WEIGHT,
@@ -1020,6 +1048,9 @@ static const cli_option_alias_t g_cli_option_aliases[] = {
     { "--validate-every", CLI_OPT_VALIDATE_EVERY },
     { "--ste-steps", CLI_OPT_STE_STEPS },
     { "--progressive-calib", CLI_OPT_PROGRESSIVE_CALIB },
+    { "--anchor-mode", CLI_OPT_ANCHOR_MODE },
+    { "--anchor-budget-ppm", CLI_OPT_ANCHOR_BUDGET_PPM },
+    { "--anchor-saliency-mode", CLI_OPT_ANCHOR_SALIENCY_MODE },
     { "--student-down-proj-rmsnorm", CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM },
     { "--max-grad-norm", CLI_OPT_MAX_GRAD_NORM },
     { "--kl-weight", CLI_OPT_KL_WEIGHT },
@@ -1078,6 +1109,8 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_CHECKPOINT_EVERY: args->checkpoint_every_n_layers = atoi(value); break;
         case CLI_OPT_VALIDATE_EVERY: args->validate_every_n = atoi(value); break;
         case CLI_OPT_STE_STEPS: args->ste_steps = atoi(value); break;
+        case CLI_OPT_ANCHOR_BUDGET_PPM: args->anchor_budget_ppm = (uint32_t)strtoul(value, NULL, 10); break;
+        case CLI_OPT_ANCHOR_SALIENCY_MODE: args->anchor_saliency_mode = atoi(value); break;
         case CLI_OPT_MAX_GRAD_NORM: args->max_grad_norm = (float)atof(value); break;
         case CLI_OPT_KL_WEIGHT: args->kl_weight = (float)atof(value); break;
         case CLI_OPT_KL_UPDATE_FREQ: args->kl_update_interval = atoi(value); break;
@@ -1112,6 +1145,10 @@ static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
         }
         if (option == CLI_OPT_PROGRESSIVE_CALIB) {
             args->progressive_calib = 1;
+            continue;
+        }
+        if (option == CLI_OPT_ANCHOR_MODE) {
+            args->use_anchor_mode = 1;
             continue;
         }
         if (option == CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM) {

@@ -10,6 +10,7 @@
 // - q8_0_avx.c (8-bit quantized)
 // - bf16_avx.c (BF16)
 // - f32_avx.c (F32)
+// - ternary_hybrid_avx2.c (Hybrid ternary + BF16 anchor)
 
 #define _POSIX_C_SOURCE 200809L
 #include "../../include/kernels.h"
@@ -159,6 +160,89 @@ static void gemv_ternary(float *y, const tensor_t *A, const float *x, int m) {
     }
 }
 
+/* =========================================================================
+ * Hybrid Ternary + BF16 Anchor GEMV (Prompt 04)
+ *
+ * Computes: y = (W_bulk_ternary * x) + (A_anchors * x)
+ * where protected anchor coordinates bypass ternary quantization.
+ * ========================================================================= */
+
+#include "../../include/ternary_anchor.h"
+
+/**
+ * @brief Scalar anchor contribution for a single row.
+ *
+ * Iterates through the row's anchor entries and accumulates:
+ *   sum += bf16_to_f32(anchor.value_bf16) * x[anchor.col]
+ */
+static float hybrid_anchor_row_dot_scalar(const ternary_anchor_entry_t *entries,
+                                          uint32_t start_idx,
+                                          uint32_t end_idx,
+                                          const float *x) {
+    float acc = 0.0f;
+    
+    for (uint32_t i = start_idx; i < end_idx; ++i) {
+        uint16_t bf16_val = entries[i].value_bf16;
+        uint32_t col = entries[i].col;
+        float weight = bf16_to_f32(bf16_val);
+        acc += weight * x[col];
+    }
+    
+    return acc;
+}
+
+/**
+ * @brief Hybrid GEMV: y = (W_ternary * x) + (A_anchors * x)
+ *
+ * Computes the ternary bulk contribution first, then adds anchor corrections.
+ * This is the scalar reference implementation for correctness (Prompt 04).
+ */
+static void gemv_ternary_hybrid_scalar(float *y,
+                                       const tensor_t *A,
+                                       const float *x,
+                                       int m) {
+    const tensor_hybrid_view_t *view = tensor_data_hybrid(A);
+    const ternary_anchor_entry_t *anchor_entries;
+    const uint32_t *anchor_row_offsets;
+    
+    if (!view || !view->packed_weights || !view->scales || !y || !x) {
+        return;
+    }
+    
+    anchor_entries = (const ternary_anchor_entry_t *)view->anchor_entries;
+    anchor_row_offsets = view->anchor_row_offsets;
+    
+    /* First pass: compute ternary bulk contribution */
+    for (int row = 0; row < m; ++row) {
+        tensor_ternary_view_t row_view;
+        
+        row_view.rows = 1u;
+        row_view.cols = view->cols;
+        row_view.packed_cols = view->packed_cols;
+        row_view.scale_group_size = view->scale_group_size;
+        row_view.groups_per_row = view->groups_per_row;
+        row_view.packed_weights = view->packed_weights + (size_t)row * view->packed_cols;
+        row_view.scales = view->scales + (size_t)row * view->groups_per_row;
+        row_view.scale_count = view->groups_per_row;
+        row_view.scale_bytes = (size_t)view->groups_per_row * sizeof(float);
+        row_view.packed_weight_bytes = view->packed_cols;
+        
+        y[row] = quantized_gemv_ternary_scalar(&row_view, x, 0, 0);
+    }
+    
+    /* Second pass: add anchor contributions */
+    if (anchor_entries && anchor_row_offsets && view->anchor_count > 0) {
+        for (int row = 0; row < m; ++row) {
+            uint32_t start = anchor_row_offsets[row];
+            uint32_t end = anchor_row_offsets[row + 1];
+            
+            if (end > start) {
+                y[row] += hybrid_anchor_row_dot_scalar(anchor_entries, start, end, x);
+            }
+        }
+    }
+}
+
 int kernel_gemm(kernel_context_t *ctx, float *Y, const tensor_t *A, const float *X, int batch_size, int out_stride) {
     if (!Y || !A || !X || batch_size <= 0) {
         LOG_ERROR("kernel_gemm invalid arguments");
@@ -234,6 +318,13 @@ int kernel_gemv(kernel_context_t *ctx, float *y, const tensor_t *A, const float 
                 LOG_ERROR("kernel_backend_exec failed with code %d", ret);
                 return -1;
             }
+            return 0;
+        }
+
+        case DTYPE_TERNARY_HYBRID: {
+            /* Hybrid ternary + BF16 anchor path (Prompt 04+08) */
+            /* Use AVX2 kernel for optimized performance */
+            gemv_ternary_hybrid_avx2(y, A, x, m);
             return 0;
         }
 
