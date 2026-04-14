@@ -39,6 +39,7 @@ typedef struct {
     int early_stop_patience;
     float early_stop_min_delta;
     float early_stop_divergence_ratio;
+    int student_down_proj_input_rmsnorm;
     int simulate_activation_a8;
     int use_hessian_proxy;
     float hessian_proxy_strength;
@@ -79,10 +80,12 @@ typedef struct {
     int8_t *ternary_weights;
     uint8_t *packed_weights;
     float *scales;
+    size_t scale_count;
     size_t weight_count;
     size_t packed_weight_bytes;
     uint32_t rows;
     uint32_t cols;
+    uint32_t scale_group_size;
 } ternary_calibration_result_t;
 
 int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,

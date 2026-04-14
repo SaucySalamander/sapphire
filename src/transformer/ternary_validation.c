@@ -5,7 +5,7 @@
 
 #include "ternary_validation.h"
 
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "kernels.h"
 #include "llm_model.h"
 #include "log.h"
@@ -152,6 +152,33 @@ static int collect_prompt_metrics(inference_context_t *ctx,
     return 0;
 }
 
+static int validation_collect_prompt_metrics(ternary_validation_state_t *state,
+                                             const char *text,
+                                             float *out_final_logits,
+                                             float *out_mean_nll,
+                                             int *out_top1)
+{
+    int rc = -1;
+
+    if (!state || !state->ctx || !state->ctx->session) {
+        return -1;
+    }
+
+    if (state->config.student_down_proj_input_rmsnorm) {
+        inference_session_set_ffn_down_proj_input_rmsnorm_override(state->ctx->session, 1);
+    }
+    rc = collect_prompt_metrics(state->ctx,
+                                text,
+                                out_final_logits,
+                                out_mean_nll,
+                                out_top1);
+    if (state->config.student_down_proj_input_rmsnorm) {
+        inference_session_clear_ffn_down_proj_input_rmsnorm_override(state->ctx->session);
+    }
+
+    return rc;
+}
+
 static float compute_logits_kl(float *baseline_probs,
                                float *current_probs,
                                const float *baseline_logits,
@@ -237,9 +264,14 @@ static tensor_t *build_proxy_tensor_from_ternary(const ternary_calibration_resul
 
     for (uint32_t r = 0; r < result->rows; ++r) {
         size_t row_base = (size_t)r * result->cols;
-        float scale = result->scales[r];
         for (uint32_t c = 0; c < result->cols; ++c) {
-            data[row_base + c] = (float)result->ternary_weights[row_base + c] * scale;
+            uint32_t groups_per_row = (uint32_t)(result->scale_count / result->rows);
+            uint32_t group = result->scale_group_size ? (c / result->scale_group_size) : 0u;
+            if (group >= groups_per_row) {
+                group = groups_per_row - 1u;
+            }
+            data[row_base + c] = (float)result->ternary_weights[row_base + c] *
+                result->scales[(size_t)r * groups_per_row + group];
         }
     }
 
@@ -279,7 +311,6 @@ static tensor_t *build_proxy_tensor_from_payload(const ternary_layer_payload_t *
     for (uint32_t r = 0; r < payload->rows; ++r) {
         size_t row_base = (size_t)r * payload->cols;
         size_t packed_row_base = (size_t)r * packed_cols;
-        float scale = payload->scales[r];
 
         for (uint32_t c = 0; c < payload->cols; ++c) {
             size_t packed_idx = packed_row_base + (size_t)c / TERNARY_PACKED_WEIGHTS_PER_BYTE;
@@ -287,6 +318,11 @@ static tensor_t *build_proxy_tensor_from_payload(const ternary_layer_payload_t *
             uint8_t packed = payload->packed_weights[packed_idx];
             uint8_t symbol = (uint8_t)((packed >> (lane * 2u)) & 0x3u);
             float value = 0.0f;
+            uint32_t group = payload->scale_group_size ? (c / payload->scale_group_size) : 0u;
+
+            if (group >= payload->groups_per_row) {
+                group = payload->groups_per_row - 1u;
+            }
 
             if (symbol == 1u) {
                 value = 1.0f;
@@ -294,7 +330,7 @@ static tensor_t *build_proxy_tensor_from_payload(const ternary_layer_payload_t *
                 value = -1.0f;
             }
 
-            data[row_base + c] = value * scale;
+            data[row_base + c] = value * payload->scales[(size_t)r * payload->groups_per_row + group];
         }
     }
 
@@ -523,11 +559,11 @@ static int run_checkpoint(ternary_validation_state_t *state, int converted_count
         int sample_top1 = -1;
         float kl = 0.0f;
 
-        if (collect_prompt_metrics(state->ctx,
-                                   state->config.sample_texts[s],
-                                   state->current_logits + (size_t)s * config->vocab_size,
-                                   &sample_mean_nll,
-                                   &sample_top1) != 0) {
+        if (validation_collect_prompt_metrics(state,
+                                              state->config.sample_texts[s],
+                                              state->current_logits + (size_t)s * config->vocab_size,
+                                              &sample_mean_nll,
+                                              &sample_top1) != 0) {
             return validation_tracy_end_status(&tracy_zone, -1);
         }
 
@@ -630,11 +666,11 @@ int ternary_validation_init(ternary_validation_state_t *state,
     }
 
     for (int s = 0; s < config->sample_count; ++s) {
-        if (collect_prompt_metrics(ctx,
-                                   config->sample_texts[s],
-                                   state->baseline_logits + (size_t)s * model_config->vocab_size,
-                                   &state->baseline_mean_nll[s],
-                                   &state->baseline_top1[s]) != 0) {
+        if (validation_collect_prompt_metrics(state,
+                                              config->sample_texts[s],
+                                              state->baseline_logits + (size_t)s * model_config->vocab_size,
+                                              &state->baseline_mean_nll[s],
+                                              &state->baseline_top1[s]) != 0) {
             ternary_validation_destroy(state);
             return validation_tracy_end_status(&tracy_zone, -1);
         }

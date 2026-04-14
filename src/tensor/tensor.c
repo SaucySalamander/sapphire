@@ -181,18 +181,44 @@ tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, v
 
 tensor_t* tensor_create_ternary_view(uint32_t rows,
                                      uint32_t cols,
-                                     const uint8_t *packed_weights,
-                                     size_t packed_weight_bytes,
-                                     const float *scales,
+                                     const tensor_ternary_payload_t *payload,
                                      int is_external) {
     tensor_t *t = NULL;
     tensor_ternary_view_t *view = NULL;
     int shape[2] = {0, 0};
     size_t packed_cols = 0u;
-    size_t scale_bytes = (size_t)rows * sizeof(float);
+    size_t scale_bytes = 0u;
+    uint32_t groups_per_row = 0u;
+    const uint8_t *packed_weights = NULL;
+    const float *scales = NULL;
+    size_t packed_weight_bytes = 0u;
+    size_t scale_count = 0u;
+    uint32_t scale_group_size = 0u;
 
-    if (!packed_weights || !scales || rows == 0u || cols == 0u) {
+    if (!payload || rows == 0u || cols == 0u) {
         LOG_ERROR("tensor_create_ternary_view invalid ternary payload");
+        return NULL;
+    }
+    packed_weights = payload->packed_weights;
+    packed_weight_bytes = payload->packed_weight_bytes;
+    scales = payload->scales;
+    scale_count = payload->scale_count;
+    scale_group_size = payload->scale_group_size;
+    if (!packed_weights || !scales) {
+        LOG_ERROR("tensor_create_ternary_view invalid ternary payload buffers");
+        return NULL;
+    }
+    if (scale_count == 0u || (scale_count % rows) != 0u) {
+        LOG_ERROR("tensor_create_ternary_view invalid scale_count=%zu for rows=%u", scale_count, rows);
+        return NULL;
+    }
+    groups_per_row = (uint32_t)(scale_count / rows);
+    if (groups_per_row == 0u) {
+        LOG_ERROR("tensor_create_ternary_view invalid groups_per_row for rows=%u scale_count=%zu", rows, scale_count);
+        return NULL;
+    }
+    if (scale_group_size == 0u) {
+        LOG_ERROR("tensor_create_ternary_view invalid scale_group_size=0");
         return NULL;
     }
 
@@ -201,6 +227,7 @@ tensor_t* tensor_create_ternary_view(uint32_t rows,
         LOG_ERROR("tensor_create_ternary_view packed byte mismatch: rows=%u cols=%u packed=%zu", rows, cols, packed_weight_bytes);
         return NULL;
     }
+    scale_bytes = scale_count * sizeof(float);
 
     t = (tensor_t *)malloc(sizeof(tensor_t));
     if (!t) {
@@ -222,7 +249,10 @@ tensor_t* tensor_create_ternary_view(uint32_t rows,
     view->rows = rows;
     view->cols = cols;
     view->packed_cols = (uint32_t)packed_cols;
+    view->scale_group_size = scale_group_size;
+    view->groups_per_row = groups_per_row;
     view->packed_weight_bytes = packed_weight_bytes;
+    view->scale_count = scale_count;
     view->scale_bytes = scale_bytes;
 
     shape[0] = (int)rows;
@@ -341,7 +371,14 @@ float tensor_get_f32(const tensor_t *t, size_t idx) {
         packed_idx = row * view->packed_cols + (col / 4u);
         lane = (uint32_t)(col % 4u);
         packed = view->packed_weights[packed_idx];
-        scale = view->scales[row];
+        {
+            size_t scale_row_base = row * view->groups_per_row;
+            size_t scale_group = col / view->scale_group_size;
+            if (scale_group >= view->groups_per_row) {
+                scale_group = view->groups_per_row - 1u;
+            }
+            scale = view->scales[scale_row_base + scale_group];
+        }
 
         switch ((packed >> (lane * 2u)) & 0x3u) {
             case 1u: symbol = 1; break;

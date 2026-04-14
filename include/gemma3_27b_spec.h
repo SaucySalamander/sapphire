@@ -7,7 +7,7 @@
 #define GEMMA3_27B_SPEC_H
 
 #include "model_spec.h"
-#include "gemma3_270m_config.h" /* Reuse gemma3_270m_config_t for 27B */
+#include "gemma3_config.h" /* Reuse gemma3_270m_config_t for 27B */
 
 #ifdef __cplusplus
 extern "C" {

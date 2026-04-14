@@ -22,7 +22,7 @@
 
 #include "calibration_corpus.h"
 #include "backend_vulkan.h"
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "inference.h"
 #include "log.h"
 #include "model_spec.h"

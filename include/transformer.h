@@ -7,7 +7,7 @@
 #include <stdlib.h>
 
 #include "llm_model.h"
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 
 struct inference_session_t;
 struct sapphire_tokenizer_t;

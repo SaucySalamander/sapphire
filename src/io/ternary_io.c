@@ -278,9 +278,13 @@ static const char* ternary_scale_dtype_name(safetensors_dtype_t dtype) {
 static int ternary_validate_layer_payload(const char *tensor_name,
                                           const ternary_layer_t *layer,
                                           size_t *out_packed_cols,
+                                          uint32_t *out_groups_per_row,
+                                          uint32_t *out_scale_group_size,
                                           const char **out_scale_dtype_name) {
     const char *scale_name = NULL;
     size_t packed_cols = 0;
+    uint32_t groups_per_row = 0u;
+    uint32_t scale_group_size = 0u;
 
     if (ternary_validate_tensor_name(tensor_name) != 0 || !layer) {
         return -1;
@@ -293,9 +297,34 @@ static int ternary_validate_layer_payload(const char *tensor_name,
         LOG_ERROR("ternary I/O: invalid rows/cols/scale_count for %s", tensor_name);
         return -1;
     }
-    if (layer->scale_count != layer->rows) {
-        LOG_ERROR("ternary I/O: scale_count=%zu must match rows=%u for %s",
+    if ((layer->scale_count % layer->rows) != 0u) {
+        LOG_ERROR("ternary I/O: scale_count=%zu must be a multiple of rows=%u for %s",
                   layer->scale_count, layer->rows, tensor_name);
+        return -1;
+    }
+    groups_per_row = (uint32_t)(layer->scale_count / layer->rows);
+    if (groups_per_row == 0u) {
+        LOG_ERROR("ternary I/O: invalid groups_per_row for %s", tensor_name);
+        return -1;
+    }
+    if (layer->groups_per_row != 0u && layer->groups_per_row != groups_per_row) {
+        LOG_ERROR("ternary I/O: groups_per_row mismatch for %s (have=%u inferred=%u)",
+                  tensor_name,
+                  layer->groups_per_row,
+                  groups_per_row);
+        return -1;
+    }
+    scale_group_size = layer->scale_group_size;
+    if (scale_group_size == 0u) {
+        scale_group_size = (uint32_t)(((size_t)layer->cols + groups_per_row - 1u) / groups_per_row);
+    }
+    if (scale_group_size == 0u ||
+        (uint32_t)(((size_t)layer->cols + scale_group_size - 1u) / scale_group_size) != groups_per_row) {
+        LOG_ERROR("ternary I/O: invalid scale layout for %s (cols=%u groups=%u group_size=%u)",
+                  tensor_name,
+                  layer->cols,
+                  groups_per_row,
+                  scale_group_size);
         return -1;
     }
 
@@ -323,6 +352,8 @@ static int ternary_validate_layer_payload(const char *tensor_name,
     }
 
     if (out_packed_cols) *out_packed_cols = packed_cols;
+    if (out_groups_per_row) *out_groups_per_row = groups_per_row;
+    if (out_scale_group_size) *out_scale_group_size = scale_group_size;
     if (out_scale_dtype_name) *out_scale_dtype_name = scale_name;
     return 0;
 }
@@ -430,9 +461,12 @@ int io_write_layer_ternary(const char *output_path,
                            const char *tensor_name,
                            const ternary_layer_t *layer,
                            uint32_t *out_crc32) {
-    char header[2048];
+    char header[4096];
+    char scale_shape[64];
     const char *scale_dtype_name = NULL;
     size_t packed_cols = 0;
+    uint32_t groups_per_row = 0u;
+    uint32_t scale_group_size = 0u;
     uint32_t crc32 = 0;
     uint64_t header_len = 0;
     uint64_t packed_begin = 0;
@@ -447,7 +481,21 @@ int io_write_layer_ternary(const char *output_path,
         LOG_ERROR("io_write_layer_ternary: invalid arguments");
         return -1;
     }
-    if (ternary_validate_layer_payload(tensor_name, layer, &packed_cols, &scale_dtype_name) != 0) {
+    if (ternary_validate_layer_payload(tensor_name,
+                                       layer,
+                                       &packed_cols,
+                                       &groups_per_row,
+                                       &scale_group_size,
+                                       &scale_dtype_name) != 0) {
+        return -1;
+    }
+    if (groups_per_row == 1u) {
+        if (snprintf(scale_shape, sizeof(scale_shape), "[%u]", layer->rows) < 0) {
+            LOG_ERROR("io_write_layer_ternary: scale shape construction failed for %s", tensor_name);
+            return -1;
+        }
+    } else if (snprintf(scale_shape, sizeof(scale_shape), "[%u,%u]", layer->rows, groups_per_row) < 0) {
+        LOG_ERROR("io_write_layer_ternary: grouped scale shape construction failed for %s", tensor_name);
         return -1;
     }
 
@@ -465,12 +513,16 @@ int io_write_layer_ternary(const char *output_path,
     header_rc = snprintf(
         header,
         sizeof(header),
-        "{\"__metadata__\":{\"sapphire_quant\":\"ternary-1.58\",\"integrity\":\"crc32\",\"crc32\":\"%08x\",\"rows\":\"%u\",\"cols\":\"%u\"},"
+        "{\"__metadata__\":{\"sapphire_quant\":\"ternary-1.58\",\"integrity\":\"crc32\",\"crc32\":\"%08x\",\"rows\":\"%u\",\"cols\":\"%u\",\"%s.groups_per_row\":%u,\"%s.scale_group_size\":%u},"
         "\"%s.packed\":{\"dtype\":\"U8\",\"shape\":[%u,%zu],\"data_offsets\":[%llu,%llu]},"
-        "\"%s.scales\":{\"dtype\":\"%s\",\"shape\":[%zu],\"data_offsets\":[%llu,%llu]}}",
+        "\"%s.scales\":{\"dtype\":\"%s\",\"shape\":%s,\"data_offsets\":[%llu,%llu]}}",
         crc32,
         layer->rows,
         layer->cols,
+        tensor_name,
+        groups_per_row,
+        tensor_name,
+        scale_group_size,
         tensor_name,
         layer->rows,
         packed_cols,
@@ -478,7 +530,7 @@ int io_write_layer_ternary(const char *output_path,
         (unsigned long long)packed_end,
         tensor_name,
         scale_dtype_name,
-        layer->scale_count,
+        scale_shape,
         (unsigned long long)scale_begin,
         (unsigned long long)scale_end);
     if (header_rc < 0 || (size_t)header_rc >= sizeof(header)) {
@@ -523,8 +575,14 @@ int io_write_layer_ternary(const char *output_path,
         return -1;
     }
 
-    LOG_INFO("Wrote ternary safetensors layer %s -> %s (packed=%zuB scales=%zuB crc32=%08x)",
-             tensor_name, output_path, layer->packed_weight_bytes, layer->scale_bytes, crc32);
+    LOG_INFO("Wrote ternary safetensors layer %s -> %s (packed=%zuB scales=%zuB groups=%u group_size=%u crc32=%08x)",
+             tensor_name,
+             output_path,
+             layer->packed_weight_bytes,
+             layer->scale_bytes,
+             groups_per_row,
+             scale_group_size,
+             crc32);
     return 0;
 }
 
@@ -917,7 +975,7 @@ int io_load_layer_ternary_payload(const char *layer_path,
         LOG_ERROR("ternary I/O: unexpected ternary payload dtypes for %s", tensor_name);
         goto payload_cleanup;
     }
-    if (packed_meta.ndim != 2 || scales_meta.ndim != 1) {
+    if (packed_meta.ndim != 2 || (scales_meta.ndim != 1 && scales_meta.ndim != 2)) {
         LOG_ERROR("ternary I/O: unexpected ternary payload rank for %s", tensor_name);
         goto payload_cleanup;
     }
@@ -931,11 +989,25 @@ int io_load_layer_ternary_payload(const char *layer_path,
         LOG_ERROR("ternary I/O: packed column count mismatch for %s", tensor_name);
         goto payload_cleanup;
     }
+    out_payload->groups_per_row = (scales_meta.ndim == 1) ? 1u : scales_meta.shape[1];
+    if (out_payload->groups_per_row == 0u ||
+        safetensors_resolve_ternary_scale_layout(file,
+                                                 tensor_name,
+                                                 expected_cols,
+                                                 out_payload->groups_per_row,
+                                                 &out_payload->scale_group_size,
+                                                 &out_payload->groups_per_row) != 0) {
+        goto payload_cleanup;
+    }
+    out_payload->scale_count = (size_t)expected_rows * out_payload->groups_per_row;
+    if (scales_size != out_payload->scale_count * sizeof(float)) {
+        LOG_ERROR("ternary I/O: scale byte count mismatch for %s", tensor_name);
+        goto payload_cleanup;
+    }
 
     out_payload->packed_weights = (uint8_t *)packed_copy;
     out_payload->packed_weight_bytes = packed_size;
     out_payload->scales = (float *)scales_copy;
-    out_payload->scale_count = expected_rows;
     out_payload->scale_bytes = scales_size;
     out_payload->rows = expected_rows;
     out_payload->cols = expected_cols;

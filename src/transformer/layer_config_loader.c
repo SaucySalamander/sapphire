@@ -10,7 +10,7 @@
 
 #include <string.h>
 
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "log.h"
 
 /**

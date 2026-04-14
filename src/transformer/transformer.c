@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../include/gemma3_270m_config.h"
+#include "../include/gemma3_config.h"
 #include "attention.h"
 #include "inference.h"
 #include "kernels.h"
@@ -299,6 +299,12 @@ static void geglu_parallel_fn(void* arg, int idx) {
     }
 }
 
+static int ffn_down_proj_input_rmsnorm_enabled(const transformer_layer_ctx_t *ctx)
+{
+    return ctx && ctx->session &&
+        inference_session_ffn_down_proj_input_rmsnorm_enabled(ctx->session);
+}
+
 void compute_ffn_stage(layer_buffers_t buf,
                        transformer_layer_ctx_t* ctx,
                        float* hidden) {
@@ -367,6 +373,14 @@ void compute_ffn_stage(layer_buffers_t buf,
         float r_a = 0;
         vec_stats(buf.ffn_gate_buf, ctx->config->intermediate_size, NULL, NULL, &r_a);
         LOG_DEBUG("Layer %d Activation RMS: %.3f", ctx->layer_idx, r_a);
+    }
+
+    if (ffn_down_proj_input_rmsnorm_enabled(ctx)) {
+        for (int b = 0; b < ctx->batch_size; b++) {
+            float *down_input = buf.ffn_gate_buf + (size_t)b * buf.pf;
+
+            (void)rmsnorm_unit(down_input, down_input, 1e-6f, ctx->config->intermediate_size);
+        }
     }
 
     if (ctx->batch_size == 1) {

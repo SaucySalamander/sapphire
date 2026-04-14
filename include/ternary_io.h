@@ -54,7 +54,7 @@ typedef struct {
  * @brief Ternary layer payload prepared for safetensors serialization.
  *
  * `packed_weights` stores 2-bit packed symbols with 4 weights per byte.
- * `scales` stores one FP32/FP16 scale per row or output channel.
+ * `scales` stores FP32/FP16 scales laid out as [rows, groups_per_row].
  */
 typedef struct {
     const uint8_t *packed_weights;
@@ -65,6 +65,8 @@ typedef struct {
     safetensors_dtype_t scale_dtype;
     uint32_t rows;
     uint32_t cols;
+    uint32_t scale_group_size;
+    uint32_t groups_per_row;
     ternary_io_integrity_t integrity;
 } ternary_layer_t;
 
@@ -76,6 +78,8 @@ typedef struct ternary_layer_payload_t {
     size_t scale_bytes;
     uint32_t rows;
     uint32_t cols;
+    uint32_t scale_group_size;
+    uint32_t groups_per_row;
 } ternary_layer_payload_t;
 
 /**
@@ -141,7 +145,7 @@ uint32_t io_crc32_update(uint32_t crc, const void *data, size_t size);
  *
  * The file contains two tensors:
  * - `<tensor_name>.packed`  : packed U8 ternary symbols
- * - `<tensor_name>.scales`  : row/channel scale buffer (F32 or F16)
+ * - `<tensor_name>.scales`  : grouped scale buffer (F32 or F16)
  *
  * A CRC32 over packed weights and scales is emitted in `__metadata__`.
  *

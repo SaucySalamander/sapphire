@@ -16,7 +16,7 @@
 #include <string.h>
 
 #include "../include/attention.h"
-#include "../include/gemma3_270m_config.h"
+#include "../include/gemma3_config.h"
 #include "../include/ggml_model.h"
 #include "../include/kv_cache.h"
 #include "../include/layer_config_loader.h"

@@ -13,7 +13,7 @@
  * - DTYPE_F16: 16-bit float (half precision)
  * - DTYPE_Q4_0: 4-bit quantized (from Phase 1 quantization)
  * - DTYPE_Q8_0: 8-bit quantized (from Phase 1 quantization)
- * - DTYPE_TERNARY_2BIT: packed ternary weights with one scale per row
+ * - DTYPE_TERNARY_2BIT: packed ternary weights with grouped FP32 scales
  */
 typedef enum {
     DTYPE_F32,     // 32-bit float
@@ -21,7 +21,7 @@ typedef enum {
     DTYPE_F16,     // 16-bit float (half precision)
     DTYPE_Q4_0,    // 4-bit quantized (Phase 1)
     DTYPE_Q8_0,    // 8-bit quantized (Phase 1)
-    DTYPE_TERNARY_2BIT, // 2-bit packed ternary symbols + row scales
+    DTYPE_TERNARY_2BIT, // 2-bit packed ternary symbols + grouped scales
 } tensor_dtype_t;
 
 typedef struct {
@@ -30,9 +30,20 @@ typedef struct {
     uint32_t rows;
     uint32_t cols;
     uint32_t packed_cols;
+    uint32_t scale_group_size;
+    uint32_t groups_per_row;
     size_t packed_weight_bytes;
+    size_t scale_count;
     size_t scale_bytes;
 } tensor_ternary_view_t;
+
+typedef struct {
+    const uint8_t *packed_weights;
+    size_t packed_weight_bytes;
+    const float *scales;
+    size_t scale_count;
+    uint32_t scale_group_size;
+} tensor_ternary_payload_t;
 
 /**
  * @brief Memory layout strategy for tensor storage.
@@ -223,14 +234,12 @@ tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, v
  * @brief Create an owned tensor wrapper for packed ternary weights.
  *
  * The returned tensor stores the logical matrix shape [rows, cols], while its
- * backing payload points at a packed 2-bit symbol stream plus one F32 scale
- * per row.
+ * backing payload points at a packed 2-bit symbol stream plus grouped F32
+ * scales.
  */
 tensor_t* tensor_create_ternary_view(uint32_t rows,
                                      uint32_t cols,
-                                     const uint8_t *packed_weights,
-                                     size_t packed_weight_bytes,
-                                     const float *scales,
+                                     const tensor_ternary_payload_t *payload,
                                      int is_external);
 
 /**

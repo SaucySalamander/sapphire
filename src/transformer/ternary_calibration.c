@@ -29,11 +29,17 @@
 #define TERNARY_PACK_WIDTH      4u
 #define STE_PROGRESSIVE_EARLY_LAYER_COUNT        6u
 #define STE_PROGRESSIVE_WARMUP_STEPS             12u
+#define STE_PROGRESSIVE_LOW_ENERGY_WARMUP_STEPS  2u
+#define STE_PROGRESSIVE_LOW_ENERGY_HESSIAN_RAMP_STEPS 6u
+#define STE_LOW_ENERGY_AUTO_DECAY_FACTOR         0.50f
+#define STE_LOW_ENERGY_AUTO_DECAY_MIN_SCALE      0.125f
 #define STE_PROGRESSIVE_MIN_GAMMA_SCALE          0.10f
-#define STE_PROGRESSIVE_LR_SCALE                 2.50f
+#define STE_PROGRESSIVE_LOW_ENERGY_MIN_GAMMA_SCALE 0.02f
+#define STE_PROGRESSIVE_LR_SCALE                 1.50f
 #define STE_PROGRESSIVE_HESSIAN_SCALE            0.35f
 #define STE_PROGRESSIVE_REGULARIZATION_SCALE     0.50f
 #define STE_PROGRESSIVE_NON_COLLAPSE_SCALE       3.00f
+#define STE_TERNARY_SCALE_GROUP_SIZE             128u
 #define STE_EXTERNAL_PROXY_CAP                   12.0f
 #define STE_EARLY_LAYER_PROXY_CAP                6.0f
 #define STE_GAMMA_FLOOR_EPSILON                  1e-5f
@@ -81,6 +87,7 @@ static transformer_ste_config_t default_ste_config(void) {
     config.kl_weight = 0.05f;
     config.kl_temperature = 1.0f;
     config.kl_update_interval = 4;
+            config.student_down_proj_input_rmsnorm = 0;
     config.kl_sample_count = STE_DEFAULT_KL_SAMPLE_COUNT;
     config.early_stop_patience = STE_DEFAULT_EARLY_STOP_PATIENCE;
     config.early_stop_min_delta = STE_DEFAULT_EARLY_STOP_MIN_DELTA;
@@ -153,6 +160,7 @@ static void normalize_ste_distillation_config(transformer_ste_config_t *config)
 
 static void normalize_ste_runtime_config(transformer_ste_config_t *config)
 {
+    config->student_down_proj_input_rmsnorm = config->student_down_proj_input_rmsnorm ? 1 : 0;
     config->simulate_activation_a8 = config->simulate_activation_a8 ? 1 : 0;
     config->use_hessian_proxy = config->use_hessian_proxy ? 1 : 0;
     if (config->hessian_proxy_strength < 0.0f) config->hessian_proxy_strength = 1.0f;
@@ -176,6 +184,83 @@ static void normalize_ste_config(transformer_ste_config_t *config) {
 static size_t ternary_packed_bytes(uint32_t rows, uint32_t cols) {
     size_t packed_cols = ((size_t)cols + (TERNARY_PACK_WIDTH - 1u)) / TERNARY_PACK_WIDTH;
     return (size_t)rows * packed_cols;
+}
+
+static uint32_t ternary_default_scale_group_size(uint32_t cols)
+{
+    if (cols == 0u) {
+        return 1u;
+    }
+    return (cols < STE_TERNARY_SCALE_GROUP_SIZE)
+        ? cols
+        : STE_TERNARY_SCALE_GROUP_SIZE;
+}
+
+static uint32_t ternary_groups_per_row(uint32_t cols, uint32_t scale_group_size)
+{
+    uint32_t group_size = scale_group_size;
+
+    if (cols == 0u) {
+        return 0u;
+    }
+    if (group_size == 0u) {
+        group_size = ternary_default_scale_group_size(cols);
+    }
+    return (uint32_t)(((size_t)cols + group_size - 1u) / group_size);
+}
+
+static size_t ternary_scale_count(uint32_t rows,
+                                  uint32_t cols,
+                                  uint32_t scale_group_size)
+{
+    return (size_t)rows * ternary_groups_per_row(cols, scale_group_size);
+}
+
+static size_t ternary_scale_index(uint32_t row,
+                                  uint32_t col,
+                                  uint32_t cols,
+                                  uint32_t scale_group_size)
+{
+    uint32_t groups_per_row = ternary_groups_per_row(cols, scale_group_size);
+    uint32_t group_size = scale_group_size ? scale_group_size : ternary_default_scale_group_size(cols);
+    uint32_t group = 0u;
+
+    if (groups_per_row == 0u) {
+        return 0u;
+    }
+
+    group = col / group_size;
+    if (group >= groups_per_row) {
+        group = groups_per_row - 1u;
+    }
+    return (size_t)row * groups_per_row + group;
+}
+
+static int ste_tensor_prefers_local_scale_floor(const char *tensor_name)
+{
+    return tensor_name &&
+        (strstr(tensor_name, ".down_proj.weight") ||
+         strstr(tensor_name, ".o_proj.weight"));
+}
+
+static float ste_compute_bf16_abs_mean_span(const uint16_t *bf16_weights,
+                                            size_t row_base,
+                                            uint32_t start_col,
+                                            uint32_t end_col)
+{
+    double abs_mean = 0.0;
+    uint32_t count = 0u;
+
+    if (!bf16_weights || end_col <= start_col) {
+        return 0.0f;
+    }
+
+    count = end_col - start_col;
+    for (uint32_t col = start_col; col < end_col; ++col) {
+        abs_mean += fabs((double)bf16_to_f32_scalar(bf16_weights[row_base + col]));
+    }
+
+    return (float)(abs_mean / (double)count);
 }
 
 static uint8_t ternary_symbol_from_value(int8_t value) {
@@ -234,10 +319,18 @@ typedef struct {
 } ternary_scale_stats_t;
 
 typedef struct {
+    float rms;
+    float abs_max;
+    float absmax_rms_ratio;
+} activation_input_stats_t;
+
+typedef struct {
     int has_layer_index;
     uint32_t layer_index;
     int early_layer_warmup;
+    int prefer_local_scale_floor;
     uint32_t warmup_steps;
+    uint32_t hessian_ramp_steps;
     float layer_step_multiplier;
     float hessian_scale;
     float regularization_scale;
@@ -299,6 +392,36 @@ static void ste_build_layer_schedule(const char *tensor_name,
     out_schedule->non_collapse_scale = STE_PROGRESSIVE_NON_COLLAPSE_SCALE;
     out_schedule->min_gamma_scale = STE_PROGRESSIVE_MIN_GAMMA_SCALE;
     out_schedule->hessian_proxy_cap = STE_EARLY_LAYER_PROXY_CAP;
+    if (ste_tensor_prefers_local_scale_floor(tensor_name)) {
+        uint32_t remaining_steps = 0u;
+
+        out_schedule->prefer_local_scale_floor = 1;
+        out_schedule->layer_step_multiplier = 1.0f;
+        if (out_schedule->warmup_steps > STE_PROGRESSIVE_LOW_ENERGY_WARMUP_STEPS) {
+            out_schedule->warmup_steps = STE_PROGRESSIVE_LOW_ENERGY_WARMUP_STEPS;
+        }
+        remaining_steps = 0u;
+        if ((uint32_t)ste_steps > out_schedule->warmup_steps) {
+            remaining_steps = (uint32_t)ste_steps - out_schedule->warmup_steps;
+        }
+        out_schedule->hessian_ramp_steps = STE_PROGRESSIVE_LOW_ENERGY_HESSIAN_RAMP_STEPS;
+        if (out_schedule->hessian_ramp_steps > remaining_steps) {
+            out_schedule->hessian_ramp_steps = remaining_steps;
+        }
+        out_schedule->min_gamma_scale = STE_PROGRESSIVE_LOW_ENERGY_MIN_GAMMA_SCALE;
+    }
+}
+
+static float ste_schedule_lerp(float start, float end, uint32_t step, uint32_t total_steps)
+{
+    float progress = 1.0f;
+
+    if (total_steps == 0u || step >= total_steps) {
+        return end;
+    }
+
+    progress = (float)step / (float)total_steps;
+    return start + ((end - start) * progress);
 }
 
 static float ste_compute_teacher_abs_mean(const float *calibration_vectors,
@@ -339,29 +462,69 @@ static float ste_compute_teacher_abs_mean(const float *calibration_vectors,
     return (float)(abs_sum / (double)value_count);
 }
 
-static void telemetry_compute_scale_stats(const float *scales,
-                                          const float *scale_floor,
-                                          uint32_t rows,
-                                          ternary_scale_stats_t *out_stats)
+static void activation_input_stats_compute(const float *vectors,
+                                           int sample_count,
+                                           uint32_t cols,
+                                           activation_input_stats_t *out_stats)
 {
-    float mean = 0.0f;
-    float min_scale = 0.0f;
-    float max_scale = 0.0f;
-    uint32_t floor_hits = 0u;
+    double sum_sq = 0.0;
+    float abs_max = 0.0f;
+    size_t value_count = 0u;
 
     if (!out_stats) {
         return;
     }
 
     memset(out_stats, 0, sizeof(*out_stats));
-    if (!scales || rows == 0u) {
+    if (!vectors || sample_count <= 0 || cols == 0u) {
+        return;
+    }
+
+    value_count = (size_t)sample_count * cols;
+    for (size_t value_idx = 0u; value_idx < value_count; ++value_idx) {
+        float value = vectors[value_idx];
+        float magnitude = fabsf(value);
+
+        sum_sq += (double)value * (double)value;
+        if (magnitude > abs_max) {
+            abs_max = magnitude;
+        }
+    }
+
+    if (value_count == 0u) {
+        return;
+    }
+
+    out_stats->rms = (float)sqrt(sum_sq / (double)value_count);
+    out_stats->abs_max = abs_max;
+    if (out_stats->rms > 1e-12f) {
+        out_stats->absmax_rms_ratio = out_stats->abs_max / out_stats->rms;
+    }
+}
+
+static void telemetry_compute_scale_stats(const float *scales,
+                                          const float *scale_floor,
+                                          size_t scale_count,
+                                          ternary_scale_stats_t *out_stats)
+{
+    float mean = 0.0f;
+    float min_scale = 0.0f;
+    float max_scale = 0.0f;
+    size_t floor_hits = 0u;
+
+    if (!out_stats) {
+        return;
+    }
+
+    memset(out_stats, 0, sizeof(*out_stats));
+    if (!scales || scale_count == 0u) {
         return;
     }
 
     min_scale = scales[0];
     max_scale = scales[0];
-    for (uint32_t row = 0; row < rows; ++row) {
-        float scale = scales[row];
+    for (size_t scale_idx = 0u; scale_idx < scale_count; ++scale_idx) {
+        float scale = scales[scale_idx];
 
         mean += scale;
         if (scale < min_scale) {
@@ -370,16 +533,16 @@ static void telemetry_compute_scale_stats(const float *scales,
         if (scale > max_scale) {
             max_scale = scale;
         }
-        if (scale_floor && scale <= scale_floor[row] + STE_GAMMA_FLOOR_EPSILON) {
+        if (scale_floor && scale <= scale_floor[scale_idx] + STE_GAMMA_FLOOR_EPSILON) {
             ++floor_hits;
         }
     }
 
-    out_stats->mean = mean / (float)rows;
+    out_stats->mean = mean / (float)scale_count;
     out_stats->min = min_scale;
     out_stats->max = max_scale;
     out_stats->floor_fraction = scale_floor
-        ? ((float)floor_hits / (float)rows)
+        ? ((float)floor_hits / (float)scale_count)
         : 0.0f;
 }
 
@@ -413,6 +576,9 @@ static uint32_t telemetry_compute_config_hash(const transformer_ste_config_t *co
     crc32 = io_crc32_update(crc32, &config->adam_beta2, sizeof(config->adam_beta2));
     crc32 = io_crc32_update(crc32, &config->adam_epsilon, sizeof(config->adam_epsilon));
     crc32 = io_crc32_update(crc32, &config->telemetry_interval, sizeof(config->telemetry_interval));
+    crc32 = io_crc32_update(crc32,
+                            &config->student_down_proj_input_rmsnorm,
+                            sizeof(config->student_down_proj_input_rmsnorm));
     crc32 = io_crc32_update(crc32, config->hessian_sidecar_path, config->hessian_sidecar_path ? strlen(config->hessian_sidecar_path) + 1u : 0u);
     crc32 = io_crc32_update(crc32, &config->hessian_sidecar_crc32, sizeof(config->hessian_sidecar_crc32));
     crc32 = io_crc32_update(crc32, tensor_name, tensor_name ? strlen(tensor_name) + 1u : 0u);
@@ -521,7 +687,27 @@ typedef struct {
     float compute_ms;
     float effective_learning_rate;
     float effective_hessian_scale;
+    float hessian_proxy_cap;
 } ste_telemetry_step_t;
+
+static float telemetry_compute_active_hessian_proxy_max(float raw_hessian_proxy_max,
+                                                        float hessian_proxy_cap,
+                                                        float effective_hessian_scale)
+{
+    float active_hessian_proxy_max = raw_hessian_proxy_max;
+
+    if (active_hessian_proxy_max < 0.0f) {
+        active_hessian_proxy_max = 0.0f;
+    }
+    if (hessian_proxy_cap > 0.0f && active_hessian_proxy_max > hessian_proxy_cap) {
+        active_hessian_proxy_max = hessian_proxy_cap;
+    }
+    if (effective_hessian_scale > 0.0f) {
+        active_hessian_proxy_max *= effective_hessian_scale;
+    }
+
+    return active_hessian_proxy_max;
+}
 
 static int ste_telemetry_runtime_init(ste_telemetry_runtime_t *runtime,
                                       const transformer_ste_config_t *config,
@@ -594,7 +780,7 @@ static int ste_emit_telemetry_step(ste_telemetry_runtime_t *runtime,
     telemetry.clip_scale = step->clip_scale;
     telemetry.latent_saturation = step->latent_saturation;
     telemetry.compute_ms = step->compute_ms;
-    telemetry_compute_scale_stats(result->scales, scale_floor, result->rows, &scale_stats);
+    telemetry_compute_scale_stats(result->scales, scale_floor, result->scale_count, &scale_stats);
     telemetry.gamma_scale = scale_stats.mean;
     telemetry.gamma_scale_min = scale_stats.min;
     telemetry.gamma_scale_max = scale_stats.max;
@@ -613,6 +799,9 @@ static int ste_emit_telemetry_step(ste_telemetry_runtime_t *runtime,
     }
     telemetry.effective_learning_rate = step->effective_learning_rate;
     telemetry.effective_hessian_scale = step->effective_hessian_scale;
+    telemetry.hessian_proxy_active_max = telemetry_compute_active_hessian_proxy_max(telemetry.hessian_proxy_max,
+                                                                                    step->hessian_proxy_cap,
+                                                                                    step->effective_hessian_scale);
     ternary_telemetry_print_pass_stdout(&telemetry);
 
     if (step->step_idx + 1u < step->total_steps && runtime->interval > 0u && ((step->step_idx + 1u) % runtime->interval) != 0u) {
@@ -899,44 +1088,70 @@ static float* build_calibration_vectors(uint32_t cols,
     return vectors;
 }
 
-static void quantize_row_ternary(const float *latent_row,
-                                 uint32_t cols,
-                                 float zero_threshold,
-                                 float min_output_scale,
-                                 float *out_scale,
-                                 int8_t *out_ternary_row) {
-    float max_abs = 0.0f;
-    float threshold_scale = 0.0f;
-    float scale = min_output_scale;
-    float threshold = 0.0f;
+typedef struct {
+    const float *latent_row;
+    uint32_t cols;
+    uint32_t scale_group_size;
+    float zero_threshold;
+    const float *min_output_scales;
+    float *out_scales;
+    int8_t *out_ternary_row;
+} ste_quantize_row_request_t;
 
-    for (uint32_t c = 0; c < cols; ++c) {
-        float magnitude = fabsf(latent_row[c]);
-        if (magnitude > max_abs) {
-            max_abs = magnitude;
+static void quantize_row_ternary(const ste_quantize_row_request_t *request) {
+    uint32_t cols = request ? request->cols : 0u;
+    uint32_t group_size = request
+        ? (request->scale_group_size ? request->scale_group_size : ternary_default_scale_group_size(cols))
+        : 0u;
+    uint32_t groups_per_row = request
+        ? ternary_groups_per_row(cols, request->scale_group_size)
+        : 0u;
+
+    if (!request || !request->latent_row || !request->out_scales || !request->out_ternary_row ||
+        groups_per_row == 0u) {
+        return;
+    }
+
+    for (uint32_t group = 0; group < groups_per_row; ++group) {
+        uint32_t start_col = group * group_size;
+        uint32_t end_col = start_col + group_size;
+        float max_abs = 0.0f;
+        float threshold_scale = 0.0f;
+        float scale = request->min_output_scales ? request->min_output_scales[group] : 0.0f;
+        float threshold = 0.0f;
+
+        if (end_col > cols) {
+            end_col = cols;
         }
-    }
 
-    if (max_abs > 1e-12f) {
-        threshold_scale = max_abs;
-    }
-    if (scale < threshold_scale) {
-        scale = threshold_scale;
-    }
-    threshold = threshold_scale * zero_threshold;
-
-    for (uint32_t c = 0; c < cols; ++c) {
-        float value = latent_row[c];
-        if (value > threshold) {
-            out_ternary_row[c] = 1;
-        } else if (value < -threshold) {
-            out_ternary_row[c] = -1;
-        } else {
-            out_ternary_row[c] = 0;
+        for (uint32_t c = start_col; c < end_col; ++c) {
+            float magnitude = fabsf(request->latent_row[c]);
+            if (magnitude > max_abs) {
+                max_abs = magnitude;
+            }
         }
-    }
 
-    *out_scale = scale;
+        if (max_abs > 1e-12f) {
+            threshold_scale = max_abs;
+        }
+        if (scale < threshold_scale) {
+            scale = threshold_scale;
+        }
+        threshold = threshold_scale * request->zero_threshold;
+
+        for (uint32_t c = start_col; c < end_col; ++c) {
+            float value = request->latent_row[c];
+            if (value > threshold) {
+                request->out_ternary_row[c] = 1;
+            } else if (value < -threshold) {
+                request->out_ternary_row[c] = -1;
+            } else {
+                request->out_ternary_row[c] = 0;
+            }
+        }
+
+        request->out_scales[group] = scale;
+    }
 }
 
 static float dot_row(const float *row, const float *vec, uint32_t cols) {
@@ -947,10 +1162,25 @@ static float dot_row(const float *row, const float *vec, uint32_t cols) {
     return acc;
 }
 
-static float dot_row_ternary(const int8_t *row, float scale, const float *vec, uint32_t cols) {
+static float dot_row_ternary(const int8_t *row,
+                             const float *scales,
+                             const float *vec,
+                             uint32_t cols,
+                             uint32_t scale_group_size) {
     float acc = 0.0f;
-    for (uint32_t c = 0; c < cols; ++c) {
-        acc += ((float)row[c] * scale) * vec[c];
+    uint32_t group_size = scale_group_size ? scale_group_size : ternary_default_scale_group_size(cols);
+
+    for (uint32_t start_col = 0u, group = 0u; start_col < cols; start_col += group_size, ++group) {
+        uint32_t end_col = start_col + group_size;
+        float group_acc = 0.0f;
+
+        if (end_col > cols) {
+            end_col = cols;
+        }
+        for (uint32_t c = start_col; c < end_col; ++c) {
+            group_acc += (float)row[c] * vec[c];
+        }
+        acc += scales[group] * group_acc;
     }
     return acc;
 }
@@ -995,6 +1225,7 @@ typedef struct {
     const float *scale_floor;
     uint32_t rows;
     uint32_t cols;
+    uint32_t scale_group_size;
     float zero_threshold;
 } ste_quantize_rows_request_t;
 
@@ -1006,13 +1237,18 @@ static void quantize_all_rows(const ste_quantize_rows_request_t *request)
 
     for (uint32_t row = 0; row < request->rows; ++row) {
         size_t row_base = (size_t)row * request->cols;
+        size_t scale_base = (size_t)row * ternary_groups_per_row(request->cols,
+                                                                 request->scale_group_size);
 
-        quantize_row_ternary(request->latent + row_base,
-                             request->cols,
-                             request->zero_threshold,
-                             request->scale_floor ? request->scale_floor[row] : 0.0f,
-                             &request->scales[row],
-                             request->ternary + row_base);
+        quantize_row_ternary(&(ste_quantize_row_request_t){
+            .latent_row = request->latent + row_base,
+            .cols = request->cols,
+            .scale_group_size = request->scale_group_size,
+            .zero_threshold = request->zero_threshold,
+            .min_output_scales = request->scale_floor ? request->scale_floor + scale_base : NULL,
+            .out_scales = request->scales + scale_base,
+            .out_ternary_row = request->ternary + row_base
+        });
     }
 }
 
@@ -1063,7 +1299,8 @@ static void quantize_activation_vectors_a8(float *vectors,
 
 static void ste_accumulate_row_gradients(const float *latent_row,
                                          const int8_t *ternary_row,
-                                         float scale,
+                                         const float *scales,
+                                         uint32_t scale_group_size,
                                          float *gradient_row,
                                          const ste_gradient_accum_context_t *context)
 {
@@ -1103,7 +1340,7 @@ static void ste_accumulate_row_gradients(const float *latent_row,
     for (int s = 0; s < sample_count; ++s) {
         const float *vec = context->calibration_vectors + (size_t)s * cols;
         float reference = dot_row(latent_row, vec, cols);
-        float proxy = dot_row_ternary(ternary_row, scale, vec, cols);
+        float proxy = dot_row_ternary(ternary_row, scales, vec, cols, scale_group_size);
         sample_diffs[s] = proxy - reference;
     }
 
@@ -1347,7 +1584,8 @@ static tensor_t **resolve_tensor_slot(llm_model_t *model,
 static tensor_t *build_proxy_tensor_from_ternary(const int8_t *ternary,
                                                  const float *scales,
                                                  uint32_t rows,
-                                                 uint32_t cols) {
+                                                 uint32_t cols,
+                                                 uint32_t scale_group_size) {
     const int shape[2] = { (int)rows, (int)cols };
     tensor_t *proxy = NULL;
     float *data = NULL;
@@ -1367,10 +1605,10 @@ static tensor_t *build_proxy_tensor_from_ternary(const int8_t *ternary,
     }
 
     for (uint32_t r = 0; r < rows; ++r) {
-        float scale = scales[r];
         size_t row_base = (size_t)r * cols;
         for (uint32_t c = 0; c < cols; ++c) {
-            data[row_base + c] = (float)ternary[row_base + c] * scale;
+            size_t scale_idx = ternary_scale_index(r, c, cols, scale_group_size);
+            data[row_base + c] = (float)ternary[row_base + c] * scales[scale_idx];
         }
     }
 
@@ -1455,6 +1693,7 @@ typedef struct {
     const float *scales;
     uint32_t rows;
     uint32_t cols;
+    uint32_t scale_group_size;
     const transformer_ste_config_t *config;
     const ternary_calibration_corpus_t *corpus;
     float *out_sample_weights;
@@ -1475,6 +1714,7 @@ typedef struct {
     float *proxy_probs;
     float kl_weight;
     float kl_temperature;
+    int student_down_proj_input_rmsnorm;
 } distillation_runtime_t;
 
 typedef struct {
@@ -1676,7 +1916,8 @@ static int distillation_prepare_runtime(const distillation_weight_request_t *req
     buffers->proxy_tensor = build_proxy_tensor_from_ternary(request->ternary,
                                                             request->scales,
                                                             request->rows,
-                                                            request->cols);
+                                                            request->cols,
+                                                            request->scale_group_size);
     if (!buffers->proxy_tensor) {
         distillation_runtime_buffers_release(buffers);
         return -1;
@@ -1698,6 +1939,7 @@ static int distillation_prepare_runtime(const distillation_weight_request_t *req
     runtime->proxy_probs = buffers->proxy_probs;
     runtime->kl_weight = request->config->kl_weight;
     runtime->kl_temperature = request->config->kl_temperature;
+    runtime->student_down_proj_input_rmsnorm = request->config->student_down_proj_input_rmsnorm ? 1 : 0;
     return 0;
 }
 
@@ -1841,6 +2083,9 @@ static int populate_reference_logits(const distillation_runtime_t *runtime,
     }
 
     *runtime->slot = runtime->original_tensor;
+    if (runtime->student_down_proj_input_rmsnorm && runtime->corpus && runtime->corpus->session) {
+        inference_session_set_ffn_down_proj_input_rmsnorm_override(runtime->corpus->session, 0);
+    }
     if (run_prompt_logits(runtime->corpus->session,
                           runtime->corpus->tokenizer,
                           runtime->corpus->model_spec,
@@ -1848,10 +2093,16 @@ static int populate_reference_logits(const distillation_runtime_t *runtime,
                           out_reference_logits,
                           runtime->model_config->vocab_size) != 0) {
         *runtime->slot = runtime->original_tensor;
+        if (runtime->student_down_proj_input_rmsnorm && runtime->corpus && runtime->corpus->session) {
+            inference_session_clear_ffn_down_proj_input_rmsnorm_override(runtime->corpus->session);
+        }
         return -1;
     }
 
     *runtime->slot = runtime->original_tensor;
+    if (runtime->student_down_proj_input_rmsnorm && runtime->corpus && runtime->corpus->session) {
+        inference_session_clear_ffn_down_proj_input_rmsnorm_override(runtime->corpus->session);
+    }
     return 0;
 }
 
@@ -1865,6 +2116,9 @@ static float compute_sample_distillation_weight(const distillation_runtime_t *ru
     }
 
     *runtime->slot = runtime->proxy_tensor;
+    if (runtime->student_down_proj_input_rmsnorm && runtime->corpus && runtime->corpus->session) {
+        inference_session_set_ffn_down_proj_input_rmsnorm_override(runtime->corpus->session, 1);
+    }
     if (run_prompt_logits(runtime->corpus->session,
                           runtime->corpus->tokenizer,
                           runtime->corpus->model_spec,
@@ -1872,9 +2126,15 @@ static float compute_sample_distillation_weight(const distillation_runtime_t *ru
                           runtime->proxy_logits,
                           runtime->model_config->vocab_size) != 0) {
         *runtime->slot = runtime->original_tensor;
+        if (runtime->student_down_proj_input_rmsnorm && runtime->corpus && runtime->corpus->session) {
+            inference_session_clear_ffn_down_proj_input_rmsnorm_override(runtime->corpus->session);
+        }
         return 1.0f;
     }
     *runtime->slot = runtime->original_tensor;
+    if (runtime->student_down_proj_input_rmsnorm && runtime->corpus && runtime->corpus->session) {
+        inference_session_clear_ffn_down_proj_input_rmsnorm_override(runtime->corpus->session);
+    }
 
     kl = compute_logits_kl(reference_logits,
                            runtime->proxy_logits,
@@ -1930,8 +2190,10 @@ typedef struct {
     int8_t *ternary;
     float *scales;
     const float *scale_floor;
+    size_t scale_count;
     uint32_t rows;
     uint32_t cols;
+    uint32_t scale_group_size;
     const transformer_ste_config_t *config;
     const char *tensor_name;
     const float *calibration_vectors;
@@ -1944,7 +2206,44 @@ typedef struct {
     ternary_hessian_proxy_stats_t hessian_proxy_stats;
     ternary_hessian_proxy_source_t hessian_proxy_source;
     ste_layer_schedule_t layer_schedule;
+    float learning_rate_scale;
+    float minimum_learning_rate_scale;
 } ste_calibration_context_t;
+
+static int ste_low_energy_hessian_ramp_active(const ste_calibration_context_t *context,
+                                              uint32_t step_index,
+                                              uint32_t *out_ramp_step,
+                                              uint32_t *out_ramp_steps)
+{
+    uint32_t ramp_step = 0u;
+    uint32_t ramp_steps = 0u;
+
+    if (!context ||
+        !context->layer_schedule.prefer_local_scale_floor ||
+        !context->layer_schedule.early_layer_warmup ||
+        step_index <= context->layer_schedule.warmup_steps) {
+        return 0;
+    }
+
+    ramp_steps = context->layer_schedule.hessian_ramp_steps;
+    if (ramp_steps == 0u) {
+        return 0;
+    }
+
+    ramp_step = step_index - context->layer_schedule.warmup_steps;
+    if (ramp_step > ramp_steps) {
+        return 0;
+    }
+
+    if (out_ramp_step) {
+        *out_ramp_step = ramp_step;
+    }
+    if (out_ramp_steps) {
+        *out_ramp_steps = ramp_steps;
+    }
+
+    return 1;
+}
 
 typedef struct {
     float mse_sum;
@@ -1975,6 +2274,11 @@ static void ste_build_step_schedule(const ste_calibration_context_t *context,
                                     uint32_t step_index,
                                     ste_step_schedule_t *out_schedule)
 {
+    float default_hessian_scale = 1.0f;
+    float default_hessian_proxy_cap = 0.0f;
+    uint32_t ramp_step = 0u;
+    uint32_t ramp_steps = 0u;
+
     if (!out_schedule) {
         return;
     }
@@ -1991,10 +2295,34 @@ static void ste_build_step_schedule(const ste_calibration_context_t *context,
     if (context->hessian_proxy_source == TERNARY_HESSIAN_PROXY_SOURCE_EXTERNAL_SIDECAR) {
         out_schedule->hessian_proxy_cap = STE_EXTERNAL_PROXY_CAP;
     }
+    default_hessian_scale = out_schedule->hessian_scale;
+    default_hessian_proxy_cap = out_schedule->hessian_proxy_cap;
     out_schedule->learning_rate *= context->layer_schedule.layer_step_multiplier;
+    out_schedule->learning_rate *= context->learning_rate_scale;
 
-    if (!context->layer_schedule.early_layer_warmup ||
-        step_index > context->layer_schedule.warmup_steps) {
+    if (!context->layer_schedule.early_layer_warmup) {
+        return;
+    }
+
+    if (step_index > context->layer_schedule.warmup_steps) {
+        if (!ste_low_energy_hessian_ramp_active(context,
+                                                step_index,
+                                                &ramp_step,
+                                                &ramp_steps)) {
+            return;
+        }
+
+        out_schedule->hessian_scale = ste_schedule_lerp(context->layer_schedule.hessian_scale,
+                                                        default_hessian_scale,
+                                                        ramp_step,
+                                                        ramp_steps);
+        if (context->layer_schedule.hessian_proxy_cap > 0.0f &&
+            default_hessian_proxy_cap > 0.0f) {
+            out_schedule->hessian_proxy_cap = ste_schedule_lerp(context->layer_schedule.hessian_proxy_cap,
+                                                                default_hessian_proxy_cap,
+                                                                ramp_step,
+                                                                ramp_steps);
+        }
         return;
     }
 
@@ -2036,6 +2364,121 @@ static int ste_should_refresh_distillation_weights(const ste_calibration_context
     return step_index == 1u || (((step_index - 1u) % (uint32_t)update_interval) == 0u);
 }
 
+static int ste_low_energy_auto_decay_enabled(const ste_calibration_context_t *context)
+{
+    return context && context->config && context->layer_schedule.prefer_local_scale_floor;
+}
+
+static void ste_maybe_apply_low_energy_auto_decay(ste_calibration_context_t *context,
+                                                  uint32_t step_index,
+                                                  float current_loss,
+                                                  float previous_loss,
+                                                  float best_loss)
+{
+    float min_delta = 0.0f;
+    float divergence_ratio = 0.0f;
+    float new_scale = 1.0f;
+
+    if (!ste_low_energy_auto_decay_enabled(context) || step_index <= 1u) {
+        return;
+    }
+    if (!isfinite(previous_loss) || !isfinite(best_loss) || best_loss <= 1e-12f) {
+        return;
+    }
+
+    min_delta = context->config->early_stop_min_delta;
+    divergence_ratio = context->config->early_stop_divergence_ratio;
+    if (divergence_ratio < 1.0f) {
+        divergence_ratio = 1.0f;
+    }
+
+    if (current_loss <= previous_loss + min_delta ||
+        current_loss <= best_loss * divergence_ratio) {
+        return;
+    }
+
+    new_scale = context->learning_rate_scale * STE_LOW_ENERGY_AUTO_DECAY_FACTOR;
+    if (new_scale < context->minimum_learning_rate_scale) {
+        new_scale = context->minimum_learning_rate_scale;
+    }
+    if (new_scale >= context->learning_rate_scale) {
+        return;
+    }
+
+    LOG_INFO("STE low-energy auto-decay: tensor=%s step=%u prev_loss=%.6f best_loss=%.6f current_loss=%.6f lr_scale=%.4f->%.4f",
+             context->tensor_name ? context->tensor_name : "<unknown>",
+             step_index,
+             (double)previous_loss,
+             (double)best_loss,
+             (double)current_loss,
+             (double)context->learning_rate_scale,
+             (double)new_scale);
+    context->learning_rate_scale = new_scale;
+}
+
+static void ste_quantize_context_latent(const ste_calibration_context_t *context)
+{
+    if (!context || !context->config) {
+        return;
+    }
+
+    quantize_all_rows(&(ste_quantize_rows_request_t){
+        .latent = context->latent,
+        .ternary = context->ternary,
+        .scales = context->scales,
+        .scale_floor = context->scale_floor,
+        .rows = context->rows,
+        .cols = context->cols,
+        .scale_group_size = context->scale_group_size,
+        .zero_threshold = context->config->zero_threshold
+    });
+}
+
+static void ste_prepare_sample_weights_for_step(const ste_calibration_context_t *context,
+                                                uint32_t step_index,
+                                                int sample_count,
+                                                float *sample_weights)
+{
+    distillation_weight_request_t distillation_request;
+
+    if (!context || !context->config || !sample_weights || sample_count <= 0 ||
+        context->config->kl_weight <= 0.0f) {
+        return;
+    }
+
+    if (ste_should_refresh_distillation_weights(context, step_index, sample_count)) {
+        memset(&distillation_request, 0, sizeof(distillation_request));
+        distillation_request.ternary = context->ternary;
+        distillation_request.scales = context->scales;
+        distillation_request.rows = context->rows;
+        distillation_request.cols = context->cols;
+        distillation_request.scale_group_size = context->scale_group_size;
+        distillation_request.config = context->config;
+        distillation_request.corpus = context->corpus;
+        distillation_request.out_sample_weights = sample_weights;
+        distillation_request.sample_count = sample_count;
+        distillation_request.kl_sample_count = context->config->kl_sample_count;
+        distillation_request.reference_cache = context->distillation_reference_cache;
+        compute_distillation_sample_weights(&distillation_request);
+        if (context->distillation_sample_weights &&
+            context->distillation_sample_weight_count &&
+            context->distillation_sample_weight_step) {
+            memcpy(context->distillation_sample_weights,
+                   sample_weights,
+                   (size_t)sample_count * sizeof(sample_weights[0]));
+            *context->distillation_sample_weight_count = sample_count;
+            *context->distillation_sample_weight_step = step_index;
+        }
+        return;
+    }
+
+    if (context->distillation_sample_weights) {
+        memcpy(sample_weights,
+               context->distillation_sample_weights,
+               (size_t)sample_count * sizeof(sample_weights[0]));
+    }
+}
+
 static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_context_t *context,
                                                      uint32_t step_index,
                                                      ste_step_schedule_t *out_step_schedule)
@@ -2043,7 +2486,6 @@ static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_conte
     float sample_weights[STE_MAX_CALIBRATION_SAMPLES];
     ste_gradient_accum_context_t gradient_context;
     ste_optimizer_context_t optimizer_context;
-    distillation_weight_request_t distillation_request;
     ste_step_metrics_t metrics;
     ste_step_schedule_t step_schedule;
     size_t weight_count = 0u;
@@ -2068,45 +2510,8 @@ static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_conte
         *out_step_schedule = step_schedule;
     }
 
-    quantize_all_rows(&(ste_quantize_rows_request_t){
-        .latent = context->latent,
-        .ternary = context->ternary,
-        .scales = context->scales,
-        .scale_floor = context->scale_floor,
-        .rows = context->rows,
-        .cols = context->cols,
-        .zero_threshold = context->config->zero_threshold
-    });
-
-    if (context->config->kl_weight > 0.0f) {
-        if (ste_should_refresh_distillation_weights(context, step_index, sample_count)) {
-            memset(&distillation_request, 0, sizeof(distillation_request));
-            distillation_request.ternary = context->ternary;
-            distillation_request.scales = context->scales;
-            distillation_request.rows = context->rows;
-            distillation_request.cols = context->cols;
-            distillation_request.config = context->config;
-            distillation_request.corpus = context->corpus;
-            distillation_request.out_sample_weights = sample_weights;
-            distillation_request.sample_count = sample_count;
-            distillation_request.kl_sample_count = context->config->kl_sample_count;
-            distillation_request.reference_cache = context->distillation_reference_cache;
-            compute_distillation_sample_weights(&distillation_request);
-            if (context->distillation_sample_weights &&
-                context->distillation_sample_weight_count &&
-                context->distillation_sample_weight_step) {
-                memcpy(context->distillation_sample_weights,
-                       sample_weights,
-                       (size_t)sample_count * sizeof(sample_weights[0]));
-                *context->distillation_sample_weight_count = sample_count;
-                *context->distillation_sample_weight_step = step_index;
-            }
-        } else if (context->distillation_sample_weights) {
-            memcpy(sample_weights,
-                   context->distillation_sample_weights,
-                   (size_t)sample_count * sizeof(sample_weights[0]));
-        }
-    }
+    ste_quantize_context_latent(context);
+    ste_prepare_sample_weights_for_step(context, step_index, sample_count, sample_weights);
 
     memset(context->gradient, 0, weight_count * sizeof(float));
 
@@ -2125,9 +2530,12 @@ static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_conte
 
     for (uint32_t r = 0; r < context->rows; ++r) {
         size_t row_base = (size_t)r * context->cols;
+        size_t scale_base = (size_t)r * ternary_groups_per_row(context->cols,
+                                                               context->scale_group_size);
         ste_accumulate_row_gradients(context->latent + row_base,
                                      context->ternary + row_base,
-                                     context->scales[r],
+                                     context->scales + scale_base,
+                                     context->scale_group_size,
                                      context->gradient + row_base,
                                      &gradient_context);
     }
@@ -2153,15 +2561,7 @@ static ste_step_metrics_t ste_calibrate_with_samples(const ste_calibration_conte
                                                    weight_count,
                                                    &optimizer_context);
 
-    quantize_all_rows(&(ste_quantize_rows_request_t){
-        .latent = context->latent,
-        .ternary = context->ternary,
-        .scales = context->scales,
-        .scale_floor = context->scale_floor,
-        .rows = context->rows,
-        .cols = context->cols,
-        .zero_threshold = context->config->zero_threshold
-    });
+    ste_quantize_context_latent(context);
 
     metrics.mse_sum = mse_sum;
     return metrics;
@@ -2535,7 +2935,7 @@ static void ste_restore_best_latent(const ste_calibration_context_t *context,
     memcpy(context->latent, context->best_latent, weight_count * sizeof(float));
 }
 
-static int run_ste_calibration_steps(const ste_calibration_context_t *context,
+static int run_ste_calibration_steps(ste_calibration_context_t *context,
                                      ternary_calibration_result_t *out_result,
                                      ste_telemetry_runtime_t *telemetry_runtime)
 {
@@ -2558,6 +2958,8 @@ static int run_ste_calibration_steps(const ste_calibration_context_t *context,
         struct timespec step_end;
         ste_telemetry_step_t telemetry_step;
         float current_loss = 0.0f;
+        float previous_loss = early_stop_state.previous_loss;
+        float best_loss = early_stop_state.best_loss;
         ste_early_stop_reason_t stop_reason = STE_EARLY_STOP_REASON_NONE;
 
         memset(&step_schedule, 0, sizeof(step_schedule));
@@ -2570,6 +2972,11 @@ static int run_ste_calibration_steps(const ste_calibration_context_t *context,
                               (uint32_t)(step + 1),
                               &step_schedule);
         current_loss = (context->rows > 0u) ? (step_metrics.mse_sum / (float)context->rows) : 0.0f;
+        ste_maybe_apply_low_energy_auto_decay(context,
+                              (uint32_t)(step + 1),
+                              current_loss,
+                              previous_loss,
+                              best_loss);
         stop_reason = ste_update_early_stop_state(context,
                                                   (uint32_t)(step + 1),
                                                   current_loss,
@@ -2590,6 +2997,7 @@ static int run_ste_calibration_steps(const ste_calibration_context_t *context,
             telemetry_step.compute_ms = telemetry_diff_ms(&step_start, &step_end);
             telemetry_step.effective_learning_rate = step_schedule.learning_rate;
             telemetry_step.effective_hessian_scale = step_schedule.hessian_scale;
+            telemetry_step.hessian_proxy_cap = step_schedule.hessian_proxy_cap;
 
             if (pack_ternary_2bit(out_result->ternary_weights,
                                   context->rows,
@@ -2633,6 +3041,7 @@ typedef struct {
     float distillation_sample_weights[STE_MAX_CALIBRATION_SAMPLES];
     distillation_reference_cache_t distillation_reference_cache;
     float teacher_abs_mean;
+    activation_input_stats_t activation_input_stats;
     int actual_sample_count;
     int distillation_sample_weight_count;
     uint32_t distillation_sample_weight_step;
@@ -2678,6 +3087,7 @@ typedef struct {
     int use_teacher_abs_mean;
     uint32_t rows;
     uint32_t cols;
+    uint32_t scale_group_size;
     const ste_layer_schedule_t *layer_schedule;
     float *out_scale_floor;
     float *out_teacher_abs_mean;
@@ -2685,6 +3095,34 @@ typedef struct {
 
 static const char *resolve_calibration_tensor_name(const ternary_calibration_corpus_t *corpus,
                                                    const ternary_activation_tape_context_t *tape_context);
+
+static int ste_student_down_proj_input_rmsnorm_enabled(const ste_calibration_workspace_request_t *request)
+{
+    const char *tensor_name = resolve_calibration_tensor_name(request ? request->corpus : NULL,
+                                                              request ? request->tape_context : NULL);
+
+    return request && request->config && request->config->student_down_proj_input_rmsnorm &&
+        tensor_name && strstr(tensor_name, ".down_proj.weight") != NULL;
+}
+
+static int activation_vectors_apply_weightless_rmsnorm(float *vectors,
+                                                       int sample_count,
+                                                       uint32_t cols)
+{
+    if (!vectors || sample_count <= 0 || cols == 0u) {
+        return -1;
+    }
+
+    for (int sample_idx = 0; sample_idx < sample_count; ++sample_idx) {
+        float *vector = vectors + ((size_t)sample_idx * cols);
+
+        if (rmsnorm_unit(vector, vector, 1e-6f, (int)cols) != 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
 
 static void ste_calibration_workspace_reset(ste_calibration_workspace_t *workspace)
 {
@@ -2712,12 +3150,128 @@ static void ste_calibration_workspace_release(ste_calibration_workspace_t *works
     ste_calibration_workspace_reset(workspace);
 }
 
+static int ste_prepare_workspace_buffers(const ste_calibration_workspace_request_t *request,
+                                        ste_calibration_workspace_t *workspace,
+                                        const char *tensor_name)
+{
+    if (!request || !request->config || !workspace) {
+        return -1;
+    }
+
+    if (request->config->early_stop_patience > 0 &&
+        request->config->ste_steps > (int)STE_EARLY_STOP_MIN_STEPS) {
+        workspace->best_latent = (float *)malloc(request->weight_count * sizeof(float));
+    }
+    workspace->first_moment = (float *)calloc(request->weight_count, sizeof(float));
+    workspace->second_moment = (float *)calloc(request->weight_count, sizeof(float));
+    workspace->gradient = (float *)malloc(request->weight_count * sizeof(float));
+    workspace->actual_sample_count = request->config->calibration_samples;
+    if (request->layer_schedule) {
+        workspace->layer_schedule = *request->layer_schedule;
+    } else {
+        ste_layer_schedule_reset(&workspace->layer_schedule);
+    }
+    if (workspace->layer_schedule.early_layer_warmup) {
+        workspace->scale_floor = (float *)malloc(ternary_scale_count(request->rows,
+                                                                     request->cols,
+                                                                     ternary_default_scale_group_size(request->cols)) * sizeof(float));
+    }
+    if (!workspace->first_moment || !workspace->second_moment || !workspace->gradient ||
+        (workspace->layer_schedule.early_layer_warmup && !workspace->scale_floor)) {
+        return -1;
+    }
+    if (!workspace->best_latent &&
+        request->config->early_stop_patience > 0 &&
+        request->config->ste_steps > (int)STE_EARLY_STOP_MIN_STEPS) {
+        LOG_WARN("STE early stop disabled for tensor=%s: failed to allocate best-latent buffer",
+                 tensor_name ? tensor_name : "<unknown>");
+    }
+
+    return 0;
+}
+
+static int ste_prepare_workspace_vectors(const ste_calibration_workspace_request_t *request,
+                                         ste_calibration_workspace_t *workspace,
+                                         const char *tensor_name,
+                                         const ternary_hessian_sidecar_t **out_hessian_sidecar)
+{
+    activation_input_stats_t raw_activation_input_stats;
+    const ternary_hessian_sidecar_t *hessian_sidecar = NULL;
+    int activation_override_active = 0;
+    int student_down_proj_input_rmsnorm = 0;
+
+    if (!request || !request->config || !workspace || !out_hessian_sidecar) {
+        return -1;
+    }
+
+    student_down_proj_input_rmsnorm = ste_student_down_proj_input_rmsnorm_enabled(request);
+    hessian_sidecar = request->sidecar;
+    if (request->config->student_down_proj_input_rmsnorm && request->corpus && request->corpus->session) {
+        inference_session_set_ffn_down_proj_input_rmsnorm_override(request->corpus->session, 1);
+        activation_override_active = 1;
+    }
+    workspace->calibration_vectors = build_calibration_vectors(request->cols,
+                                                               request->config->calibration_samples,
+                                                               request->corpus,
+                                                               request->tape_context,
+                                                               &workspace->actual_sample_count);
+    if (activation_override_active) {
+        inference_session_clear_ffn_down_proj_input_rmsnorm_override(request->corpus->session);
+    }
+    if (!workspace->calibration_vectors) {
+        return -1;
+    }
+
+    activation_input_stats_compute(workspace->calibration_vectors,
+                                   workspace->actual_sample_count,
+                                   request->cols,
+                                   &raw_activation_input_stats);
+    workspace->activation_input_stats = raw_activation_input_stats;
+    if (request->tape_context && request->tape_context->tape) {
+        LOG_INFO("Activation input stats: tensor=%s samples=%d cols=%u rms=%.6f absmax=%.6f absmax_rms_ratio=%.6f",
+                 tensor_name ? tensor_name : "<unknown>",
+                 workspace->actual_sample_count,
+                 request->cols,
+                 (double)raw_activation_input_stats.rms,
+                 (double)raw_activation_input_stats.abs_max,
+                 (double)raw_activation_input_stats.absmax_rms_ratio);
+    }
+    if (student_down_proj_input_rmsnorm && request->tape_context && request->tape_context->tape) {
+        if (activation_vectors_apply_weightless_rmsnorm(workspace->calibration_vectors,
+                                                        workspace->actual_sample_count,
+                                                        request->cols) != 0) {
+            return -1;
+        }
+        activation_input_stats_compute(workspace->calibration_vectors,
+                                       workspace->actual_sample_count,
+                                       request->cols,
+                                       &workspace->activation_input_stats);
+        LOG_INFO("Student down-proj RMSNorm adjusted calibration vectors: tensor=%s samples=%d cols=%u rms=%.6f absmax=%.6f absmax_rms_ratio=%.6f",
+                 tensor_name ? tensor_name : "<unknown>",
+                 workspace->actual_sample_count,
+                 request->cols,
+                 (double)workspace->activation_input_stats.rms,
+                 (double)workspace->activation_input_stats.abs_max,
+                 (double)workspace->activation_input_stats.absmax_rms_ratio);
+        if (hessian_sidecar) {
+            LOG_INFO("Hessian proxy: ignoring external sidecar for %s because student down-proj RMSNorm changes the calibration boundary",
+                     tensor_name ? tensor_name : "<unknown>");
+            hessian_sidecar = NULL;
+        }
+    }
+
+    *out_hessian_sidecar = hessian_sidecar;
+    return 0;
+}
+
 static int ste_prepare_output_buffers(ternary_calibration_result_t *out_result,
                                       size_t weight_count,
                                       uint32_t rows,
                                       uint32_t cols)
 {
     size_t packed_bytes = ternary_packed_bytes(rows, cols);
+    uint32_t scale_group_size = ternary_default_scale_group_size(cols);
+    size_t scale_count = ternary_scale_count(rows, cols, scale_group_size);
 
     if (!out_result) {
         return -1;
@@ -2727,7 +3281,7 @@ static int ste_prepare_output_buffers(ternary_calibration_result_t *out_result,
     out_result->latent_weights = (float *)malloc(weight_count * sizeof(float));
     out_result->ternary_weights = (int8_t *)malloc(weight_count * sizeof(int8_t));
     out_result->packed_weights = (uint8_t *)malloc(packed_bytes);
-    out_result->scales = (float *)malloc((size_t)rows * sizeof(float));
+    out_result->scales = (float *)malloc(scale_count * sizeof(float));
     if (!out_result->latent_weights || !out_result->ternary_weights ||
         !out_result->packed_weights || !out_result->scales) {
         transformer_free_ternary_calibration_result(out_result);
@@ -2736,20 +3290,26 @@ static int ste_prepare_output_buffers(ternary_calibration_result_t *out_result,
 
     out_result->weight_count = weight_count;
     out_result->packed_weight_bytes = packed_bytes;
+    out_result->scale_count = scale_count;
     out_result->rows = rows;
     out_result->cols = cols;
+    out_result->scale_group_size = scale_group_size;
     return 0;
 }
 
 static int ste_build_scale_floor(const ste_scale_floor_request_t *request)
 {
     float teacher_abs_mean = 0.0f;
+    uint32_t groups_per_row = 0u;
 
     if (!request || !request->out_scale_floor || request->rows == 0u || request->cols == 0u) {
         return -1;
     }
 
-    memset(request->out_scale_floor, 0, (size_t)request->rows * sizeof(float));
+    groups_per_row = ternary_groups_per_row(request->cols, request->scale_group_size);
+    memset(request->out_scale_floor, 0, ternary_scale_count(request->rows,
+                                                            request->cols,
+                                                            request->scale_group_size) * sizeof(float));
     if (request->out_teacher_abs_mean) {
         *request->out_teacher_abs_mean = 0.0f;
     }
@@ -2767,24 +3327,31 @@ static int ste_build_scale_floor(const ste_scale_floor_request_t *request)
     }
 
     for (uint32_t row = 0; row < request->rows; ++row) {
-        float scale_floor = teacher_abs_mean;
+        size_t row_base = (size_t)row * request->cols;
+        size_t scale_base = (size_t)row * groups_per_row;
+        uint32_t group_size = request->scale_group_size
+            ? request->scale_group_size
+            : ternary_default_scale_group_size(request->cols);
 
-        if (scale_floor <= 1e-12f) {
-            double abs_mean = 0.0;
-            size_t row_base = (size_t)row * request->cols;
+        for (uint32_t group = 0; group < groups_per_row; ++group) {
+            uint32_t start_col = group * group_size;
+            uint32_t end_col = start_col + group_size;
+            float scale_floor = teacher_abs_mean;
 
-            for (uint32_t col = 0; col < request->cols; ++col) {
-                abs_mean += fabs((double)bf16_to_f32_scalar(request->bf16_weights[row_base + col]));
+            if (end_col > request->cols) {
+                end_col = request->cols;
             }
-
-            abs_mean /= (double)request->cols;
-            scale_floor = (float)abs_mean;
+            if (request->layer_schedule->prefer_local_scale_floor || scale_floor <= 1e-12f) {
+                scale_floor = ste_compute_bf16_abs_mean_span(request->bf16_weights,
+                                                             row_base,
+                                                             start_col,
+                                                             end_col);
+            }
+            if (scale_floor < request->layer_schedule->min_gamma_scale) {
+                scale_floor = request->layer_schedule->min_gamma_scale;
+            }
+            request->out_scale_floor[scale_base + group] = scale_floor;
         }
-
-        if (scale_floor < request->layer_schedule->min_gamma_scale) {
-            scale_floor = request->layer_schedule->min_gamma_scale;
-        }
-        request->out_scale_floor[row] = scale_floor;
     }
 
     return 0;
@@ -2794,44 +3361,19 @@ static int ste_prepare_workspace(const ste_calibration_workspace_request_t *requ
                                  ste_calibration_workspace_t *workspace)
 {
     hessian_proxy_request_t proxy_request;
+    const ternary_hessian_sidecar_t *hessian_sidecar = NULL;
+    const char *tensor_name = NULL;
 
     if (!request || !request->config || !workspace) {
         return -1;
     }
 
     ste_calibration_workspace_reset(workspace);
-    if (request->config->early_stop_patience > 0 &&
-        request->config->ste_steps > (int)STE_EARLY_STOP_MIN_STEPS) {
-        workspace->best_latent = (float *)malloc(request->weight_count * sizeof(float));
-    }
-    workspace->first_moment = (float *)calloc(request->weight_count, sizeof(float));
-    workspace->second_moment = (float *)calloc(request->weight_count, sizeof(float));
-    workspace->gradient = (float *)malloc(request->weight_count * sizeof(float));
-    workspace->actual_sample_count = request->config->calibration_samples;
-    if (request->layer_schedule) {
-        workspace->layer_schedule = *request->layer_schedule;
-    } else {
-        ste_layer_schedule_reset(&workspace->layer_schedule);
-    }
-    workspace->calibration_vectors = build_calibration_vectors(request->cols,
-                                                               request->config->calibration_samples,
-                                                               request->corpus,
-                                                               request->tape_context,
-                                                               &workspace->actual_sample_count);
-    if (workspace->layer_schedule.early_layer_warmup) {
-        workspace->scale_floor = (float *)malloc((size_t)request->rows * sizeof(float));
-    }
-    if (!workspace->first_moment || !workspace->second_moment || !workspace->gradient ||
-        !workspace->calibration_vectors ||
-        (workspace->layer_schedule.early_layer_warmup && !workspace->scale_floor)) {
+    tensor_name = resolve_calibration_tensor_name(request->corpus, request->tape_context);
+    if (ste_prepare_workspace_buffers(request, workspace, tensor_name) != 0 ||
+        ste_prepare_workspace_vectors(request, workspace, tensor_name, &hessian_sidecar) != 0) {
         ste_calibration_workspace_release(workspace);
         return -1;
-    }
-    if (!workspace->best_latent &&
-        request->config->early_stop_patience > 0 &&
-        request->config->ste_steps > (int)STE_EARLY_STOP_MIN_STEPS) {
-        LOG_WARN("STE early stop disabled for tensor=%s: failed to allocate best-latent buffer",
-                 resolve_calibration_tensor_name(request->corpus, request->tape_context));
     }
     if (workspace->scale_floor &&
         ste_build_scale_floor(&(ste_scale_floor_request_t){
@@ -2841,6 +3383,7 @@ static int ste_prepare_workspace(const ste_calibration_workspace_request_t *requ
             .use_teacher_abs_mean = request->tape_context && request->tape_context->tape,
             .rows = request->rows,
             .cols = request->cols,
+            .scale_group_size = ternary_default_scale_group_size(request->cols),
             .layer_schedule = &workspace->layer_schedule,
             .out_scale_floor = workspace->scale_floor,
             .out_teacher_abs_mean = &workspace->teacher_abs_mean
@@ -2858,7 +3401,7 @@ static int ste_prepare_workspace(const ste_calibration_workspace_request_t *requ
     memset(&proxy_request, 0, sizeof(proxy_request));
     proxy_request.config = request->config;
     proxy_request.tape_context = request->tape_context;
-    proxy_request.sidecar = request->sidecar;
+    proxy_request.sidecar = hessian_sidecar;
     proxy_request.calibration_vectors = workspace->calibration_vectors;
     proxy_request.sample_count = workspace->actual_sample_count;
     proxy_request.cols = request->cols;
@@ -2907,8 +3450,10 @@ static void ste_init_calibration_context(ste_calibration_context_t *context,
     context->ternary = request->result->ternary_weights;
     context->scales = request->result->scales;
     context->scale_floor = request->workspace->scale_floor;
+    context->scale_count = request->result->scale_count;
     context->rows = request->rows;
     context->cols = request->cols;
+    context->scale_group_size = request->result->scale_group_size;
     context->config = request->config;
     context->tensor_name = request->tensor_name;
     context->calibration_vectors = request->workspace->calibration_vectors;
@@ -2923,6 +3468,8 @@ static void ste_init_calibration_context(ste_calibration_context_t *context,
     context->hessian_proxy_stats = request->workspace->hessian_proxy.stats;
     context->hessian_proxy_source = request->workspace->hessian_proxy.source;
     context->layer_schedule = request->workspace->layer_schedule;
+    context->learning_rate_scale = 1.0f;
+    context->minimum_learning_rate_scale = STE_LOW_ENERGY_AUTO_DECAY_MIN_SCALE;
 }
 
 static int ste_prepare_telemetry_runtime(ste_telemetry_runtime_t *runtime,
@@ -3058,6 +3605,7 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
         .scale_floor = workspace.scale_floor,
         .rows = rows,
         .cols = cols,
+        .scale_group_size = out_result->scale_group_size,
         .zero_threshold = effective_config.zero_threshold
     });
 
@@ -3077,7 +3625,7 @@ cleanup:
         return -1;
     }
 
-    LOG_INFO("Calibrated ternary layer: rows=%u cols=%u steps=%d samples=%d proxy=%u grad_clip=%.4f kl_weight=%.4f kl_temp=%.2f a8=%u non_collapse=%.4f floor=%.2f gamma_floor=%.3f warmup=%u packed=%zuB",
+    LOG_INFO("Calibrated ternary layer: rows=%u cols=%u steps=%d samples=%d proxy=%u grad_clip=%.4f kl_weight=%.4f kl_temp=%.2f a8=%u non_collapse=%.4f floor=%.2f gamma_floor=%.3f warmup=%u scale_group=%u scales=%zu packed=%zuB",
              rows,
              cols,
              effective_config.ste_steps,
@@ -3091,6 +3639,8 @@ cleanup:
              (double)effective_config.zero_occupancy_floor,
              (double)workspace.layer_schedule.min_gamma_scale,
              workspace.layer_schedule.warmup_steps,
+             out_result->scale_group_size,
+             out_result->scale_count,
              out_result->packed_weight_bytes);
     ste_calibration_workspace_release(&workspace);
     return 0;

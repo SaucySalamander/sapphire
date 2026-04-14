@@ -14,7 +14,7 @@
 #include <string.h>
 
 #include "file_reader.h"
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "gemma3_27b_spec.h"
 #include "layer_config_loader.h"
 #include "llm_model.h"
@@ -131,6 +131,28 @@ static void parse_27b_rope_scaling(const char *json, const sjson_token_t *tokens
     }
 }
 
+static void parse_27b_sapphire_feature_flags(const char *json,
+                                             const sjson_token_t *tokens,
+                                             int nt,
+                                             gemma3_270m_config_t *cfg)
+{
+    int value_idx = -1;
+    int len = 0;
+
+    if (!json || !tokens || nt <= 0 || !cfg) {
+        return;
+    }
+
+    value_idx = sjson_find_key(json, tokens, nt, 0, "sapphire_ffn_down_proj_input_rmsnorm");
+    if (value_idx < 0) {
+        return;
+    }
+
+    len = tokens[value_idx].end - tokens[value_idx].start;
+    cfg->sapphire_ffn_down_proj_input_rmsnorm =
+        (len == 4 && strncmp(json + tokens[value_idx].start, "true", 4) == 0) ? 1 : 0;
+}
+
 /* -------------------------------------------------------------------------
  * Build layer_types_mask: global attention at (layer_idx % 6) == 5
  * -------------------------------------------------------------------------*/
@@ -203,6 +225,7 @@ static int load_27b_config(const char *model_dir, model_spec_t *spec)
     /* Parse all JSON fields from text_config */
     parse_27b_tc_fields(json, tokens, nt, tc_idx, cfg);
     parse_27b_rope_scaling(json, tokens, nt, tc_idx, cfg);
+    parse_27b_sapphire_feature_flags(json, tokens, nt, cfg);
     build_27b_layer_types_mask(cfg);
 
     LOG_INFO("gemma3_27b: hidden=%d inter=%d layers=%d heads=%d kv=%d dim=%d rope_scale=%.1f",

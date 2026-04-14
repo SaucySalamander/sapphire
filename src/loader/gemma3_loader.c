@@ -12,7 +12,7 @@
 
 #include "file_reader.h"
 #include "gemma3_270m_map.h"
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "gemma3_270m_spec.h"  /* Now provides GEMMA3_270M_TENSOR_MAP and getter */
 #include "llm_model.h"
 #include "model_spec.h"
@@ -175,6 +175,20 @@ static void parse_bool_field(const char* json, const sjson_token_t* tokens, int 
     *field_ptr = value;
 }
 
+static void parse_sapphire_feature_flags(const char *json,
+                                         const sjson_token_t *tokens,
+                                         int nt,
+                                         gemma3_270m_config_t *cfg)
+{
+    static const gemma3_field_spec_t DOWN_PROJ_INPUT_RMSNORM_FIELD = {
+        "sapphire_ffn_down_proj_input_rmsnorm",
+        offsetof(gemma3_270m_config_t, sapphire_ffn_down_proj_input_rmsnorm),
+        FIELD_BOOL
+    };
+
+    parse_bool_field(json, tokens, nt, cfg, &DOWN_PROJ_INPUT_RMSNORM_FIELD);
+}
+
 /* Helper to populate all standard numeric, string, and boolean fields via tables */
 static void populate_config_standard_fields(const char* json, const sjson_token_t* tokens, int nt,
                                            gemma3_270m_config_t* cfg) {
@@ -230,6 +244,7 @@ static void populate_config_standard_fields(const char* json, const sjson_token_
     /* Handle nullable softcaps separately */
     parse_nullable_softcap(json, tokens, nt, &cfg->final_logit_softcapping, "final_logit_softcap", "final_logit_softcapping");
     parse_nullable_softcap(json, tokens, nt, &cfg->attn_logit_softcapping, "attn_logit_softcap", "attn_logit_softcapping");
+    parse_sapphire_feature_flags(json, tokens, nt, cfg);
 }
 
 static void populate_config_layer_types_from_pattern(gemma3_270m_config_t* cfg) {

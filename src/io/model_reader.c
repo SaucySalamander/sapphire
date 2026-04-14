@@ -1,7 +1,7 @@
 #include "llm_model.h"
 #include "model_spec.h"
 #include "safetensors_reader.h"
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "tensor_mapper.h"
 #include <stdlib.h>
 #include <stdio.h>

@@ -29,6 +29,7 @@ typedef struct {
     int validate_every_n;
     int ste_steps;
     int progressive_calib;
+    int student_down_proj_input_rmsnorm;
     float kl_weight;
     int kl_update_interval;
     int kl_sample_count;

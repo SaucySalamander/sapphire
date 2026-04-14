@@ -36,6 +36,7 @@ typedef struct {
     float gamma_floor_fraction;
     float hessian_proxy_mean;
     float hessian_proxy_max;
+    float hessian_proxy_active_max;
     uint32_t hessian_proxy_source;
     float effective_learning_rate;
     float effective_hessian_scale;

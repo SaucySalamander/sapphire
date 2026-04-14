@@ -198,6 +198,9 @@ int sapphire_geglu(float *output, const float *input, size_t size);
 /** RMSNorm: out[i] = (in[i] / RMS) * weight[i] */
 int rmsnorm(float *out, const float *in, const float *weight, float epsilon, int dim);
 
+/** Weightless RMSNorm: out[i] = in[i] / RMS */
+int rmsnorm_unit(float *out, const float *in, float epsilon, int dim);
+
 /** RMSNorm (Gemma 3 style): out[i] = (in[i] / RMS) * (1.0 + weight[i]) */
 int rmsnorm_delta(float *out, const float *in, const float *weight, float epsilon, int dim);
 

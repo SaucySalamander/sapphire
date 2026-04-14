@@ -28,7 +28,7 @@
 #include "../../include/vk_kv_paged.h"
 #include "../../include/kv_cache_state.h"
 #include "../../include/model_spec.h"
-#include "../../include/gemma3_270m_config.h"
+#include "../../include/gemma3_config.h"
 #include "../../include/llm_model.h"
 #include "../../include/rope.h"
 #include "../../include/tensor.h"
@@ -1498,6 +1498,22 @@ static int setup_vk_timing_and_staging(backend_vulkan_session_data_t *bd,
     return 0;
 }
 
+static const gemma3_270m_config_t *vulkan_session_config_or_null(const model_spec_t *spec)
+{
+    const gemma3_270m_config_t *cfg = (const gemma3_270m_config_t *)spec->variant_config;
+
+    if (!cfg) {
+        LOG_ERROR("Model config is NULL in vulkan_session_init");
+        return NULL;
+    }
+    if (cfg->sapphire_ffn_down_proj_input_rmsnorm) {
+        LOG_ERROR("Vulkan backend does not yet support models with sapphire_ffn_down_proj_input_rmsnorm enabled");
+        return NULL;
+    }
+
+    return cfg;
+}
+
 static int vulkan_session_init(inference_session_t* session, const model_spec_t* spec, int max_context_len) {
     if (!session || !spec) {
         LOG_ERROR("session or spec is NULL");
@@ -1539,9 +1555,8 @@ static int vulkan_session_init(inference_session_t* session, const model_spec_t*
         return -1;
     }
 
-    const gemma3_270m_config_t *cfg = (const gemma3_270m_config_t *)spec->variant_config;
+    const gemma3_270m_config_t *cfg = vulkan_session_config_or_null(spec);
     if (!cfg) {
-        LOG_ERROR("Model config is NULL in vulkan_session_init");
         free(bd);
         vk_backend_shutdown(vk_ctx);
         return -1;

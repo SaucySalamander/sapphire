@@ -7,7 +7,7 @@
 #define GEMMA3_270M_SPEC_H
 
 #include "model_spec.h"
-#include "gemma3_270m_config.h" /* Provides `gemma3_config_t` and config constants */
+#include "gemma3_config.h" /* Provides Gemma 3 config types and config constants */
 
 /* Forward-declare Gemma3 loader hooks (defined in src/loader/gemma3_loader.c) */
 extern const model_loader_hooks_t GEMMA3_LOADER_HOOKS;

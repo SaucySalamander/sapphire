@@ -11,7 +11,7 @@
 
 #include "activation_tape.h"
 #include "calibration_corpus.h"
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "inference.h"
 #include "transformer.h"
 

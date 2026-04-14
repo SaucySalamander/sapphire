@@ -62,6 +62,7 @@ static void print_help(const char* program_name) {
     printf("  --ste-steps <n>          STE optimization steps per tensor (default: 3)\n");
     printf("  --progressive-calib      Run 3-stage progressive molding (layers 0-5, 6-12, then full model)\n");
     printf("  --max-grad-norm <value>  Global gradient norm clip for STE (default: 1.0)\n");
+    printf("  --student-down-proj-rmsnorm  Enable a student-only weightless RMSNorm before FFN down_proj during conversion\n");
     printf("  --disable-hessian-proxy  Disable tape-derived diagonal Hessian proxying\n");
     printf("  --hessian-proxy-strength <value>  Diagonal Hessian proxy strength (default: 1.0)\n");
     printf("  --hessian-proxy-floor <value>     Minimum diagonal Hessian proxy scale (default: 0.05)\n");
@@ -150,6 +151,7 @@ typedef struct {
     int validate_every_n;
     int ste_steps;
     int progressive_calib;
+    int student_down_proj_input_rmsnorm;
     float kl_weight;
     int kl_update_interval;
     int kl_sample_count;
@@ -194,6 +196,7 @@ static void cli_args_init(cli_args_t *args)
     args->validate_every_n = 0;
     args->ste_steps = 3;
     args->progressive_calib = 0;
+    args->student_down_proj_input_rmsnorm = 0;
     args->kl_weight = 0.05f;
     args->kl_update_interval = 4;
     args->kl_sample_count = 4;
@@ -291,6 +294,11 @@ static int validate_record_hessian_sidecar_args(const cli_args_t *args)
 
 static int validate_convert_ternary_mode_args(const cli_args_t *args)
 {
+    if (!args->convert_ternary && args->student_down_proj_input_rmsnorm) {
+        LOG_ERROR("ERROR: --student-down-proj-rmsnorm is only supported with --convert-ternary.");
+        return -1;
+    }
+
     if (!args->convert_ternary) {
         return 0;
     }
@@ -509,6 +517,7 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.validate_every_n = args->validate_every_n;
     config.ste_steps = args->ste_steps;
     config.progressive_calib = args->progressive_calib;
+    config.student_down_proj_input_rmsnorm = args->student_down_proj_input_rmsnorm;
     config.kl_weight = args->kl_weight;
     config.kl_update_interval = args->kl_update_interval;
     config.kl_sample_count = args->kl_sample_count;
@@ -960,6 +969,7 @@ typedef enum {
     CLI_OPT_VALIDATE_EVERY,
     CLI_OPT_STE_STEPS,
     CLI_OPT_PROGRESSIVE_CALIB,
+    CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM,
     CLI_OPT_MAX_GRAD_NORM,
     CLI_OPT_KL_WEIGHT,
     CLI_OPT_KL_UPDATE_FREQ,
@@ -1010,6 +1020,7 @@ static const cli_option_alias_t g_cli_option_aliases[] = {
     { "--validate-every", CLI_OPT_VALIDATE_EVERY },
     { "--ste-steps", CLI_OPT_STE_STEPS },
     { "--progressive-calib", CLI_OPT_PROGRESSIVE_CALIB },
+    { "--student-down-proj-rmsnorm", CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM },
     { "--max-grad-norm", CLI_OPT_MAX_GRAD_NORM },
     { "--kl-weight", CLI_OPT_KL_WEIGHT },
     { "--kl-update-freq", CLI_OPT_KL_UPDATE_FREQ },
@@ -1101,6 +1112,10 @@ static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
         }
         if (option == CLI_OPT_PROGRESSIVE_CALIB) {
             args->progressive_calib = 1;
+            continue;
+        }
+        if (option == CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM) {
+            args->student_down_proj_input_rmsnorm = 1;
             continue;
         }
         if (option == CLI_OPT_UNKNOWN || i + 1 >= argc) {

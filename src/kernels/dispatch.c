@@ -89,6 +89,8 @@ float quantized_gemv_ternary_scalar(const void *W_row, const float *x, int block
     float sum = 0.0f;
     size_t packed_cols = 0u;
     size_t packed_idx = 0u;
+    uint32_t group_size = 0u;
+    uint32_t groups_per_row = 0u;
     int col = 0;
 
     (void)block_count;
@@ -99,19 +101,28 @@ float quantized_gemv_ternary_scalar(const void *W_row, const float *x, int block
     }
 
     packed_cols = row->packed_cols;
+    group_size = row->scale_group_size ? row->scale_group_size : row->cols;
+    groups_per_row = row->groups_per_row ? row->groups_per_row : 1u;
     for (packed_idx = 0u; packed_idx < packed_cols; ++packed_idx) {
         uint8_t packed = row->packed_weights[packed_idx];
         for (int lane = 0; lane < 4 && col < (int)row->cols; ++lane, ++col) {
             uint8_t code = (uint8_t)((packed >> (lane * 2)) & 0x3u);
+            uint32_t scale_group = (uint32_t)col / group_size;
+            float scale = 0.0f;
+
+            if (scale_group >= groups_per_row) {
+                scale_group = groups_per_row - 1u;
+            }
+            scale = row->scales[scale_group];
             if (code == 1u) {
-                sum += x[col];
+                sum += scale * x[col];
             } else if (code == 2u) {
-                sum -= x[col];
+                sum -= scale * x[col];
             }
         }
     }
 
-    return row->scales[0] * sum;
+    return sum;
 }
 
 void kernel_gemm_ternary_scalar(const gemm_args_t *args) {
@@ -141,7 +152,9 @@ static void gemv_ternary(float *y, const tensor_t *A, const float *x, int m) {
         tensor_ternary_view_t row_view = *view;
         row_view.rows = 1u;
         row_view.packed_weights = view->packed_weights + (size_t)row * view->packed_cols;
-        row_view.scales = view->scales + row;
+        row_view.scales = view->scales + (size_t)row * view->groups_per_row;
+        row_view.scale_count = view->groups_per_row;
+        row_view.scale_bytes = (size_t)view->groups_per_row * sizeof(float);
         y[row] = quantized_gemv_ternary_scalar(&row_view, x, 0, 0);
     }
 }

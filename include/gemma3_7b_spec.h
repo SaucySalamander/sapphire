@@ -6,7 +6,7 @@
 #ifndef GEMMA3_7B_SPEC_H
 #define GEMMA3_7B_SPEC_H
 
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "model_spec.h"
 
 #ifdef __cplusplus

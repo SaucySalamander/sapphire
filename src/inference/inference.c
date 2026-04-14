@@ -14,7 +14,7 @@
 #include <time.h>  /* clock_gettime for high-resolution wall-clock timing */
 
 #include "../include/attention.h"
-#include "../include/gemma3_270m_config.h"
+#include "../include/gemma3_config.h"
 #include "../include/ggml_model.h"
 #include "../include/kv_cache.h"
 #include "../include/kv_cache_state.h"
@@ -88,6 +88,18 @@ static int resolve_logits_rows(const model_spec_t *spec)
     }
 
     return logits_rows;
+}
+
+static int spec_ffn_down_proj_input_rmsnorm_enabled(const model_spec_t *spec)
+{
+    const gemma3_270m_config_t *config = NULL;
+
+    if (!spec || !spec->variant_config) {
+        return 0;
+    }
+
+    config = (const gemma3_270m_config_t *)spec->variant_config;
+    return config->sapphire_ffn_down_proj_input_rmsnorm ? 1 : 0;
 }
 
 /**
@@ -773,6 +785,7 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
     memset(session, 0, sizeof(inference_session_t));
 
     session->model_spec = spec;
+    session->ffn_down_proj_input_rmsnorm_default = spec_ffn_down_proj_input_rmsnorm_enabled(spec);
     session->num_layers = config->num_hidden_layers;
     session->layer_configs = (sapphire_layer_config_t*)malloc(session->num_layers * sizeof(sapphire_layer_config_t));
     if (!session->layer_configs) {
@@ -830,6 +843,50 @@ void inference_session_reset(inference_session_t* session) {
     if (!session || !session->backend) return;
 
     session->backend->reset(session);
+}
+
+int inference_session_ffn_down_proj_input_rmsnorm_enabled(const inference_session_t *session)
+{
+    if (!session) {
+        return 0;
+    }
+
+    if (session->ffn_down_proj_input_rmsnorm_override_active) {
+        return session->ffn_down_proj_input_rmsnorm_override ? 1 : 0;
+    }
+
+    return session->ffn_down_proj_input_rmsnorm_default ? 1 : 0;
+}
+
+void inference_session_set_ffn_down_proj_input_rmsnorm_default(inference_session_t *session,
+                                                               int enabled)
+{
+    if (!session) {
+        return;
+    }
+
+    session->ffn_down_proj_input_rmsnorm_default = enabled ? 1 : 0;
+}
+
+void inference_session_set_ffn_down_proj_input_rmsnorm_override(inference_session_t *session,
+                                                                int enabled)
+{
+    if (!session) {
+        return;
+    }
+
+    session->ffn_down_proj_input_rmsnorm_override_active = 1;
+    session->ffn_down_proj_input_rmsnorm_override = enabled ? 1 : 0;
+}
+
+void inference_session_clear_ffn_down_proj_input_rmsnorm_override(inference_session_t *session)
+{
+    if (!session) {
+        return;
+    }
+
+    session->ffn_down_proj_input_rmsnorm_override_active = 0;
+    session->ffn_down_proj_input_rmsnorm_override = 0;
 }
 
 /**

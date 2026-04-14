@@ -45,6 +45,20 @@ static inline void rmsnorm_apply_avx2(float *out, const float *in, const float *
     }
 }
 
+static inline void rmsnorm_unit_apply_avx2(float *out, const float *in, float rms_inv, int dim) {
+    int i = 0;
+    __m256 v_rms_inv = _mm256_set1_ps(rms_inv);
+
+    for (; i + 8 <= dim; i += 8) {
+        __m256 v_in = _mm256_loadu_ps(in + i);
+        __m256 v_out = _mm256_mul_ps(v_in, v_rms_inv);
+        _mm256_storeu_ps(out + i, v_out);
+    }
+    for (; i < dim; i++) {
+        out[i] = in[i] * rms_inv;
+    }
+}
+
 static inline void rmsnorm_delta_apply_avx2(float *out, const float *in, const float *weight, float rms_inv, int dim) {
     int i = 0;
     __m256 v_rms_inv = _mm256_set1_ps(rms_inv);
@@ -98,6 +112,20 @@ int rmsnorm(float *out, const float *in, const float *weight,
     
     rmsnorm_apply_avx2(out, in, weight, rms_inv, dim);
     
+    return 0;
+}
+
+int rmsnorm_unit(float *out, const float *in, float epsilon, int dim) {
+    float sum_sq = 0.0f;
+    float rms_inv = 0.0f;
+
+    if (!out || !in || dim <= 0 || epsilon < 0.0f) {
+        return -1;
+    }
+
+    sum_sq = sum_sq_avx2(in, dim);
+    rms_inv = 1.0f / sqrtf(sum_sq / (float)dim + epsilon);
+    rmsnorm_unit_apply_avx2(out, in, rms_inv, dim);
     return 0;
 }
 

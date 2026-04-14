@@ -18,6 +18,7 @@ extern "C" {
 
 typedef struct {
     int validate_every_n;
+    int student_down_proj_input_rmsnorm;
     const char *output_dir;
     const char *telemetry_path;
     const char *const *sample_texts;

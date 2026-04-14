@@ -6,7 +6,7 @@
 #include "activation_alignment.h"
 
 #include "file_reader.h"
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "log.h"
 #include "ternary_io.h"
 

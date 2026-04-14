@@ -146,6 +146,13 @@ tensor_t* safetensors_create_ternary_tensor_ref(const safetensors_file_t *st,
                                                 size_t packed_weight_bytes,
                                                 uint32_t expected_crc32);
 
+int safetensors_resolve_ternary_scale_layout(const safetensors_file_t *st,
+                                             const char *tensor_name,
+                                             uint32_t cols,
+                                             uint32_t fallback_groups_per_row,
+                                             uint32_t *out_scale_group_size,
+                                             uint32_t *out_groups_per_row);
+
 /**
  * @brief Load a Safetensors tensor into a freshly allocated tensor_t.
  *

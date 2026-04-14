@@ -52,6 +52,8 @@ struct sapphire_context {
     size_t ternary_packed_cols;
     size_t ternary_row_stride_bytes;
     const float *ternary_scales;
+    uint32_t ternary_scale_group_size;
+    uint32_t ternary_groups_per_row;
 
     // Parallel For Extension
     parallel_for_fn_t parallel_fn;
@@ -105,6 +107,8 @@ static void *worker_fn(void *arg) {
         size_t ternary_packed_cols = ctx->ternary_packed_cols;
         size_t ternary_row_stride_bytes = ctx->ternary_row_stride_bytes;
         const float *ternary_scales = ctx->ternary_scales;
+        uint32_t ternary_scale_group_size = ctx->ternary_scale_group_size;
+        uint32_t ternary_groups_per_row = ctx->ternary_groups_per_row;
         int chunk_size = ctx->chunk_size;
         parallel_for_fn_t parallel_fn = ctx->parallel_fn;
         void *parallel_arg = ctx->parallel_arg;
@@ -140,12 +144,15 @@ static void *worker_fn(void *arg) {
                 if (ternary_scales) {
                     memset(&ternary_row, 0, sizeof(ternary_row));
                     ternary_row.packed_weights = (const uint8_t *)row_ptr;
-                    ternary_row.scales = ternary_scales + r;
+                    ternary_row.scales = ternary_scales + (size_t)r * ternary_groups_per_row;
                     ternary_row.rows = 1u;
                     ternary_row.cols = (uint32_t)cols;
                     ternary_row.packed_cols = (uint32_t)ternary_packed_cols;
+                    ternary_row.scale_group_size = ternary_scale_group_size;
+                    ternary_row.groups_per_row = ternary_groups_per_row;
                     ternary_row.packed_weight_bytes = ternary_row_stride_bytes;
-                    ternary_row.scale_bytes = sizeof(float);
+                    ternary_row.scale_count = ternary_groups_per_row;
+                    ternary_row.scale_bytes = (size_t)ternary_groups_per_row * sizeof(float);
                     row_ptr = &ternary_row;
                     count = cols;
                     b_size = 1;
@@ -348,7 +355,9 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
         case DTYPE_TERNARY_2BIT:
             ternary_view = tensor_data_ternary(A);
             if (!ternary_view || !ternary_view->packed_weights || !ternary_view->scales ||
-                ternary_view->rows != (uint32_t)rows || ternary_view->cols != (uint32_t)cols) {
+                ternary_view->rows != (uint32_t)rows || ternary_view->cols != (uint32_t)cols ||
+                ternary_view->groups_per_row == 0u ||
+                ternary_view->scale_count != (size_t)rows * ternary_view->groups_per_row) {
                 LOG_ERROR("kernel_backend_exec: invalid ternary tensor payload");
                 return -1;
             }
@@ -358,6 +367,8 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
             ternary_row_stride_bytes = ternary_packed_cols;
             row_stride_bytes = ternary_row_stride_bytes;
             ternary_scales = ternary_view->scales;
+            ctx->ternary_scale_group_size = ternary_view->scale_group_size;
+            ctx->ternary_groups_per_row = ternary_view->groups_per_row;
             W_data = ternary_view->packed_weights;
             break;
         default:

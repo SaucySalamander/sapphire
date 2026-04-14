@@ -14,7 +14,7 @@
 #include <string.h>
 
 #include "file_reader.h"
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "gemma3_7b_spec.h"
 #include "layer_config_loader.h"
 #include "llm_model.h"
@@ -223,6 +223,33 @@ static int parse_float_field(const char *json,
         return -1;
     }
     return 0;
+}
+
+static void parse_7b_sapphire_feature_flags(const char *json,
+                                            const sjson_token_t *tokens,
+                                            int nt,
+                                            int obj_idx,
+                                            gemma3_270m_config_t *cfg)
+{
+    int value_idx = -1;
+    int len = 0;
+
+    if (!json || !tokens || nt <= 0 || !cfg) {
+        return;
+    }
+
+    value_idx = find_key_in_object_or_root(json,
+                                           tokens,
+                                           nt,
+                                           obj_idx,
+                                           "sapphire_ffn_down_proj_input_rmsnorm");
+    if (value_idx < 0) {
+        return;
+    }
+
+    len = tokens[value_idx].end - tokens[value_idx].start;
+    cfg->sapphire_ffn_down_proj_input_rmsnorm =
+        (len == 4 && strncmp(json + tokens[value_idx].start, "true", 4) == 0) ? 1 : 0;
 }
 
 static int is_global_layer_type_string(const char *value, int len)
@@ -629,6 +656,7 @@ static int load_7b_config(const char *model_dir, const model_spec_t *spec)
 
     load_7b_optional_fields(json, tokens, nt, cfg_obj_idx, cfg);
     load_7b_token_ids(json, tokens, nt, cfg_obj_idx, cfg);
+    parse_7b_sapphire_feature_flags(json, tokens, nt, cfg_obj_idx, cfg);
 
     if (load_7b_layer_types(json, tokens, nt, cfg_obj_idx, cfg) != 0) {
         goto missing_required;

@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../include/gemma3_270m_config.h"
+#include "../include/gemma3_config.h"
 #include "inference.h"
 #include "llm_model.h"
 #include "kernels.h"

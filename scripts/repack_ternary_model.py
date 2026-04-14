@@ -34,6 +34,7 @@ METADATA_FILES = (
     "chat_template.jinja",
     "README.md",
 )
+CONFIG_OVERRIDE_FILE = "sapphire_config_overrides.json"
 
 
 WriteTensorData = Callable[[BinaryIO], None]
@@ -53,7 +54,7 @@ class BaseTensorRef:
         return math.prod(self.shape) * BF16_BYTES
 
 
-@dataclass(frozen=True)
+@dataclass
 class TernaryManifestEntry:
     name: str
     file_name: str
@@ -62,6 +63,8 @@ class TernaryManifestEntry:
     packed_weight_bytes: int
     crc32: int
     kind: str = "ternary"
+    groups_per_row: int = 1
+    scale_group_size: int = 0
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -77,11 +80,11 @@ class TernaryManifestEntry:
 
     @property
     def scale_shape(self) -> tuple[int, ...]:
-        return (self.rows,)
+        return (self.rows,) if self.groups_per_row == 1 else (self.rows, self.groups_per_row)
 
     @property
     def scale_byte_count(self) -> int:
-        return self.rows * np.dtype("<f4").itemsize
+        return self.rows * self.groups_per_row * np.dtype("<f4").itemsize
 
     @property
     def stored_byte_count(self) -> int:
@@ -106,6 +109,59 @@ class OutputTensorItem:
     writer: WriteTensorData
     source_kind: str
     manifest_entry: TernaryManifestEntry | None = None
+    metadata_entries: tuple[tuple[str, int], ...] = ()
+
+
+def _metadata_int(metadata: object, key: str) -> int | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(key)
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        return int(value)
+    raise ValueError(f"Invalid metadata value for {key}: {value!r}")
+
+
+def _read_ternary_payload_layout(payload_path: Path,
+                                 tensor_name: str,
+                                 rows: int,
+                                 cols: int) -> tuple[int, int]:
+    header, _ = _read_safetensors_header(payload_path)
+    scales_meta = _payload_meta(payload_path, header, tensor_name, "scales")
+    scales_shape = _tensor_shape(scales_meta)
+    metadata = header.get("__metadata__")
+
+    if len(scales_shape) == 1:
+        if scales_shape != (rows,):
+            raise ValueError(f"Scale payload shape mismatch for {tensor_name}: {scales_shape}")
+        groups_per_row = 1
+    elif len(scales_shape) == 2:
+        if scales_shape[0] != rows or scales_shape[1] <= 0:
+            raise ValueError(f"Grouped scale payload shape mismatch for {tensor_name}: {scales_shape}")
+        groups_per_row = int(scales_shape[1])
+    else:
+        raise ValueError(f"Unsupported scale payload rank for {tensor_name}: {scales_shape}")
+
+    metadata_groups = _metadata_int(metadata, f"{tensor_name}.groups_per_row")
+    if metadata_groups is not None:
+        if metadata_groups != groups_per_row:
+            raise ValueError(
+                f"Grouped scale metadata mismatch for {tensor_name}: metadata={metadata_groups} shape={groups_per_row}"
+            )
+        groups_per_row = metadata_groups
+
+    scale_group_size = _metadata_int(metadata, f"{tensor_name}.scale_group_size")
+    if scale_group_size is None:
+        scale_group_size = math.ceil(cols / groups_per_row)
+    if scale_group_size <= 0 or math.ceil(cols / scale_group_size) != groups_per_row:
+        raise ValueError(
+            f"Invalid grouped scale layout for {tensor_name}: cols={cols} groups={groups_per_row} group_size={scale_group_size}"
+        )
+
+    return groups_per_row, scale_group_size
 
 
 def _parse_shard_size(value: str) -> int:
@@ -284,7 +340,7 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
             else:
                 raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
 
-            entries[name] = TernaryManifestEntry(
+            entry = TernaryManifestEntry(
                 name=name,
                 file_name=file_name,
                 rows=int(rows),
@@ -293,6 +349,15 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
                 crc32=int(crc32, 16),
                 kind=kind,
             )
+            if kind == "ternary":
+                payload_path = ternary_dir / file_name
+                entry.groups_per_row, entry.scale_group_size = _read_ternary_payload_layout(
+                    payload_path,
+                    name,
+                    entry.rows,
+                    entry.cols,
+                )
+            entries[name] = entry
 
     if not entries:
         raise RuntimeError(f"No ternary tensors found in {manifest_path}")
@@ -484,6 +549,37 @@ def _copy_metadata_files(source_dir: Path, output_dir: Path, overwrite: bool) ->
         shutil.copy2(source_path, destination_path)
 
 
+def _load_config_overrides(ternary_dir: Path) -> OrderedDict[str, object]:
+    override_path = ternary_dir / CONFIG_OVERRIDE_FILE
+
+    if not override_path.is_file():
+        return OrderedDict()
+
+    overrides = _load_json(override_path)
+    if not isinstance(overrides, dict):
+        raise ValueError(f"Invalid config override payload: {override_path}")
+
+    return OrderedDict(overrides.items())
+
+
+def _apply_config_overrides(output_dir: Path, overrides: OrderedDict[str, object]) -> None:
+    config_path = output_dir / "config.json"
+    config = OrderedDict()
+
+    if not overrides:
+        return
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Cannot apply config overrides without config.json: {config_path}")
+
+    config = _load_json(config_path)
+    for key, value in overrides.items():
+        config[key] = value
+
+    with config_path.open("w", encoding="utf-8") as config_file:
+        json.dump(config, config_file, indent=2, ensure_ascii=False)
+        config_file.write("\n")
+
+
 def _pack_shards(tensor_items: list[OutputTensorItem], max_shard_size: int) -> list[list[OutputTensorItem]]:
     shards: list[list[OutputTensorItem]] = []
     current_shard: list[OutputTensorItem] = []
@@ -521,6 +617,9 @@ def _write_safetensors_file(
             ("ternary_manifest", "manifest.tsv"),
         ]
     )
+    for tensor in tensor_items:
+        for key, value in tensor.metadata_entries:
+            header["__metadata__"][key] = value
 
     data_offset = 0
     for tensor in tensor_items:
@@ -637,6 +736,10 @@ def _build_output_tensor_items(
                 writer=_make_ternary_writer(ternary_dir, entry),
                 source_kind="ternary",
                 manifest_entry=entry,
+                metadata_entries=(
+                    (f"{name}.groups_per_row", entry.groups_per_row),
+                    (f"{name}.scale_group_size", entry.scale_group_size),
+                ),
             )
         )
         converted_count += 1
@@ -686,6 +789,10 @@ def _build_output_tensor_items(
                 writer=_make_ternary_writer(ternary_dir, entry),
                 source_kind="ternary-extra",
                 manifest_entry=entry,
+                metadata_entries=(
+                    (f"{name}.groups_per_row", entry.groups_per_row),
+                    (f"{name}.scale_group_size", entry.scale_group_size),
+                ),
             )
         )
         converted_count += 1
@@ -738,6 +845,7 @@ def repack_ternary_model(
 
     _ensure_output_dir_ready(output_dir, overwrite)
     _copy_metadata_files(base_model_dir, output_dir, overwrite=overwrite)
+    _apply_config_overrides(output_dir, _load_config_overrides(ternary_dir))
 
     weight_map: dict[str, str] = {}
     logical_weight_map: dict[str, str] = {}

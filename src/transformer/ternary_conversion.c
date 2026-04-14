@@ -9,7 +9,7 @@
 #include "activation_alignment.h"
 #include "activation_tape.h"
 #include "file_reader.h"
-#include "gemma3_270m_config.h"
+#include "gemma3_config.h"
 #include "inference.h"
 #include "kernels.h"
 #include "log.h"
@@ -49,6 +49,8 @@
 #define PROGRESSIVE_RESIDUAL_CORRECTION_MIN_VARIANCE_RATIO 0.85f
 #define PROGRESSIVE_RESIDUAL_CORRECTION_MAX_SCALE 1.10f
 #define PROGRESSIVE_CALIB_SCHEDULE_VERSION 4u
+#define CONVERSION_CONFIG_OVERRIDE_FILENAME "sapphire_config_overrides.json"
+#define CONVERSION_CONFIG_OVERRIDE_TMP_FILENAME "sapphire_config_overrides.json.tmp"
 
 typedef enum {
     PROGRESSIVE_CALIB_STAGE_DISABLED = 0,
@@ -110,7 +112,72 @@ typedef struct {
     ternary_hessian_proxy_cache_t hessian_proxy_cache;
     ternary_hessian_sidecar_t *hessian_sidecar;
     structural_map_t structural_map;
+    char telemetry_path[TERNARY_TELEMETRY_PATH_MAX];
 } conversion_runtime_t;
+
+static transformer_ste_config_t default_runtime_ste_config(const ternary_conversion_config_t *config);
+
+static int build_runtime_telemetry_path(const char *base_path,
+                                        char *out_path,
+                                        size_t out_path_size)
+{
+    const char *file_name = NULL;
+    const char *extension = NULL;
+    size_t dir_len = 0u;
+    size_t stem_len = 0u;
+    time_t now = 0;
+    struct tm local_tm;
+    char timestamp[32];
+    int written = 0;
+
+    if (!base_path || !out_path || out_path_size == 0u) {
+        return -1;
+    }
+
+    file_name = strrchr(base_path, '/');
+    file_name = file_name ? file_name + 1 : base_path;
+    dir_len = (size_t)(file_name - base_path);
+    extension = strrchr(file_name, '.');
+    if (!extension) {
+        extension = "";
+        stem_len = strlen(file_name);
+    } else {
+        stem_len = (size_t)(extension - file_name);
+    }
+
+    now = time(NULL);
+    if (now == (time_t)-1 || localtime_r(&now, &local_tm) == NULL) {
+        return -1;
+    }
+    if (strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &local_tm) == 0u) {
+        return -1;
+    }
+
+    written = snprintf(out_path,
+                       out_path_size,
+                       "%.*s%.*s_%s%s",
+                       (int)dir_len,
+                       base_path,
+                       (int)stem_len,
+                       file_name,
+                       timestamp,
+                       extension);
+    if (written < 0 || (size_t)written >= out_path_size) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static const char *conversion_runtime_telemetry_path(const ternary_conversion_config_t *config,
+                                                     const conversion_runtime_t *runtime)
+{
+    if (runtime && runtime->telemetry_path[0] != '\0') {
+        return runtime->telemetry_path;
+    }
+
+    return default_runtime_ste_config(config).telemetry_path;
+}
 
 static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
                                    uint32_t hessian_sidecar_crc32)
@@ -175,9 +242,71 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
     crc32 = io_crc32_update(crc32, &config->hessian_proxy_strength, sizeof(config->hessian_proxy_strength));
     crc32 = io_crc32_update(crc32, &config->hessian_proxy_floor, sizeof(config->hessian_proxy_floor));
     crc32 = io_crc32_update(crc32, &config->max_grad_norm, sizeof(config->max_grad_norm));
+    crc32 = io_crc32_update(crc32,
+                            &config->student_down_proj_input_rmsnorm,
+                            sizeof(config->student_down_proj_input_rmsnorm));
     crc32 = io_crc32_update(crc32, config->hessian_sidecar_path, config->hessian_sidecar_path ? strlen(config->hessian_sidecar_path) + 1u : 0u);
     crc32 = io_crc32_update(crc32, &hessian_sidecar_crc32, sizeof(hessian_sidecar_crc32));
     return crc32;
+}
+
+static int write_conversion_config_overrides(const ternary_conversion_config_t *config)
+{
+    char *overrides_path = NULL;
+    char *tmp_path = NULL;
+    FILE *file = NULL;
+    int rc = -1;
+
+    if (!config || !config->student_down_proj_input_rmsnorm ||
+        !config->output_path || config->output_path[0] == '\0' ||
+        (config->layer_name && config->layer_name[0] != '\0')) {
+        return 0;
+    }
+
+    overrides_path = construct_safe_path(config->output_path,
+                                         CONVERSION_CONFIG_OVERRIDE_FILENAME,
+                                         NULL);
+    tmp_path = construct_safe_path(config->output_path,
+                                   CONVERSION_CONFIG_OVERRIDE_TMP_FILENAME,
+                                   NULL);
+    if (!overrides_path || !tmp_path) {
+        LOG_ERROR("ternary conversion: failed to build config override path under %s", config->output_path);
+        goto cleanup;
+    }
+
+    file = fopen(tmp_path, "w");
+    if (!file) {
+        LOG_ERROR("ternary conversion: failed to open %s: %s", tmp_path, strerror(errno));
+        goto cleanup;
+    }
+    if (fprintf(file,
+                "{\n  \"sapphire_ffn_down_proj_input_rmsnorm\": true\n}\n") < 0) {
+        LOG_ERROR("ternary conversion: failed to write %s", tmp_path);
+        goto cleanup;
+    }
+    if (fclose(file) != 0) {
+        file = NULL;
+        LOG_ERROR("ternary conversion: failed to close %s: %s", tmp_path, strerror(errno));
+        goto cleanup;
+    }
+    file = NULL;
+    if (rename(tmp_path, overrides_path) != 0) {
+        LOG_ERROR("ternary conversion: failed to publish %s: %s", overrides_path, strerror(errno));
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (file) {
+        fclose(file);
+    }
+    if (rc != 0 && tmp_path) {
+        remove(tmp_path);
+    }
+    free(tmp_path);
+    free(overrides_path);
+    return rc;
 }
 
 static uint32_t conversion_stage_pass_count(const ternary_conversion_config_t *config)
@@ -1607,6 +1736,7 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
     ste_config.telemetry_path = "./out/ternary_telemetry.jsonl";
     ste_config.hessian_sidecar_path = config ? config->hessian_sidecar_path : NULL;
     ste_config.hessian_sidecar_crc32 = 0u;
+    ste_config.student_down_proj_input_rmsnorm = config ? (config->student_down_proj_input_rmsnorm ? 1 : 0) : 0;
     ste_config.telemetry = NULL;
     return ste_config;
 }
@@ -1879,8 +2009,9 @@ static void init_conversion_validation(const ternary_conversion_config_t *config
 
     memset(&validation_config, 0, sizeof(validation_config));
     validation_config.validate_every_n = config->validate_every_n;
+    validation_config.student_down_proj_input_rmsnorm = config->student_down_proj_input_rmsnorm ? 1 : 0;
     validation_config.output_dir = config->output_path;
-    validation_config.telemetry_path = default_runtime_ste_config(config).telemetry_path;
+    validation_config.telemetry_path = conversion_runtime_telemetry_path(config, runtime);
     validation_config.sample_texts = (const char *const *)runtime->validation_corpus_storage.samples;
     validation_config.sample_count = runtime->validation_corpus_storage.sample_count;
 
@@ -2108,6 +2239,19 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
         LOG_ERROR("ternary conversion: failed to prepare output path %s", config->output_path);
         return conversion_tracy_end_status(&tracy_zone, -1);
     }
+    if (write_conversion_config_overrides(config) != 0) {
+        return conversion_tracy_end_status(&tracy_zone, -1);
+    }
+    if (build_runtime_telemetry_path(default_runtime_ste_config(config).telemetry_path,
+                                     out_runtime->telemetry_path,
+                                     sizeof(out_runtime->telemetry_path)) != 0) {
+        LOG_WARN("ternary conversion: failed to timestamp telemetry path; using default %s",
+                 default_runtime_ste_config(config).telemetry_path);
+        snprintf(out_runtime->telemetry_path,
+                 sizeof(out_runtime->telemetry_path),
+                 "%s",
+                 default_runtime_ste_config(config).telemetry_path);
+    }
 
     if (open_runtime_activation_tape(config, out_runtime) != 0 ||
         open_runtime_hessian_sidecar(config, out_runtime) != 0) {
@@ -2120,6 +2264,9 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
                                                            config->context_len > 0 ? config->context_len : 2048,
                                                            config->model_name);
     if (out_runtime->activation_ctx) {
+        if (config->student_down_proj_input_rmsnorm && out_runtime->activation_ctx->session) {
+            inference_session_set_ffn_down_proj_input_rmsnorm_default(out_runtime->activation_ctx->session, 1);
+        }
         attach_runtime_activation_context(out_runtime);
     } else {
         LOG_WARN("ternary conversion: failed to initialize activation replay context; using tokenized fallback vectors");
@@ -2208,6 +2355,7 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
     }
 
     ste_config = default_runtime_ste_config(config);
+    ste_config.telemetry_path = conversion_runtime_telemetry_path(config, runtime);
     ste_config.hessian_sidecar_path = config->hessian_sidecar_path;
     ste_config.hessian_sidecar_crc32 = runtime ? runtime->hessian_sidecar_crc32 : 0u;
 
@@ -2241,11 +2389,13 @@ static int run_single_layer_conversion(const ternary_conversion_config_t *config
     layer.packed_weights = result.packed_weights;
     layer.packed_weight_bytes = result.packed_weight_bytes;
     layer.scales = result.scales;
-    layer.scale_count = result.rows;
-    layer.scale_bytes = (size_t)result.rows * sizeof(float);
+    layer.scale_count = result.scale_count;
+    layer.scale_bytes = result.scale_count * sizeof(float);
     layer.scale_dtype = SAFETENSORS_F32;
     layer.rows = result.rows;
     layer.cols = result.cols;
+    layer.scale_group_size = result.scale_group_size;
+    layer.groups_per_row = (uint32_t)(result.scale_count / result.rows);
     layer.integrity = TERNARY_IO_INTEGRITY_CRC32;
 
     rc = io_write_layer_ternary(config->output_path, config->layer_name, &layer, &crc32);
@@ -2718,11 +2868,13 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     layer.packed_weights = result.packed_weights;
     layer.packed_weight_bytes = result.packed_weight_bytes;
     layer.scales = result.scales;
-    layer.scale_count = result.rows;
-    layer.scale_bytes = (size_t)result.rows * sizeof(float);
+    layer.scale_count = result.scale_count;
+    layer.scale_bytes = result.scale_count * sizeof(float);
     layer.scale_dtype = SAFETENSORS_F32;
     layer.rows = result.rows;
     layer.cols = result.cols;
+    layer.scale_group_size = result.scale_group_size;
+    layer.groups_per_row = (uint32_t)(result.scale_count / result.rows);
     layer.integrity = TERNARY_IO_INTEGRITY_CRC32;
 
     rc = io_write_layer_ternary_into_dir(job->output_dir, job->tensor_name, &layer, &crc32);
@@ -2829,6 +2981,7 @@ static int prepare_full_model_layer_ste_config(const full_model_tensor_task_t *t
     }
 
     *out_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
+    out_ste_config->telemetry_path = conversion_runtime_telemetry_path(task->config, task->runtime);
     distillation_schedule = progressive_calib_distillation_schedule(task->config,
                                                                    task->progressive_stage,
                                                                    has_layer_index,
@@ -3061,6 +3214,7 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
     sapphire_tracy_plot_i64("conversion.progress_index", (int64_t)start_progress);
     sapphire_tracy_plot_i64("conversion.converted_tensors", (int64_t)converted);
     ste_config = default_runtime_ste_config(config);
+    ste_config.telemetry_path = conversion_runtime_telemetry_path(config, runtime);
     ste_config.hessian_sidecar_path = config->hessian_sidecar_path;
     ste_config.hessian_sidecar_crc32 = runtime ? runtime->hessian_sidecar_crc32 : 0u;
 
@@ -3178,6 +3332,8 @@ static void log_conversion_config(const ternary_conversion_config_t *config)
              (config->calibration_sample_limit > 0) ? config->calibration_sample_limit : 4);
     LOG_INFO("  ste_steps: %d", (config->ste_steps > 0) ? config->ste_steps : 3);
     LOG_INFO("  progressive_calib: %s", config->progressive_calib ? "enabled" : "disabled");
+    LOG_INFO("  student_down_proj_rmsnorm: %s",
+             config->student_down_proj_input_rmsnorm ? "enabled" : "disabled");
     LOG_INFO("  max_grad_norm: %.4f", (double)((config->max_grad_norm > 0.0f) ? config->max_grad_norm : 1.0f));
     LOG_INFO("  validate_every: %d", config->validate_every_n);
     LOG_INFO("  kl_weight: %.4f", (double)((config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f));

@@ -1,15 +1,13 @@
 /*
- * @file gemma3_270m_config.h
- * @brief Gemma 3 (270M IT) model configuration helper (header-only)
+ * @file gemma3_config.h
+ * @brief Generic Gemma 3 runtime configuration shared across model sizes.
  *
- * This header provides canonical configuration values extracted from the
- * model's config.json. It is intended to be included by loaders or tests to
- * initialize missing fields in runtime `model_config_t` structures when the
- * on-disk model metadata is incomplete.
+ * This header defines the common config.json-backed runtime configuration
+ * structure used by Sapphire's Gemma 3 loaders and runtime.
  */
 
-#ifndef GEMMA3_270M_CONFIG_H
-#define GEMMA3_270M_CONFIG_H
+#ifndef GEMMA3_CONFIG_H
+#define GEMMA3_CONFIG_H
 
 #include "llm_model.h"
 
@@ -17,12 +15,10 @@
 extern "C" {
 #endif
 
-/* No default config defined here; parsing must populate a `gemma3_config_t` instance explicitly. */
-
 /**
  * Gemma3-specific configuration structure (maps to config.json)
  */
-typedef struct {
+typedef struct gemma3_config {
     /* Per-config fields (directly map to keys in config.json) */
     int sliding_window_pattern;      /* _sliding_window_pattern */
     const char *architectures_first; /* first architecture string (helpers may parse full array if needed) */
@@ -56,18 +52,20 @@ typedef struct {
     float rope_local_base_freq;
     float rope_scaling;               /* nullable */
     float rope_theta;
+    int sapphire_ffn_down_proj_input_rmsnorm;
     int sliding_window;
     const char *torch_dtype;
     const char *transformers_version;
     int use_bidirectional_attention;
     int use_cache;
     int vocab_size;
-} gemma3_270m_config_t;
+} gemma3_config_t;
 
-/* No default config defined here; parsing must populate a `gemma3_config_t` instance explicitly. */
+/* Backward-compatible alias for existing code paths. */
+typedef gemma3_config_t gemma3_270m_config_t;
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* GEMMA3_270M_CONFIG_H */
+#endif /* GEMMA3_CONFIG_H */
