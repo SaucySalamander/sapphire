@@ -3358,6 +3358,17 @@ static void hessian_proxy_result_reset(hessian_proxy_result_t *result)
     result->source = TERNARY_HESSIAN_PROXY_SOURCE_NONE;
 }
 
+static uint32_t tape_context_crc32(const ternary_activation_tape_context_t *tape_context)
+{
+    if (!tape_context || !tape_context->tape) {
+        return 0u;
+    }
+    if (tape_context->tape_crc32_known) {
+        return tape_context->tape_crc32;
+    }
+    return activation_tape_crc32(tape_context->tape);
+}
+
 static int hessian_proxy_request_is_valid(const hessian_proxy_request_t *request)
 {
     return request && request->config && request->config->use_hessian_proxy &&
@@ -3392,13 +3403,15 @@ static int hessian_proxy_publish_sidecar_hit(const hessian_proxy_request_t *requ
 {
     const ternary_hessian_sidecar_entry_t *entry = NULL;
     const float *diagonal = NULL;
+    uint32_t tape_crc32 = 0u;
 
     if (!request || !result || !request->sidecar || !request->tape_context ||
         !request->tape_context->tape || !request->tape_context->tensor_name) {
         return -1;
     }
 
-    if (activation_tape_crc32(request->tape_context->tape) != ternary_hessian_sidecar_tape_crc32(request->sidecar)) {
+    tape_crc32 = tape_context_crc32(request->tape_context);
+    if (tape_crc32 != ternary_hessian_sidecar_tape_crc32(request->sidecar)) {
         LOG_ERROR("hessian proxy: sidecar tape provenance mismatch for %s", request->tape_context->tensor_name);
         return -1;
     }
@@ -4313,7 +4326,7 @@ static int ste_prepare_telemetry_runtime(ste_telemetry_runtime_t *runtime,
         }
     }
     if (telemetry_active && runtime->telemetry.tape_hash == 0u && request->tape_context && request->tape_context->tape) {
-        runtime->telemetry.tape_hash = activation_tape_crc32(request->tape_context->tape);
+        runtime->telemetry.tape_hash = tape_context_crc32(request->tape_context);
     }
     if (telemetry_active && request->workspace) {
         runtime->telemetry.hessian_proxy_mean = request->workspace->hessian_proxy.stats.mean;

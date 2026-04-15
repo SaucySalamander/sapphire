@@ -2611,7 +2611,7 @@ static int open_runtime_hessian_sidecar(const ternary_conversion_config_t *confi
     }
 
     runtime->hessian_sidecar_crc32 = ternary_hessian_sidecar_crc32(runtime->hessian_sidecar);
-    if (activation_tape_crc32(runtime->activation_tape) != ternary_hessian_sidecar_tape_crc32(runtime->hessian_sidecar)) {
+    if (runtime->activation_tape_hash != ternary_hessian_sidecar_tape_crc32(runtime->hessian_sidecar)) {
         LOG_ERROR("ternary conversion: Hessian sidecar tape CRC mismatch for %s", config->hessian_sidecar_path);
         return conversion_tracy_end_status(&tracy_zone, -1);
     }
@@ -2908,6 +2908,8 @@ static const ternary_calibration_source_t *init_single_layer_calibration_source(
         tape_context->tape = runtime->activation_tape;
         tape_context->tensor_name = config->layer_name;
         tape_context->proxy_cache = NULL;
+        tape_context->tape_crc32 = runtime->activation_tape_hash;
+        tape_context->tape_crc32_known = 1;
         calibration_source->tape_context = tape_context;
     }
     calibration_source->sidecar = runtime->hessian_sidecar;
@@ -3205,6 +3207,7 @@ typedef struct {
     const char *output_dir;
     const char *tensor_name;
     const activation_tape_t *activation_tape;
+    uint32_t activation_tape_crc32;
     const ternary_hessian_sidecar_t *hessian_sidecar;
     ternary_bf16_io_cache_t *bf16_io_cache;
     ternary_hessian_proxy_cache_t *hessian_proxy_cache;
@@ -3640,7 +3643,9 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
         calibration_source.tape_context = &(ternary_activation_tape_context_t){
             .tape = job->activation_tape,
             .tensor_name = job->tensor_name,
-            .proxy_cache = job->hessian_proxy_cache
+            .proxy_cache = job->hessian_proxy_cache,
+            .tape_crc32 = job->activation_tape_crc32,
+            .tape_crc32_known = 1
         };
         calibration_source.sidecar = job->hessian_sidecar;
 
@@ -3991,6 +3996,7 @@ static int process_full_model_tensor(full_model_tensor_task_t *task)
     job.output_dir = task->config->output_path;
     job.tensor_name = task->tensor_name;
     job.activation_tape = task->runtime ? task->runtime->activation_tape : NULL;
+    job.activation_tape_crc32 = task->runtime ? task->runtime->activation_tape_hash : 0u;
     job.hessian_sidecar = task->runtime ? task->runtime->hessian_sidecar : NULL;
     job.bf16_io_cache = task->runtime ? &task->runtime->bf16_io_cache : NULL;
     job.hessian_proxy_cache = task->runtime ? &task->runtime->hessian_proxy_cache : NULL;

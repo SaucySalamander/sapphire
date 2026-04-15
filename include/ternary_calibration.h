@@ -81,6 +81,8 @@ typedef struct {
     const activation_tape_t *tape;
     const char *tensor_name;
     ternary_hessian_proxy_cache_t *proxy_cache;
+    uint32_t tape_crc32;
+    int tape_crc32_known;
 } ternary_activation_tape_context_t;
 
 typedef struct {
