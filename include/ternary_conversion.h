@@ -43,6 +43,8 @@ typedef struct {
     float hessian_proxy_strength;
     float hessian_proxy_floor;
     float max_grad_norm;
+    int emit_spatial_telemetry;
+    int spatial_telemetry_row_bucket_size;
     /* Mixed-precision anchor mode (Prompt 05) */
     int use_anchor_mode;              /* Enable hybrid ternary+anchor format */
     uint32_t anchor_budget_ppm;       /* Anchor budget in parts-per-million (default: 1000 = 0.1%) */

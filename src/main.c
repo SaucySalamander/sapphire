@@ -70,6 +70,8 @@ static void print_help(const char* program_name) {
     printf("  --disable-hessian-proxy  Disable tape-derived diagonal Hessian proxying\n");
     printf("  --hessian-proxy-strength <value>  Diagonal Hessian proxy strength (default: 1.0)\n");
     printf("  --hessian-proxy-floor <value>     Minimum diagonal Hessian proxy scale (default: 0.05)\n");
+    printf("  --spatial-telemetry     Emit a companion spatial JSONL for block-wise molding plots\n");
+    printf("  --spatial-telemetry-row-bucket <n>  Row bucket size for spatial telemetry (default: 64)\n");
     printf("  --validation-corpus <p>   Optional held-out text corpus file or URL for checkpoints\n");
     printf("  --validation-manifest <p> Optional local held-out corpus manifest file\n");
     printf("  --validation-samples <n>  Held-out prompt count for checkpoint evaluation\n");
@@ -168,6 +170,8 @@ typedef struct {
     float hessian_proxy_strength;
     float hessian_proxy_floor;
     float max_grad_norm;
+    int emit_spatial_telemetry;
+    int spatial_telemetry_row_bucket_size;
     int use_anchor_mode;
     uint32_t anchor_budget_ppm;
     int anchor_saliency_mode;
@@ -218,6 +222,8 @@ static void cli_args_init(cli_args_t *args)
     args->hessian_proxy_strength = 1.0f;
     args->hessian_proxy_floor = 0.05f;
     args->max_grad_norm = 1.0f;
+    args->emit_spatial_telemetry = 0;
+    args->spatial_telemetry_row_bucket_size = 64;
     args->use_anchor_mode = 0;
     args->anchor_budget_ppm = 1000u;
     args->anchor_saliency_mode = 1;
@@ -310,6 +316,10 @@ static int validate_convert_ternary_mode_args(const cli_args_t *args)
 {
     if (!args->convert_ternary && args->student_down_proj_input_rmsnorm) {
         LOG_ERROR("ERROR: --student-down-proj-rmsnorm is only supported with --convert-ternary.");
+        return -1;
+    }
+    if (!args->convert_ternary && args->emit_spatial_telemetry) {
+        LOG_ERROR("ERROR: --spatial-telemetry is only supported with --convert-ternary.");
         return -1;
     }
 
@@ -441,6 +451,10 @@ static int validate_convert_ternary_numeric_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --max-grad-norm must be > 0.");
         return -1;
     }
+    if (args->spatial_telemetry_row_bucket_size <= 0) {
+        LOG_ERROR("ERROR: --spatial-telemetry-row-bucket must be > 0.");
+        return -1;
+    }
     if (args->anchor_budget_ppm == 0u) {
         LOG_ERROR("ERROR: --anchor-budget-ppm must be > 0.");
         return -1;
@@ -554,6 +568,8 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.hessian_proxy_strength = args->hessian_proxy_strength;
     config.hessian_proxy_floor = args->hessian_proxy_floor;
     config.max_grad_norm = args->max_grad_norm;
+    config.emit_spatial_telemetry = args->emit_spatial_telemetry;
+    config.spatial_telemetry_row_bucket_size = args->spatial_telemetry_row_bucket_size;
     config.use_anchor_mode = args->use_anchor_mode;
     config.anchor_budget_ppm = args->anchor_budget_ppm;
     config.anchor_saliency_mode = args->anchor_saliency_mode;
@@ -1014,6 +1030,8 @@ typedef enum {
     CLI_OPT_DISABLE_HESSIAN_PROXY,
     CLI_OPT_HESSIAN_PROXY_STRENGTH,
     CLI_OPT_HESSIAN_PROXY_FLOOR,
+    CLI_OPT_SPATIAL_TELEMETRY,
+    CLI_OPT_SPATIAL_TELEMETRY_ROW_BUCKET,
     CLI_OPT_SAVE_STATE,
     CLI_OPT_LOAD_STATE
 } cli_option_t;
@@ -1070,6 +1088,8 @@ static const cli_option_alias_t g_cli_option_aliases[] = {
     { "--disable-hessian-proxy", CLI_OPT_DISABLE_HESSIAN_PROXY },
     { "--hessian-proxy-strength", CLI_OPT_HESSIAN_PROXY_STRENGTH },
     { "--hessian-proxy-floor", CLI_OPT_HESSIAN_PROXY_FLOOR },
+    { "--spatial-telemetry", CLI_OPT_SPATIAL_TELEMETRY },
+    { "--spatial-telemetry-row-bucket", CLI_OPT_SPATIAL_TELEMETRY_ROW_BUCKET },
     { "--save-state", CLI_OPT_SAVE_STATE },
     { "--load-state", CLI_OPT_LOAD_STATE }
 };
@@ -1131,6 +1151,7 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_STE_EARLY_STOP_DIVERGENCE: args->early_stop_divergence_ratio = (float)atof(value); break;
         case CLI_OPT_HESSIAN_PROXY_STRENGTH: args->hessian_proxy_strength = (float)atof(value); break;
         case CLI_OPT_HESSIAN_PROXY_FLOOR: args->hessian_proxy_floor = (float)atof(value); break;
+        case CLI_OPT_SPATIAL_TELEMETRY_ROW_BUCKET: args->spatial_telemetry_row_bucket_size = atoi(value); break;
         case CLI_OPT_SAVE_STATE: args->save_state_path = value; break;
         case CLI_OPT_LOAD_STATE: args->load_state_path = value; break;
         default: break;
@@ -1160,6 +1181,10 @@ static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
         }
         if (option == CLI_OPT_ANCHOR_MODE) {
             args->use_anchor_mode = 1;
+            continue;
+        }
+        if (option == CLI_OPT_SPATIAL_TELEMETRY) {
+            args->emit_spatial_telemetry = 1;
             continue;
         }
         if (option == CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM) {

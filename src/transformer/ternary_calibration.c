@@ -10,6 +10,7 @@
 #include "llm_model.h"
 #include "inference.h"
 #include "model_spec.h"
+#include "ternary_anchor.h"
 #include "ternary_io.h"
 #include "ternary_hessian_proxy.h"
 #include "ternary_telemetry.h"
@@ -105,6 +106,8 @@ static transformer_ste_config_t default_ste_config(void) {
     config.adam_epsilon = 1e-8f;
     config.telemetry_interval = 10;
     config.telemetry_path = "./out/ternary_telemetry.jsonl";
+    config.spatial_telemetry_path = NULL;
+    config.spatial_telemetry_row_bucket_size = 64;
     config.hessian_sidecar_path = NULL;
     config.hessian_sidecar_crc32 = 0u;
     config.telemetry = NULL;
@@ -115,6 +118,7 @@ static transformer_ste_config_t default_ste_config(void) {
     config.protected_anchor_entries = NULL;
     config.protected_anchor_row_offsets = NULL;
     config.protected_anchor_count = 0u;
+    config.telemetry_reference_weights = NULL;
     return config;
 }
 
@@ -180,6 +184,7 @@ static void normalize_ste_runtime_config(transformer_ste_config_t *config)
     if (config->adam_beta2 < 0.0f || config->adam_beta2 >= 1.0f) config->adam_beta2 = 0.95f;
     if (config->adam_epsilon <= 0.0f) config->adam_epsilon = 1e-8f;
     if (config->telemetry_interval <= 0) config->telemetry_interval = 10;
+    if (config->spatial_telemetry_row_bucket_size <= 0) config->spatial_telemetry_row_bucket_size = 64;
 }
 
 static void normalize_ste_config(transformer_ste_config_t *config) {
@@ -334,6 +339,9 @@ typedef struct {
     float abs_max;
     float absmax_rms_ratio;
 } activation_input_stats_t;
+
+typedef struct ste_calibration_context_t ste_calibration_context_t;
+typedef struct ste_telemetry_step_t ste_telemetry_step_t;
 
 typedef struct {
     int has_layer_index;
@@ -588,6 +596,9 @@ static uint32_t telemetry_compute_config_hash(const transformer_ste_config_t *co
     crc32 = io_crc32_update(crc32, &config->adam_epsilon, sizeof(config->adam_epsilon));
     crc32 = io_crc32_update(crc32, &config->telemetry_interval, sizeof(config->telemetry_interval));
     crc32 = io_crc32_update(crc32,
+                            &config->spatial_telemetry_row_bucket_size,
+                            sizeof(config->spatial_telemetry_row_bucket_size));
+    crc32 = io_crc32_update(crc32,
                             &config->student_down_proj_input_rmsnorm,
                             sizeof(config->student_down_proj_input_rmsnorm));
     crc32 = io_crc32_update(crc32, config->hessian_sidecar_path, config->hessian_sidecar_path ? strlen(config->hessian_sidecar_path) + 1u : 0u);
@@ -682,12 +693,63 @@ static void seed_latent_weights(ternary_calibration_result_t *result,
 
 typedef struct {
     int enabled;
+    int spatial_enabled;
     uint32_t interval;
+    uint32_t spatial_row_bucket_size;
     ternary_telemetry_writer_t writer;
+    ternary_telemetry_writer_t spatial_writer;
     ternary_telemetry_t telemetry;
 } ste_telemetry_runtime_t;
 
 typedef struct {
+    double gamma_sum;
+    float gamma_min;
+    float gamma_max;
+    uint32_t gamma_count;
+    double weight_sq_error_sum;
+    double hessian_sq_error_sum;
+    uint32_t element_count;
+    uint32_t ternary_count;
+    uint32_t zero_count;
+    uint32_t anchor_count;
+} spatial_block_accumulator_t;
+
+typedef struct {
+    const uint16_t *bf16_weights;
+    const char *tensor_name;
+    uint32_t cols;
+    const float *hessian_proxy;
+    const ternary_anchor_entry_t *protected_anchor_entries;
+    const uint32_t *protected_anchor_row_offsets;
+} spatial_telemetry_context_t;
+
+typedef struct {
+    const spatial_telemetry_context_t *context;
+    const ternary_calibration_result_t *result;
+    const ste_telemetry_step_t *step;
+    uint32_t row_bucket_size;
+    spatial_block_accumulator_t *block_accumulators;
+    float *out_group_hessian_mean;
+    float *out_group_hessian_max;
+    float *out_histogram_limit;
+} spatial_block_metrics_request_t;
+
+typedef struct {
+    spatial_block_accumulator_t *block_accumulators;
+    float *group_hessian_mean;
+    float *group_hessian_max;
+    uint32_t *teacher_counts;
+    uint32_t *student_counts;
+    uint32_t *student_bulk_counts;
+    uint32_t groups_per_row;
+    uint32_t group_size;
+    uint32_t row_bucket_size;
+    uint32_t row_bucket_count;
+    size_t block_count;
+    float histogram_limit;
+} spatial_snapshot_buffers_t;
+
+struct ste_telemetry_step_t {
     uint32_t step_idx;
     uint32_t total_steps;
     float mse_loss;
@@ -699,7 +761,12 @@ typedef struct {
     float effective_learning_rate;
     float effective_hessian_scale;
     float hessian_proxy_cap;
-} ste_telemetry_step_t;
+};
+
+static int ste_telemetry_runtime_has_outputs(const ste_telemetry_runtime_t *runtime)
+{
+    return runtime && (runtime->enabled || runtime->spatial_enabled);
+}
 
 static float telemetry_compute_active_hessian_proxy_max(float raw_hessian_proxy_max,
                                                         float hessian_proxy_cap,
@@ -726,16 +793,24 @@ static int ste_telemetry_runtime_init(ste_telemetry_runtime_t *runtime,
                                       uint32_t rows,
                                       uint32_t cols)
 {
+    int summary_requested = 0;
+    int spatial_requested = 0;
+
     if (!runtime || !config) {
         return 0;
     }
 
     memset(runtime, 0, sizeof(*runtime));
-    if (!config->telemetry_path || config->telemetry_path[0] == '\0' || config->telemetry_interval <= 0) {
+    summary_requested = config->telemetry_path && config->telemetry_path[0] != '\0' && config->telemetry_interval > 0;
+    spatial_requested = config->spatial_telemetry_path && config->spatial_telemetry_path[0] != '\0';
+    if (!summary_requested && !spatial_requested) {
         return 0;
     }
 
-    runtime->interval = (uint32_t)config->telemetry_interval;
+    runtime->interval = config->telemetry_interval > 0 ? (uint32_t)config->telemetry_interval : 0u;
+    runtime->spatial_row_bucket_size = config->spatial_telemetry_row_bucket_size > 0
+        ? (uint32_t)config->spatial_telemetry_row_bucket_size
+        : 64u;
     runtime->telemetry = config->telemetry ? *config->telemetry : (ternary_telemetry_t){0};
     if (runtime->telemetry.config_hash == 0u) {
         runtime->telemetry.config_hash = telemetry_compute_config_hash(config, tensor_name, rows, cols);
@@ -748,14 +823,20 @@ static int ste_telemetry_runtime_init(ste_telemetry_runtime_t *runtime,
         }
     }
 
-    if (ternary_telemetry_writer_init(&runtime->writer, config->telemetry_path) != 0) {
+    if (summary_requested &&
+        ternary_telemetry_writer_init(&runtime->writer, config->telemetry_path) != 0) {
         LOG_WARN("telemetry: disabled for %s", tensor_name ? tensor_name : "<unknown>");
-        memset(runtime, 0, sizeof(*runtime));
-        return 0;
+    } else if (summary_requested) {
+        runtime->enabled = 1;
+    }
+    if (spatial_requested &&
+        ternary_telemetry_writer_init(&runtime->spatial_writer, config->spatial_telemetry_path) != 0) {
+        LOG_WARN("spatial telemetry: disabled for %s", tensor_name ? tensor_name : "<unknown>");
+    } else if (spatial_requested) {
+        runtime->spatial_enabled = 1;
     }
 
-    runtime->enabled = 1;
-    return 1;
+    return ste_telemetry_runtime_has_outputs(runtime);
 }
 
 static void ste_telemetry_runtime_close(ste_telemetry_runtime_t *runtime)
@@ -766,6 +847,9 @@ static void ste_telemetry_runtime_close(ste_telemetry_runtime_t *runtime)
 
     if (runtime->enabled) {
         ternary_telemetry_writer_close(&runtime->writer);
+    }
+    if (runtime->spatial_enabled) {
+        ternary_telemetry_writer_close(&runtime->spatial_writer);
     }
     memset(runtime, 0, sizeof(*runtime));
 }
@@ -824,6 +908,623 @@ static int ste_emit_telemetry_step(ste_telemetry_runtime_t *runtime,
     }
 
     return telemetry_dump_step(&runtime->writer, &telemetry);
+}
+
+static uint32_t spatial_row_bucket_count(uint32_t rows, uint32_t row_bucket_size)
+{
+    if (rows == 0u || row_bucket_size == 0u) {
+        return 0u;
+    }
+    return (uint32_t)(((size_t)rows + row_bucket_size - 1u) / row_bucket_size);
+}
+
+static size_t spatial_block_index(uint32_t row_bucket_idx,
+                                  uint32_t group_idx,
+                                  uint32_t groups_per_row)
+{
+    return (size_t)row_bucket_idx * groups_per_row + group_idx;
+}
+
+static float spatial_effective_hessian_weight(float raw_proxy,
+                                              const ste_telemetry_step_t *step)
+{
+    float effective_proxy = raw_proxy;
+
+    if (effective_proxy < 0.0f) {
+        effective_proxy = 0.0f;
+    }
+    if (step && step->hessian_proxy_cap > 0.0f && effective_proxy > step->hessian_proxy_cap) {
+        effective_proxy = step->hessian_proxy_cap;
+    }
+    if (step && step->effective_hessian_scale > 0.0f) {
+        effective_proxy *= step->effective_hessian_scale;
+    }
+
+    return effective_proxy;
+}
+
+static float spatial_histogram_limit_or_default(float max_abs_value)
+{
+    return max_abs_value > 1e-12f ? max_abs_value : 1.0f;
+}
+
+static uint32_t spatial_histogram_bucket(float value,
+                                         float histogram_limit,
+                                         uint32_t bin_count)
+{
+    float normalized = 0.5f;
+    uint32_t bucket = 0u;
+
+    if (bin_count == 0u || histogram_limit <= 0.0f) {
+        return 0u;
+    }
+
+    normalized = (value + histogram_limit) / (2.0f * histogram_limit);
+    if (normalized <= 0.0f) {
+        return 0u;
+    }
+    if (normalized >= 1.0f) {
+        return bin_count - 1u;
+    }
+
+    bucket = (uint32_t)(normalized * (float)bin_count);
+    if (bucket >= bin_count) {
+        bucket = bin_count - 1u;
+    }
+    return bucket;
+}
+
+static void spatial_increment_histogram(uint32_t *counts,
+                                        uint32_t bin_count,
+                                        float histogram_limit,
+                                        float value)
+{
+    uint32_t bucket = 0u;
+
+    if (!counts || bin_count == 0u) {
+        return;
+    }
+
+    bucket = spatial_histogram_bucket(value, histogram_limit, bin_count);
+    counts[bucket] += 1u;
+}
+
+static void spatial_prepare_group_hessian_stats(const spatial_telemetry_context_t *context,
+                                                uint32_t groups_per_row,
+                                                uint32_t group_size,
+                                                float *out_group_mean,
+                                                float *out_group_max)
+{
+    if (!out_group_mean || !out_group_max) {
+        return;
+    }
+
+    for (uint32_t group_idx = 0u; group_idx < groups_per_row; ++group_idx) {
+        out_group_mean[group_idx] = NAN;
+        out_group_max[group_idx] = NAN;
+    }
+    if (!context || !context->hessian_proxy || context->cols == 0u || group_size == 0u) {
+        return;
+    }
+
+    for (uint32_t group_idx = 0u; group_idx < groups_per_row; ++group_idx) {
+        uint32_t col_start = group_idx * group_size;
+        uint32_t col_end = col_start + group_size;
+        double proxy_sum = 0.0;
+        float proxy_max = 0.0f;
+
+        if (col_end > context->cols) {
+            col_end = context->cols;
+        }
+        if (col_start >= col_end) {
+            continue;
+        }
+
+        for (uint32_t col = col_start; col < col_end; ++col) {
+            float proxy_value = context->hessian_proxy[col];
+
+            if (proxy_value < 0.0f) {
+                proxy_value = 0.0f;
+            }
+            proxy_sum += (double)proxy_value;
+            if (proxy_value > proxy_max) {
+                proxy_max = proxy_value;
+            }
+        }
+
+        out_group_mean[group_idx] = (float)(proxy_sum / (double)(col_end - col_start));
+        out_group_max[group_idx] = proxy_max;
+    }
+}
+
+static void spatial_accumulate_gamma_stats(spatial_block_accumulator_t *block_accumulators,
+                                           uint32_t row_bucket_size,
+                                           uint32_t rows,
+                                           uint32_t groups_per_row,
+                                           const float *scales)
+{
+    if (!block_accumulators || !scales || row_bucket_size == 0u || groups_per_row == 0u) {
+        return;
+    }
+
+    for (uint32_t row = 0u; row < rows; ++row) {
+        size_t scale_base = (size_t)row * groups_per_row;
+        uint32_t row_bucket_idx = row / row_bucket_size;
+
+        for (uint32_t group_idx = 0u; group_idx < groups_per_row; ++group_idx) {
+            spatial_block_accumulator_t *block = NULL;
+            float scale = scales[scale_base + group_idx];
+
+            block = block_accumulators + spatial_block_index(row_bucket_idx, group_idx, groups_per_row);
+            if (block->gamma_count == 0u) {
+                block->gamma_min = scale;
+                block->gamma_max = scale;
+            } else {
+                if (scale < block->gamma_min) {
+                    block->gamma_min = scale;
+                }
+                if (scale > block->gamma_max) {
+                    block->gamma_max = scale;
+                }
+            }
+            block->gamma_sum += (double)scale;
+            block->gamma_count += 1u;
+        }
+    }
+}
+
+static int spatial_lookup_anchor_value(const spatial_telemetry_context_t *context,
+                                       uint32_t col,
+                                       uint32_t *io_anchor_idx,
+                                       uint32_t anchor_end,
+                                       float *out_value)
+{
+    const ternary_anchor_entry_t *entries = NULL;
+
+    if (!context || !io_anchor_idx || !out_value ||
+        !context->protected_anchor_entries || *io_anchor_idx >= anchor_end) {
+        return 0;
+    }
+
+    entries = context->protected_anchor_entries;
+    while (*io_anchor_idx < anchor_end && entries[*io_anchor_idx].col < col) {
+        *io_anchor_idx += 1u;
+    }
+    if (*io_anchor_idx >= anchor_end || entries[*io_anchor_idx].col != col) {
+        return 0;
+    }
+
+    *out_value = bf16_to_f32_scalar(entries[*io_anchor_idx].value_bf16);
+    *io_anchor_idx += 1u;
+    return 1;
+}
+
+static int spatial_accumulate_block_metrics(const spatial_block_metrics_request_t *request)
+{
+    const spatial_telemetry_context_t *context = NULL;
+    const ternary_calibration_result_t *result = NULL;
+    const ste_telemetry_step_t *step = NULL;
+    spatial_block_accumulator_t *block_accumulators = NULL;
+    float *out_group_hessian_mean = NULL;
+    float *out_group_hessian_max = NULL;
+    float *out_histogram_limit = NULL;
+    uint32_t row_bucket_size = 0u;
+    uint32_t groups_per_row = 0u;
+    uint32_t group_size = 0u;
+    float max_abs_value = 0.0f;
+
+    if (!request) {
+        return -1;
+    }
+
+    context = request->context;
+    result = request->result;
+    step = request->step;
+    row_bucket_size = request->row_bucket_size;
+    block_accumulators = request->block_accumulators;
+    out_group_hessian_mean = request->out_group_hessian_mean;
+    out_group_hessian_max = request->out_group_hessian_max;
+    out_histogram_limit = request->out_histogram_limit;
+    if (!context || !context->bf16_weights || !result || !block_accumulators ||
+        !out_group_hessian_mean || !out_group_hessian_max || !out_histogram_limit ||
+        row_bucket_size == 0u || result->scale_group_size == 0u) {
+        return -1;
+    }
+
+    groups_per_row = ternary_groups_per_row(result->cols, result->scale_group_size);
+    group_size = result->scale_group_size;
+    if (groups_per_row == 0u) {
+        return -1;
+    }
+
+    spatial_prepare_group_hessian_stats(context,
+                                        groups_per_row,
+                                        group_size,
+                                        out_group_hessian_mean,
+                                        out_group_hessian_max);
+    spatial_accumulate_gamma_stats(block_accumulators,
+                                   row_bucket_size,
+                                   result->rows,
+                                   groups_per_row,
+                                   result->scales);
+
+    for (uint32_t row = 0u; row < result->rows; ++row) {
+        size_t row_base = (size_t)row * result->cols;
+        size_t scale_base = (size_t)row * groups_per_row;
+        uint32_t row_bucket_idx = row / row_bucket_size;
+        uint32_t anchor_idx = 0u;
+        uint32_t anchor_end = 0u;
+
+        if (context->protected_anchor_entries && context->protected_anchor_row_offsets) {
+            anchor_idx = context->protected_anchor_row_offsets[row];
+            anchor_end = context->protected_anchor_row_offsets[row + 1u];
+        }
+
+        for (uint32_t col = 0u; col < result->cols; ++col) {
+            uint32_t group_idx = col / group_size;
+            spatial_block_accumulator_t *block = NULL;
+            float teacher_value = 0.0f;
+            float student_value = 0.0f;
+            float student_bulk_value = 0.0f;
+            float error_value = 0.0f;
+            float scale = 0.0f;
+            int anchored = 0;
+
+            if (group_idx >= groups_per_row) {
+                group_idx = groups_per_row - 1u;
+            }
+            scale = result->scales[scale_base + group_idx];
+            block = block_accumulators + spatial_block_index(row_bucket_idx, group_idx, groups_per_row);
+            teacher_value = bf16_to_f32_scalar(context->bf16_weights[row_base + col]);
+            student_bulk_value = scale * (float)result->ternary_weights[row_base + col];
+            student_value = student_bulk_value;
+            anchored = spatial_lookup_anchor_value(context, col, &anchor_idx, anchor_end, &student_value);
+            error_value = student_value - teacher_value;
+
+            block->weight_sq_error_sum += (double)error_value * (double)error_value;
+            if (context->hessian_proxy) {
+                float effective_proxy = spatial_effective_hessian_weight(context->hessian_proxy[col], step);
+
+                block->hessian_sq_error_sum += (double)error_value * (double)error_value * (double)effective_proxy;
+            }
+            block->element_count += 1u;
+            if (anchored) {
+                block->anchor_count += 1u;
+            } else {
+                block->ternary_count += 1u;
+                if (result->ternary_weights[row_base + col] == 0) {
+                    block->zero_count += 1u;
+                }
+            }
+
+            max_abs_value = fmaxf(max_abs_value, fabsf(teacher_value));
+            max_abs_value = fmaxf(max_abs_value, fabsf(student_value));
+            max_abs_value = fmaxf(max_abs_value, fabsf(student_bulk_value));
+        }
+    }
+
+    *out_histogram_limit = spatial_histogram_limit_or_default(max_abs_value);
+    return 0;
+}
+
+static int spatial_accumulate_histograms(const spatial_telemetry_context_t *context,
+                                         const ternary_calibration_result_t *result,
+                                         float histogram_limit,
+                                         uint32_t *teacher_counts,
+                                         uint32_t *student_counts,
+                                         uint32_t *student_bulk_counts)
+{
+    uint32_t groups_per_row = 0u;
+    uint32_t group_size = 0u;
+
+    if (!context || !context->bf16_weights || !result || !teacher_counts || !student_counts || !student_bulk_counts) {
+        return -1;
+    }
+
+    groups_per_row = ternary_groups_per_row(result->cols, result->scale_group_size);
+    group_size = result->scale_group_size;
+    if (groups_per_row == 0u || group_size == 0u) {
+        return -1;
+    }
+
+    for (uint32_t row = 0u; row < result->rows; ++row) {
+        size_t row_base = (size_t)row * result->cols;
+        size_t scale_base = (size_t)row * groups_per_row;
+        uint32_t anchor_idx = 0u;
+        uint32_t anchor_end = 0u;
+
+        if (context->protected_anchor_entries && context->protected_anchor_row_offsets) {
+            anchor_idx = context->protected_anchor_row_offsets[row];
+            anchor_end = context->protected_anchor_row_offsets[row + 1u];
+        }
+
+        for (uint32_t col = 0u; col < result->cols; ++col) {
+            uint32_t group_idx = col / group_size;
+            float teacher_value = 0.0f;
+            float student_value = 0.0f;
+            float student_bulk_value = 0.0f;
+            int anchored = 0;
+
+            if (group_idx >= groups_per_row) {
+                group_idx = groups_per_row - 1u;
+            }
+            teacher_value = bf16_to_f32_scalar(context->bf16_weights[row_base + col]);
+            student_bulk_value = result->scales[scale_base + group_idx] * (float)result->ternary_weights[row_base + col];
+            student_value = student_bulk_value;
+            anchored = spatial_lookup_anchor_value(context, col, &anchor_idx, anchor_end, &student_value);
+
+            spatial_increment_histogram(teacher_counts,
+                                        TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS,
+                                        histogram_limit,
+                                        teacher_value);
+            spatial_increment_histogram(student_counts,
+                                        TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS,
+                                        histogram_limit,
+                                        student_value);
+                        if (!anchored) {
+                spatial_increment_histogram(student_bulk_counts,
+                                            TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS,
+                                            histogram_limit,
+                                            student_bulk_value);
+            }
+        }
+    }
+
+    return 0;
+}
+
+static void spatial_snapshot_buffers_reset(spatial_snapshot_buffers_t *buffers)
+{
+    if (!buffers) {
+        return;
+    }
+
+    memset(buffers, 0, sizeof(*buffers));
+}
+
+static void spatial_snapshot_buffers_release(spatial_snapshot_buffers_t *buffers)
+{
+    if (!buffers) {
+        return;
+    }
+
+    free(buffers->student_bulk_counts);
+    free(buffers->student_counts);
+    free(buffers->teacher_counts);
+    free(buffers->group_hessian_max);
+    free(buffers->group_hessian_mean);
+    free(buffers->block_accumulators);
+    spatial_snapshot_buffers_reset(buffers);
+}
+
+static int spatial_snapshot_buffers_init(spatial_snapshot_buffers_t *buffers,
+                                         const ste_telemetry_runtime_t *runtime,
+                                         const ternary_calibration_result_t *result)
+{
+    if (!buffers || !runtime || !result) {
+        return -1;
+    }
+
+    spatial_snapshot_buffers_reset(buffers);
+    buffers->groups_per_row = ternary_groups_per_row(result->cols, result->scale_group_size);
+    buffers->group_size = result->scale_group_size;
+    buffers->row_bucket_size = runtime->spatial_row_bucket_size;
+    buffers->row_bucket_count = spatial_row_bucket_count(result->rows, buffers->row_bucket_size);
+    buffers->block_count = (size_t)buffers->row_bucket_count * buffers->groups_per_row;
+    if (buffers->groups_per_row == 0u || buffers->group_size == 0u ||
+        buffers->row_bucket_count == 0u || buffers->block_count == 0u) {
+        return -1;
+    }
+
+    buffers->block_accumulators = (spatial_block_accumulator_t *)calloc(buffers->block_count,
+                                                                        sizeof(*buffers->block_accumulators));
+    buffers->group_hessian_mean = (float *)malloc(buffers->groups_per_row * sizeof(*buffers->group_hessian_mean));
+    buffers->group_hessian_max = (float *)malloc(buffers->groups_per_row * sizeof(*buffers->group_hessian_max));
+    buffers->teacher_counts = (uint32_t *)calloc(TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS,
+                                                 sizeof(*buffers->teacher_counts));
+    buffers->student_counts = (uint32_t *)calloc(TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS,
+                                                 sizeof(*buffers->student_counts));
+    buffers->student_bulk_counts = (uint32_t *)calloc(TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS,
+                                                      sizeof(*buffers->student_bulk_counts));
+    if (!buffers->block_accumulators || !buffers->group_hessian_mean || !buffers->group_hessian_max ||
+        !buffers->teacher_counts || !buffers->student_counts || !buffers->student_bulk_counts) {
+        spatial_snapshot_buffers_release(buffers);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int spatial_emit_snapshot_meta_record(ternary_telemetry_writer_t *writer,
+                                             const spatial_telemetry_context_t *context,
+                                             const ternary_telemetry_t *telemetry,
+                                             const ste_telemetry_step_t *step,
+                                             const ternary_calibration_result_t *result,
+                                             const spatial_snapshot_buffers_t *buffers)
+{
+    return telemetry_dump_spatial_snapshot_meta(writer,
+                                                &(ternary_spatial_telemetry_meta_t){
+                                                    .tensor_name = context->tensor_name,
+                                                    .config_hash = telemetry->config_hash,
+                                                    .layer_idx = telemetry->layer_idx,
+                                                    .resume_step_idx = telemetry->resume_step_idx,
+                                                    .step_idx = step->step_idx,
+                                                    .tape_hash = telemetry->tape_hash,
+                                                    .student_checkpoint_hash = telemetry->student_checkpoint_hash,
+                                                    .rows = result->rows,
+                                                    .cols = result->cols,
+                                                    .scale_group_size = buffers->group_size,
+                                                    .groups_per_row = buffers->groups_per_row,
+                                                    .row_bucket_size = buffers->row_bucket_size,
+                                                    .row_bucket_count = buffers->row_bucket_count,
+                                                    .hessian_proxy_source = telemetry->hessian_proxy_source,
+                                                    .use_anchor_mode = telemetry->use_anchor_mode,
+                                                    .anchor_count = telemetry->anchor_count,
+                                                    .histogram_bin_count = TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS,
+                                                    .histogram_min = -buffers->histogram_limit,
+                                                    .histogram_max = buffers->histogram_limit,
+                                                    .effective_learning_rate = step->effective_learning_rate,
+                                                    .effective_hessian_scale = step->effective_hessian_scale,
+                                                    .hessian_proxy_cap = step->hessian_proxy_cap
+                                                });
+}
+
+static int spatial_emit_snapshot_block_records(ternary_telemetry_writer_t *writer,
+                                               const spatial_telemetry_context_t *context,
+                                               const ternary_telemetry_t *telemetry,
+                                               const ste_telemetry_step_t *step,
+                                               const ternary_calibration_result_t *result,
+                                               const spatial_snapshot_buffers_t *buffers)
+{
+    for (uint32_t row_bucket_idx = 0u; row_bucket_idx < buffers->row_bucket_count; ++row_bucket_idx) {
+        uint32_t row_start = row_bucket_idx * buffers->row_bucket_size;
+        uint32_t row_end = row_start + buffers->row_bucket_size;
+
+        if (row_end > result->rows) {
+            row_end = result->rows;
+        }
+
+        for (uint32_t group_idx = 0u; group_idx < buffers->groups_per_row; ++group_idx) {
+            const spatial_block_accumulator_t *block = buffers->block_accumulators + spatial_block_index(row_bucket_idx,
+                                                                                                          group_idx,
+                                                                                                          buffers->groups_per_row);
+            uint32_t col_start = group_idx * buffers->group_size;
+            uint32_t col_end = col_start + buffers->group_size;
+            float gamma_mean = NAN;
+            float gamma_min = NAN;
+            float gamma_max = NAN;
+            float block_weight_mse = NAN;
+            float block_hessian_error = NAN;
+            float p_zero_fraction = NAN;
+            float anchor_fraction = NAN;
+
+            if (col_end > result->cols) {
+                col_end = result->cols;
+            }
+            if (block->gamma_count > 0u) {
+                gamma_mean = (float)(block->gamma_sum / (double)block->gamma_count);
+                gamma_min = block->gamma_min;
+                gamma_max = block->gamma_max;
+            }
+            if (block->element_count > 0u) {
+                block_weight_mse = (float)(block->weight_sq_error_sum / (double)block->element_count);
+                anchor_fraction = (float)block->anchor_count / (float)block->element_count;
+                if (context->hessian_proxy) {
+                    block_hessian_error = (float)(block->hessian_sq_error_sum / (double)block->element_count);
+                }
+            }
+            if (block->ternary_count > 0u) {
+                p_zero_fraction = (float)block->zero_count / (float)block->ternary_count;
+            }
+
+            if (telemetry_dump_spatial_snapshot_block(writer,
+                                                      &(ternary_spatial_telemetry_block_t){
+                                                          .config_hash = telemetry->config_hash,
+                                                          .layer_idx = telemetry->layer_idx,
+                                                          .step_idx = step->step_idx,
+                                                          .row_bucket_idx = row_bucket_idx,
+                                                          .group_idx = group_idx,
+                                                          .row_start = row_start,
+                                                          .row_end = row_end,
+                                                          .col_start = col_start,
+                                                          .col_end = col_end,
+                                                          .gamma_mean = gamma_mean,
+                                                          .gamma_min = gamma_min,
+                                                          .gamma_max = gamma_max,
+                                                          .hessian_group_mean = buffers->group_hessian_mean[group_idx],
+                                                          .hessian_group_max = buffers->group_hessian_max[group_idx],
+                                                          .block_weight_mse = block_weight_mse,
+                                                          .block_hessian_error = block_hessian_error,
+                                                          .p_zero_fraction = p_zero_fraction,
+                                                          .anchor_fraction = anchor_fraction
+                                                      }) != 0) {
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int spatial_emit_snapshot_histogram_record(ternary_telemetry_writer_t *writer,
+                                                  const spatial_telemetry_context_t *context,
+                                                  const ternary_telemetry_t *telemetry,
+                                                  const ste_telemetry_step_t *step,
+                                                  const spatial_snapshot_buffers_t *buffers)
+{
+    return telemetry_dump_spatial_snapshot_histogram(writer,
+                                                     &(ternary_spatial_telemetry_histogram_t){
+                                                         .tensor_name = context->tensor_name,
+                                                         .config_hash = telemetry->config_hash,
+                                                         .layer_idx = telemetry->layer_idx,
+                                                         .step_idx = step->step_idx,
+                                                         .histogram_bin_count = TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS,
+                                                         .histogram_min = -buffers->histogram_limit,
+                                                         .histogram_max = buffers->histogram_limit,
+                                                         .teacher_counts = buffers->teacher_counts,
+                                                         .student_counts = buffers->student_counts,
+                                                         .student_bulk_counts = buffers->student_bulk_counts
+                                                     });
+}
+
+static int ste_emit_spatial_snapshot(ste_telemetry_runtime_t *runtime,
+                                     const spatial_telemetry_context_t *context,
+                                     const ternary_calibration_result_t *result,
+                                     const ste_telemetry_step_t *step)
+{
+    spatial_snapshot_buffers_t buffers;
+    int status = -1;
+
+    if (!runtime || !runtime->spatial_enabled || !context || !context->tensor_name || !result || !step) {
+        return 0;
+    }
+    if (step->step_idx + 1u < step->total_steps) {
+        return 0;
+    }
+    if (spatial_snapshot_buffers_init(&buffers, runtime, result) != 0) {
+        return -1;
+    }
+    if (spatial_accumulate_block_metrics(&(spatial_block_metrics_request_t){
+            .context = context,
+            .result = result,
+            .step = step,
+            .row_bucket_size = buffers.row_bucket_size,
+            .block_accumulators = buffers.block_accumulators,
+            .out_group_hessian_mean = buffers.group_hessian_mean,
+            .out_group_hessian_max = buffers.group_hessian_max,
+            .out_histogram_limit = &buffers.histogram_limit
+        }) != 0 ||
+        spatial_accumulate_histograms(context,
+                                      result,
+                                      buffers.histogram_limit,
+                                      buffers.teacher_counts,
+                                      buffers.student_counts,
+                                      buffers.student_bulk_counts) != 0 ||
+        spatial_emit_snapshot_meta_record(&runtime->spatial_writer,
+                                          context,
+                                          &runtime->telemetry,
+                                          step,
+                                          result,
+                                          &buffers) != 0 ||
+        spatial_emit_snapshot_block_records(&runtime->spatial_writer,
+                                            context,
+                                            &runtime->telemetry,
+                                            step,
+                                            result,
+                                            &buffers) != 0 ||
+        spatial_emit_snapshot_histogram_record(&runtime->spatial_writer,
+                                               context,
+                                               &runtime->telemetry,
+                                               step,
+                                               &buffers) != 0) {
+        goto cleanup;
+    }
+
+    status = 0;
+
+cleanup:
+    spatial_snapshot_buffers_release(&buffers);
+    return status;
 }
 
 static void build_feature_hashed_vector(const int *tokens,
@@ -2214,7 +2915,7 @@ static void compute_distillation_sample_weights(const distillation_weight_reques
     distillation_runtime_buffers_release(&buffers);
 }
 
-typedef struct {
+struct ste_calibration_context_t {
     float *latent;
     float *best_latent;
     float *first_moment;
@@ -2222,6 +2923,7 @@ typedef struct {
     float *gradient;
     int8_t *ternary;
     float *scales;
+    const uint16_t *bf16_weights;
     const float *scale_floor;
     size_t scale_count;
     uint32_t rows;
@@ -2244,7 +2946,7 @@ typedef struct {
     const ternary_anchor_entry_t *protected_anchor_entries;
     const uint32_t *protected_anchor_row_offsets;
     uint32_t protected_anchor_count;
-} ste_calibration_context_t;
+};
 
 static int ste_low_energy_hessian_ramp_active(const ste_calibration_context_t *context,
                                               uint32_t step_index,
@@ -3040,6 +3742,7 @@ static int run_ste_calibration_steps(ste_calibration_context_t *context,
     for (int step = 0; step < context->config->ste_steps; ++step) {
         ste_step_metrics_t step_metrics;
         ste_step_schedule_t step_schedule;
+        spatial_telemetry_context_t spatial_context;
         int auto_decay_applied = 0;
         struct timespec step_start;
         struct timespec step_end;
@@ -3051,7 +3754,7 @@ static int run_ste_calibration_steps(ste_calibration_context_t *context,
 
         memset(&step_schedule, 0, sizeof(step_schedule));
 
-        if (telemetry_runtime && telemetry_runtime->enabled) {
+        if (ste_telemetry_runtime_has_outputs(telemetry_runtime)) {
             (void)clock_gettime(CLOCK_MONOTONIC, &step_start);
         }
 
@@ -3070,7 +3773,7 @@ static int run_ste_calibration_steps(ste_calibration_context_t *context,
                           auto_decay_applied,
                                                   &early_stop_state);
 
-        if (telemetry_runtime && telemetry_runtime->enabled) {
+        if (ste_telemetry_runtime_has_outputs(telemetry_runtime)) {
             (void)clock_gettime(CLOCK_MONOTONIC, &step_end);
             memset(&telemetry_step, 0, sizeof(telemetry_step));
             telemetry_step.step_idx = (uint32_t)step;
@@ -3086,6 +3789,13 @@ static int run_ste_calibration_steps(ste_calibration_context_t *context,
             telemetry_step.effective_learning_rate = step_schedule.learning_rate;
             telemetry_step.effective_hessian_scale = step_schedule.hessian_scale;
             telemetry_step.hessian_proxy_cap = step_schedule.hessian_proxy_cap;
+            memset(&spatial_context, 0, sizeof(spatial_context));
+            spatial_context.bf16_weights = context->bf16_weights;
+            spatial_context.tensor_name = context->tensor_name;
+            spatial_context.cols = context->cols;
+            spatial_context.hessian_proxy = context->hessian_proxy;
+            spatial_context.protected_anchor_entries = context->protected_anchor_entries;
+            spatial_context.protected_anchor_row_offsets = context->protected_anchor_row_offsets;
 
             if (pack_ternary_2bit(out_result->ternary_weights,
                                   context->rows,
@@ -3097,6 +3807,12 @@ static int run_ste_calibration_steps(ste_calibration_context_t *context,
                                             context->scale_floor,
                                             &telemetry_step) != 0) {
                     LOG_WARN("telemetry: failed to dump step %d", step);
+                }
+                if (ste_emit_spatial_snapshot(telemetry_runtime,
+                                              &spatial_context,
+                                              out_result,
+                                              &telemetry_step) != 0) {
+                    LOG_WARN("spatial telemetry: failed to dump step %d", step);
                 }
             } else {
                 LOG_WARN("telemetry: failed to pack step snapshot");
@@ -3161,6 +3877,7 @@ typedef struct {
     uint32_t rows;
     uint32_t cols;
     const transformer_ste_config_t *config;
+    const uint16_t *bf16_weights;
     const char *tensor_name;
     const ternary_calibration_corpus_t *corpus;
     ste_calibration_workspace_t *workspace;
@@ -3544,6 +4261,9 @@ static void ste_init_calibration_context(ste_calibration_context_t *context,
     context->gradient = request->workspace->gradient;
     context->ternary = request->result->ternary_weights;
     context->scales = request->result->scales;
+    context->bf16_weights = request->config->telemetry_reference_weights
+        ? request->config->telemetry_reference_weights
+        : request->bf16_weights;
     context->scale_floor = request->workspace->scale_floor;
     context->scale_count = request->result->scale_count;
     context->rows = request->rows;
@@ -3681,6 +4401,7 @@ int transformer_calibrate_layer_ste_with_tape(const uint16_t *bf16_weights,
     context_request.rows = rows;
     context_request.cols = cols;
     context_request.config = &effective_config;
+    context_request.bf16_weights = bf16_weights;
     context_request.tensor_name = tensor_name;
     context_request.corpus = corpus;
     context_request.workspace = &workspace;
@@ -3984,6 +4705,7 @@ int transformer_calibrate_layer_ste_hybrid(const uint16_t *bf16_weights,
     effective_config.protected_anchor_entries = anchor_selection.entries;
     effective_config.protected_anchor_row_offsets = anchor_selection.row_offsets;
     effective_config.protected_anchor_count = anchor_selection.anchor_count;
+    effective_config.telemetry_reference_weights = bf16_weights;
     hybrid_telemetry = config->telemetry ? *config->telemetry : (ternary_telemetry_t){0};
     hybrid_seed_telemetry(&hybrid_telemetry, &anchor_config, &anchor_selection);
     effective_config.telemetry = &hybrid_telemetry;

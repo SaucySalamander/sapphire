@@ -52,6 +52,8 @@ typedef struct {
     float adam_epsilon;
     int telemetry_interval;
     const char *telemetry_path;
+    const char *spatial_telemetry_path;
+    int spatial_telemetry_row_bucket_size;
     const char *hessian_sidecar_path;
     uint32_t hessian_sidecar_crc32;
     ternary_telemetry_t *telemetry;
@@ -63,6 +65,7 @@ typedef struct {
     const ternary_anchor_entry_t *protected_anchor_entries; /* Internal STE freeze mask */
     const uint32_t *protected_anchor_row_offsets;           /* Internal STE freeze mask */
     uint32_t protected_anchor_count;                        /* Internal STE freeze mask */
+    const uint16_t *telemetry_reference_weights;           /* Internal telemetry-only teacher reference */
 } transformer_ste_config_t;
 
 typedef struct {

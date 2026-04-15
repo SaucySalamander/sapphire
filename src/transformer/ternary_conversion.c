@@ -118,6 +118,7 @@ typedef struct {
     ternary_hessian_sidecar_t *hessian_sidecar;
     structural_map_t structural_map;
     char telemetry_path[TERNARY_TELEMETRY_PATH_MAX];
+    char spatial_telemetry_path[TERNARY_TELEMETRY_PATH_MAX];
 } conversion_runtime_t;
 
 static transformer_ste_config_t default_runtime_ste_config(const ternary_conversion_config_t *config);
@@ -182,6 +183,59 @@ static const char *conversion_runtime_telemetry_path(const ternary_conversion_co
     }
 
     return default_runtime_ste_config(config).telemetry_path;
+}
+
+static int build_runtime_spatial_telemetry_path(const char *summary_path,
+                                                char *out_path,
+                                                size_t out_path_size)
+{
+    const char *file_name = NULL;
+    const char *extension = NULL;
+    size_t dir_len = 0u;
+    size_t stem_len = 0u;
+    int written = 0;
+
+    if (!summary_path || !out_path || out_path_size == 0u) {
+        return -1;
+    }
+
+    file_name = strrchr(summary_path, '/');
+    file_name = file_name ? file_name + 1 : summary_path;
+    dir_len = (size_t)(file_name - summary_path);
+    extension = strrchr(file_name, '.');
+    if (!extension) {
+        extension = "";
+        stem_len = strlen(file_name);
+    } else {
+        stem_len = (size_t)(extension - file_name);
+    }
+
+    written = snprintf(out_path,
+                       out_path_size,
+                       "%.*s%.*s_spatial%s",
+                       (int)dir_len,
+                       summary_path,
+                       (int)stem_len,
+                       file_name,
+                       extension);
+    if (written < 0 || (size_t)written >= out_path_size) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static const char *conversion_runtime_spatial_telemetry_path(const ternary_conversion_config_t *config,
+                                                             const conversion_runtime_t *runtime)
+{
+    if (!config || !config->emit_spatial_telemetry) {
+        return NULL;
+    }
+    if (runtime && runtime->spatial_telemetry_path[0] != '\0') {
+        return runtime->spatial_telemetry_path;
+    }
+
+    return NULL;
 }
 
 static uint32_t config_hash_update_string(uint32_t crc32, const char *value)
@@ -310,6 +364,12 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
     crc32 = io_crc32_update(crc32, &config->hessian_proxy_strength, sizeof(config->hessian_proxy_strength));
     crc32 = io_crc32_update(crc32, &config->hessian_proxy_floor, sizeof(config->hessian_proxy_floor));
     crc32 = io_crc32_update(crc32, &config->max_grad_norm, sizeof(config->max_grad_norm));
+    crc32 = io_crc32_update(crc32,
+                            &config->emit_spatial_telemetry,
+                            sizeof(config->emit_spatial_telemetry));
+    crc32 = io_crc32_update(crc32,
+                            &config->spatial_telemetry_row_bucket_size,
+                            sizeof(config->spatial_telemetry_row_bucket_size));
     crc32 = io_crc32_update(crc32,
                             &config->student_down_proj_input_rmsnorm,
                             sizeof(config->student_down_proj_input_rmsnorm));
@@ -1894,6 +1954,149 @@ static int write_student_checkpoint(const ternary_conversion_config_t *config,
     return conversion_tracy_end_status(&tracy_zone, rc);
 }
 
+static int spec_copy_layer_prefix_local(const model_spec_t *spec,
+                                        char *out_prefix,
+                                        size_t out_prefix_size)
+{
+    const char *layer_marker = ".layers.";
+    size_t layer_marker_len = strlen(layer_marker);
+
+    if (!spec || !spec->tensor_map || !out_prefix || out_prefix_size == 0u) {
+        return -1;
+    }
+
+    out_prefix[0] = '\0';
+    for (int idx = 0; spec->tensor_map[idx].hf_name; ++idx) {
+        const char *name = spec->tensor_map[idx].hf_name;
+        const char *layer_pos = name ? strstr(name, layer_marker) : NULL;
+        size_t prefix_len = 0u;
+
+        if (!layer_pos) {
+            continue;
+        }
+
+        prefix_len = (size_t)((layer_pos - name) + layer_marker_len);
+        if (prefix_len == 0u || prefix_len >= out_prefix_size) {
+            return -1;
+        }
+
+        memcpy(out_prefix, name, prefix_len);
+        out_prefix[prefix_len] = '\0';
+        return 0;
+    }
+
+    return -1;
+}
+
+static int activation_tape_matches_student_layout(const activation_tape_t *tape,
+                                                  const model_spec_t *spec)
+{
+    const gemma3_270m_config_t *cfg = NULL;
+    const tape_file_header_t *header = NULL;
+    const tape_manifest_entry_t *entry = NULL;
+    char expected_prefix[128];
+
+    if (!tape || !spec || !spec->variant_config) {
+        return 0;
+    }
+
+    cfg = (const gemma3_270m_config_t *)spec->variant_config;
+    if (cfg->num_hidden_layers <= 0 || cfg->hidden_size <= 0) {
+        return 0;
+    }
+
+    header = activation_tape_header(tape);
+    if (!header) {
+        return 0;
+    }
+    if (activation_tape_entry_count(tape) !=
+        (uint32_t)cfg->num_hidden_layers * TAPE_TENSORS_PER_LAYER) {
+        return 0;
+    }
+    if (header->hidden_size != (uint32_t)cfg->hidden_size) {
+        return 0;
+    }
+
+    if (spec_copy_layer_prefix_local(spec, expected_prefix, sizeof(expected_prefix)) != 0) {
+        return 0;
+    }
+
+    entry = activation_tape_entry(tape, 0u);
+    if (!entry) {
+        return 0;
+    }
+
+    return strncmp(entry->tensor_name,
+                   expected_prefix,
+                   strlen(expected_prefix)) == 0;
+}
+
+static char *derive_alignment_manifest_path_from_tape(const char *alignment_tape_path)
+{
+    struct stat st;
+    char *manifest_path = NULL;
+    size_t path_len = 0u;
+
+    if (!alignment_tape_path) {
+        return NULL;
+    }
+
+    path_len = strlen(alignment_tape_path);
+    if (path_len <= 5u || strcmp(alignment_tape_path + (path_len - 5u), ".tape") != 0) {
+        return NULL;
+    }
+
+    manifest_path = duplicate_text_local(alignment_tape_path);
+    if (!manifest_path) {
+        return NULL;
+    }
+
+    strcpy(manifest_path + (path_len - 5u), ".tsv");
+    if (stat(manifest_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        free(manifest_path);
+        return NULL;
+    }
+
+    return manifest_path;
+}
+
+static int reuse_supplied_aligned_tape(const ternary_conversion_config_t *config,
+                                       conversion_runtime_t *runtime)
+{
+    char *alignment_tape_path = NULL;
+    char *alignment_manifest_path = NULL;
+
+    if (!config || !runtime || !runtime->activation_tape || !runtime->model_spec ||
+        !config->activation_tape_path || config->activation_tape_path[0] == '\0') {
+        return 0;
+    }
+
+    if (!activation_tape_matches_student_layout(runtime->activation_tape, runtime->model_spec)) {
+        return 0;
+    }
+
+    alignment_tape_path = duplicate_text_local(config->activation_tape_path);
+    alignment_manifest_path = derive_alignment_manifest_path_from_tape(config->activation_tape_path);
+    if (!alignment_tape_path || !alignment_manifest_path) {
+        LOG_ERROR("ternary alignment: supplied activation tape already matches the student layout, but the companion alignment manifest is missing");
+        free(alignment_tape_path);
+        free(alignment_manifest_path);
+        return -1;
+    }
+
+    free(runtime->alignment_manifest_path);
+    runtime->alignment_manifest_path = alignment_manifest_path;
+    alignment_manifest_path = NULL;
+    free(runtime->alignment_tape_path);
+    runtime->alignment_tape_path = alignment_tape_path;
+    alignment_tape_path = NULL;
+
+    LOG_INFO("ternary alignment: reusing supplied student-aligned tape %s",
+             runtime->alignment_tape_path);
+    LOG_INFO("ternary alignment: manifest=%s", runtime->alignment_manifest_path);
+    return 1;
+}
+
 static int prepare_teacher_student_alignment(const ternary_conversion_config_t *config,
                                              conversion_runtime_t *runtime)
 {
@@ -1903,6 +2106,7 @@ static int prepare_teacher_student_alignment(const ternary_conversion_config_t *
     activation_tape_t *aligned_tape = NULL;
     const model_spec_t *teacher_spec = NULL;
     const activation_tape_t *teacher_tape = NULL;
+    int reuse_status = 0;
     int rc = -1;
     SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "prepare_teacher_student_alignment");
 
@@ -1925,6 +2129,14 @@ static int prepare_teacher_student_alignment(const ternary_conversion_config_t *
         return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
+    reuse_status = reuse_supplied_aligned_tape(config, runtime);
+    if (reuse_status < 0) {
+        return conversion_tracy_end_status(&tracy_zone, -1);
+    }
+    if (reuse_status > 0) {
+        return conversion_tracy_end_status(&tracy_zone, 0);
+    }
+
     teacher_tape = runtime->activation_tape;
     teacher_spec = get_model_spec(config->teacher_model_name);
     if (!teacher_spec) {
@@ -1936,6 +2148,7 @@ static int prepare_teacher_student_alignment(const ternary_conversion_config_t *
     request.teacher_spec = teacher_spec;
     request.student_spec = runtime->model_spec;
     request.teacher_tape = teacher_tape;
+    request.structural_map_path = config->structural_map_path;
     request.depth_strategy = ACTIVATION_ALIGNMENT_DEPTH_BUCKET;
     request.width_strategy = ACTIVATION_ALIGNMENT_WIDTH_AUTO;
 
@@ -2047,6 +2260,8 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
     ste_config.adam_epsilon = 1e-8f;
     ste_config.telemetry_interval = 10;
     ste_config.telemetry_path = "./out/ternary_telemetry.jsonl";
+    ste_config.spatial_telemetry_path = NULL;
+    ste_config.spatial_telemetry_row_bucket_size = positive_int_or_default(cfg->spatial_telemetry_row_bucket_size, 64);
     ste_config.hessian_sidecar_path = cfg->hessian_sidecar_path;
     ste_config.hessian_sidecar_crc32 = 0u;
     ste_config.student_down_proj_input_rmsnorm = normalize_flag(cfg->student_down_proj_input_rmsnorm);
@@ -2058,6 +2273,7 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
     ste_config.protected_anchor_entries = NULL;
     ste_config.protected_anchor_row_offsets = NULL;
     ste_config.protected_anchor_count = 0u;
+    ste_config.telemetry_reference_weights = NULL;
     return ste_config;
 }
 
@@ -2578,6 +2794,14 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
                  "%s",
                  default_runtime_ste_config(config).telemetry_path);
     }
+    if (config->emit_spatial_telemetry &&
+        build_runtime_spatial_telemetry_path(out_runtime->telemetry_path,
+                                             out_runtime->spatial_telemetry_path,
+                                             sizeof(out_runtime->spatial_telemetry_path)) != 0) {
+        LOG_WARN("ternary conversion: failed to derive spatial telemetry path from %s",
+                 out_runtime->telemetry_path);
+        out_runtime->spatial_telemetry_path[0] = '\0';
+    }
 
     if (open_runtime_activation_tape(config, out_runtime) != 0 ||
         open_runtime_hessian_sidecar(config, out_runtime) != 0) {
@@ -2712,6 +2936,7 @@ static int calibrate_single_layer_tensor(const ternary_conversion_config_t *conf
 
     ste_config = default_runtime_ste_config(config);
     ste_config.telemetry_path = conversion_runtime_telemetry_path(config, runtime);
+    ste_config.spatial_telemetry_path = conversion_runtime_spatial_telemetry_path(config, runtime);
     ste_config.hessian_sidecar_path = config->hessian_sidecar_path;
     ste_config.hessian_sidecar_crc32 = runtime ? runtime->hessian_sidecar_crc32 : 0u;
 
@@ -3583,6 +3808,7 @@ static int prepare_full_model_layer_ste_config(const full_model_tensor_task_t *t
 
     *out_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
     out_ste_config->telemetry_path = conversion_runtime_telemetry_path(task->config, task->runtime);
+    out_ste_config->spatial_telemetry_path = conversion_runtime_spatial_telemetry_path(task->config, task->runtime);
     distillation_schedule = progressive_calib_distillation_schedule(task->config,
                                                                    task->progressive_stage,
                                                                    has_layer_index,
@@ -3847,6 +4073,7 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
     sapphire_tracy_plot_i64("conversion.converted_tensors", (int64_t)converted);
     ste_config = default_runtime_ste_config(config);
     ste_config.telemetry_path = conversion_runtime_telemetry_path(config, runtime);
+    ste_config.spatial_telemetry_path = conversion_runtime_spatial_telemetry_path(config, runtime);
     ste_config.hessian_sidecar_path = config->hessian_sidecar_path;
     ste_config.hessian_sidecar_crc32 = runtime ? runtime->hessian_sidecar_crc32 : 0u;
 

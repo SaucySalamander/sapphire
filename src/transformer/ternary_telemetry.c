@@ -316,3 +316,199 @@ int telemetry_dump_validation_checkpoint(ternary_telemetry_writer_t *writer,
 
     return telemetry_write_line(writer, line, (size_t)written, "validation");
 }
+
+int telemetry_dump_spatial_snapshot_meta(ternary_telemetry_writer_t *writer,
+                                         const ternary_spatial_telemetry_meta_t *telemetry)
+{
+    char line[1536];
+    char histogram_min_buf[32];
+    char histogram_max_buf[32];
+    char effective_learning_rate_buf[32];
+    char effective_hessian_scale_buf[32];
+    char hessian_proxy_cap_buf[32];
+    int written = 0;
+
+    if (!writer || !writer->stream || !telemetry || !telemetry->tensor_name) {
+        return -1;
+    }
+
+    written = snprintf(line,
+                       sizeof(line),
+                       "{\"record_type\":\"spatial_snapshot_meta\",\"tensor_name\":\"%s\",\"config_hash\":%u,\"layer_idx\":%u,\"resume_step_idx\":%u,\"step_idx\":%u,\"tape_hash\":%u,\"student_checkpoint_hash\":%u,\"rows\":%u,\"cols\":%u,\"scale_group_size\":%u,\"groups_per_row\":%u,\"row_bucket_size\":%u,\"row_bucket_count\":%u,\"hessian_proxy_source\":%u,\"use_anchor_mode\":%u,\"anchor_count\":%u,\"histogram_bin_count\":%u,\"histogram_min\":%s,\"histogram_max\":%s,\"effective_learning_rate\":%s,\"effective_hessian_scale\":%s,\"hessian_proxy_cap\":%s}\n",
+                       telemetry->tensor_name,
+                       telemetry->config_hash,
+                       telemetry->layer_idx,
+                       telemetry->resume_step_idx,
+                       telemetry->step_idx,
+                       telemetry->tape_hash,
+                       telemetry->student_checkpoint_hash,
+                       telemetry->rows,
+                       telemetry->cols,
+                       telemetry->scale_group_size,
+                       telemetry->groups_per_row,
+                       telemetry->row_bucket_size,
+                       telemetry->row_bucket_count,
+                       telemetry->hessian_proxy_source,
+                       telemetry->use_anchor_mode,
+                       telemetry->anchor_count,
+                       telemetry->histogram_bin_count,
+                       telemetry_format_float(histogram_min_buf, sizeof(histogram_min_buf), telemetry->histogram_min),
+                       telemetry_format_float(histogram_max_buf, sizeof(histogram_max_buf), telemetry->histogram_max),
+                       telemetry_format_float(effective_learning_rate_buf,
+                                              sizeof(effective_learning_rate_buf),
+                                              telemetry->effective_learning_rate),
+                       telemetry_format_float(effective_hessian_scale_buf,
+                                              sizeof(effective_hessian_scale_buf),
+                                              telemetry->effective_hessian_scale),
+                       telemetry_format_float(hessian_proxy_cap_buf,
+                                              sizeof(hessian_proxy_cap_buf),
+                                              telemetry->hessian_proxy_cap));
+    if (written < 0 || (size_t)written >= sizeof(line)) {
+        LOG_ERROR("telemetry: spatial meta line too long for %s", writer->path);
+        return -1;
+    }
+
+    return telemetry_write_line(writer, line, (size_t)written, "spatial-meta");
+}
+
+int telemetry_dump_spatial_snapshot_block(ternary_telemetry_writer_t *writer,
+                                          const ternary_spatial_telemetry_block_t *telemetry)
+{
+    char line[1024];
+    char gamma_mean_buf[32];
+    char gamma_min_buf[32];
+    char gamma_max_buf[32];
+    char hessian_group_mean_buf[32];
+    char hessian_group_max_buf[32];
+    char block_weight_mse_buf[32];
+    char block_hessian_error_buf[32];
+    char p_zero_fraction_buf[32];
+    char anchor_fraction_buf[32];
+    int written = 0;
+
+    if (!writer || !writer->stream || !telemetry) {
+        return -1;
+    }
+
+    written = snprintf(line,
+                       sizeof(line),
+                       "{\"record_type\":\"spatial_snapshot_block\",\"config_hash\":%u,\"layer_idx\":%u,\"step_idx\":%u,\"row_bucket_idx\":%u,\"group_idx\":%u,\"row_start\":%u,\"row_end\":%u,\"col_start\":%u,\"col_end\":%u,\"gamma_mean\":%s,\"gamma_min\":%s,\"gamma_max\":%s,\"hessian_group_mean\":%s,\"hessian_group_max\":%s,\"block_weight_mse\":%s,\"block_hessian_error\":%s,\"p_zero_fraction\":%s,\"anchor_fraction\":%s}\n",
+                       telemetry->config_hash,
+                       telemetry->layer_idx,
+                       telemetry->step_idx,
+                       telemetry->row_bucket_idx,
+                       telemetry->group_idx,
+                       telemetry->row_start,
+                       telemetry->row_end,
+                       telemetry->col_start,
+                       telemetry->col_end,
+                       telemetry_format_float(gamma_mean_buf, sizeof(gamma_mean_buf), telemetry->gamma_mean),
+                       telemetry_format_float(gamma_min_buf, sizeof(gamma_min_buf), telemetry->gamma_min),
+                       telemetry_format_float(gamma_max_buf, sizeof(gamma_max_buf), telemetry->gamma_max),
+                       telemetry_format_float(hessian_group_mean_buf,
+                                              sizeof(hessian_group_mean_buf),
+                                              telemetry->hessian_group_mean),
+                       telemetry_format_float(hessian_group_max_buf,
+                                              sizeof(hessian_group_max_buf),
+                                              telemetry->hessian_group_max),
+                       telemetry_format_float(block_weight_mse_buf,
+                                              sizeof(block_weight_mse_buf),
+                                              telemetry->block_weight_mse),
+                       telemetry_format_float(block_hessian_error_buf,
+                                              sizeof(block_hessian_error_buf),
+                                              telemetry->block_hessian_error),
+                       telemetry_format_float(p_zero_fraction_buf,
+                                              sizeof(p_zero_fraction_buf),
+                                              telemetry->p_zero_fraction),
+                       telemetry_format_float(anchor_fraction_buf,
+                                              sizeof(anchor_fraction_buf),
+                                              telemetry->anchor_fraction));
+    if (written < 0 || (size_t)written >= sizeof(line)) {
+        LOG_ERROR("telemetry: spatial block line too long for %s", writer->path);
+        return -1;
+    }
+
+    return telemetry_write_line(writer, line, (size_t)written, "spatial-block");
+}
+
+static int telemetry_write_json_u32_array(FILE *stream,
+                                          const uint32_t *values,
+                                          uint32_t count)
+{
+    if (!stream) {
+        return -1;
+    }
+    if (fputc('[', stream) == EOF) {
+        return -1;
+    }
+    for (uint32_t index = 0u; index < count; ++index) {
+        if (index > 0u && fputc(',', stream) == EOF) {
+            return -1;
+        }
+        if (fprintf(stream, "%u", values ? values[index] : 0u) < 0) {
+            return -1;
+        }
+    }
+    if (fputc(']', stream) == EOF) {
+        return -1;
+    }
+    return 0;
+}
+
+int telemetry_dump_spatial_snapshot_histogram(ternary_telemetry_writer_t *writer,
+                                              const ternary_spatial_telemetry_histogram_t *telemetry)
+{
+    FILE *stream = NULL;
+    char histogram_min_buf[32];
+    char histogram_max_buf[32];
+
+    if (!writer || !writer->stream || !telemetry || !telemetry->tensor_name ||
+        !telemetry->teacher_counts || !telemetry->student_counts) {
+        return -1;
+    }
+
+    stream = writer->stream;
+    if (fprintf(stream,
+                "{\"record_type\":\"spatial_snapshot_histogram\",\"tensor_name\":\"%s\",\"config_hash\":%u,\"layer_idx\":%u,\"step_idx\":%u,\"histogram_bin_count\":%u,\"histogram_min\":%s,\"histogram_max\":%s,\"teacher_counts\":",
+                telemetry->tensor_name,
+                telemetry->config_hash,
+                telemetry->layer_idx,
+                telemetry->step_idx,
+                telemetry->histogram_bin_count,
+                telemetry_format_float(histogram_min_buf, sizeof(histogram_min_buf), telemetry->histogram_min),
+                telemetry_format_float(histogram_max_buf, sizeof(histogram_max_buf), telemetry->histogram_max)) < 0) {
+        LOG_ERROR("telemetry: spatial histogram write failed for %s", writer->path);
+        return -1;
+    }
+    if (telemetry_write_json_u32_array(stream,
+                                       telemetry->teacher_counts,
+                                       telemetry->histogram_bin_count) != 0 ||
+        fprintf(stream, ",\"student_counts\":") < 0 ||
+        telemetry_write_json_u32_array(stream,
+                                       telemetry->student_counts,
+                                       telemetry->histogram_bin_count) != 0) {
+        LOG_ERROR("telemetry: spatial histogram write failed for %s", writer->path);
+        return -1;
+    }
+    if (fprintf(stream, ",\"student_bulk_counts\":") < 0) {
+        LOG_ERROR("telemetry: spatial histogram write failed for %s", writer->path);
+        return -1;
+    }
+    if (telemetry->student_bulk_counts) {
+        if (telemetry_write_json_u32_array(stream,
+                                           telemetry->student_bulk_counts,
+                                           telemetry->histogram_bin_count) != 0) {
+            LOG_ERROR("telemetry: spatial histogram write failed for %s", writer->path);
+            return -1;
+        }
+    } else if (fprintf(stream, "null") < 0) {
+        LOG_ERROR("telemetry: spatial histogram write failed for %s", writer->path);
+        return -1;
+    }
+    if (fprintf(stream, "}\n") < 0 || fflush(stream) != 0) {
+        LOG_ERROR("telemetry: spatial histogram flush failed for %s", writer->path);
+        return -1;
+    }
+
+    return 0;
+}

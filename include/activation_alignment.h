@@ -32,6 +32,7 @@ typedef struct {
     const model_spec_t *teacher_spec;
     const model_spec_t *student_spec;
     const activation_tape_t *teacher_tape;
+    const char *structural_map_path;
     activation_alignment_depth_strategy_t depth_strategy;
     activation_alignment_width_strategy_t width_strategy;
 } activation_alignment_request_t;

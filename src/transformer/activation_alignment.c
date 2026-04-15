@@ -35,6 +35,198 @@ static const alignment_wt_t k_alignment_wt[7] = {
     {"mlp.down_proj.weight",     CAPTURE_TARGET_DOWN_INPUT, -1},
 };
 
+typedef struct {
+    uint32_t *teacher_by_student;
+    uint32_t student_layer_count;
+} alignment_layer_map_t;
+
+typedef struct {
+    const activation_alignment_request_t *request;
+    const gemma3_270m_config_t *student_cfg;
+    activation_alignment_manifest_t *manifest;
+    uint32_t sample_count;
+    uint64_t *current_offset;
+} alignment_build_context_t;
+
+static void alignment_layer_map_release(alignment_layer_map_t *map)
+{
+    if (!map) {
+        return;
+    }
+
+    free(map->teacher_by_student);
+    map->teacher_by_student = NULL;
+    map->student_layer_count = 0u;
+}
+
+static int alignment_parse_u32_field(const char *text,
+                                     uint32_t *out_value)
+{
+    char *end = NULL;
+    unsigned long value = 0ul;
+
+    if (!text || !out_value || text[0] == '\0') {
+        return -1;
+    }
+
+    errno = 0;
+    value = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value > UINT32_MAX) {
+        return -1;
+    }
+
+    *out_value = (uint32_t)value;
+    return 0;
+}
+
+static int alignment_read_text_file(const char *path,
+                                    char **out_text,
+                                    size_t *out_size)
+{
+    char *buffer = NULL;
+    size_t buffer_size = 0u;
+    char *text = NULL;
+
+    if (!path || !out_text || !out_size) {
+        return -1;
+    }
+
+    if (file_read_to_buffer(path, &buffer, &buffer_size) != 0) {
+        return -1;
+    }
+
+    text = (char *)malloc(buffer_size + 1u);
+    if (!text) {
+        free(buffer);
+        return -1;
+    }
+
+    memcpy(text, buffer, buffer_size);
+    text[buffer_size] = '\0';
+    free(buffer);
+
+    *out_text = text;
+    *out_size = buffer_size;
+    return 0;
+}
+
+static int alignment_load_structural_layer_map(const char *path,
+                                               uint32_t expected_student_layers,
+                                               alignment_layer_map_t *out_map)
+{
+    uint32_t *teacher_by_student = NULL;
+    char *text = NULL;
+    size_t text_size = 0u;
+    char *cursor = NULL;
+    size_t mapped_layer_count = 0u;
+    int rc = -1;
+
+    if (!path || path[0] == '\0' || !out_map || expected_student_layers == 0u) {
+        return -1;
+    }
+
+    memset(out_map, 0, sizeof(*out_map));
+    teacher_by_student = (uint32_t *)malloc((size_t)expected_student_layers * sizeof(*teacher_by_student));
+    if (!teacher_by_student) {
+        LOG_ERROR("activation alignment: failed to allocate structural layer map");
+        return -1;
+    }
+
+    for (uint32_t idx = 0u; idx < expected_student_layers; ++idx) {
+        teacher_by_student[idx] = UINT32_MAX;
+    }
+
+    if (alignment_read_text_file(path, &text, &text_size) != 0) {
+        LOG_ERROR("activation alignment: failed to read structural map %s", path);
+        goto cleanup;
+    }
+
+    cursor = text;
+    while (cursor && *cursor != '\0') {
+        char *line_end = strchr(cursor, '\n');
+
+        if (line_end) {
+            *line_end = '\0';
+        }
+
+        while (*cursor == ' ' || *cursor == '\t') {
+            cursor++;
+        }
+
+        if (cursor[0] != '\0' && cursor[0] != '#') {
+            char line_copy[1024];
+            char *fields[3];
+            size_t field_count = 0u;
+            char *saveptr = NULL;
+            char *field = NULL;
+            uint32_t student_layer_idx = 0u;
+            uint32_t teacher_layer_idx = 0u;
+            size_t line_len = strlen(cursor);
+
+            if (line_len >= sizeof(line_copy)) {
+                LOG_ERROR("activation alignment: structural map line is too long in %s", path);
+                goto cleanup;
+            }
+
+            memcpy(line_copy, cursor, line_len + 1u);
+            field = strtok_r(line_copy, " \t", &saveptr);
+            while (field && field_count < (sizeof(fields) / sizeof(fields[0]))) {
+                fields[field_count++] = field;
+                field = strtok_r(NULL, " \t", &saveptr);
+            }
+
+            if (field_count >= 2u &&
+                alignment_parse_u32_field(fields[0], &student_layer_idx) == 0 &&
+                alignment_parse_u32_field(fields[1], &teacher_layer_idx) == 0) {
+                if (student_layer_idx >= expected_student_layers) {
+                    LOG_ERROR("activation alignment: structural map references student layer %u beyond expected %u layers",
+                              student_layer_idx,
+                              expected_student_layers);
+                    goto cleanup;
+                }
+                if (teacher_by_student[student_layer_idx] != UINT32_MAX) {
+                    LOG_ERROR("activation alignment: duplicate structural map entry for student layer %u",
+                              student_layer_idx);
+                    goto cleanup;
+                }
+
+                teacher_by_student[student_layer_idx] = teacher_layer_idx;
+                mapped_layer_count++;
+            }
+        }
+
+        if (!line_end) {
+            break;
+        }
+        cursor = line_end + 1;
+    }
+
+    if (mapped_layer_count == 0u) {
+        LOG_ERROR("activation alignment: structural map %s does not contain any layer mappings", path);
+        goto cleanup;
+    }
+    for (uint32_t idx = 0u; idx < expected_student_layers; ++idx) {
+        if (teacher_by_student[idx] == UINT32_MAX) {
+            LOG_ERROR("activation alignment: structural map %s is missing student layer %u", path, idx);
+            goto cleanup;
+        }
+    }
+
+    out_map->teacher_by_student = teacher_by_student;
+    out_map->student_layer_count = expected_student_layers;
+    teacher_by_student = NULL;
+    LOG_INFO("activation alignment: loaded %zu structural layer mappings from %s",
+             mapped_layer_count,
+             path);
+    rc = 0;
+
+cleanup:
+    free(teacher_by_student);
+    free(text);
+    (void)text_size;
+    return rc;
+}
+
 static const char *capture_target_name(capture_target_t target)
 {
     switch (target) {
@@ -369,32 +561,19 @@ static int validate_request(const activation_alignment_request_t *request)
     return 0;
 }
 
-int activation_alignment_build_manifest(activation_alignment_manifest_t *manifest,
-                                        const activation_alignment_request_t *request)
+static int activation_alignment_init_manifest(activation_alignment_manifest_t *manifest,
+                                              const activation_alignment_request_t *request,
+                                              uint32_t teacher_layer_count,
+                                              uint32_t student_layer_count,
+                                              uint32_t sample_count)
 {
-    const gemma3_270m_config_t *student_cfg = NULL;
     char teacher_prefix[128];
     char student_prefix[128];
-    uint32_t teacher_layer_count = 0u;
-    uint32_t student_layer_count = 0u;
-    uint32_t sample_count = 0u;
     size_t entry_count = 0u;
-    uint64_t current_offset = 0u;
 
-    if (!manifest) {
-        LOG_ERROR("activation alignment: manifest is NULL");
+    if (!manifest || !request) {
         return -1;
     }
-
-    memset(manifest, 0, sizeof(*manifest));
-    if (validate_request(request) != 0) {
-        return -1;
-    }
-
-    student_cfg = (const gemma3_270m_config_t *)request->student_spec->variant_config;
-    teacher_layer_count = infer_layer_count(request->teacher_spec);
-    student_layer_count = infer_layer_count(request->student_spec);
-    sample_count = (uint32_t)activation_tape_sample_count(request->teacher_tape);
 
     if (copy_tensor_prefix(request->teacher_spec, teacher_prefix, sizeof(teacher_prefix)) != 0 ||
         copy_tensor_prefix(request->student_spec, student_prefix, sizeof(student_prefix)) != 0) {
@@ -436,76 +615,178 @@ int activation_alignment_build_manifest(activation_alignment_manifest_t *manifes
     manifest->depth_strategy = request->depth_strategy;
     manifest->width_strategy = request->width_strategy;
     manifest->entry_count = entry_count;
+    return 0;
+}
+
+static int activation_alignment_resolve_teacher_layer_idx(const alignment_layer_map_t *layer_map,
+                                                          uint32_t student_layer_idx,
+                                                          uint32_t teacher_layer_count,
+                                                          uint32_t student_layer_count,
+                                                          activation_alignment_depth_strategy_t depth_strategy,
+                                                          uint32_t *out_teacher_layer_idx)
+{
+    uint32_t teacher_layer_idx = 0u;
+
+    if (!out_teacher_layer_idx) {
+        return -1;
+    }
+
+    teacher_layer_idx = (layer_map && layer_map->teacher_by_student)
+        ? layer_map->teacher_by_student[student_layer_idx]
+        : map_teacher_layer(student_layer_idx,
+                            teacher_layer_count,
+                            student_layer_count,
+                            depth_strategy);
+    if (teacher_layer_idx >= teacher_layer_count) {
+        LOG_ERROR("activation alignment: invalid depth mapping for student layer %u", student_layer_idx);
+        return -1;
+    }
+
+    *out_teacher_layer_idx = teacher_layer_idx;
+    return 0;
+}
+
+static int activation_alignment_populate_entry(const alignment_build_context_t *build_ctx,
+                                               uint32_t teacher_layer_idx,
+                                               uint32_t student_layer_idx,
+                                               int wt_idx)
+{
+    activation_alignment_entry_t *entry = NULL;
+    uint32_t source_dim = 0u;
+    uint32_t target_dim = 0u;
+
+    if (!build_ctx || !build_ctx->manifest || !build_ctx->request || !build_ctx->current_offset) {
+        return -1;
+    }
+
+    entry = &build_ctx->manifest->entries[primary_entry_index(student_layer_idx, wt_idx)];
+    if (format_tensor_name(entry->teacher_tensor_name,
+                           sizeof(entry->teacher_tensor_name),
+                           build_ctx->manifest->teacher_prefix,
+                           teacher_layer_idx,
+                           k_alignment_wt[wt_idx].suffix) != 0 ||
+        format_tensor_name(entry->student_tensor_name,
+                           sizeof(entry->student_tensor_name),
+                           build_ctx->manifest->student_prefix,
+                           student_layer_idx,
+                           k_alignment_wt[wt_idx].suffix) != 0) {
+        LOG_ERROR("activation alignment: failed to build tensor names");
+        return -1;
+    }
+
+    source_dim = activation_tape_vector_dim(build_ctx->request->teacher_tape, entry->teacher_tensor_name);
+    target_dim = target_dim_for_config(k_alignment_wt[wt_idx].target, build_ctx->student_cfg);
+    if (source_dim == 0u || target_dim == 0u) {
+        LOG_ERROR("activation alignment: shape mismatch for %s -> %s",
+                  entry->teacher_tensor_name,
+                  entry->student_tensor_name);
+        return -1;
+    }
+
+    entry->teacher_layer_idx = teacher_layer_idx;
+    entry->student_layer_idx = student_layer_idx;
+    entry->target = k_alignment_wt[wt_idx].target;
+    entry->teacher_entry_idx = primary_entry_index(teacher_layer_idx, wt_idx);
+    entry->student_entry_idx = primary_entry_index(student_layer_idx, wt_idx);
+    entry->source_dim = source_dim;
+    entry->target_dim = target_dim;
+    entry->sample_count = build_ctx->sample_count;
+    entry->alias_of_entry = (k_alignment_wt[wt_idx].alias_idx < 0)
+        ? TAPE_NO_ALIAS
+        : primary_entry_index(student_layer_idx, k_alignment_wt[wt_idx].alias_idx);
+    entry->teacher_layer_type = layer_type_for_idx(teacher_layer_idx);
+    entry->student_layer_type = layer_type_for_idx(student_layer_idx);
+
+    if (entry->alias_of_entry == TAPE_NO_ALIAS) {
+        uint64_t bytes = (uint64_t)entry->target_dim * (uint64_t)entry->sample_count * (uint64_t)sizeof(float);
+
+        if (bytes == 0u || *build_ctx->current_offset > UINT64_MAX - bytes) {
+            LOG_ERROR("activation alignment: tape data section overflow");
+            return -1;
+        }
+        *build_ctx->current_offset += bytes;
+    }
+
+    return 0;
+}
+
+int activation_alignment_build_manifest(activation_alignment_manifest_t *manifest,
+                                        const activation_alignment_request_t *request)
+{
+    const gemma3_270m_config_t *student_cfg = NULL;
+    alignment_build_context_t build_ctx;
+    alignment_layer_map_t layer_map;
+    uint32_t teacher_layer_count = 0u;
+    uint32_t student_layer_count = 0u;
+    uint32_t sample_count = 0u;
+    uint64_t current_offset = 0u;
+
+    if (!manifest) {
+        LOG_ERROR("activation alignment: manifest is NULL");
+        return -1;
+    }
+
+    memset(&layer_map, 0, sizeof(layer_map));
+    memset(&build_ctx, 0, sizeof(build_ctx));
+    memset(manifest, 0, sizeof(*manifest));
+    if (validate_request(request) != 0) {
+        return -1;
+    }
+
+    student_cfg = (const gemma3_270m_config_t *)request->student_spec->variant_config;
+    teacher_layer_count = infer_layer_count(request->teacher_spec);
+    student_layer_count = infer_layer_count(request->student_spec);
+    sample_count = (uint32_t)activation_tape_sample_count(request->teacher_tape);
+
+    if (request->structural_map_path && request->structural_map_path[0] != '\0' &&
+        alignment_load_structural_layer_map(request->structural_map_path,
+                                            student_layer_count,
+                                            &layer_map) != 0) {
+        return -1;
+    }
+
+    if (activation_alignment_init_manifest(manifest,
+                                           request,
+                                           teacher_layer_count,
+                                           student_layer_count,
+                                           sample_count) != 0) {
+        alignment_layer_map_release(&layer_map);
+        return -1;
+    }
+
+    build_ctx.request = request;
+    build_ctx.student_cfg = student_cfg;
+    build_ctx.manifest = manifest;
+    build_ctx.sample_count = sample_count;
+    build_ctx.current_offset = &current_offset;
 
     for (uint32_t student_layer_idx = 0u; student_layer_idx < student_layer_count; ++student_layer_idx) {
-        uint32_t teacher_layer_idx = map_teacher_layer(student_layer_idx,
-                                                       teacher_layer_count,
-                                                       student_layer_count,
-                                                       request->depth_strategy);
+        uint32_t teacher_layer_idx = 0u;
 
-        if (teacher_layer_idx >= teacher_layer_count) {
-            LOG_ERROR("activation alignment: invalid depth mapping for student layer %u", student_layer_idx);
+        if (activation_alignment_resolve_teacher_layer_idx(&layer_map,
+                                                           student_layer_idx,
+                                                           teacher_layer_count,
+                                                           student_layer_count,
+                                                           request->depth_strategy,
+                                                           &teacher_layer_idx) != 0) {
             activation_alignment_manifest_free(manifest);
+            alignment_layer_map_release(&layer_map);
             return -1;
         }
 
         for (int wt_idx = 0; wt_idx < 7; ++wt_idx) {
-            activation_alignment_entry_t *entry = &manifest->entries[primary_entry_index(student_layer_idx, wt_idx)];
-            uint32_t source_dim = 0u;
-            uint32_t target_dim = 0u;
-
-            if (format_tensor_name(entry->teacher_tensor_name,
-                                   sizeof(entry->teacher_tensor_name),
-                                   manifest->teacher_prefix,
-                                   teacher_layer_idx,
-                                   k_alignment_wt[wt_idx].suffix) != 0 ||
-                format_tensor_name(entry->student_tensor_name,
-                                   sizeof(entry->student_tensor_name),
-                                   manifest->student_prefix,
-                                   student_layer_idx,
-                                   k_alignment_wt[wt_idx].suffix) != 0) {
-                LOG_ERROR("activation alignment: failed to build tensor names");
+            if (activation_alignment_populate_entry(&build_ctx,
+                                                    teacher_layer_idx,
+                                                    student_layer_idx,
+                                                    wt_idx) != 0) {
                 activation_alignment_manifest_free(manifest);
+                alignment_layer_map_release(&layer_map);
                 return -1;
-            }
-
-            source_dim = activation_tape_vector_dim(request->teacher_tape, entry->teacher_tensor_name);
-            target_dim = target_dim_for_config(k_alignment_wt[wt_idx].target, student_cfg);
-            if (source_dim == 0u || target_dim == 0u) {
-                LOG_ERROR("activation alignment: shape mismatch for %s -> %s",
-                          entry->teacher_tensor_name,
-                          entry->student_tensor_name);
-                activation_alignment_manifest_free(manifest);
-                return -1;
-            }
-
-            entry->teacher_layer_idx = teacher_layer_idx;
-            entry->student_layer_idx = student_layer_idx;
-            entry->target = k_alignment_wt[wt_idx].target;
-            entry->teacher_entry_idx = primary_entry_index(teacher_layer_idx, wt_idx);
-            entry->student_entry_idx = primary_entry_index(student_layer_idx, wt_idx);
-            entry->source_dim = source_dim;
-            entry->target_dim = target_dim;
-            entry->sample_count = sample_count;
-            entry->alias_of_entry = (k_alignment_wt[wt_idx].alias_idx < 0)
-                ? TAPE_NO_ALIAS
-                : primary_entry_index(student_layer_idx, k_alignment_wt[wt_idx].alias_idx);
-            entry->teacher_layer_type = layer_type_for_idx(teacher_layer_idx);
-            entry->student_layer_type = layer_type_for_idx(student_layer_idx);
-
-            if (entry->alias_of_entry == TAPE_NO_ALIAS) {
-                uint64_t bytes = (uint64_t)entry->target_dim * (uint64_t)entry->sample_count * (uint64_t)sizeof(float);
-
-                if (bytes == 0u || current_offset > UINT64_MAX - bytes) {
-                    LOG_ERROR("activation alignment: tape data section overflow");
-                    activation_alignment_manifest_free(manifest);
-                    return -1;
-                }
-                current_offset += bytes;
             }
         }
     }
 
+    alignment_layer_map_release(&layer_map);
     return 0;
 }
 

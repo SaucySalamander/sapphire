@@ -185,6 +185,7 @@ SAPPHIRE_BACKEND=vulkan ./out/sapphire -m gemma-3-1b-it \
 SAPPHIRE_BACKEND=cpu ./out/sapphire \
   -m gemma-3-7b-q1.58b \
   --convert-ternary \
+  --spatial-telemetry \
   --output ./out/gemma-3-7b-q1.58b-ternary \
   --teacher-model gemma-3-1b-it \
   --activation-tape ./data/7b-aligned.tape \
