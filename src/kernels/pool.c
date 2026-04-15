@@ -1,5 +1,6 @@
 #include "../../include/kernels.h"
 #include "../../include/tensor.h"  // For unified tensor_dtype_t
+#include "../../include/ternary_anchor.h"
 #include "../../include/log.h"
 
 #include <pthread.h>
@@ -54,6 +55,8 @@ struct sapphire_context {
     const float *ternary_scales;
     uint32_t ternary_scale_group_size;
     uint32_t ternary_groups_per_row;
+    const ternary_anchor_entry_t *hybrid_anchor_entries;
+    const uint32_t *hybrid_anchor_row_offsets;
 
     // Parallel For Extension
     parallel_for_fn_t parallel_fn;
@@ -63,6 +66,230 @@ struct sapphire_context {
 // Internal prototype for dispatch from dispatch.c
 // Declared here to ensure implementation matches
 int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X, float *Y, int is_gemm, int batch_size);
+
+typedef struct {
+    const void *row_ptr;
+    tensor_ternary_view_t ternary_row;
+    tensor_hybrid_view_t hybrid_row;
+    uint32_t hybrid_row_offsets[2];
+    int block_count;
+    int block_size;
+} worker_row_state_t;
+
+typedef struct {
+    gemv_kernel_t kernel_fn;
+    gemm_kernel_t gemm_kernel_fn;
+    const void *weight_data;
+    size_t row_stride_bytes;
+    size_t ternary_packed_cols;
+    size_t ternary_row_stride_bytes;
+    const float *ternary_scales;
+    uint32_t ternary_scale_group_size;
+    uint32_t ternary_groups_per_row;
+    const ternary_anchor_entry_t *hybrid_anchor_entries;
+    const uint32_t *hybrid_anchor_row_offsets;
+} backend_exec_plan_t;
+
+typedef struct {
+    int cols;
+    int blocks_per_row;
+    size_t row_stride_bytes;
+    size_t ternary_packed_cols;
+    size_t ternary_row_stride_bytes;
+    const float *ternary_scales;
+    uint32_t ternary_scale_group_size;
+    uint32_t ternary_groups_per_row;
+    const ternary_anchor_entry_t *hybrid_anchor_entries;
+    const uint32_t *hybrid_anchor_row_offsets;
+} row_prepare_config_t;
+
+static void init_ternary_row_view(tensor_ternary_view_t *row,
+                                  const row_prepare_config_t *config,
+                                  const uint8_t *packed_weights,
+                                  const float *scales)
+{
+    memset(row, 0, sizeof(*row));
+    row->packed_weights = packed_weights;
+    row->scales = scales;
+    row->rows = 1u;
+    row->cols = (uint32_t)config->cols;
+    row->packed_cols = (uint32_t)config->ternary_packed_cols;
+    row->scale_group_size = config->ternary_scale_group_size;
+    row->groups_per_row = config->ternary_groups_per_row;
+    row->packed_weight_bytes = config->ternary_row_stride_bytes;
+    row->scale_count = config->ternary_groups_per_row;
+    row->scale_bytes = (size_t)config->ternary_groups_per_row * sizeof(float);
+}
+
+static void init_hybrid_row_view(tensor_hybrid_view_t *row,
+                                 uint32_t local_row_offsets[2],
+                                 const row_prepare_config_t *config,
+                                 const uint8_t *packed_weights,
+                                 const float *scales,
+                                 int row_index)
+{
+    uint32_t anchor_start = config->hybrid_anchor_row_offsets[row_index];
+    uint32_t anchor_end = config->hybrid_anchor_row_offsets[row_index + 1];
+
+    memset(row, 0, sizeof(*row));
+    row->packed_weights = packed_weights;
+    row->scales = scales;
+    row->rows = 1u;
+    row->cols = (uint32_t)config->cols;
+    row->packed_cols = (uint32_t)config->ternary_packed_cols;
+    row->scale_group_size = config->ternary_scale_group_size;
+    row->groups_per_row = config->ternary_groups_per_row;
+    row->packed_weight_bytes = config->ternary_row_stride_bytes;
+    row->scale_count = config->ternary_groups_per_row;
+    row->scale_bytes = (size_t)config->ternary_groups_per_row * sizeof(float);
+    row->anchor_entries = config->hybrid_anchor_entries ? (config->hybrid_anchor_entries + anchor_start) : NULL;
+    local_row_offsets[0] = 0u;
+    local_row_offsets[1] = anchor_end - anchor_start;
+    row->anchor_row_offsets = local_row_offsets;
+    row->anchor_count = local_row_offsets[1];
+    row->owns_anchor_memory = 0;
+}
+
+static void prepare_worker_row_state(worker_row_state_t *state,
+                                     const row_prepare_config_t *config,
+                                     const void *weights,
+                                     int row_index)
+{
+    const uint8_t *row_weights = (const uint8_t *)weights + (size_t)row_index * config->row_stride_bytes;
+
+    state->row_ptr = row_weights;
+    state->block_count = config->blocks_per_row;
+    state->block_size = 32;
+
+    if (config->row_stride_bytes == (size_t)config->cols * 2u ||
+        config->row_stride_bytes == (size_t)config->cols * 4u) {
+        state->block_count = config->cols;
+        state->block_size = 1;
+    }
+
+    if (config->ternary_scales) {
+        init_ternary_row_view(&state->ternary_row,
+                              config,
+                              row_weights,
+                              config->ternary_scales + (size_t)row_index * config->ternary_groups_per_row);
+        state->row_ptr = &state->ternary_row;
+        state->block_count = config->cols;
+        state->block_size = 1;
+    }
+
+    if (config->hybrid_anchor_row_offsets) {
+        init_hybrid_row_view(&state->hybrid_row,
+                             state->hybrid_row_offsets,
+                             config,
+                             row_weights,
+                             config->ternary_scales + (size_t)row_index * config->ternary_groups_per_row,
+                             row_index);
+        state->row_ptr = &state->hybrid_row;
+        state->block_count = config->cols;
+        state->block_size = 1;
+    }
+}
+
+static int prepare_ternary_exec_plan(backend_exec_plan_t *plan,
+                                     const tensor_t *A,
+                                     int rows,
+                                     int cols)
+{
+    const tensor_ternary_view_t *ternary_view = tensor_data_ternary(A);
+
+    if (!ternary_view || !ternary_view->packed_weights || !ternary_view->scales ||
+        ternary_view->rows != (uint32_t)rows || ternary_view->cols != (uint32_t)cols ||
+        ternary_view->groups_per_row == 0u ||
+        ternary_view->scale_count != (size_t)rows * ternary_view->groups_per_row) {
+        LOG_ERROR("kernel_backend_exec: invalid ternary tensor payload");
+        return -1;
+    }
+
+    plan->kernel_fn = quantized_gemv_ternary_scalar;
+    plan->gemm_kernel_fn = kernel_gemm_ternary_scalar;
+    plan->weight_data = ternary_view->packed_weights;
+    plan->row_stride_bytes = ternary_view->packed_cols;
+    plan->ternary_packed_cols = ternary_view->packed_cols;
+    plan->ternary_row_stride_bytes = ternary_view->packed_cols;
+    plan->ternary_scales = ternary_view->scales;
+    plan->ternary_scale_group_size = ternary_view->scale_group_size;
+    plan->ternary_groups_per_row = ternary_view->groups_per_row;
+    return 0;
+}
+
+static int prepare_hybrid_exec_plan(backend_exec_plan_t *plan,
+                                    const tensor_t *A,
+                                    int rows,
+                                    int cols)
+{
+    const tensor_hybrid_view_t *hybrid_view = tensor_data_hybrid(A);
+
+    if (!hybrid_view || !hybrid_view->packed_weights || !hybrid_view->scales ||
+        hybrid_view->rows != (uint32_t)rows || hybrid_view->cols != (uint32_t)cols ||
+        hybrid_view->groups_per_row == 0u ||
+        hybrid_view->scale_count != (size_t)rows * hybrid_view->groups_per_row) {
+        LOG_ERROR("kernel_backend_exec: invalid hybrid tensor payload");
+        return -1;
+    }
+    if (hybrid_view->anchor_count > 0u &&
+        (!hybrid_view->anchor_entries || !hybrid_view->anchor_row_offsets)) {
+        LOG_ERROR("kernel_backend_exec: hybrid tensor is missing anchor metadata");
+        return -1;
+    }
+
+    plan->kernel_fn = quantized_gemv_ternary_hybrid_avx2;
+    plan->gemm_kernel_fn = kernel_gemm_ternary_hybrid_avx2;
+    plan->weight_data = hybrid_view->packed_weights;
+    plan->row_stride_bytes = hybrid_view->packed_cols;
+    plan->ternary_packed_cols = hybrid_view->packed_cols;
+    plan->ternary_row_stride_bytes = hybrid_view->packed_cols;
+    plan->ternary_scales = hybrid_view->scales;
+    plan->ternary_scale_group_size = hybrid_view->scale_group_size;
+    plan->ternary_groups_per_row = hybrid_view->groups_per_row;
+    plan->hybrid_anchor_entries = (const ternary_anchor_entry_t *)hybrid_view->anchor_entries;
+    plan->hybrid_anchor_row_offsets = hybrid_view->anchor_row_offsets;
+    return 0;
+}
+
+static int build_backend_exec_plan(backend_exec_plan_t *plan,
+                                   const tensor_t *A,
+                                   int rows,
+                                   int cols,
+                                   int blocks_per_row,
+                                   int x_aligned)
+{
+    memset(plan, 0, sizeof(*plan));
+
+    switch (tensor_dtype(A)) {
+        case DTYPE_Q4_0:
+            plan->kernel_fn = x_aligned ? quantized_gemv_q4_0_aligned : quantized_gemv_q4_0_unaligned;
+            plan->row_stride_bytes = (size_t)blocks_per_row * sizeof(ggml_block_q4_0);
+            return 0;
+        case DTYPE_Q8_0:
+            plan->kernel_fn = x_aligned ? quantized_gemv_q8_0_aligned : quantized_gemv_q8_0_unaligned;
+            plan->row_stride_bytes = (size_t)blocks_per_row * sizeof(ggml_block_q8_0);
+            return 0;
+        case DTYPE_BF16:
+            plan->kernel_fn = quantized_gemv_bf16_avx2;
+            plan->gemm_kernel_fn = kernel_gemm_bf16_avx2;
+            plan->weight_data = tensor_data(A);
+            plan->row_stride_bytes = (size_t)cols * 2u;
+            return 0;
+        case DTYPE_F32:
+            plan->kernel_fn = quantized_gemv_f32_avx2;
+            plan->gemm_kernel_fn = kernel_gemm_f32_avx2;
+            plan->weight_data = tensor_data(A);
+            plan->row_stride_bytes = (size_t)cols * 4u;
+            return 0;
+        case DTYPE_TERNARY_2BIT:
+            return prepare_ternary_exec_plan(plan, A, rows, cols);
+        case DTYPE_TERNARY_HYBRID:
+            return prepare_hybrid_exec_plan(plan, A, rows, cols);
+        default:
+            LOG_ERROR("kernel_backend_exec: unsupported dtype %d", (int)tensor_dtype(A));
+            return -1;
+    }
+}
 
 /**
  * Persistent worker thread function.
@@ -104,11 +331,18 @@ static void *worker_fn(void *arg) {
         int is_gemm = ctx->is_gemm;
         int batch_size = ctx->batch_size;
         int d_model = ctx->d_model;
-        size_t ternary_packed_cols = ctx->ternary_packed_cols;
-        size_t ternary_row_stride_bytes = ctx->ternary_row_stride_bytes;
-        const float *ternary_scales = ctx->ternary_scales;
-        uint32_t ternary_scale_group_size = ctx->ternary_scale_group_size;
-        uint32_t ternary_groups_per_row = ctx->ternary_groups_per_row;
+        row_prepare_config_t row_config = {
+            .cols = cols,
+            .blocks_per_row = blocks_per_row,
+            .row_stride_bytes = row_stride_bytes,
+            .ternary_packed_cols = ctx->ternary_packed_cols,
+            .ternary_row_stride_bytes = ctx->ternary_row_stride_bytes,
+            .ternary_scales = ctx->ternary_scales,
+            .ternary_scale_group_size = ctx->ternary_scale_group_size,
+            .ternary_groups_per_row = ctx->ternary_groups_per_row,
+            .hybrid_anchor_entries = ctx->hybrid_anchor_entries,
+            .hybrid_anchor_row_offsets = ctx->hybrid_anchor_row_offsets,
+        };
         int chunk_size = ctx->chunk_size;
         parallel_for_fn_t parallel_fn = ctx->parallel_fn;
         void *parallel_arg = ctx->parallel_arg;
@@ -129,51 +363,29 @@ static void *worker_fn(void *arg) {
             if (end > rows) end = rows;
             
             for (int r = start; r < end; ++r) {
-                const char *W_base = (const char *)W;
-                const void *row_ptr = (const void *)(W_base + (size_t)r * row_stride_bytes);
-                tensor_ternary_view_t ternary_row;
-                
-                int count = blocks_per_row;
-                int b_size = 32;
-                if (row_stride_bytes == (size_t)cols * 2 || 
-                    row_stride_bytes == (size_t)cols * 4) {
-                    count = cols;
-                    b_size = 1;
-                }
+                worker_row_state_t row_state;
 
-                if (ternary_scales) {
-                    memset(&ternary_row, 0, sizeof(ternary_row));
-                    ternary_row.packed_weights = (const uint8_t *)row_ptr;
-                    ternary_row.scales = ternary_scales + (size_t)r * ternary_groups_per_row;
-                    ternary_row.rows = 1u;
-                    ternary_row.cols = (uint32_t)cols;
-                    ternary_row.packed_cols = (uint32_t)ternary_packed_cols;
-                    ternary_row.scale_group_size = ternary_scale_group_size;
-                    ternary_row.groups_per_row = ternary_groups_per_row;
-                    ternary_row.packed_weight_bytes = ternary_row_stride_bytes;
-                    ternary_row.scale_count = ternary_groups_per_row;
-                    ternary_row.scale_bytes = (size_t)ternary_groups_per_row * sizeof(float);
-                    row_ptr = &ternary_row;
-                    count = cols;
-                    b_size = 1;
-                }
+                prepare_worker_row_state(&row_state,
+                                         &row_config,
+                                         W,
+                                         r);
 
                 if (is_gemm) {
                     // Batched path: Y[token][row]
                     // pass y + r as the start address for this row's column in Y
                     gemm_args_t g_args = {
-                        .w_row = row_ptr,
+                        .w_row = row_state.row_ptr,
                         .X = x,
                         .Y = y + r,
                         .batch_size = batch_size,
                         .d_model = d_model,
                         .out_stride = rows,
-                        .blocks = count,
-                        .block_size = b_size
+                        .blocks = row_state.block_count,
+                        .block_size = row_state.block_size
                     };
                     gemm_kernel_fn(&g_args);
                 } else {
-                    float result = kernel_fn(row_ptr, x, count, b_size);
+                    float result = kernel_fn(row_state.row_ptr, x, row_state.block_count, row_state.block_size);
                     y[r] = result;
                 }
             }
@@ -317,66 +529,19 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
     }
     
     tensor_dtype_t dtype = tensor_dtype(A);
-    const void *W_data = tensor_data(A);
     int rows = tensor_shape(A)[0];
     int cols = tensor_shape(A)[tensor_ndim(A) - 1];
     int blocks_per_row = (cols + 31) / 32;
-    size_t row_stride_bytes = 0;
-    size_t ternary_packed_cols = 0u;
-    size_t ternary_row_stride_bytes = 0u;
-    const float *ternary_scales = NULL;
-    const tensor_ternary_view_t *ternary_view = NULL;
+    backend_exec_plan_t plan;
     
-    if (!W_data) return 1;
+    if (!tensor_data(A)) return 1;
     
     int x_aligned = (((uintptr_t)(const void*)X) & 31) == 0;
-    gemv_kernel_t kernel_fn = NULL;
-    gemm_kernel_t gemm_kernel_fn = NULL;
-    
-    switch (dtype) {
-        case DTYPE_Q4_0:
-            kernel_fn = x_aligned ? quantized_gemv_q4_0_aligned : quantized_gemv_q4_0_unaligned;
-            row_stride_bytes = (size_t)blocks_per_row * sizeof(ggml_block_q4_0);
-            break;
-        case DTYPE_Q8_0:
-            kernel_fn = x_aligned ? quantized_gemv_q8_0_aligned : quantized_gemv_q8_0_unaligned;
-            row_stride_bytes = (size_t)blocks_per_row * sizeof(ggml_block_q8_0);
-            break;
-        case DTYPE_BF16:
-            kernel_fn = quantized_gemv_bf16_avx2;
-            gemm_kernel_fn = kernel_gemm_bf16_avx2;
-            row_stride_bytes = (size_t)cols * 2;
-            break;
-        case DTYPE_F32:
-            kernel_fn = quantized_gemv_f32_avx2;
-            gemm_kernel_fn = kernel_gemm_f32_avx2;
-            row_stride_bytes = (size_t)cols * 4;
-            break;
-        case DTYPE_TERNARY_2BIT:
-            ternary_view = tensor_data_ternary(A);
-            if (!ternary_view || !ternary_view->packed_weights || !ternary_view->scales ||
-                ternary_view->rows != (uint32_t)rows || ternary_view->cols != (uint32_t)cols ||
-                ternary_view->groups_per_row == 0u ||
-                ternary_view->scale_count != (size_t)rows * ternary_view->groups_per_row) {
-                LOG_ERROR("kernel_backend_exec: invalid ternary tensor payload");
-                return -1;
-            }
-            kernel_fn = quantized_gemv_ternary_scalar;
-            gemm_kernel_fn = kernel_gemm_ternary_scalar;
-            ternary_packed_cols = ternary_view->packed_cols;
-            ternary_row_stride_bytes = ternary_packed_cols;
-            row_stride_bytes = ternary_row_stride_bytes;
-            ternary_scales = ternary_view->scales;
-            ctx->ternary_scale_group_size = ternary_view->scale_group_size;
-            ctx->ternary_groups_per_row = ternary_view->groups_per_row;
-            W_data = ternary_view->packed_weights;
-            break;
-        default:
-            LOG_ERROR("kernel_backend_exec: unsupported dtype %d", (int)dtype);
-            return -1;
+    if (build_backend_exec_plan(&plan, A, rows, cols, blocks_per_row, x_aligned) != 0) {
+        return -1;
     }
 
-    if (is_gemm && gemm_kernel_fn == NULL) {
+    if (is_gemm && plan.gemm_kernel_fn == NULL) {
         LOG_ERROR("kernel_backend_exec: dtype %d does not support batching yet", (int)dtype);
         return -1;
     }
@@ -394,16 +559,20 @@ int kernel_backend_exec(kernel_context_t *ctx, const tensor_t *A, const float *X
     ctx->is_gemm = is_gemm;
     ctx->batch_size = batch_size;
     ctx->d_model = cols;
-    ctx->kernel_fn = kernel_fn;
-    ctx->gemm_kernel_fn = gemm_kernel_fn;
-    ctx->W = W_data;
+    ctx->kernel_fn = plan.kernel_fn;
+    ctx->gemm_kernel_fn = plan.gemm_kernel_fn;
+    ctx->W = plan.weight_data ? plan.weight_data : tensor_data(A);
     ctx->rows = rows;
     ctx->cols = cols;
     ctx->blocks_per_row = blocks_per_row;
-    ctx->row_stride_bytes = row_stride_bytes;
-    ctx->ternary_packed_cols = ternary_packed_cols;
-    ctx->ternary_row_stride_bytes = ternary_row_stride_bytes;
-    ctx->ternary_scales = ternary_scales;
+    ctx->row_stride_bytes = plan.row_stride_bytes;
+    ctx->ternary_packed_cols = plan.ternary_packed_cols;
+    ctx->ternary_row_stride_bytes = plan.ternary_row_stride_bytes;
+    ctx->ternary_scales = plan.ternary_scales;
+    ctx->ternary_scale_group_size = plan.ternary_scale_group_size;
+    ctx->ternary_groups_per_row = plan.ternary_groups_per_row;
+    ctx->hybrid_anchor_entries = plan.hybrid_anchor_entries;
+    ctx->hybrid_anchor_row_offsets = plan.hybrid_anchor_row_offsets;
     ctx->x = X;
     ctx->y = Y;
     ctx->x_aligned = x_aligned;

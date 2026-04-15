@@ -45,9 +45,9 @@ typedef struct safetensors_file_t {
     char *json_header;                 // Allocated copy of JSON (for parsing)
 } safetensors_file_t;
 
-static int safetensors_parse_metadata_u32(const safetensors_file_t *st,
-                                          const char *key,
-                                          uint32_t *out_value)
+int safetensors_metadata_get_u32(const safetensors_file_t *st,
+                                 const char *key,
+                                 uint32_t *out_value)
 {
     sjson_cursor_t cursor;
     char parsed_key[384];
@@ -99,7 +99,9 @@ static int safetensors_parse_metadata_u32(const safetensors_file_t *st,
                             return 0;
                         }
                         errno = 0;
-                        parsed = strtoul(parsed_value, &end, 10);
+                        parsed = strtoul(parsed_value,
+                                         &end,
+                                         strpbrk(parsed_value, "abcdefABCDEF") ? 16 : 0);
                         if (errno != 0 || end == parsed_value || *end != '\0' || parsed > 0xFFFFFFFFul) {
                             return 0;
                         }
@@ -112,6 +114,76 @@ static int safetensors_parse_metadata_u32(const safetensors_file_t *st,
                     }
                     *out_value = (uint32_t)parsed_u64;
                     return 1;
+                }
+
+                if (sjson_cursor_skip_value(&cursor) != 0) {
+                    return 0;
+                }
+                (void)sjson_cursor_consume(&cursor, ',');
+            }
+            return 0;
+        }
+
+        if (sjson_cursor_skip_value(&cursor) != 0) {
+            return 0;
+        }
+        (void)sjson_cursor_consume(&cursor, ',');
+    }
+
+    return 0;
+}
+
+int safetensors_metadata_get_string(const safetensors_file_t *st,
+                                    const char *key,
+                                    char *out_value,
+                                    size_t out_value_size)
+{
+    sjson_cursor_t cursor;
+    char parsed_key[384];
+
+    if (!st || !st->json_header || !key || !out_value || out_value_size == 0u) {
+        return 0;
+    }
+
+    out_value[0] = '\0';
+    cursor = sjson_cursor_init(st->json_header, strlen(st->json_header));
+    if (!sjson_cursor_consume(&cursor, '{')) {
+        return 0;
+    }
+
+    while (sjson_cursor_peek(&cursor) != '\0') {
+        if (sjson_cursor_consume(&cursor, '}')) {
+            break;
+        }
+        if (sjson_cursor_parse_string(&cursor, parsed_key, (int)sizeof(parsed_key)) != 0) {
+            return 0;
+        }
+        if (!sjson_cursor_consume(&cursor, ':')) {
+            return 0;
+        }
+
+        if (strcmp(parsed_key, "__metadata__") == 0) {
+            if (!sjson_cursor_consume(&cursor, '{')) {
+                return 0;
+            }
+            while (sjson_cursor_peek(&cursor) != '\0') {
+                if (sjson_cursor_consume(&cursor, '}')) {
+                    break;
+                }
+                if (sjson_cursor_parse_string(&cursor, parsed_key, (int)sizeof(parsed_key)) != 0) {
+                    return 0;
+                }
+                if (!sjson_cursor_consume(&cursor, ':')) {
+                    return 0;
+                }
+
+                if (strcmp(parsed_key, key) == 0) {
+                    if (sjson_cursor_peek(&cursor) != '"') {
+                        return 0;
+                    }
+                    return sjson_cursor_parse_string(&cursor,
+                                                     out_value,
+                                                     (int)out_value_size) == 0;
                 }
 
                 if (sjson_cursor_skip_value(&cursor) != 0) {
@@ -153,7 +225,7 @@ int safetensors_resolve_ternary_scale_layout(const safetensors_file_t *st,
         return -1;
     }
 
-    if (safetensors_parse_metadata_u32(st, groups_key, &metadata_groups)) {
+    if (safetensors_metadata_get_u32(st, groups_key, &metadata_groups)) {
         if (metadata_groups != fallback_groups_per_row) {
             LOG_ERROR("safetensors ternary scale metadata mismatch for %s: groups=%u shape=%u",
                       tensor_name,
@@ -163,7 +235,7 @@ int safetensors_resolve_ternary_scale_layout(const safetensors_file_t *st,
         }
         groups_per_row = metadata_groups;
     }
-    if (!safetensors_parse_metadata_u32(st, group_size_key, &scale_group_size)) {
+    if (!safetensors_metadata_get_u32(st, group_size_key, &scale_group_size)) {
         scale_group_size = (uint32_t)(((size_t)cols + groups_per_row - 1u) / groups_per_row);
     }
     if (scale_group_size == 0u ||
@@ -193,6 +265,8 @@ static safetensors_dtype_t safetensors_dtype_from_string(const char *s) {
     if (strcmp(s, "I32") == 0 || strcmp(s, "int32") == 0) return SAFETENSORS_I32;
     if (strcmp(s, "I64") == 0 || strcmp(s, "int64") == 0) return SAFETENSORS_I64;
     if (strcmp(s, "U8") == 0 || strcmp(s, "uint8") == 0) return SAFETENSORS_U8;
+    if (strcmp(s, "U16") == 0 || strcmp(s, "uint16") == 0) return SAFETENSORS_U16;
+    if (strcmp(s, "U32") == 0 || strcmp(s, "uint32") == 0) return SAFETENSORS_U32;
     
     return SAFETENSORS_UNKNOWN;
 }
@@ -801,6 +875,9 @@ void safetensors_print_info(const safetensors_file_t *st) {
             case SAFETENSORS_F16: dtype_str = "F16"; break;
             case SAFETENSORS_I32: dtype_str = "I32"; break;
             case SAFETENSORS_I64: dtype_str = "I64"; break;
+            case SAFETENSORS_U8: dtype_str = "U8"; break;
+            case SAFETENSORS_U16: dtype_str = "U16"; break;
+            case SAFETENSORS_U32: dtype_str = "U32"; break;
             default: break;
         }
 

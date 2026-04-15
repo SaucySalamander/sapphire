@@ -82,7 +82,7 @@ DEPS := $(shell test -d $(OUTDIR) && find $(OUTDIR) -name '*.d' -print; \
 	test -d $(ASAN_OUTDIR) && find $(ASAN_OUTDIR) -name '*.d' -print)
 -include $(DEPS)
 
-.PHONY: all bench check-bench bench_f32 bench_bf16 kv-paging-matrix test clean shaders
+.PHONY: all bench check-bench bench_f32 bench_bf16 kv-paging-matrix test clean shaders check-hybrid-packaging-smoke check-hybrid-runtime-smoke
 
 # ============================================================================
 # SPIR-V Shader Compilation (Phase 11-04)
@@ -198,6 +198,12 @@ test: $(TEST_BINS)
 	done
 	@echo "----------------------------------------------------------------"
 	@echo "All tests passed!"
+
+check-hybrid-packaging-smoke:
+	python3 scripts/test_hybrid_packaging_smoke.py
+
+check-hybrid-runtime-smoke: bin
+	python3 scripts/run_hybrid_runtime_smoke.py
 
 
 # ============================================================================

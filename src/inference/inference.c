@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>  /* clock_gettime for high-resolution wall-clock timing */
+#include <unistd.h>
 
 #include "../include/attention.h"
 #include "../include/gemma3_config.h"
@@ -23,6 +24,7 @@
 #include "../include/model_reader.h"
 #include "../include/backend_vulkan.h"
 #include "../include/rope.h"
+#include "../include/simple_json.h"
 #include "../include/tensor.h"
 #include "../include/kernels.h"
 #include "../include/transformer.h"
@@ -66,6 +68,118 @@ static int load_or_reuse_tokenizer(model_spec_t* spec, const char* model_dir) {
     // Cache tokenizer in spec for reuse by future contexts
     spec->tokenizer_handle = (void*)tk;
     sapphire_tracy_zone_end(&tracy_zone);
+    return 0;
+}
+
+static int model_config_has_mixed_precision_anchors(const char *model_dir, bool *enabled)
+{
+    char *config_path = NULL;
+    char *config_json = NULL;
+    size_t config_len = 0u;
+    int token_count = 0;
+    int value_idx = -1;
+    sjson_token_t tokens[512];
+
+    if (!model_dir || !enabled) {
+        return -1;
+    }
+
+    *enabled = false;
+    config_path = construct_safe_path(model_dir, "config.json", NULL);
+    if (!config_path) {
+        return -1;
+    }
+
+    if (access(config_path, R_OK) != 0) {
+        free(config_path);
+        return 0;
+    }
+
+    if (file_read_json(config_path, &config_json, &config_len) != 0) {
+        free(config_path);
+        return -1;
+    }
+
+    (void)config_len;
+    token_count = sjson_tokenize(config_json, tokens, (int)(sizeof(tokens) / sizeof(tokens[0])));
+    if (token_count < 0) {
+        LOG_WARN("Failed to parse %s for backend compatibility preflight", config_path);
+        free(config_json);
+        free(config_path);
+        return -1;
+    }
+
+    value_idx = sjson_find_key(config_json, tokens, token_count, 0, "sapphire_mixed_precision_anchors");
+    if (value_idx >= 0) {
+        int len = tokens[value_idx].end - tokens[value_idx].start;
+        *enabled = (len == 4 && strncmp(config_json + tokens[value_idx].start, "true", 4) == 0);
+    }
+
+    free(config_json);
+    free(config_path);
+    return 0;
+}
+
+static int preflight_model_backend_compatibility(const char *model_name, const char *model_dir)
+{
+    sapphire_backend_type_t backend_type;
+    bool mixed_precision_anchors = false;
+
+    if (!model_name || !model_dir) {
+        return -1;
+    }
+
+    backend_type = backend_detect();
+    if (backend_type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        return 0;
+    }
+
+    if (model_config_has_mixed_precision_anchors(model_dir, &mixed_precision_anchors) != 0) {
+        LOG_WARN("Could not inspect %s/config.json before Vulkan session init; deferring capability validation to backend startup",
+                 model_dir);
+        return 0;
+    }
+
+    if (!mixed_precision_anchors) {
+        return 0;
+    }
+
+    LOG_ERROR("Model %s enables sapphire_mixed_precision_anchors in config.json and cannot run on the Vulkan backend yet; rerun with SAPPHIRE_BACKEND=cpu",
+              model_name);
+    return -1;
+}
+
+static char *prepare_model_directory(const char *model_name)
+{
+    char *model_dir = construct_safe_path("./models", model_name, NULL);
+
+    if (!model_dir) {
+        LOG_ERROR("Failed to construct model directory path");
+        return NULL;
+    }
+    if (preflight_model_backend_compatibility(model_name, model_dir) != 0) {
+        free(model_dir);
+        return NULL;
+    }
+
+    return model_dir;
+}
+
+static int populate_model_from_spec(const char *model_dir, model_spec_t *spec)
+{
+    if (!spec || !spec->loader_hooks || !spec->loader_hooks->populate_from_files) {
+        LOG_ERROR("Model spec has no loader hooks");
+        return -1;
+    }
+
+    SAPPHIRE_TRACY_ZONE_SCOPE(loader_zone, "model_loader_populate");
+    int rc = spec->loader_hooks->populate_from_files(model_dir, spec);
+    sapphire_tracy_zone_end(&loader_zone);
+    if (rc != 0) {
+        LOG_ERROR("Failed to populate model from files");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -134,9 +248,8 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
 
     // Construct the model directory path: ./models/{model_name}
     // construct_safe_path allocates exact size needed and validates all components
-    char *model_dir = construct_safe_path("./models", model_name, NULL);
+    char *model_dir = prepare_model_directory(model_name);
     if (!model_dir) {
-        LOG_ERROR("Failed to construct model directory path");
         sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
@@ -153,21 +266,7 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
 
     spec->llm_model = model;
 
-    // Trigger the loader hooks to populate model and config
-    // The loader function logs its own detailed errors; we just check the return code
-    if (spec->loader_hooks && spec->loader_hooks->populate_from_files) {
-        SAPPHIRE_TRACY_ZONE_SCOPE(loader_zone, "model_loader_populate");
-        int rc = spec->loader_hooks->populate_from_files(model_dir, spec);
-        sapphire_tracy_zone_end(&loader_zone);
-        if (rc != 0) {
-            LOG_ERROR("Failed to populate model from files");
-            free(model);
-            free(model_dir);
-            sapphire_tracy_zone_end(&tracy_zone);
-            return NULL;
-        }
-    } else {
-        LOG_ERROR("Model spec has no loader hooks");
+    if (populate_model_from_spec(model_dir, spec) != 0) {
         free(model);
         free(model_dir);
         sapphire_tracy_zone_end(&tracy_zone);

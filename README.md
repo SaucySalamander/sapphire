@@ -133,6 +133,110 @@ If you want help for the runtime itself, run `./out/sapphire -h`.
 - `--teacher-model` requires `--activation-tape` and only applies to full-model
   conversion.
 
+### 1B Teacher To 7B Student Workflow
+
+Use this procedure when you want to record a Gemma 3 1B teacher, expand the
+recordings to the 7B student layout, distill the 7B model, and validate the
+packaged hybrid output.
+
+1. Record the teacher activation tape on CPU.
+
+```bash
+SAPPHIRE_BACKEND=cpu ./out/sapphire -m gemma-3-1b-it \
+  --record-tape ./data/1b-teacher-raw.tape \
+  --calibration-manifest ./configs/corpus/high_signal_calib_manifest.csv
+```
+
+1. Record the teacher Hessian sidecar on Vulkan using the tape.
+
+```bash
+SAPPHIRE_BACKEND=vulkan ./out/sapphire -m gemma-3-1b-it \
+  --record-hessian-sidecar ./data/1b-teacher.hsc \
+  --activation-tape ./data/1b-teacher-raw.tape \
+  --calibration-manifest ./configs/corpus/high_signal_calib_manifest.csv
+```
+
+1. Expand the teacher artifacts to the 7B student layout.
+
+```bash
+./.venv/bin/python scripts/expand_tape.py \
+  ./data/1b-teacher-raw.tape ./data/7b-aligned.tape \
+  --manifest-out ./data/7b-aligned.tsv \
+  --student-model-dir ./models/gemma-3-7b-q1.58b \
+  --teacher-model-id gemma-3-1b-it \
+  --student-model-id gemma-3-7b-q1.58b \
+  --structural-map ./configs/manifests/gemma3_7b_structural.tsv
+```
+
+```bash
+./.venv/bin/python scripts/expand_hessian_sidecar.py \
+  ./data/1b-teacher.hsc ./data/7b-aligned.hsc \
+  --input-tape ./data/1b-teacher-raw.tape \
+  --aligned-tape ./data/7b-aligned.tape \
+  --student-model-dir ./models/gemma-3-7b-q1.58b \
+  --teacher-model-id gemma-3-1b-it \
+  --student-model-id gemma-3-7b-q1.58b \
+  --structural-map ./configs/manifests/gemma3_7b_structural.tsv
+```
+
+1. Distill the 7B model from the aligned tape and Hessian sidecar.
+
+```bash
+SAPPHIRE_BACKEND=cpu ./out/sapphire \
+  -m gemma-3-7b-q1.58b \
+  --convert-ternary \
+  --output ./out/gemma-3-7b-q1.58b-ternary \
+  --teacher-model gemma-3-1b-it \
+  --activation-tape ./data/7b-aligned.tape \
+  --hessian-sidecar ./data/7b-aligned.hsc \
+  --structural-map ./configs/manifests/gemma3_7b_structural.tsv \
+  --calibration-manifest ./configs/corpus/high_signal_calib_manifest.csv \
+  --validation-manifest ./configs/corpus/high_signal_validation_manifest.csv \
+  --calibration-samples 32 \
+  --validation-samples 64 \
+  --checkpoint-every 32 \
+  --validate-every 32 \
+  --progressive-calib \
+  --anchor-mode \
+  --anchor-budget-ppm 5000 \
+  --anchor-saliency-mode 2 \
+  --max-grad-norm 0.001 \
+  --ste-steps 40 \
+  --ste-learning-rate 1e-3 \
+  --kl-weight 0.05
+```
+
+1. Repack the workflow output into a loadable model package and validate it.
+
+```bash
+./.venv/bin/python scripts/repack_ternary_model.py \
+  --base-model-dir ./models/gemma-3-7b-q1.58b \
+  --ternary-dir ./out/gemma-3-7b-q1.58b-ternary \
+  --output-dir ./models/gemma-3-7b-q1.58b-hybrid-infer \
+  --overwrite
+```
+
+```bash
+./.venv/bin/python scripts/verify_model_storage_bits.py ./models/gemma-3-7b-q1.58b-hybrid-infer
+SAPPHIRE_BACKEND=cpu ./out/sapphire -m gemma-3-7b-q1.58b-hybrid-infer -t 0.0 -p "The capital of France is" -n 10
+SAPPHIRE_BACKEND=vulkan ./out/sapphire -m gemma-3-7b-q1.58b-hybrid-infer -t 0.0 -p "The capital of France is" -n 10
+```
+
+The CPU run should succeed and the Vulkan run should fail explicitly with the
+hybrid-backend fallback message.
+
+### Anchor-Bearing Hybrid Packages
+
+- Production anchor sidecars use `.anchors.safetensors` with `format_version=2`.
+  Loader and repack still accept legacy `.anchors.bin` sidecars during the
+  migration window.
+- Packaged anchor-bearing models advertise
+  `sapphire_mixed_precision_anchors=true` and currently run on the CPU backend
+  only. Sapphire rejects those packages early when `SAPPHIRE_BACKEND=vulkan` is
+  selected and prints an explicit CPU fallback message.
+- The operator runbook and validation commands for hybrid packaging and runtime
+  smoke live in [docs/full-model-anchor-bearing-validation.md](docs/full-model-anchor-bearing-validation.md).
+
 ### Ternary conversion corpora
 
 The ternary conversion path accepts either a single text corpus source or a local
@@ -145,8 +249,8 @@ manifest file via `--calib-manifest` and `--validation-manifest`.
 
 This repository includes a 27B-oriented “high-signal” corpus preset:
 
-- [configs/corpus/27b_high_signal_calib_manifest.csv](configs/corpus/27b_high_signal_calib_manifest.csv)
-- [configs/corpus/27b_high_signal_validation_manifest.csv](configs/corpus/27b_high_signal_validation_manifest.csv)
+- [configs/corpus/high_signal_calib_manifest.csv](configs/corpus/high_signal_calib_manifest.csv)
+- [configs/corpus/high_signal_validation_manifest.csv](configs/corpus/high_signal_validation_manifest.csv)
 - [configs/corpus/README.md](configs/corpus/README.md)
 - [scripts/prepare_ternary_corpus.py](scripts/prepare_ternary_corpus.py)
 
@@ -187,6 +291,7 @@ Example full-model conversion run for the custom 7B student:
   --hessian-sidecar ./data/7b-aligned.hsc \
   --calibration-corpus ./corpora/calibration/fineweb_edu.txt \
   --calibration-samples 8 \
+  --ste-learning-rate 1e-3 \
   --validation-corpus ./corpora/validation/gsm8k_prompts.txt \
   --validation-samples 32 \
   --validate-every 32 \

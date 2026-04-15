@@ -30,6 +30,7 @@ typedef struct {
     int checkpoint_every_n_layers;
     int validate_every_n;
     int ste_steps;
+    float ste_learning_rate;
     int progressive_calib;
     int student_down_proj_input_rmsnorm;
     float kl_weight;

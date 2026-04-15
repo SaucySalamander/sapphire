@@ -42,6 +42,8 @@ typedef enum {
     SAFETENSORS_I32 = 3,     // int32
     SAFETENSORS_I64 = 4,     // int64
     SAFETENSORS_U8 = 5,      // uint8
+    SAFETENSORS_U16 = 6,     // uint16
+    SAFETENSORS_U32 = 7,     // uint32
     SAFETENSORS_UNKNOWN = -1
 } safetensors_dtype_t;
 
@@ -152,6 +154,15 @@ int safetensors_resolve_ternary_scale_layout(const safetensors_file_t *st,
                                              uint32_t fallback_groups_per_row,
                                              uint32_t *out_scale_group_size,
                                              uint32_t *out_groups_per_row);
+
+int safetensors_metadata_get_u32(const safetensors_file_t *st,
+                                 const char *key,
+                                 uint32_t *out_value);
+
+int safetensors_metadata_get_string(const safetensors_file_t *st,
+                                    const char *key,
+                                    char *out_value,
+                                    size_t out_value_size);
 
 /**
  * @brief Load a Safetensors tensor into a freshly allocated tensor_t.

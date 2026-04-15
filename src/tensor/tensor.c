@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "tensor.h"
+#include "ternary_anchor.h"
 #include "../include/log.h"
 
 // Concrete definition of the tensor structure (private to this .c file)
@@ -48,6 +49,181 @@ static void tensor_hybrid_release_payload(tensor_t *t) {
         free((void *)view->anchor_row_offsets);
     }
     free(view);
+}
+
+static float tensor_bf16_to_f32_local(uint16_t value) {
+    union {
+        uint32_t u32;
+        float f32;
+    } bits;
+
+    bits.u32 = ((uint32_t)value) << 16u;
+    return bits.f32;
+}
+
+static int tensor_hybrid_validate_anchor_payload_local(uint32_t rows,
+                                                       uint32_t cols,
+                                                       const ternary_anchor_entry_t *entries,
+                                                       const uint32_t *row_offsets,
+                                                       uint32_t anchor_count) {
+    uint32_t row = 0u;
+
+    if (anchor_count == 0u) {
+        if (!row_offsets) {
+            return 0;
+        }
+        for (row = 0u; row <= rows; ++row) {
+            if (row_offsets[row] != 0u) {
+                LOG_ERROR("tensor_create_hybrid_view invalid zero-anchor row_offsets");
+                return -1;
+            }
+        }
+        return 0;
+    }
+    if (!entries || !row_offsets) {
+        LOG_ERROR("tensor_create_hybrid_view anchor_count>0 but missing entries/offsets");
+        return -1;
+    }
+    if (row_offsets[0] != 0u || row_offsets[rows] != anchor_count) {
+        LOG_ERROR("tensor_create_hybrid_view invalid anchor row_offsets terminal range");
+        return -1;
+    }
+
+    for (row = 0u; row < rows; ++row) {
+        uint32_t start = row_offsets[row];
+        uint32_t end = row_offsets[row + 1u];
+        uint16_t prev_col = 0u;
+        int has_prev_col = 0;
+
+        if (end < start || end > anchor_count) {
+            LOG_ERROR("tensor_create_hybrid_view non-monotonic row_offsets at row=%u", row);
+            return -1;
+        }
+        for (uint32_t idx = start; idx < end; ++idx) {
+            if (entries[idx].row != row) {
+                LOG_ERROR("tensor_create_hybrid_view row_offsets/entry row mismatch at index=%u", idx);
+                return -1;
+            }
+            if (entries[idx].col >= cols) {
+                LOG_ERROR("tensor_create_hybrid_view anchor col out of bounds at index=%u", idx);
+                return -1;
+            }
+            if (has_prev_col && entries[idx].col <= prev_col) {
+                LOG_ERROR("tensor_create_hybrid_view anchor entries must be strictly ordered within each row");
+                return -1;
+            }
+            prev_col = entries[idx].col;
+            has_prev_col = 1;
+        }
+    }
+
+    return 0;
+}
+
+static tensor_t* tensor_clone_ternary_local(const tensor_t *src) {
+    const tensor_ternary_view_t *view = NULL;
+    tensor_ternary_payload_t payload;
+    uint8_t *packed_copy = NULL;
+    float *scale_copy = NULL;
+    tensor_t *clone = NULL;
+
+    view = tensor_data_ternary(src);
+    if (!view) {
+        return NULL;
+    }
+
+    packed_copy = (uint8_t *)malloc(view->packed_weight_bytes);
+    scale_copy = (float *)malloc(view->scale_bytes);
+    if (!packed_copy || !scale_copy) {
+        free(packed_copy);
+        free(scale_copy);
+        LOG_ERROR("tensor_clone failed to allocate ternary payload copy");
+        return NULL;
+    }
+
+    memcpy(packed_copy, view->packed_weights, view->packed_weight_bytes);
+    memcpy(scale_copy, view->scales, view->scale_bytes);
+    memset(&payload, 0, sizeof(payload));
+    payload.packed_weights = packed_copy;
+    payload.packed_weight_bytes = view->packed_weight_bytes;
+    payload.scales = scale_copy;
+    payload.scale_count = view->scale_count;
+    payload.scale_group_size = view->scale_group_size;
+
+    clone = tensor_create_ternary_view(view->rows, view->cols, &payload, 0);
+    if (!clone) {
+        free(packed_copy);
+        free(scale_copy);
+        return NULL;
+    }
+    clone->layout = src->layout;
+    return clone;
+}
+
+static tensor_t* tensor_clone_hybrid_local(const tensor_t *src) {
+    const tensor_hybrid_view_t *view = NULL;
+    tensor_hybrid_payload_t payload;
+    uint8_t *packed_copy = NULL;
+    float *scale_copy = NULL;
+    ternary_anchor_entry_t *anchor_entries_copy = NULL;
+    uint32_t *anchor_row_offsets_copy = NULL;
+    tensor_t *clone = NULL;
+
+    view = tensor_data_hybrid(src);
+    if (!view) {
+        return NULL;
+    }
+
+    packed_copy = (uint8_t *)malloc(view->packed_weight_bytes);
+    scale_copy = (float *)malloc(view->scale_bytes);
+    if (!packed_copy || !scale_copy) {
+        free(packed_copy);
+        free(scale_copy);
+        LOG_ERROR("tensor_clone failed to allocate hybrid bulk payload copy");
+        return NULL;
+    }
+    memcpy(packed_copy, view->packed_weights, view->packed_weight_bytes);
+    memcpy(scale_copy, view->scales, view->scale_bytes);
+
+    if (view->anchor_count > 0u) {
+        const size_t anchor_entry_bytes = (size_t)view->anchor_count * sizeof(ternary_anchor_entry_t);
+        const size_t anchor_row_offsets_bytes = ((size_t)view->rows + 1u) * sizeof(uint32_t);
+
+        anchor_entries_copy = (ternary_anchor_entry_t *)malloc(anchor_entry_bytes);
+        anchor_row_offsets_copy = (uint32_t *)malloc(anchor_row_offsets_bytes);
+        if (!anchor_entries_copy || !anchor_row_offsets_copy) {
+            free(packed_copy);
+            free(scale_copy);
+            free(anchor_entries_copy);
+            free(anchor_row_offsets_copy);
+            LOG_ERROR("tensor_clone failed to allocate hybrid anchor payload copy");
+            return NULL;
+        }
+        memcpy(anchor_entries_copy, view->anchor_entries, anchor_entry_bytes);
+        memcpy(anchor_row_offsets_copy, view->anchor_row_offsets, anchor_row_offsets_bytes);
+    }
+
+    memset(&payload, 0, sizeof(payload));
+    payload.bulk.packed_weights = packed_copy;
+    payload.bulk.packed_weight_bytes = view->packed_weight_bytes;
+    payload.bulk.scales = scale_copy;
+    payload.bulk.scale_count = view->scale_count;
+    payload.bulk.scale_group_size = view->scale_group_size;
+    payload.anchor_entries = anchor_entries_copy;
+    payload.anchor_row_offsets = anchor_row_offsets_copy;
+    payload.anchor_count = view->anchor_count;
+    payload.owns_anchor_memory = 1;
+
+    clone = tensor_create_hybrid_view(view->rows, view->cols, &payload, 0);
+    if (!clone) {
+        free(packed_copy);
+        free(scale_copy);
+        free(anchor_entries_copy);
+        free(anchor_row_offsets_copy);
+        return NULL;
+    }
+    clone->layout = src->layout;
+    return clone;
 }
 
 // ============================================================================
@@ -349,9 +525,11 @@ tensor_t* tensor_create_hybrid_view(uint32_t rows,
     }
     scale_bytes = scale_count * sizeof(float);
 
-    /* Validate anchor data if provided */
-    if (anchor_count > 0 && (!anchor_entries || !anchor_row_offsets)) {
-        LOG_ERROR("tensor_create_hybrid_view anchor_count>0 but missing entries/offsets");
+    if (tensor_hybrid_validate_anchor_payload_local(rows,
+                                                    cols,
+                                                    (const ternary_anchor_entry_t *)anchor_entries,
+                                                    anchor_row_offsets,
+                                                    anchor_count) != 0) {
         return NULL;
     }
 
@@ -408,10 +586,19 @@ tensor_t* tensor_create_hybrid_view(uint32_t rows,
  * Creates new tensor with identical metadata and data.
  */
 tensor_t* tensor_clone(const tensor_t *src) {
+    tensor_t *clone = NULL;
+
     if (!src) return NULL;
 
+    if (src->dtype == DTYPE_TERNARY_2BIT) {
+        return tensor_clone_ternary_local(src);
+    }
+    if (src->dtype == DTYPE_TERNARY_HYBRID) {
+        return tensor_clone_hybrid_local(src);
+    }
+
     // Create new tensor with same shape and dtype
-    tensor_t *clone = tensor_create(src->ndim, src->shape, src->dtype);
+    clone = tensor_create(src->ndim, src->shape, src->dtype);
     if (!clone) return NULL;
 
     // Copy memory layout
@@ -467,6 +654,7 @@ size_t tensor_numel(const tensor_t *t) {
  * Get element as F32 (with dequantization if needed).
  * 
  * For F32 tensors: direct read
+ * For ternary / hybrid tensors: scalar decode (slow; testing/debug only)
  * For Q4_0/Q8_0: dequantize (slow! use for testing only)
  * 
  * Note: Quantized dequantization is placeholder.
@@ -516,6 +704,56 @@ float tensor_get_f32(const tensor_t *t, size_t idx) {
             default: symbol = 0; break;
         }
         return scale * (float)symbol;
+    } else if (t->dtype == DTYPE_TERNARY_HYBRID) {
+        const tensor_hybrid_view_t *view = (const tensor_hybrid_view_t *)t->data;
+        const ternary_anchor_entry_t *entries = NULL;
+        size_t row = 0u;
+        size_t col = 0u;
+        size_t packed_idx = 0u;
+        uint32_t lane = 0u;
+        uint8_t packed = 0u;
+        float scale = 0.0f;
+        float value = 0.0f;
+        int8_t symbol = 0;
+
+        if (!view || !view->packed_weights || !view->scales || view->cols == 0u) {
+            return 0.0f;
+        }
+
+        row = idx / view->cols;
+        col = idx % view->cols;
+        packed_idx = row * view->packed_cols + (col / 4u);
+        lane = (uint32_t)(col % 4u);
+        packed = view->packed_weights[packed_idx];
+        {
+            size_t scale_row_base = row * view->groups_per_row;
+            size_t scale_group = col / view->scale_group_size;
+            if (scale_group >= view->groups_per_row) {
+                scale_group = view->groups_per_row - 1u;
+            }
+            scale = view->scales[scale_row_base + scale_group];
+        }
+
+        switch ((packed >> (lane * 2u)) & 0x3u) {
+            case 1u: symbol = 1; break;
+            case 2u: symbol = -1; break;
+            default: symbol = 0; break;
+        }
+        value = scale * (float)symbol;
+        if (view->anchor_count == 0u || !view->anchor_entries || !view->anchor_row_offsets) {
+            return value;
+        }
+
+        entries = (const ternary_anchor_entry_t *)view->anchor_entries;
+        for (uint32_t anchor_idx = view->anchor_row_offsets[row];
+             anchor_idx < view->anchor_row_offsets[row + 1u];
+             ++anchor_idx) {
+            if (entries[anchor_idx].col == col) {
+                value += tensor_bf16_to_f32_local(entries[anchor_idx].value_bf16);
+                break;
+            }
+        }
+        return value;
     } else if (t->dtype == DTYPE_Q4_0 || t->dtype == DTYPE_Q8_0) {
         // Placeholder: quantized dequantization
         // TODO: Integrate actual dequantization from Phase 1 (ggml_reader.c)

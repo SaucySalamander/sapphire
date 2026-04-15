@@ -60,7 +60,8 @@ static void print_help(const char* program_name) {
     printf("  --calibration-manifest <p> Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
     printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
     printf("  --ste-steps <n>          STE optimization steps per tensor (default: 3)\n");
-    printf("  --anchor-mode            Enable hybrid ternary + BF16 anchor output (single-layer only)\n");
+    printf("  --ste-learning-rate <value>  Base STE learning rate before progressive layer scaling (default: 0.03)\n");
+    printf("  --anchor-mode            Enable hybrid ternary + BF16 anchor output\n");
     printf("  --anchor-budget-ppm <n>  Anchor budget in ppm (default: 1000 = 0.1%%)\n");
     printf("  --anchor-saliency-mode <n> Anchor saliency: 0=none 1=weight*hessian 2=hessian 3=weight\n");
     printf("  --progressive-calib      Run 3-stage progressive molding (layers 0-5, 6-12, then full model)\n");
@@ -153,6 +154,8 @@ typedef struct {
     int checkpoint_every_n_layers;
     int validate_every_n;
     int ste_steps;
+    float ste_learning_rate;
+    int ste_learning_rate_set;
     int progressive_calib;
     int student_down_proj_input_rmsnorm;
     float kl_weight;
@@ -201,6 +204,8 @@ static void cli_args_init(cli_args_t *args)
     args->checkpoint_every_n_layers = 1;
     args->validate_every_n = 0;
     args->ste_steps = 3;
+    args->ste_learning_rate = 0.0f;
+    args->ste_learning_rate_set = 0;
     args->progressive_calib = 0;
     args->student_down_proj_input_rmsnorm = 0;
     args->kl_weight = 0.05f;
@@ -332,11 +337,6 @@ static int validate_convert_ternary_mode_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --progressive-calib requires --activation-tape so staged calibration can reuse teacher activation statistics.");
         return -1;
     }
-    if (args->use_anchor_mode && !args->layer_name) {
-        LOG_ERROR("ERROR: --anchor-mode currently supports single-layer ternary conversion only; use --layer.");
-        return -1;
-    }
-
     return 0;
 }
 
@@ -461,6 +461,10 @@ static int validate_convert_ternary_numeric_args(const cli_args_t *args)
         LOG_ERROR("ERROR: --ste-steps must be > 0.");
         return -1;
     }
+    if (args->ste_learning_rate_set && args->ste_learning_rate <= 0.0f) {
+        LOG_ERROR("ERROR: --ste-learning-rate must be > 0.");
+        return -1;
+    }
     if (args->checkpoint_every_n_layers <= 0) {
         LOG_ERROR("ERROR: --checkpoint-every must be > 0.");
         return -1;
@@ -537,6 +541,7 @@ static int run_ternary_conversion_mode(const cli_args_t *args)
     config.checkpoint_every_n_layers = args->checkpoint_every_n_layers;
     config.validate_every_n = args->validate_every_n;
     config.ste_steps = args->ste_steps;
+    config.ste_learning_rate = args->ste_learning_rate;
     config.progressive_calib = args->progressive_calib;
     config.student_down_proj_input_rmsnorm = args->student_down_proj_input_rmsnorm;
     config.kl_weight = args->kl_weight;
@@ -993,6 +998,7 @@ typedef enum {
     CLI_OPT_CHECKPOINT_EVERY,
     CLI_OPT_VALIDATE_EVERY,
     CLI_OPT_STE_STEPS,
+    CLI_OPT_STE_LEARNING_RATE,
     CLI_OPT_PROGRESSIVE_CALIB,
     CLI_OPT_ANCHOR_MODE,
     CLI_OPT_ANCHOR_BUDGET_PPM,
@@ -1047,6 +1053,7 @@ static const cli_option_alias_t g_cli_option_aliases[] = {
     { "--checkpoint-every", CLI_OPT_CHECKPOINT_EVERY },
     { "--validate-every", CLI_OPT_VALIDATE_EVERY },
     { "--ste-steps", CLI_OPT_STE_STEPS },
+    { "--ste-learning-rate", CLI_OPT_STE_LEARNING_RATE },
     { "--progressive-calib", CLI_OPT_PROGRESSIVE_CALIB },
     { "--anchor-mode", CLI_OPT_ANCHOR_MODE },
     { "--anchor-budget-ppm", CLI_OPT_ANCHOR_BUDGET_PPM },
@@ -1109,6 +1116,10 @@ static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *
         case CLI_OPT_CHECKPOINT_EVERY: args->checkpoint_every_n_layers = atoi(value); break;
         case CLI_OPT_VALIDATE_EVERY: args->validate_every_n = atoi(value); break;
         case CLI_OPT_STE_STEPS: args->ste_steps = atoi(value); break;
+        case CLI_OPT_STE_LEARNING_RATE:
+            args->ste_learning_rate = (float)atof(value);
+            args->ste_learning_rate_set = 1;
+            break;
         case CLI_OPT_ANCHOR_BUDGET_PPM: args->anchor_budget_ppm = (uint32_t)strtoul(value, NULL, 10); break;
         case CLI_OPT_ANCHOR_SALIENCY_MODE: args->anchor_saliency_mode = atoi(value); break;
         case CLI_OPT_MAX_GRAD_NORM: args->max_grad_norm = (float)atof(value); break;

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits.h>
 #include <dirent.h>
 #include <log.h>
 #include <file_reader.h>
@@ -24,6 +25,14 @@ typedef enum {
     TERNARY_MANIFEST_KIND_ANCHOR = 2
 } ternary_manifest_loader_kind_t;
 
+typedef enum {
+    TERNARY_MANIFEST_FORM_NONE = 0,
+    TERNARY_MANIFEST_FORM_BULK = 1 << 0,
+    TERNARY_MANIFEST_FORM_MOLD = 1 << 1,
+    TERNARY_MANIFEST_FORM_LEGACY_ANCHOR = 1 << 2,
+    TERNARY_MANIFEST_FORM_UNIFIED_ANCHOR = 1 << 3
+} ternary_manifest_loader_form_t;
+
 typedef struct {
     char tensor_name[256];
     char bulk_file_name[256];
@@ -34,6 +43,7 @@ typedef struct {
     uint32_t crc32;
     uint32_t anchor_count;
     ternary_manifest_loader_kind_t kind;
+    uint32_t source_forms;
 } ternary_manifest_loader_entry_t;
 
 static tensor_t **resolve_tensor_slot_from_entry(llm_model_t *model,
@@ -105,18 +115,53 @@ static const char *path_basename_local(const char *path) {
     return last_slash ? (last_slash + 1) : path;
 }
 
-static int parse_manifest_line_local(char *line,
-                                     ternary_manifest_loader_entry_t *out_entry) {
-    char *fields[9] = {0};
+static int parse_manifest_u32_local(const char *text,
+                                    int base,
+                                    uint32_t *out_value) {
+    char *end = NULL;
+    unsigned long value = 0ul;
+
+    if (!text || !*text || !out_value) {
+        return -1;
+    }
+
+    value = strtoul(text, &end, base);
+    if (end == text || *end != '\0' || value > UINT_MAX) {
+        return -1;
+    }
+    *out_value = (uint32_t)value;
+    return 0;
+}
+
+static int parse_manifest_size_local(const char *text,
+                                     size_t *out_value) {
+    char *end = NULL;
+    unsigned long long value = 0ull;
+
+    if (!text || !*text || !out_value) {
+        return -1;
+    }
+
+    value = strtoull(text, &end, 10);
+    if (end == text || *end != '\0' || value > (unsigned long long)((size_t)-1)) {
+        return -1;
+    }
+    *out_value = (size_t)value;
+    return 0;
+}
+
+static int split_manifest_fields_local(char *line,
+                                       char **fields,
+                                       int max_fields) {
     char *cursor = line;
     char *next = NULL;
     int field_idx = 0;
 
-    if (!line || !out_entry) {
+    if (!line || !fields || max_fields <= 0) {
         return -1;
     }
 
-    while (field_idx < 9 && cursor) {
+    while (field_idx < max_fields && cursor) {
         next = strchr(cursor, '\t');
         if (next) {
             *next = '\0';
@@ -127,46 +172,168 @@ static int parse_manifest_line_local(char *line,
             cursor = NULL;
         }
     }
-    if (field_idx != 6 && field_idx != 7 && field_idx != 8 && field_idx != 9) {
+    return field_idx;
+}
+
+static int parse_manifest_common_entry_local(char **fields,
+                                             const char *manifest_path,
+                                             unsigned int line_number,
+                                             ternary_manifest_loader_entry_t *out_entry) {
+    if (!fields || !manifest_path || !out_entry) {
         return -1;
     }
 
-    memset(out_entry, 0, sizeof(*out_entry));
+    if (!fields[0] || fields[0][0] == '\0') {
+        LOG_ERROR("Invalid manifest row at %s:%u: missing tensor name", manifest_path, line_number);
+        return -1;
+    }
     snprintf(out_entry->tensor_name, sizeof(out_entry->tensor_name), "%s", fields[0]);
-    out_entry->rows = (uint32_t)strtoul(fields[2], NULL, 10);
-    out_entry->cols = (uint32_t)strtoul(fields[3], NULL, 10);
-    out_entry->packed_weight_bytes = (size_t)strtoull(fields[4], NULL, 10);
-    out_entry->crc32 = (uint32_t)strtoul(fields[5], NULL, 16);
-
-    if (field_idx == 6) {
-        snprintf(out_entry->bulk_file_name, sizeof(out_entry->bulk_file_name), "%s", fields[1]);
-        out_entry->kind = TERNARY_MANIFEST_KIND_TERNARY;
-        return 0;
+    if (parse_manifest_u32_local(fields[2], 10, &out_entry->rows) != 0 ||
+        parse_manifest_u32_local(fields[3], 10, &out_entry->cols) != 0 ||
+        parse_manifest_size_local(fields[4], &out_entry->packed_weight_bytes) != 0 ||
+        parse_manifest_u32_local(fields[5], 16, &out_entry->crc32) != 0) {
+        LOG_ERROR("Invalid numeric field in manifest row at %s:%u for tensor %s",
+                  manifest_path,
+                  line_number,
+                  out_entry->tensor_name);
+        return -1;
     }
 
-    if (field_idx == 7 && strcmp(fields[6], "mold") == 0) {
-        snprintf(out_entry->bulk_file_name, sizeof(out_entry->bulk_file_name), "%s", fields[1]);
-        out_entry->kind = TERNARY_MANIFEST_KIND_MOLD;
-        return 0;
+    return 0;
+}
+
+static int parse_manifest_payload_row_local(const char *payload_path,
+                                            ternary_manifest_loader_kind_t kind,
+                                            uint32_t source_form,
+                                            const char *manifest_path,
+                                            unsigned int line_number,
+                                            ternary_manifest_loader_entry_t *out_entry) {
+    const char *row_kind = (kind == TERNARY_MANIFEST_KIND_MOLD) ? "mold" : "ternary";
+
+    if (!payload_path || payload_path[0] == '\0') {
+        LOG_ERROR("Invalid %s manifest row at %s:%u: missing payload for %s",
+                  row_kind,
+                  manifest_path,
+                  line_number,
+                  out_entry->tensor_name);
+        return -1;
     }
 
-    if (strcmp(fields[6], "anchor") != 0) {
+    snprintf(out_entry->bulk_file_name, sizeof(out_entry->bulk_file_name), "%s", payload_path);
+    out_entry->kind = kind;
+    out_entry->source_forms = source_form;
+    return 0;
+}
+
+static int parse_manifest_anchor_row_local(char **fields,
+                                           int field_idx,
+                                           const char *manifest_path,
+                                           unsigned int line_number,
+                                           ternary_manifest_loader_entry_t *out_entry) {
+    if (!fields || !manifest_path || !out_entry) {
         return -1;
     }
 
     out_entry->kind = TERNARY_MANIFEST_KIND_ANCHOR;
     if (field_idx == 8) {
+        if (!fields[1] || fields[1][0] == '\0') {
+            LOG_ERROR("Invalid legacy anchor manifest row at %s:%u: missing anchor sidecar for %s",
+                      manifest_path,
+                      line_number,
+                      out_entry->tensor_name);
+            return -1;
+        }
         snprintf(out_entry->anchor_file_name, sizeof(out_entry->anchor_file_name), "%s", fields[1]);
-        out_entry->anchor_count = (uint32_t)strtoul(fields[7], NULL, 10);
+        if (parse_manifest_u32_local(fields[7], 10, &out_entry->anchor_count) != 0) {
+            LOG_ERROR("Invalid anchor_count in manifest row at %s:%u for %s",
+                      manifest_path,
+                      line_number,
+                      out_entry->tensor_name);
+            return -1;
+        }
+        out_entry->source_forms = TERNARY_MANIFEST_FORM_LEGACY_ANCHOR;
         return 0;
     }
     if (field_idx == 9) {
+        if (!fields[1] || fields[1][0] == '\0' || !fields[7] || fields[7][0] == '\0') {
+            LOG_ERROR("Invalid unified anchor manifest row at %s:%u: missing payload path for %s",
+                      manifest_path,
+                      line_number,
+                      out_entry->tensor_name);
+            return -1;
+        }
         snprintf(out_entry->bulk_file_name, sizeof(out_entry->bulk_file_name), "%s", fields[1]);
         snprintf(out_entry->anchor_file_name, sizeof(out_entry->anchor_file_name), "%s", fields[7]);
-        out_entry->anchor_count = (uint32_t)strtoul(fields[8], NULL, 10);
+        if (parse_manifest_u32_local(fields[8], 10, &out_entry->anchor_count) != 0) {
+            LOG_ERROR("Invalid anchor_count in manifest row at %s:%u for %s",
+                      manifest_path,
+                      line_number,
+                      out_entry->tensor_name);
+            return -1;
+        }
+        out_entry->source_forms = TERNARY_MANIFEST_FORM_UNIFIED_ANCHOR;
         return 0;
     }
-    return 0;
+
+    return -1;
+}
+
+static int parse_manifest_line_local(char *line,
+                                     const char *manifest_path,
+                                     unsigned int line_number,
+                                     ternary_manifest_loader_entry_t *out_entry) {
+    char *fields[9] = {0};
+    int field_idx = 0;
+
+    if (!line || !manifest_path || !out_entry) {
+        return -1;
+    }
+
+    field_idx = split_manifest_fields_local(line, fields, 9);
+    if (field_idx != 6 && field_idx != 7 && field_idx != 8 && field_idx != 9) {
+        LOG_ERROR("Invalid manifest row at %s:%u: expected 6, 7, 8, or 9 tab-separated fields",
+                  manifest_path,
+                  line_number);
+        return -1;
+    }
+
+    memset(out_entry, 0, sizeof(*out_entry));
+    if (parse_manifest_common_entry_local(fields, manifest_path, line_number, out_entry) != 0) {
+        return -1;
+    }
+
+    if (field_idx == 6) {
+        return parse_manifest_payload_row_local(fields[1],
+                                                TERNARY_MANIFEST_KIND_TERNARY,
+                                                TERNARY_MANIFEST_FORM_BULK,
+                                                manifest_path,
+                                                line_number,
+                                                out_entry);
+    }
+
+    if (field_idx == 7 && strcmp(fields[6], "mold") == 0) {
+        return parse_manifest_payload_row_local(fields[1],
+                                                TERNARY_MANIFEST_KIND_MOLD,
+                                                TERNARY_MANIFEST_FORM_MOLD,
+                                                manifest_path,
+                                                line_number,
+                                                out_entry);
+    }
+
+    if (strcmp(fields[6], "anchor") != 0) {
+        LOG_ERROR("Invalid manifest row at %s:%u: unsupported kind '%s' for %s",
+                  manifest_path,
+                  line_number,
+                  fields[6],
+                  out_entry->tensor_name);
+        return -1;
+    }
+
+    return parse_manifest_anchor_row_local(fields,
+                                           field_idx,
+                                           manifest_path,
+                                           line_number,
+                                           out_entry);
 }
 
 static ternary_manifest_loader_entry_t *find_manifest_entry_local(ternary_manifest_loader_entry_t *entries,
@@ -253,20 +420,43 @@ static int merge_manifest_kind_local(ternary_manifest_loader_entry_t *dst,
     if (!dst || !src) {
         return -1;
     }
-    if (dst->kind == TERNARY_MANIFEST_KIND_MOLD || src->kind == TERNARY_MANIFEST_KIND_MOLD) {
-        if (dst->kind != src->kind) {
-            return -1;
-        }
-        dst->kind = TERNARY_MANIFEST_KIND_MOLD;
-        return 0;
+
+    if ((dst->source_forms & TERNARY_MANIFEST_FORM_MOLD) ||
+        (src->source_forms & TERNARY_MANIFEST_FORM_MOLD)) {
+        LOG_ERROR("Invalid manifest contract for %s: mold rows cannot be duplicated or mixed",
+                  dst->tensor_name);
+        return -1;
     }
-    if (dst->kind == TERNARY_MANIFEST_KIND_ANCHOR || src->kind == TERNARY_MANIFEST_KIND_ANCHOR) {
+    if ((dst->source_forms & TERNARY_MANIFEST_FORM_UNIFIED_ANCHOR) ||
+        (src->source_forms & TERNARY_MANIFEST_FORM_UNIFIED_ANCHOR)) {
+        LOG_ERROR("Invalid manifest contract for %s: unified anchor rows cannot be mixed with duplicate rows",
+                  dst->tensor_name);
+        return -1;
+    }
+    if ((dst->source_forms & TERNARY_MANIFEST_FORM_BULK) &&
+        (src->source_forms & TERNARY_MANIFEST_FORM_BULK)) {
+        LOG_ERROR("Invalid manifest contract for %s: duplicate ternary bulk rows are not allowed",
+                  dst->tensor_name);
+        return -1;
+    }
+    if ((dst->source_forms & TERNARY_MANIFEST_FORM_LEGACY_ANCHOR) &&
+        (src->source_forms & TERNARY_MANIFEST_FORM_LEGACY_ANCHOR)) {
+        LOG_ERROR("Invalid manifest contract for %s: duplicate legacy anchor rows are not allowed",
+                  dst->tensor_name);
+        return -1;
+    }
+    if (((dst->source_forms & TERNARY_MANIFEST_FORM_BULK) &&
+         (src->source_forms & TERNARY_MANIFEST_FORM_LEGACY_ANCHOR)) ||
+        ((dst->source_forms & TERNARY_MANIFEST_FORM_LEGACY_ANCHOR) &&
+         (src->source_forms & TERNARY_MANIFEST_FORM_BULK))) {
         dst->kind = TERNARY_MANIFEST_KIND_ANCHOR;
+        dst->source_forms |= src->source_forms;
         return 0;
     }
 
-    dst->kind = TERNARY_MANIFEST_KIND_TERNARY;
-    return 0;
+    LOG_ERROR("Invalid manifest contract for %s: unsupported duplicate row combination",
+              dst->tensor_name);
+    return -1;
 }
 
 static int merge_manifest_entry_local(ternary_manifest_loader_entry_t *dst,
@@ -274,27 +464,58 @@ static int merge_manifest_entry_local(ternary_manifest_loader_entry_t *dst,
     if (!dst || !src || strcmp(dst->tensor_name, src->tensor_name) != 0) {
         return -1;
     }
-    if (merge_manifest_shape_local(dst, src) != 0 ||
+    if (merge_manifest_kind_local(dst, src) != 0 ||
+        merge_manifest_shape_local(dst, src) != 0 ||
         merge_manifest_bulk_local(dst, src) != 0 ||
-        merge_manifest_anchor_local(dst, src) != 0 ||
-        merge_manifest_kind_local(dst, src) != 0) {
+        merge_manifest_anchor_local(dst, src) != 0) {
         return -1;
+    }
+    if (dst->source_forms == TERNARY_MANIFEST_FORM_BULK) {
+        dst->kind = TERNARY_MANIFEST_KIND_TERNARY;
+    } else if (dst->source_forms == (TERNARY_MANIFEST_FORM_BULK | TERNARY_MANIFEST_FORM_LEGACY_ANCHOR)) {
+        dst->kind = TERNARY_MANIFEST_KIND_ANCHOR;
     }
     return 0;
 }
 
-static int validate_manifest_entry_local(const ternary_manifest_loader_entry_t *entry) {
-    if (!entry || entry->tensor_name[0] == '\0' || entry->rows == 0u || entry->cols == 0u) {
+static int validate_manifest_entry_local(const ternary_manifest_loader_entry_t *entry,
+                                         const char *manifest_path) {
+    if (!entry || !manifest_path) {
         return -1;
     }
-    if (entry->kind == TERNARY_MANIFEST_KIND_MOLD) {
-        return (entry->bulk_file_name[0] != '\0') ? 0 : -1;
+    if (entry->tensor_name[0] == '\0' || entry->rows == 0u || entry->cols == 0u) {
+        LOG_ERROR("Invalid manifest entry in %s: tensor name/shape missing", manifest_path);
+        return -1;
+    }
+    if (entry->source_forms == TERNARY_MANIFEST_FORM_MOLD) {
+        if (entry->bulk_file_name[0] == '\0') {
+            LOG_ERROR("Invalid mold manifest entry for %s in %s: missing payload",
+                      entry->tensor_name,
+                      manifest_path);
+            return -1;
+        }
+        return 0;
+    }
+    if (entry->source_forms != TERNARY_MANIFEST_FORM_BULK &&
+        entry->source_forms != (TERNARY_MANIFEST_FORM_BULK | TERNARY_MANIFEST_FORM_LEGACY_ANCHOR) &&
+        entry->source_forms != TERNARY_MANIFEST_FORM_UNIFIED_ANCHOR) {
+        LOG_ERROR("Invalid manifest contract for %s in %s: incomplete or ambiguous migration row set",
+                  entry->tensor_name,
+                  manifest_path);
+        return -1;
     }
     if (entry->bulk_file_name[0] == '\0' || entry->packed_weight_bytes == 0u) {
+        LOG_ERROR("Invalid manifest entry for %s in %s: missing ternary bulk payload",
+                  entry->tensor_name,
+                  manifest_path);
         return -1;
     }
-    if (entry->kind == TERNARY_MANIFEST_KIND_ANCHOR) {
+    if (entry->source_forms == (TERNARY_MANIFEST_FORM_BULK | TERNARY_MANIFEST_FORM_LEGACY_ANCHOR) ||
+        entry->source_forms == TERNARY_MANIFEST_FORM_UNIFIED_ANCHOR) {
         if (entry->anchor_file_name[0] == '\0' || entry->anchor_count == 0u) {
+            LOG_ERROR("Invalid anchor manifest entry for %s in %s: missing anchor sidecar metadata",
+                      entry->tensor_name,
+                      manifest_path);
             return -1;
         }
     }
@@ -308,8 +529,10 @@ static int load_ternary_manifest_local(const char *model_dir,
     FILE *manifest_file = NULL;
     ternary_manifest_loader_entry_t *entries = NULL;
     char line[1024];
+    unsigned int line_number = 0u;
     int count = 0;
     int capacity = 0;
+    int rc = -1;
 
     if (!model_dir || !out_entries || !out_count) {
         return -1;
@@ -327,8 +550,8 @@ static int load_ternary_manifest_local(const char *model_dir,
     }
 
     manifest_file = fopen(manifest_path, "r");
-    free(manifest_path);
     if (!manifest_file) {
+        free(manifest_path);
         return -1;
     }
 
@@ -336,6 +559,7 @@ static int load_ternary_manifest_local(const char *model_dir,
         ternary_manifest_loader_entry_t entry;
         ternary_manifest_loader_entry_t *existing = NULL;
         size_t len = strlen(line);
+        ++line_number;
 
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
@@ -343,17 +567,17 @@ static int load_ternary_manifest_local(const char *model_dir,
         if (len == 0) {
             continue;
         }
-        if (parse_manifest_line_local(line, &entry) != 0) {
-            fclose(manifest_file);
-            free(entries);
-            return -1;
+        if (parse_manifest_line_local(line, manifest_path, line_number, &entry) != 0) {
+            goto cleanup;
         }
         existing = find_manifest_entry_local(entries, count, entry.tensor_name);
         if (existing) {
             if (merge_manifest_entry_local(existing, &entry) != 0) {
-                fclose(manifest_file);
-                free(entries);
-                return -1;
+                LOG_ERROR("Invalid duplicate manifest row for %s at %s:%u",
+                          entry.tensor_name,
+                          manifest_path,
+                          line_number);
+                goto cleanup;
             }
             continue;
         }
@@ -362,9 +586,8 @@ static int load_ternary_manifest_local(const char *model_dir,
             ternary_manifest_loader_entry_t *new_entries = (ternary_manifest_loader_entry_t *)realloc(entries,
                                                                                                        (size_t)new_capacity * sizeof(*entries));
             if (!new_entries) {
-                fclose(manifest_file);
-                free(entries);
-                return -1;
+                LOG_ERROR("Failed to grow manifest normalization buffer for %s", manifest_path);
+                goto cleanup;
             }
             entries = new_entries;
             capacity = new_capacity;
@@ -372,16 +595,31 @@ static int load_ternary_manifest_local(const char *model_dir,
         entries[count++] = entry;
     }
 
-    fclose(manifest_file);
+    if (ferror(manifest_file)) {
+        LOG_ERROR("Failed to read manifest %s", manifest_path);
+        goto cleanup;
+    }
+    if (count == 0) {
+        LOG_ERROR("Ternary manifest is empty: %s", manifest_path);
+        goto cleanup;
+    }
     for (int i = 0; i < count; ++i) {
-        if (validate_manifest_entry_local(&entries[i]) != 0) {
-            free(entries);
-            return -1;
+        if (validate_manifest_entry_local(&entries[i], manifest_path) != 0) {
+            goto cleanup;
         }
     }
     *out_entries = entries;
     *out_count = count;
-    return 1;
+    entries = NULL;
+    rc = 1;
+
+cleanup:
+    if (manifest_file) {
+        fclose(manifest_file);
+    }
+    free(manifest_path);
+    free(entries);
+    return rc;
 }
 
 static int find_shard_index_by_name(char **shard_paths,
@@ -439,7 +677,7 @@ static tensor_t *create_hybrid_tensor_from_manifest_entry(const ternary_manifest
         tensor_release(bulk_tensor);
         return NULL;
     }
-    if (ternary_anchor_load(anchor_path, &anchor_view) != 0) {
+    if (ternary_anchor_load_for_tensor(anchor_path, entry->tensor_name, &anchor_view) != 0) {
         free(anchor_path);
         tensor_release(bulk_tensor);
         return NULL;
@@ -449,6 +687,28 @@ static tensor_t *create_hybrid_tensor_from_manifest_entry(const ternary_manifest
 
     if (anchor_view.rows != entry->rows || anchor_view.cols != entry->cols ||
         anchor_view.anchor_count != entry->anchor_count) {
+        LOG_ERROR("Hybrid manifest payload mismatch for %s: manifest rows=%u cols=%u anchors=%u, sidecar rows=%u cols=%u anchors=%u",
+                  entry->tensor_name,
+                  entry->rows,
+                  entry->cols,
+                  entry->anchor_count,
+                  anchor_view.rows,
+                  anchor_view.cols,
+                  anchor_view.anchor_count);
+        ternary_anchor_view_release(&anchor_view);
+        tensor_release(bulk_tensor);
+        return NULL;
+    }
+    if ((anchor_view.metadata.scale_group_size != 0u &&
+         anchor_view.metadata.scale_group_size != bulk_view->scale_group_size) ||
+        (anchor_view.metadata.groups_per_row != 0u &&
+         anchor_view.metadata.groups_per_row != bulk_view->groups_per_row)) {
+        LOG_ERROR("Hybrid scale layout mismatch for %s: bulk group_size=%u groups=%u, sidecar group_size=%u groups=%u",
+                  entry->tensor_name,
+                  bulk_view->scale_group_size,
+                  bulk_view->groups_per_row,
+                  anchor_view.metadata.scale_group_size,
+                  anchor_view.metadata.groups_per_row);
         ternary_anchor_view_release(&anchor_view);
         tensor_release(bulk_tensor);
         return NULL;

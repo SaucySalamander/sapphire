@@ -43,6 +43,42 @@ static void validation_tracy_zone_text_if_present(const sapphire_tracy_zone_t *z
     sapphire_tracy_zone_text(zone, text, strlen(text));
 }
 
+static float validation_bf16_to_f32(uint16_t value)
+{
+    union {
+        uint32_t u32;
+        float f32;
+    } bits;
+
+    bits.u32 = ((uint32_t)value) << 16u;
+    return bits.f32;
+}
+
+static int overlay_anchor_entries(float *data,
+                                  uint32_t rows,
+                                  uint32_t cols,
+                                  const ternary_anchor_entry_t *entries,
+                                  uint32_t anchor_count)
+{
+    if (!data) {
+        return -1;
+    }
+    if (!entries || anchor_count == 0u) {
+        return 0;
+    }
+
+    for (uint32_t idx = 0; idx < anchor_count; ++idx) {
+        const ternary_anchor_entry_t *entry = &entries[idx];
+
+        if (entry->row >= rows || entry->col >= cols) {
+            return -1;
+        }
+        data[(size_t)entry->row * cols + entry->col] = validation_bf16_to_f32(entry->value_bf16);
+    }
+
+    return 0;
+}
+
 static int validation_append_telemetry_checkpoint(ternary_validation_state_t *state,
                                                   const ternary_validation_checkpoint_t *checkpoint)
 {
@@ -240,6 +276,71 @@ static tensor_t **resolve_tensor_slot(llm_model_t *model,
     return NULL;
 }
 
+static tensor_t *build_proxy_tensor_from_dense(const float *weights,
+                                               uint32_t rows,
+                                               uint32_t cols)
+{
+    int shape[2] = {0, 0};
+    tensor_t *proxy = NULL;
+    float *data = NULL;
+    size_t element_count = 0u;
+
+    if (!weights || rows == 0u || cols == 0u) {
+        return NULL;
+    }
+
+    shape[0] = (int)rows;
+    shape[1] = (int)cols;
+    proxy = tensor_create(2, shape, DTYPE_F32);
+    if (!proxy) {
+        return NULL;
+    }
+
+    data = tensor_data_f32(proxy);
+    if (!data) {
+        tensor_release(proxy);
+        return NULL;
+    }
+
+    element_count = (size_t)rows * cols;
+    memcpy(data, weights, element_count * sizeof(float));
+    return proxy;
+}
+
+static tensor_t *build_proxy_tensor_from_bf16(const uint16_t *weights,
+                                              uint32_t rows,
+                                              uint32_t cols)
+{
+    int shape[2] = {0, 0};
+    tensor_t *proxy = NULL;
+    float *data = NULL;
+    size_t element_count = 0u;
+
+    if (!weights || rows == 0u || cols == 0u) {
+        return NULL;
+    }
+
+    shape[0] = (int)rows;
+    shape[1] = (int)cols;
+    proxy = tensor_create(2, shape, DTYPE_F32);
+    if (!proxy) {
+        return NULL;
+    }
+
+    data = tensor_data_f32(proxy);
+    if (!data) {
+        tensor_release(proxy);
+        return NULL;
+    }
+
+    element_count = (size_t)rows * cols;
+    for (size_t idx = 0u; idx < element_count; ++idx) {
+        data[idx] = validation_bf16_to_f32(weights[idx]);
+    }
+
+    return proxy;
+}
+
 static tensor_t *build_proxy_tensor_from_ternary(const ternary_calibration_result_t *result) {
     int shape[2] = { 0, 0 };
     tensor_t *proxy = NULL;
@@ -275,10 +376,20 @@ static tensor_t *build_proxy_tensor_from_ternary(const ternary_calibration_resul
         }
     }
 
+    if (overlay_anchor_entries(data,
+                               result->rows,
+                               result->cols,
+                               result->anchor_entries,
+                               result->anchor_count) != 0) {
+        tensor_release(proxy);
+        return NULL;
+    }
+
     return proxy;
 }
 
-static tensor_t *build_proxy_tensor_from_payload(const ternary_layer_payload_t *payload)
+static tensor_t *build_proxy_tensor_from_payload(const ternary_layer_payload_t *payload,
+                                                 const ternary_anchor_view_t *anchor_view)
 {
     int shape[2] = { 0, 0 };
     tensor_t *proxy = NULL;
@@ -334,34 +445,47 @@ static tensor_t *build_proxy_tensor_from_payload(const ternary_layer_payload_t *
         }
     }
 
+    if (anchor_view && anchor_view->anchor_count > 0u) {
+        if (anchor_view->rows != payload->rows || anchor_view->cols != payload->cols) {
+            tensor_release(proxy);
+            return NULL;
+        }
+        if (overlay_anchor_entries(data,
+                                   payload->rows,
+                                   payload->cols,
+                                   anchor_view->entries,
+                                   anchor_view->anchor_count) != 0) {
+            tensor_release(proxy);
+            return NULL;
+        }
+    }
+
     return proxy;
 }
 
 static int run_checkpoint(ternary_validation_state_t *state, int converted_count);
+static int store_validation_patch_record(ternary_validation_state_t *state,
+                                         const ternary_validation_patch_record_t *record);
 
-static int make_proxy_record_from_payload(inference_context_t *ctx,
-                                          const char *tensor_name,
-                                          const ternary_layer_payload_t *payload,
-                                          uint32_t crc32,
-                                          ternary_validation_patch_record_t *out_record)
+static int make_proxy_record_from_tensor(inference_context_t *ctx,
+                                         const char *tensor_name,
+                                         tensor_t *proxy_tensor,
+                                         uint32_t crc32,
+                                         ternary_validation_patch_record_t *out_record)
 {
     llm_model_t *model = NULL;
     tensor_t **slot = NULL;
-    tensor_t *proxy_tensor = NULL;
 
-    if (!ctx || !tensor_name || !payload || !out_record || !ctx->spec || !ctx->spec->llm_model) {
+    if (!ctx || !tensor_name || !proxy_tensor || !out_record || !ctx->spec || !ctx->spec->llm_model) {
+        tensor_release(proxy_tensor);
         return -1;
     }
 
     model = (llm_model_t *)ctx->spec->llm_model;
     slot = resolve_tensor_slot(model, ctx->spec, tensor_name);
     if (!slot || !*slot) {
+        tensor_release(proxy_tensor);
         return 0;
-    }
-
-    proxy_tensor = build_proxy_tensor_from_payload(payload);
-    if (!proxy_tensor) {
-        return -1;
     }
 
     memset(out_record, 0, sizeof(*out_record));
@@ -372,6 +496,27 @@ static int make_proxy_record_from_payload(inference_context_t *ctx,
     out_record->crc32 = crc32;
     *slot = proxy_tensor;
     return 1;
+}
+
+static int make_proxy_record_from_payload(inference_context_t *ctx,
+                                          const char *tensor_name,
+                                          const ternary_layer_payload_t *payload,
+                                          const ternary_anchor_view_t *anchor_view,
+                                          uint32_t crc32,
+                                          ternary_validation_patch_record_t *out_record)
+{
+    tensor_t *proxy_tensor = NULL;
+
+    if (!ctx || !tensor_name || !payload || !out_record || !ctx->spec || !ctx->spec->llm_model) {
+        return -1;
+    }
+
+    proxy_tensor = build_proxy_tensor_from_payload(payload, anchor_view);
+    if (!proxy_tensor) {
+        return -1;
+    }
+
+    return make_proxy_record_from_tensor(ctx, tensor_name, proxy_tensor, crc32, out_record);
 }
 
 static int make_proxy_record(inference_context_t *ctx,
@@ -380,18 +525,10 @@ static int make_proxy_record(inference_context_t *ctx,
                              uint32_t crc32,
                              ternary_validation_patch_record_t *out_record)
 {
-    llm_model_t *model = NULL;
-    tensor_t **slot = NULL;
     tensor_t *proxy_tensor = NULL;
 
     if (!ctx || !tensor_name || !result || !out_record || !ctx->spec || !ctx->spec->llm_model) {
         return -1;
-    }
-
-    model = (llm_model_t *)ctx->spec->llm_model;
-    slot = resolve_tensor_slot(model, ctx->spec, tensor_name);
-    if (!slot || !*slot) {
-        return 0;
     }
 
     proxy_tensor = build_proxy_tensor_from_ternary(result);
@@ -399,14 +536,80 @@ static int make_proxy_record(inference_context_t *ctx,
         return -1;
     }
 
-    memset(out_record, 0, sizeof(*out_record));
-    memcpy(out_record->tensor_name, tensor_name, strlen(tensor_name) + 1u);
-    out_record->slot = slot;
-    out_record->original_tensor = *slot;
-    out_record->proxy_tensor = proxy_tensor;
-    out_record->crc32 = crc32;
-    *slot = proxy_tensor;
-    return 1;
+    return make_proxy_record_from_tensor(ctx, tensor_name, proxy_tensor, crc32, out_record);
+}
+
+static int make_proxy_record_from_dense(inference_context_t *ctx,
+                                        const char *tensor_name,
+                                        const ternary_validation_dense_view_t *view,
+                                        uint32_t crc32,
+                                        ternary_validation_patch_record_t *out_record)
+{
+    tensor_t *proxy_tensor = NULL;
+
+    if (!ctx || !tensor_name || !view || !view->weights || !out_record || !ctx->spec || !ctx->spec->llm_model) {
+        return -1;
+    }
+
+    proxy_tensor = build_proxy_tensor_from_dense(view->weights, view->rows, view->cols);
+    if (!proxy_tensor) {
+        return -1;
+    }
+
+    return make_proxy_record_from_tensor(ctx, tensor_name, proxy_tensor, crc32, out_record);
+}
+
+static int make_proxy_record_from_bf16(inference_context_t *ctx,
+                                       const char *tensor_name,
+                                       const ternary_validation_bf16_view_t *view,
+                                       uint32_t crc32,
+                                       ternary_validation_patch_record_t *out_record)
+{
+    tensor_t *proxy_tensor = NULL;
+
+    if (!ctx || !tensor_name || !view || !view->weights || !out_record || !ctx->spec || !ctx->spec->llm_model) {
+        return -1;
+    }
+
+    proxy_tensor = build_proxy_tensor_from_bf16(view->weights, view->rows, view->cols);
+    if (!proxy_tensor) {
+        return -1;
+    }
+
+    return make_proxy_record_from_tensor(ctx, tensor_name, proxy_tensor, crc32, out_record);
+}
+
+static int finish_proxy_application(ternary_validation_state_t *state,
+                                    const char *tensor_name,
+                                    uint32_t crc32,
+                                    int converted_count,
+                                    int make_record_rc,
+                                    ternary_validation_patch_record_t *record)
+{
+    if (!state || !record) {
+        return -1;
+    }
+    if (make_record_rc <= 0) {
+        return make_record_rc;
+    }
+
+    if (store_validation_patch_record(state, record) != 0) {
+        if (record->slot) {
+            *record->slot = record->original_tensor;
+        }
+        tensor_release(record->proxy_tensor);
+        return -1;
+    }
+
+    memcpy(state->last_tensor_name, tensor_name, strlen(tensor_name) + 1u);
+    state->last_crc32 = crc32;
+
+    if (state->config.validate_every_n > 0 &&
+        converted_count > 0 &&
+        (converted_count % state->config.validate_every_n) == 0) {
+        return run_checkpoint(state, converted_count);
+    }
+    return 0;
 }
 
 int ternary_validation_capture_proxy_record(inference_context_t *ctx,
@@ -482,27 +685,72 @@ int ternary_validation_apply_proxy_from_payload(ternary_validation_state_t *stat
         return 0;
     }
 
-    rc = make_proxy_record_from_payload(state->ctx, tensor_name, payload, crc32, &record);
-    if (rc <= 0) {
-        return rc;
-    }
-    if (store_validation_patch_record(state, &record) != 0) {
-        if (record.slot) {
-            *record.slot = record.original_tensor;
-        }
-        tensor_release(record.proxy_tensor);
+    rc = make_proxy_record_from_payload(state->ctx, tensor_name, payload, NULL, crc32, &record);
+    return finish_proxy_application(state, tensor_name, crc32, converted_count, rc, &record);
+}
+
+int ternary_validation_apply_proxy_from_hybrid_payload(ternary_validation_state_t *state,
+                                                       const char *tensor_name,
+                                                       const ternary_layer_payload_t *payload,
+                                                       const ternary_anchor_view_t *anchor_view,
+                                                       uint32_t crc32,
+                                                       int converted_count)
+{
+    ternary_validation_patch_record_t record;
+    int rc = 0;
+
+    if (!state || !tensor_name || !payload || !anchor_view ||
+        !state->ctx || !state->ctx->spec || !state->ctx->spec->llm_model) {
         return -1;
     }
-
-    memcpy(state->last_tensor_name, tensor_name, strlen(tensor_name) + 1u);
-    state->last_crc32 = crc32;
-
-    if (state->config.validate_every_n > 0 &&
-        converted_count > 0 &&
-        (converted_count % state->config.validate_every_n) == 0) {
-        return run_checkpoint(state, converted_count);
+    if (state->config.sample_count <= 0) {
+        return 0;
     }
-    return 0;
+
+    rc = make_proxy_record_from_payload(state->ctx, tensor_name, payload, anchor_view, crc32, &record);
+    return finish_proxy_application(state, tensor_name, crc32, converted_count, rc, &record);
+}
+
+int ternary_validation_apply_proxy_from_dense(ternary_validation_state_t *state,
+                                              const char *tensor_name,
+                                              const ternary_validation_dense_view_t *view,
+                                              uint32_t crc32,
+                                              int converted_count)
+{
+    ternary_validation_patch_record_t record;
+    int rc = 0;
+
+    if (!state || !tensor_name || !view || !view->weights ||
+        !state->ctx || !state->ctx->spec || !state->ctx->spec->llm_model) {
+        return -1;
+    }
+    if (state->config.sample_count <= 0) {
+        return 0;
+    }
+
+    rc = make_proxy_record_from_dense(state->ctx, tensor_name, view, crc32, &record);
+    return finish_proxy_application(state, tensor_name, crc32, converted_count, rc, &record);
+}
+
+int ternary_validation_apply_proxy_from_bf16(ternary_validation_state_t *state,
+                                             const char *tensor_name,
+                                             const ternary_validation_bf16_view_t *view,
+                                             uint32_t crc32,
+                                             int converted_count)
+{
+    ternary_validation_patch_record_t record;
+    int rc = 0;
+
+    if (!state || !tensor_name || !view || !view->weights ||
+        !state->ctx || !state->ctx->spec || !state->ctx->spec->llm_model) {
+        return -1;
+    }
+    if (state->config.sample_count <= 0) {
+        return 0;
+    }
+
+    rc = make_proxy_record_from_bf16(state->ctx, tensor_name, view, crc32, &record);
+    return finish_proxy_application(state, tensor_name, crc32, converted_count, rc, &record);
 }
 
 int ternary_validation_adopt_patch_records(ternary_validation_state_t *state,
@@ -698,26 +946,7 @@ int ternary_validation_apply_proxy(ternary_validation_state_t *state,
     }
 
     rc = make_proxy_record(state->ctx, tensor_name, result, crc32, &record);
-    if (rc <= 0) {
-        return rc;
-    }
-    if (store_validation_patch_record(state, &record) != 0) {
-        if (record.slot) {
-            *record.slot = record.original_tensor;
-        }
-        tensor_release(record.proxy_tensor);
-        return -1;
-    }
-
-    memcpy(state->last_tensor_name, tensor_name, strlen(tensor_name) + 1u);
-    state->last_crc32 = crc32;
-
-    if (state->config.validate_every_n > 0 &&
-        converted_count > 0 &&
-        (converted_count % state->config.validate_every_n) == 0) {
-        return run_checkpoint(state, converted_count);
-    }
-    return 0;
+    return finish_proxy_application(state, tensor_name, crc32, converted_count, rc, &record);
 }
 
 int ternary_validation_finish(ternary_validation_state_t *state,

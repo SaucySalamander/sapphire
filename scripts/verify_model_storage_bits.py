@@ -37,6 +37,20 @@ from typing import Iterable
 
 TERNARY_PACKED_WEIGHTS_PER_BYTE = 4
 TERNARY_SYMBOL_CODES = (0, 1, 2)
+ANCHOR_MAGIC = 0x414E4331
+ANCHOR_VERSION = 1
+ANCHOR_SAFETENSORS_VERSION = 2
+ANCHOR_METADATA_STRUCT = struct.Struct("<IIIIIIIIIfffII")
+PACKAGE_STORAGE_ENCODING = "mixed_bf16_ternary_2bit"
+PACKAGE_FEATURE_CONTRACT_KEY = "sapphire_hybrid_feature_contract"
+PACKAGE_FEATURE_CONTRACT_VALUE = "anchor-bearing-v1"
+PACKAGE_FORMAT_VERSION_KEY = "sapphire_hybrid_package_format_version"
+PACKAGE_FORMAT_VERSION_VALUE = 1
+PACKAGE_STORAGE_ENCODING_KEY = "sapphire_hybrid_storage_encoding"
+MANIFEST_FORM_BULK = 1 << 0
+MANIFEST_FORM_MOLD = 1 << 1
+MANIFEST_FORM_LEGACY_ANCHOR = 1 << 2
+MANIFEST_FORM_UNIFIED_ANCHOR = 1 << 3
 SUPPORTED_MODEL_DTYPES = {
     "U8": 8,
     "I8": 8,
@@ -51,7 +65,7 @@ SUPPORTED_MODEL_DTYPES = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass
 class TernaryManifestEntry:
     name: str
     file_name: str
@@ -59,10 +73,31 @@ class TernaryManifestEntry:
     cols: int
     packed_weight_bytes: int
     crc32: int
+    kind: str = "ternary"
+    groups_per_row: int = 1
+    scale_group_size: int = 0
+    anchor_file_name: str | None = None
+    anchor_count: int = 0
 
     @property
     def weight_count(self) -> int:
         return self.rows * self.cols
+
+    @property
+    def packed_cols(self) -> int:
+        return (self.cols + TERNARY_PACKED_WEIGHTS_PER_BYTE - 1) // TERNARY_PACKED_WEIGHTS_PER_BYTE
+
+    @property
+    def packed_shape(self) -> tuple[int, ...]:
+        return (self.rows, self.packed_cols)
+
+    @property
+    def scale_shape(self) -> tuple[int, ...]:
+        return (self.rows,) if self.groups_per_row == 1 else (self.rows, self.groups_per_row)
+
+    @property
+    def scale_bytes(self) -> int:
+        return self.rows * self.groups_per_row * 4
 
 
 @dataclass(frozen=True)
@@ -86,9 +121,61 @@ class ModelTensorStats:
     bits_per_element: float
 
 
+@dataclass(frozen=True)
+class HybridPackageMetadata:
+    mixed_precision_anchors: bool
+    anchor_budget_ppm: int
+    format_version: int
+    feature_contract: str
+    storage_encoding: str
+
+
 def _read_json(path: Path) -> OrderedDict:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle, object_pairs_hook=OrderedDict)
+
+
+def _metadata_int(metadata: object, key: str) -> int | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Invalid metadata value for {key}: {value!r}")
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        return int(value)
+    raise ValueError(f"Invalid metadata value for {key}: {value!r}")
+
+
+def _metadata_bool(metadata: object, key: str) -> bool | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    raise ValueError(f"Invalid metadata value for {key}: {value!r}")
+
+
+def _metadata_str(metadata: object, key: str) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str) and value:
+        return value
+    raise ValueError(f"Invalid metadata value for {key}: {value!r}")
 
 
 def _read_safetensors_header(path: Path) -> tuple[OrderedDict, int]:
@@ -132,12 +219,52 @@ def _payload_meta(path: Path, header: OrderedDict, tensor_name: str, suffix: str
     return meta
 
 
+def _read_ternary_payload_layout(payload_path: Path,
+                                 tensor_name: str,
+                                 rows: int,
+                                 cols: int) -> tuple[int, int]:
+    header, _ = _read_safetensors_header(payload_path)
+    scales_meta = _payload_meta(payload_path, header, tensor_name, "scales")
+    scales_shape = _tensor_shape(scales_meta, payload_path)
+    metadata = header.get("__metadata__")
+
+    if len(scales_shape) == 1:
+        if scales_shape != (rows,):
+            raise ValueError(f"Scale payload shape mismatch for {tensor_name}: {scales_shape}")
+        groups_per_row = 1
+    elif len(scales_shape) == 2:
+        if scales_shape[0] != rows or scales_shape[1] <= 0:
+            raise ValueError(f"Grouped scale payload shape mismatch for {tensor_name}: {scales_shape}")
+        groups_per_row = int(scales_shape[1])
+    else:
+        raise ValueError(f"Unsupported scale payload rank for {tensor_name}: {scales_shape}")
+
+    metadata_groups = _metadata_int(metadata, f"{tensor_name}.groups_per_row")
+    if metadata_groups is not None:
+        if metadata_groups != groups_per_row:
+            raise ValueError(
+                f"Grouped scale metadata mismatch for {tensor_name}: metadata={metadata_groups} shape={groups_per_row}"
+            )
+        groups_per_row = metadata_groups
+
+    scale_group_size = _metadata_int(metadata, f"{tensor_name}.scale_group_size")
+    if scale_group_size is None:
+        scale_group_size = math.ceil(cols / groups_per_row)
+    if scale_group_size <= 0 or math.ceil(cols / scale_group_size) != groups_per_row:
+        raise ValueError(
+            f"Invalid grouped scale layout for {tensor_name}: cols={cols} groups={groups_per_row} group_size={scale_group_size}"
+        )
+
+    return groups_per_row, scale_group_size
+
+
 def _read_manifest(artifact_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
     manifest_path = artifact_dir / "manifest.tsv"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Missing ternary manifest: {manifest_path}")
 
     entries: OrderedDict[str, TernaryManifestEntry] = OrderedDict()
+    entry_forms: dict[str, int] = {}
     with manifest_path.open("r", encoding="utf-8") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
             line = raw_line.strip()
@@ -148,19 +275,37 @@ def _read_manifest(artifact_dir: Path) -> OrderedDict[str, TernaryManifestEntry]
             if len(parts) == 6:
                 name, file_name, rows, cols, packed_bytes, crc32 = parts
                 kind = "ternary"
+                anchor_file_name = None
+                anchor_count = 0
+                form = MANIFEST_FORM_BULK
             elif len(parts) == 7:
                 name, file_name, rows, cols, packed_bytes, crc32, kind = parts
                 if kind not in {"mold"}:
                     raise ValueError(
                         f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}"
                     )
+                anchor_file_name = None
+                anchor_count = 0
+                form = MANIFEST_FORM_MOLD
+            elif len(parts) == 8:
+                name, anchor_file_name, rows, cols, packed_bytes, crc32, kind, anchor_count = parts
+                if kind != "anchor":
+                    raise ValueError(
+                        f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}"
+                    )
+                file_name = ""
+                form = MANIFEST_FORM_LEGACY_ANCHOR
+            elif len(parts) == 9:
+                name, file_name, rows, cols, packed_bytes, crc32, kind, anchor_file_name, anchor_count = parts
+                if kind != "anchor":
+                    raise ValueError(
+                        f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}"
+                    )
+                form = MANIFEST_FORM_UNIFIED_ANCHOR
             else:
                 raise ValueError(
                     f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}"
                 )
-
-            if kind == "mold":
-                continue
 
             entry = TernaryManifestEntry(
                 name=name,
@@ -169,11 +314,71 @@ def _read_manifest(artifact_dir: Path) -> OrderedDict[str, TernaryManifestEntry]
                 cols=int(cols),
                 packed_weight_bytes=int(packed_bytes),
                 crc32=int(crc32, 16),
+                kind=kind,
+                anchor_file_name=anchor_file_name,
+                anchor_count=int(anchor_count),
             )
-            entries[entry.name] = entry
+
+            existing = entries.get(name)
+            if existing is None:
+                entries[name] = entry
+                entry_forms[name] = form
+                continue
+
+            existing_forms = entry_forms[name]
+            if (existing_forms & MANIFEST_FORM_MOLD) or (form & MANIFEST_FORM_MOLD):
+                raise ValueError(f"Invalid mixed or duplicate mold manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
+            if (existing_forms & MANIFEST_FORM_UNIFIED_ANCHOR) or (form & MANIFEST_FORM_UNIFIED_ANCHOR):
+                raise ValueError(
+                    f"Unified anchor manifest rows cannot be mixed with duplicates for {name} at {manifest_path}:{line_number}"
+                )
+            if form == MANIFEST_FORM_BULK and (existing_forms & MANIFEST_FORM_BULK):
+                raise ValueError(f"Duplicate ternary bulk manifest row for {name} at {manifest_path}:{line_number}")
+            if form == MANIFEST_FORM_LEGACY_ANCHOR and (existing_forms & MANIFEST_FORM_LEGACY_ANCHOR):
+                raise ValueError(f"Duplicate legacy anchor manifest row for {name} at {manifest_path}:{line_number}")
+            if entry.file_name:
+                if existing.file_name and existing.file_name != entry.file_name:
+                    raise ValueError(f"Conflicting bulk payload for {name} at {manifest_path}:{line_number}")
+                existing.file_name = entry.file_name
+                existing.crc32 = entry.crc32
+                existing.packed_weight_bytes = entry.packed_weight_bytes
+            if entry.anchor_file_name:
+                if existing.anchor_file_name and existing.anchor_file_name != entry.anchor_file_name:
+                    raise ValueError(f"Conflicting anchor payload for {name} at {manifest_path}:{line_number}")
+                existing.anchor_file_name = entry.anchor_file_name
+                existing.anchor_count = entry.anchor_count
+            if form == MANIFEST_FORM_LEGACY_ANCHOR or existing.kind == "anchor":
+                existing.kind = "anchor"
+            entry_forms[name] = existing_forms | form
 
     if not entries:
         raise RuntimeError(f"No ternary tensors found in {manifest_path}")
+
+    for entry in entries.values():
+        forms = entry_forms[entry.name]
+        if forms == MANIFEST_FORM_MOLD:
+            entry.kind = "mold"
+        elif forms == MANIFEST_FORM_BULK:
+            entry.kind = "ternary"
+        elif forms in {MANIFEST_FORM_UNIFIED_ANCHOR, MANIFEST_FORM_BULK | MANIFEST_FORM_LEGACY_ANCHOR}:
+            entry.kind = "anchor"
+        else:
+            raise ValueError(f"Incomplete or ambiguous manifest migration contract for {entry.name} in {manifest_path}")
+
+        if entry.kind in {"ternary", "anchor"}:
+            if not entry.file_name:
+                raise ValueError(f"Missing ternary bulk payload for {entry.name} in {manifest_path}")
+            payload_path = artifact_dir / entry.file_name
+            entry.groups_per_row, entry.scale_group_size = _read_ternary_payload_layout(
+                payload_path,
+                entry.name,
+                entry.rows,
+                entry.cols,
+            )
+        if entry.kind == "anchor":
+            if not entry.anchor_file_name or entry.anchor_count <= 0:
+                raise ValueError(f"Missing anchor payload metadata for {entry.name} in {manifest_path}")
+
     return entries
 
 
@@ -226,15 +431,13 @@ def _load_ternary_tensor_stats(artifact_dir: Path, entry: TernaryManifestEntry) 
 
     packed_shape = _tensor_shape(packed_meta, payload_path)
     scales_shape = _tensor_shape(scales_meta, payload_path)
-    expected_packed_cols = (entry.cols + TERNARY_PACKED_WEIGHTS_PER_BYTE - 1) // TERNARY_PACKED_WEIGHTS_PER_BYTE
-    expected_packed_shape = (entry.rows, expected_packed_cols)
-    if packed_shape != expected_packed_shape:
+    if packed_shape != entry.packed_shape:
         raise ValueError(
-            f"Packed payload shape mismatch for {entry.name}: expected {expected_packed_shape}, got {packed_shape}"
+            f"Packed payload shape mismatch for {entry.name}: expected {entry.packed_shape}, got {packed_shape}"
         )
-    if scales_shape != (entry.rows,):
+    if scales_shape != entry.scale_shape:
         raise ValueError(
-            f"Scale payload shape mismatch for {entry.name}: expected {(entry.rows,)}, got {scales_shape}"
+            f"Scale payload shape mismatch for {entry.name}: expected {entry.scale_shape}, got {scales_shape}"
         )
 
     packed_start, packed_end = _tensor_offsets(payload_path, packed_meta, data_start)
@@ -245,6 +448,10 @@ def _load_ternary_tensor_stats(artifact_dir: Path, entry: TernaryManifestEntry) 
     if packed_size != entry.packed_weight_bytes:
         raise ValueError(
             f"Packed byte count mismatch for {entry.name}: expected {entry.packed_weight_bytes}, got {packed_size}"
+        )
+    if scale_size != entry.scale_bytes:
+        raise ValueError(
+            f"Scale byte count mismatch for {entry.name}: expected {entry.scale_bytes}, got {scale_size}"
         )
 
     with payload_path.open("rb") as handle:
@@ -279,6 +486,199 @@ def _load_ternary_tensor_stats(artifact_dir: Path, entry: TernaryManifestEntry) 
         empirical_symbol_entropy_bits=empirical_symbol_entropy_bits,
         symbol_counts=symbol_counts,
     )
+
+
+def _read_anchor_budget_ppm(artifact_dir: Path, entry: TernaryManifestEntry) -> int:
+    if entry.kind != "anchor" or not entry.anchor_file_name:
+        return 0
+
+    anchor_path = artifact_dir / entry.anchor_file_name
+    if not anchor_path.is_file():
+        raise FileNotFoundError(f"Missing anchor payload: {anchor_path}")
+
+    if anchor_path.suffix == ".safetensors":
+        header, data_start = _read_safetensors_header(anchor_path)
+        metadata = header.get("__metadata__")
+        entries_meta = header.get(f"{entry.name}.anchor_entries")
+
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Missing anchor safetensors metadata: {anchor_path}")
+        if not isinstance(entries_meta, dict):
+            raise ValueError(f"Missing anchor_entries tensor for {entry.name}: {anchor_path}")
+        if entries_meta.get("dtype") != "U16":
+            raise ValueError(f"Unsupported anchor_entries dtype in {anchor_path}: {entries_meta.get('dtype')}")
+        if _tensor_shape(entries_meta, anchor_path) != (entry.anchor_count, 4):
+            raise ValueError(
+                f"Anchor entries shape mismatch for {entry.name}: expected {(entry.anchor_count, 4)}, got {_tensor_shape(entries_meta, anchor_path)}"
+            )
+
+        start, end = _tensor_offsets(anchor_path, entries_meta, data_start)
+        if end - start != entry.anchor_count * 8:
+            raise ValueError(
+                f"Anchor entries byte count mismatch for {entry.name}: expected {entry.anchor_count * 8}, got {end - start}"
+            )
+
+        format_version = _metadata_int(metadata, "format_version")
+        rows = _metadata_int(metadata, "rows")
+        cols = _metadata_int(metadata, "cols")
+        anchor_count = _metadata_int(metadata, "anchor_count")
+        budget_ppm = _metadata_int(metadata, "budget_ppm")
+        value_dtype = _metadata_str(metadata, "value_dtype")
+        tensor_name = _metadata_str(metadata, "tensor_name")
+
+        if format_version != ANCHOR_SAFETENSORS_VERSION:
+            raise ValueError(f"Unsupported anchor safetensors format version in {anchor_path}: {format_version}")
+        if rows != entry.rows or cols != entry.cols or anchor_count != entry.anchor_count:
+            raise ValueError(f"Anchor safetensors metadata mismatch for {entry.name}: {anchor_path}")
+        if value_dtype != "BF16":
+            raise ValueError(f"Unsupported anchor value dtype in {anchor_path}: {value_dtype!r}")
+        if tensor_name != entry.name:
+            raise ValueError(f"Anchor safetensors tensor_name mismatch for {entry.name}: {anchor_path}")
+        if budget_ppm is None:
+            raise ValueError(f"Missing anchor budget metadata in {anchor_path}")
+
+        return int(budget_ppm)
+
+    with anchor_path.open("rb") as anchor_file:
+        header = anchor_file.read(ANCHOR_METADATA_STRUCT.size)
+    if len(header) != ANCHOR_METADATA_STRUCT.size:
+        raise ValueError(f"Truncated anchor payload header: {anchor_path}")
+
+    (
+        magic,
+        version,
+        rows,
+        cols,
+        anchor_count,
+        _scale_group_size,
+        _groups_per_row,
+        _saliency_mode,
+        budget_ppm,
+        _saliency_cutoff,
+        _anchor_value_rms,
+        _bulk_gamma_mean,
+        _max_row_nnz,
+        _crc32,
+    ) = ANCHOR_METADATA_STRUCT.unpack(header)
+
+    if magic != ANCHOR_MAGIC or version != ANCHOR_VERSION:
+        raise ValueError(f"Invalid anchor payload header: {anchor_path}")
+    if rows != entry.rows or cols != entry.cols or anchor_count != entry.anchor_count:
+        raise ValueError(f"Anchor payload metadata mismatch for {entry.name}: {anchor_path}")
+    return int(budget_ppm)
+
+
+def _load_package_sidecar_metadata(model_dir: Path) -> OrderedDict:
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        index_data = _read_json(index_path)
+        metadata = index_data.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Invalid metadata in {index_path}")
+        return OrderedDict(metadata)
+
+    shard_path = model_dir / "model.safetensors"
+    if not shard_path.is_file():
+        shard_path = _iter_model_shards(model_dir)[0]
+
+    header, _ = _read_safetensors_header(shard_path)
+    metadata = header.get("__metadata__")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Missing __metadata__ in {shard_path}")
+    return OrderedDict(metadata)
+
+
+def _load_package_config(model_dir: Path) -> OrderedDict:
+    config_path = model_dir / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Missing config.json: {config_path}")
+    config = _read_json(config_path)
+    if not isinstance(config, dict):
+        raise ValueError(f"Invalid config.json payload: {config_path}")
+    return config
+
+
+def _parse_hybrid_config_metadata(metadata: OrderedDict, source: str) -> HybridPackageMetadata:
+    mixed_precision_anchors = _metadata_bool(metadata, "sapphire_mixed_precision_anchors")
+    anchor_budget_ppm = _metadata_int(metadata, "sapphire_anchor_budget_ppm")
+    format_version = _metadata_int(metadata, PACKAGE_FORMAT_VERSION_KEY)
+    feature_contract = _metadata_str(metadata, PACKAGE_FEATURE_CONTRACT_KEY)
+    storage_encoding = _metadata_str(metadata, PACKAGE_STORAGE_ENCODING_KEY)
+
+    if mixed_precision_anchors is not True:
+        raise ValueError(f"{source} is missing sapphire_mixed_precision_anchors=true")
+    if anchor_budget_ppm is None or anchor_budget_ppm <= 0:
+        raise ValueError(f"{source} is missing a positive sapphire_anchor_budget_ppm")
+    if format_version != PACKAGE_FORMAT_VERSION_VALUE:
+        raise ValueError(f"{source} has unsupported {PACKAGE_FORMAT_VERSION_KEY}: {format_version!r}")
+    if feature_contract != PACKAGE_FEATURE_CONTRACT_VALUE:
+        raise ValueError(f"{source} has unsupported {PACKAGE_FEATURE_CONTRACT_KEY}: {feature_contract!r}")
+    if storage_encoding != PACKAGE_STORAGE_ENCODING:
+        raise ValueError(f"{source} has unsupported {PACKAGE_STORAGE_ENCODING_KEY}: {storage_encoding!r}")
+
+    return HybridPackageMetadata(
+        mixed_precision_anchors=True,
+        anchor_budget_ppm=anchor_budget_ppm,
+        format_version=format_version,
+        feature_contract=feature_contract,
+        storage_encoding=storage_encoding,
+    )
+
+
+def _parse_hybrid_sidecar_metadata(metadata: OrderedDict, source: str) -> HybridPackageMetadata:
+    package_metadata = _parse_hybrid_config_metadata(metadata, source)
+    package_storage_encoding = _metadata_str(metadata, "storage_encoding")
+    ternary_manifest = _metadata_str(metadata, "ternary_manifest")
+
+    if package_storage_encoding != PACKAGE_STORAGE_ENCODING:
+        raise ValueError(f"{source} has unsupported storage_encoding: {package_storage_encoding!r}")
+    if ternary_manifest != "manifest.tsv":
+        raise ValueError(f"{source} has unsupported ternary_manifest: {ternary_manifest!r}")
+    return package_metadata
+
+
+def _validate_hybrid_package_metadata(model_dir: Path,
+                                      entries: list[TernaryManifestEntry]) -> HybridPackageMetadata | None:
+    anchor_entries = [entry for entry in entries if entry.kind == "anchor"]
+    config = _load_package_config(model_dir)
+
+    if not anchor_entries:
+        stray_keys = [
+            key
+            for key in (
+                "sapphire_mixed_precision_anchors",
+                "sapphire_anchor_budget_ppm",
+                PACKAGE_FORMAT_VERSION_KEY,
+                PACKAGE_FEATURE_CONTRACT_KEY,
+                PACKAGE_STORAGE_ENCODING_KEY,
+            )
+            if key in config
+        ]
+        if stray_keys:
+            raise ValueError(
+                "Non-anchor package advertises hybrid capability metadata in config.json: " + ", ".join(stray_keys)
+            )
+        return None
+
+    budgets = sorted({_read_anchor_budget_ppm(model_dir, entry) for entry in anchor_entries})
+    if len(budgets) != 1 or budgets[0] <= 0:
+        raise ValueError(f"Anchor-bearing package has inconsistent or missing budget metadata: {budgets}")
+
+    config_metadata = _parse_hybrid_config_metadata(config, f"{model_dir / 'config.json'}")
+    sidecar_metadata = _parse_hybrid_sidecar_metadata(_load_package_sidecar_metadata(model_dir), str(model_dir))
+
+    if config_metadata.anchor_budget_ppm != budgets[0]:
+        raise ValueError(
+            f"config.json sapphire_anchor_budget_ppm={config_metadata.anchor_budget_ppm} does not match payload budget {budgets[0]}"
+        )
+    if sidecar_metadata.anchor_budget_ppm != budgets[0]:
+        raise ValueError(
+            f"Model package metadata sapphire_anchor_budget_ppm={sidecar_metadata.anchor_budget_ppm} does not match payload budget {budgets[0]}"
+        )
+    if config_metadata != sidecar_metadata:
+        raise ValueError("config.json hybrid metadata does not match package header/index metadata")
+
+    return config_metadata
 
 
 def _weighted_average(items: Iterable[tuple[int, float]]) -> float:
@@ -495,8 +895,8 @@ def _print_model_report(model_dir: Path,
 def _print_mixed_model_report(model_dir: Path,
                               tensor_stats: list[ModelTensorStats],
                               ternary_stats: list[TernaryTensorStats],
+                              hybrid_metadata: HybridPackageMetadata | None,
                               expect_max_bits: float | None) -> int:
-    ternary_names = {item.name for item in ternary_stats}
     total_physical_bytes = sum(item.data_bytes for item in tensor_stats)
     passthrough_logical_weights = sum(
         item.element_count
@@ -514,7 +914,10 @@ def _print_mixed_model_report(model_dir: Path,
     for item in tensor_stats:
         dtype_totals[item.dtype] += item.data_bytes
 
-    print("artifact_type: mixed_safetensors_model_package")
+    if hybrid_metadata is not None:
+        print("artifact_type: anchor_bearing_mixed_safetensors_model_package")
+    else:
+        print("artifact_type: mixed_safetensors_model_package")
     print(f"artifact_dir: {model_dir}")
     print(f"physical_tensor_count: {len(tensor_stats)}")
     print(f"ternary_logical_tensor_count: {len(ternary_stats)}")
@@ -530,6 +933,13 @@ def _print_mixed_model_report(model_dir: Path,
     for dtype, count in sorted(dtype_totals.items()):
         print(f"  {dtype}: {_format_ratio(count, total_physical_bytes)}")
     print(f"logical_ternary_weight_share: {_format_ratio(ternary_logical_weights, total_logical_weights)}")
+    if hybrid_metadata is not None:
+        print("hybrid_capability_metadata:")
+        print(f"  sapphire_mixed_precision_anchors: {str(hybrid_metadata.mixed_precision_anchors).lower()}")
+        print(f"  sapphire_anchor_budget_ppm: {hybrid_metadata.anchor_budget_ppm}")
+        print(f"  {PACKAGE_FORMAT_VERSION_KEY}: {hybrid_metadata.format_version}")
+        print(f"  {PACKAGE_FEATURE_CONTRACT_KEY}: {hybrid_metadata.feature_contract}")
+        print(f"  {PACKAGE_STORAGE_ENCODING_KEY}: {hybrid_metadata.storage_encoding}")
 
     if expect_max_bits is None:
         return 0
@@ -602,7 +1012,14 @@ def main() -> int:
             ternary_entries,
             show_progress=_resolve_progress_setting(args.show_progress),
         )
-        return _print_mixed_model_report(artifact_dir, model_tensor_stats, ternary_stats, args.expect_max_bits)
+        hybrid_metadata = _validate_hybrid_package_metadata(artifact_dir, ternary_entries)
+        return _print_mixed_model_report(
+            artifact_dir,
+            model_tensor_stats,
+            ternary_stats,
+            hybrid_metadata,
+            args.expect_max_bits,
+        )
 
     if ternary_entries is not None:
         entries = list(_read_manifest(artifact_dir).values())

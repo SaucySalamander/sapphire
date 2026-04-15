@@ -80,6 +80,9 @@ static size_t checkpoint_payload_size(const ternary_student_update_checkpoint_t 
     size += sizeof("alignment_manifest_crc32\t00000000\n") - 1u;
     size += sizeof("alignment_tape_path\t\n") - 1u + text_len(checkpoint->alignment_tape_path);
     size += sizeof("alignment_tape_provenance_hash\t00000000\n") - 1u;
+    size += sizeof("use_anchor_mode\t4294967295\n") - 1u;
+    size += sizeof("anchor_budget_ppm\t4294967295\n") - 1u;
+    size += sizeof("anchor_saliency_mode\t4294967295\n") - 1u;
     size += sizeof("calibration_corpus_path\t\n") - 1u + text_len(checkpoint->calibration_corpus_path);
     size += sizeof("calibration_corpus_manifest_path\t\n") - 1u + text_len(checkpoint->calibration_corpus_manifest_path);
     size += sizeof("validation_corpus_path\t\n") - 1u + text_len(checkpoint->validation_corpus_path);
@@ -90,7 +93,6 @@ static size_t checkpoint_payload_size(const ternary_student_update_checkpoint_t 
     size += sizeof("converted_tensor_count\t4294967295\n") - 1u;
     size += sizeof("checkpoint_every_n_layers\t4294967295\n") - 1u;
     size += sizeof("validate_every_n\t4294967295\n") - 1u;
-    size += sizeof("checkpoint_crc32\t00000000\n") - 1u;
     return size;
 }
 
@@ -128,6 +130,9 @@ static int build_checkpoint_payload(const ternary_student_update_checkpoint_t *c
         append_hex32_line(&cursor, &remaining, "alignment_manifest_crc32", checkpoint->alignment_manifest_crc32) != 0 ||
         append_line(&cursor, &remaining, "alignment_tape_path", checkpoint->alignment_tape_path) != 0 ||
         append_hex32_line(&cursor, &remaining, "alignment_tape_provenance_hash", checkpoint->alignment_tape_provenance_hash) != 0 ||
+        append_u32_line(&cursor, &remaining, "use_anchor_mode", checkpoint->use_anchor_mode) != 0 ||
+        append_u32_line(&cursor, &remaining, "anchor_budget_ppm", checkpoint->anchor_budget_ppm) != 0 ||
+        append_u32_line(&cursor, &remaining, "anchor_saliency_mode", checkpoint->anchor_saliency_mode) != 0 ||
         append_line(&cursor, &remaining, "calibration_corpus_path", checkpoint->calibration_corpus_path) != 0 ||
         append_line(&cursor, &remaining, "calibration_corpus_manifest_path", checkpoint->calibration_corpus_manifest_path) != 0 ||
         append_line(&cursor, &remaining, "validation_corpus_path", checkpoint->validation_corpus_path) != 0 ||
@@ -144,7 +149,7 @@ static int build_checkpoint_payload(const ternary_student_update_checkpoint_t *c
 
     *cursor = '\0';
     *out_payload = payload;
-    *out_payload_size = payload_size;
+    *out_payload_size = (size_t)(cursor - payload);
     return 0;
 }
 
@@ -222,88 +227,139 @@ static int copy_line_field(char *dst, size_t dst_size, const char *value)
     return 0;
 }
 
-static int parse_checkpoint_line(ternary_student_update_checkpoint_t *checkpoint,
-                                 const char *key,
-                                 const char *value,
-                                 uint32_t *stored_crc32,
-                                 int *seen_crc32)
+static int parse_checkpoint_text_field_local(ternary_student_update_checkpoint_t *checkpoint,
+                                             const char *key,
+                                             const char *value)
 {
-    if (!checkpoint || !key || !value || !stored_crc32 || !seen_crc32) {
-        return -1;
-    }
-
-    if (strcmp(key, "checkpoint_version") == 0) {
-        return parse_u32_value(value, &checkpoint->schema_version);
-    }
-    if (strcmp(key, "config_hash") == 0) {
-        return parse_hex_u32_value(value, &checkpoint->config_hash);
-    }
     if (strcmp(key, "model_name") == 0) {
-        return copy_line_field(checkpoint->model_name, sizeof(checkpoint->model_name), value);
+        return copy_line_field(checkpoint->model_name, sizeof(checkpoint->model_name), value) == 0 ? 1 : -1;
     }
     if (strcmp(key, "teacher_model_name") == 0) {
-        return copy_line_field(checkpoint->teacher_model_name, sizeof(checkpoint->teacher_model_name), value);
+        return copy_line_field(checkpoint->teacher_model_name, sizeof(checkpoint->teacher_model_name), value) == 0 ? 1 : -1;
     }
     if (strcmp(key, "output_dir") == 0) {
-        return copy_line_field(checkpoint->output_dir, sizeof(checkpoint->output_dir), value);
+        return copy_line_field(checkpoint->output_dir, sizeof(checkpoint->output_dir), value) == 0 ? 1 : -1;
     }
     if (strcmp(key, "activation_tape_path") == 0) {
-        return copy_line_field(checkpoint->activation_tape_path, sizeof(checkpoint->activation_tape_path), value);
+        return copy_line_field(checkpoint->activation_tape_path, sizeof(checkpoint->activation_tape_path), value) == 0 ? 1 : -1;
     }
     if (strcmp(key, "hessian_sidecar_path") == 0) {
-        return copy_line_field(checkpoint->hessian_sidecar_path, sizeof(checkpoint->hessian_sidecar_path), value);
-    }
-    if (strcmp(key, "hessian_sidecar_crc32") == 0) {
-        return parse_hex_u32_value(value, &checkpoint->hessian_sidecar_crc32);
+        return copy_line_field(checkpoint->hessian_sidecar_path, sizeof(checkpoint->hessian_sidecar_path), value) == 0 ? 1 : -1;
     }
     if (strcmp(key, "alignment_manifest_path") == 0) {
-        return copy_line_field(checkpoint->alignment_manifest_path, sizeof(checkpoint->alignment_manifest_path), value);
-    }
-    if (strcmp(key, "alignment_manifest_crc32") == 0) {
-        return parse_hex_u32_value(value, &checkpoint->alignment_manifest_crc32);
+        return copy_line_field(checkpoint->alignment_manifest_path, sizeof(checkpoint->alignment_manifest_path), value) == 0 ? 1 : -1;
     }
     if (strcmp(key, "alignment_tape_path") == 0) {
-        return copy_line_field(checkpoint->alignment_tape_path, sizeof(checkpoint->alignment_tape_path), value);
-    }
-    if (strcmp(key, "alignment_tape_provenance_hash") == 0) {
-        return parse_hex_u32_value(value, &checkpoint->alignment_tape_provenance_hash);
+        return copy_line_field(checkpoint->alignment_tape_path, sizeof(checkpoint->alignment_tape_path), value) == 0 ? 1 : -1;
     }
     if (strcmp(key, "calibration_corpus_path") == 0) {
-        return copy_line_field(checkpoint->calibration_corpus_path, sizeof(checkpoint->calibration_corpus_path), value);
+        return copy_line_field(checkpoint->calibration_corpus_path, sizeof(checkpoint->calibration_corpus_path), value) == 0 ? 1 : -1;
     }
     if (strcmp(key, "calibration_corpus_manifest_path") == 0) {
-        return copy_line_field(checkpoint->calibration_corpus_manifest_path, sizeof(checkpoint->calibration_corpus_manifest_path), value);
+        return copy_line_field(checkpoint->calibration_corpus_manifest_path, sizeof(checkpoint->calibration_corpus_manifest_path), value) == 0 ? 1 : -1;
     }
     if (strcmp(key, "validation_corpus_path") == 0) {
-        return copy_line_field(checkpoint->validation_corpus_path, sizeof(checkpoint->validation_corpus_path), value);
+        return copy_line_field(checkpoint->validation_corpus_path, sizeof(checkpoint->validation_corpus_path), value) == 0 ? 1 : -1;
     }
     if (strcmp(key, "validation_corpus_manifest_path") == 0) {
-        return copy_line_field(checkpoint->validation_corpus_manifest_path, sizeof(checkpoint->validation_corpus_manifest_path), value);
+        return copy_line_field(checkpoint->validation_corpus_manifest_path, sizeof(checkpoint->validation_corpus_manifest_path), value) == 0 ? 1 : -1;
     }
-    if (strcmp(key, "total_layer_count") == 0) {
-        return parse_u32_value(value, &checkpoint->total_layer_count);
+
+    return 0;
+}
+
+static int parse_checkpoint_hex_field_local(ternary_student_update_checkpoint_t *checkpoint,
+                                            const char *key,
+                                            const char *value,
+                                            uint32_t *stored_crc32,
+                                            int *seen_crc32)
+{
+    if (strcmp(key, "config_hash") == 0) {
+        return parse_hex_u32_value(value, &checkpoint->config_hash) == 0 ? 1 : -1;
     }
-    if (strcmp(key, "next_layer_index") == 0) {
-        return parse_u32_value(value, &checkpoint->next_layer_index);
+    if (strcmp(key, "hessian_sidecar_crc32") == 0) {
+        return parse_hex_u32_value(value, &checkpoint->hessian_sidecar_crc32) == 0 ? 1 : -1;
     }
-    if (strcmp(key, "last_completed_layer") == 0) {
-        return parse_u32_value(value, &checkpoint->last_completed_layer);
+    if (strcmp(key, "alignment_manifest_crc32") == 0) {
+        return parse_hex_u32_value(value, &checkpoint->alignment_manifest_crc32) == 0 ? 1 : -1;
     }
-    if (strcmp(key, "converted_tensor_count") == 0) {
-        return parse_u32_value(value, &checkpoint->converted_tensor_count);
-    }
-    if (strcmp(key, "checkpoint_every_n_layers") == 0) {
-        return parse_u32_value(value, &checkpoint->checkpoint_every_n_layers);
-    }
-    if (strcmp(key, "validate_every_n") == 0) {
-        return parse_u32_value(value, &checkpoint->validate_every_n);
+    if (strcmp(key, "alignment_tape_provenance_hash") == 0) {
+        return parse_hex_u32_value(value, &checkpoint->alignment_tape_provenance_hash) == 0 ? 1 : -1;
     }
     if (strcmp(key, "checkpoint_crc32") == 0) {
         if (parse_hex_u32_value(value, stored_crc32) != 0) {
             return -1;
         }
         *seen_crc32 = 1;
-        return 0;
+        return 1;
+    }
+
+    return 0;
+}
+
+static int parse_checkpoint_u32_field_local(ternary_student_update_checkpoint_t *checkpoint,
+                                            const char *key,
+                                            const char *value)
+{
+    if (strcmp(key, "checkpoint_version") == 0) {
+        return parse_u32_value(value, &checkpoint->schema_version) == 0 ? 1 : -1;
+    }
+    if (strcmp(key, "use_anchor_mode") == 0) {
+        return parse_u32_value(value, &checkpoint->use_anchor_mode) == 0 ? 1 : -1;
+    }
+    if (strcmp(key, "anchor_budget_ppm") == 0) {
+        return parse_u32_value(value, &checkpoint->anchor_budget_ppm) == 0 ? 1 : -1;
+    }
+    if (strcmp(key, "anchor_saliency_mode") == 0) {
+        return parse_u32_value(value, &checkpoint->anchor_saliency_mode) == 0 ? 1 : -1;
+    }
+    if (strcmp(key, "total_layer_count") == 0) {
+        return parse_u32_value(value, &checkpoint->total_layer_count) == 0 ? 1 : -1;
+    }
+    if (strcmp(key, "next_layer_index") == 0) {
+        return parse_u32_value(value, &checkpoint->next_layer_index) == 0 ? 1 : -1;
+    }
+    if (strcmp(key, "last_completed_layer") == 0) {
+        return parse_u32_value(value, &checkpoint->last_completed_layer) == 0 ? 1 : -1;
+    }
+    if (strcmp(key, "converted_tensor_count") == 0) {
+        return parse_u32_value(value, &checkpoint->converted_tensor_count) == 0 ? 1 : -1;
+    }
+    if (strcmp(key, "checkpoint_every_n_layers") == 0) {
+        return parse_u32_value(value, &checkpoint->checkpoint_every_n_layers) == 0 ? 1 : -1;
+    }
+    if (strcmp(key, "validate_every_n") == 0) {
+        return parse_u32_value(value, &checkpoint->validate_every_n) == 0 ? 1 : -1;
+    }
+
+    return 0;
+}
+
+static int parse_checkpoint_line(ternary_student_update_checkpoint_t *checkpoint,
+                                 const char *key,
+                                 const char *value,
+                                 uint32_t *stored_crc32,
+                                 int *seen_crc32)
+{
+    int status = 0;
+
+    if (!checkpoint || !key || !value || !stored_crc32 || !seen_crc32) {
+        return -1;
+    }
+
+    status = parse_checkpoint_text_field_local(checkpoint, key, value);
+    if (status != 0) {
+        return status > 0 ? 0 : -1;
+    }
+
+    status = parse_checkpoint_hex_field_local(checkpoint, key, value, stored_crc32, seen_crc32);
+    if (status != 0) {
+        return status > 0 ? 0 : -1;
+    }
+
+    status = parse_checkpoint_u32_field_local(checkpoint, key, value);
+    if (status != 0) {
+        return status > 0 ? 0 : -1;
     }
 
     return -1;

@@ -52,6 +52,9 @@
 #define PROGRESSIVE_CALIB_SCHEDULE_VERSION 4u
 #define CONVERSION_CONFIG_OVERRIDE_FILENAME "sapphire_config_overrides.json"
 #define CONVERSION_CONFIG_OVERRIDE_TMP_FILENAME "sapphire_config_overrides.json.tmp"
+#define FULL_MODEL_ANCHOR_POLICY_VERSION 1u
+#define FULL_MODEL_ANCHOR_POLICY_NAME "ffn_down_proj_only"
+#define FULL_MODEL_ANCHOR_POLICY_PATTERN "*.mlp.down_proj.weight"
 
 typedef enum {
     PROGRESSIVE_CALIB_STAGE_DISABLED = 0,
@@ -108,6 +111,7 @@ typedef struct {
     char *checkpoint_tmp_path;
     uint32_t activation_tape_hash;
     uint32_t hessian_sidecar_crc32;
+    uint32_t structural_map_crc32;
     uint32_t resume_step_index;
     ternary_bf16_io_cache_t bf16_io_cache;
     ternary_hessian_proxy_cache_t hessian_proxy_cache;
@@ -185,8 +189,75 @@ static uint32_t config_hash_update_string(uint32_t crc32, const char *value)
     return io_crc32_update(crc32, value, value ? strlen(value) + 1u : 0u);
 }
 
+static int full_model_anchor_mode_enabled(const ternary_conversion_config_t *config)
+{
+    return config && config->use_anchor_mode &&
+        (!config->layer_name || config->layer_name[0] == '\0');
+}
+
+static const char *full_model_anchor_policy_name(const ternary_conversion_config_t *config)
+{
+    return full_model_anchor_mode_enabled(config) ? FULL_MODEL_ANCHOR_POLICY_NAME : "";
+}
+
+static const char *full_model_anchor_policy_pattern(const ternary_conversion_config_t *config)
+{
+    (void)config;
+    return FULL_MODEL_ANCHOR_POLICY_PATTERN;
+}
+
+static const char *full_model_anchor_policy_filter(const ternary_conversion_config_t *config)
+{
+    if (!config || !config->anchor_tensor_pattern || config->anchor_tensor_pattern[0] == '\0') {
+        return "";
+    }
+
+    return config->anchor_tensor_pattern;
+}
+
+static uint32_t config_resume_hash_update_path_inputs(uint32_t crc32,
+                                                      const ternary_conversion_config_t *config)
+{
+    crc32 = config_hash_update_string(crc32, config->model_name);
+    crc32 = config_hash_update_string(crc32, config->output_path);
+    crc32 = config_hash_update_string(crc32, config->layer_name);
+    crc32 = config_hash_update_string(crc32, config->activation_tape_path);
+    crc32 = config_hash_update_string(crc32, config->teacher_model_name);
+    crc32 = config_hash_update_string(crc32, config->structural_map_path);
+    crc32 = config_hash_update_string(crc32, config->calibration_corpus_path);
+    crc32 = config_hash_update_string(crc32, config->calibration_corpus_manifest_path);
+    crc32 = config_hash_update_string(crc32, config->validation_corpus_path);
+    crc32 = config_hash_update_string(crc32, config->validation_corpus_manifest_path);
+    crc32 = config_hash_update_string(crc32, config->hessian_sidecar_path);
+    return crc32;
+}
+
+static uint32_t config_resume_hash_update_anchor_inputs(uint32_t crc32,
+                                                        const ternary_conversion_config_t *config)
+{
+    uint32_t anchor_artifact_version = TERNARY_ANCHOR_VERSION;
+
+    crc32 = io_crc32_update(crc32, &config->use_anchor_mode, sizeof(config->use_anchor_mode));
+    crc32 = io_crc32_update(crc32, &config->anchor_budget_ppm, sizeof(config->anchor_budget_ppm));
+    crc32 = io_crc32_update(crc32, &config->anchor_saliency_mode, sizeof(config->anchor_saliency_mode));
+    if (config->use_anchor_mode) {
+        crc32 = io_crc32_update(crc32, &anchor_artifact_version, sizeof(anchor_artifact_version));
+    }
+    if (full_model_anchor_mode_enabled(config)) {
+        const uint32_t anchor_policy_version = FULL_MODEL_ANCHOR_POLICY_VERSION;
+
+        crc32 = io_crc32_update(crc32, &anchor_policy_version, sizeof(anchor_policy_version));
+        crc32 = config_hash_update_string(crc32, full_model_anchor_policy_name(config));
+        crc32 = config_hash_update_string(crc32, full_model_anchor_policy_pattern(config));
+        crc32 = config_hash_update_string(crc32, full_model_anchor_policy_filter(config));
+    }
+
+    return crc32;
+}
+
 static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
-                                   uint32_t hessian_sidecar_crc32)
+                                   uint32_t hessian_sidecar_crc32,
+                                   uint32_t structural_map_crc32)
 {
     uint32_t crc32 = 0u;
     float early_stop_divergence_ratio = 1.25f;
@@ -220,16 +291,7 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
         early_stop_divergence_ratio = config->early_stop_divergence_ratio;
     }
 
-    crc32 = config_hash_update_string(crc32, config->model_name);
-    crc32 = config_hash_update_string(crc32, config->output_path);
-    crc32 = config_hash_update_string(crc32, config->layer_name);
-    crc32 = config_hash_update_string(crc32, config->activation_tape_path);
-    crc32 = config_hash_update_string(crc32, config->teacher_model_name);
-    crc32 = config_hash_update_string(crc32, config->structural_map_path);
-    crc32 = config_hash_update_string(crc32, config->calibration_corpus_path);
-    crc32 = config_hash_update_string(crc32, config->calibration_corpus_manifest_path);
-    crc32 = config_hash_update_string(crc32, config->validation_corpus_path);
-    crc32 = config_hash_update_string(crc32, config->validation_corpus_manifest_path);
+    crc32 = config_resume_hash_update_path_inputs(crc32, config);
     crc32 = io_crc32_update(crc32, &config->context_len, sizeof(config->context_len));
     crc32 = io_crc32_update(crc32, &config->calibration_sample_limit, sizeof(config->calibration_sample_limit));
     crc32 = io_crc32_update(crc32, &config->validation_sample_limit, sizeof(config->validation_sample_limit));
@@ -251,11 +313,9 @@ static uint32_t config_resume_hash(const ternary_conversion_config_t *config,
     crc32 = io_crc32_update(crc32,
                             &config->student_down_proj_input_rmsnorm,
                             sizeof(config->student_down_proj_input_rmsnorm));
-    crc32 = io_crc32_update(crc32, &config->use_anchor_mode, sizeof(config->use_anchor_mode));
-    crc32 = io_crc32_update(crc32, &config->anchor_budget_ppm, sizeof(config->anchor_budget_ppm));
-    crc32 = io_crc32_update(crc32, &config->anchor_saliency_mode, sizeof(config->anchor_saliency_mode));
-    crc32 = config_hash_update_string(crc32, config->hessian_sidecar_path);
+    crc32 = config_resume_hash_update_anchor_inputs(crc32, config);
     crc32 = io_crc32_update(crc32, &hessian_sidecar_crc32, sizeof(hessian_sidecar_crc32));
+    crc32 = io_crc32_update(crc32, &structural_map_crc32, sizeof(structural_map_crc32));
     return crc32;
 }
 
@@ -677,13 +737,22 @@ static int checkpoint_tmp_path_for_output(const char *output_dir, char **out_pat
     return *out_path ? 0 : -1;
 }
 
+typedef enum {
+    FULL_MODEL_TENSOR_REPRESENTATION_TERNARY = 0,
+    FULL_MODEL_TENSOR_REPRESENTATION_MOLD = 1,
+    FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR = 2
+} full_model_tensor_representation_t;
+
 typedef struct {
     char tensor_name[256];
     char file_name[256];
+    char anchor_file_name[256];
     uint32_t rows;
     uint32_t cols;
+    uint32_t anchor_count;
     size_t packed_weight_bytes;
     uint32_t crc32;
+    full_model_tensor_representation_t representation;
 } resume_manifest_entry_t;
 
 static int copy_text_field_local(char *dst, size_t dst_size, const char *src)
@@ -791,6 +860,7 @@ static int parse_resume_manifest_line(char *line, resume_manifest_entry_t *out_e
     }
 
     memset(out_entry, 0, sizeof(*out_entry));
+    out_entry->representation = FULL_MODEL_TENSOR_REPRESENTATION_TERNARY;
     field = strtok_r(line, "\t", &saveptr);
     if (!field || copy_text_field_local(out_entry->tensor_name, sizeof(out_entry->tensor_name), field) != 0) {
         return -1;
@@ -818,6 +888,31 @@ static int parse_resume_manifest_line(char *line, resume_manifest_entry_t *out_e
 
     field = strtok_r(NULL, "\t\r\n", &saveptr);
     if (!field || parse_hex_u32_field(field, &out_entry->crc32) != 0) {
+        return -1;
+    }
+
+    field = strtok_r(NULL, "\t\r\n", &saveptr);
+    if (!field) {
+        return 0;
+    }
+    if (strcmp(field, "mold") == 0) {
+        out_entry->representation = FULL_MODEL_TENSOR_REPRESENTATION_MOLD;
+        return 0;
+    }
+
+    out_entry->representation = FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR;
+    if (strcmp(field, "anchor") == 0) {
+        field = strtok_r(NULL, "\t\r\n", &saveptr);
+        if (!field) {
+            return -1;
+        }
+    }
+    if (copy_text_field_local(out_entry->anchor_file_name, sizeof(out_entry->anchor_file_name), field) != 0) {
+        return -1;
+    }
+
+    field = strtok_r(NULL, "\t\r\n", &saveptr);
+    if (!field || parse_u32_field(field, &out_entry->anchor_count) != 0) {
         return -1;
     }
 
@@ -1227,6 +1322,199 @@ static int manifest_path_exists(const char *output_dir)
     return rc;
 }
 
+static int resume_validation_apply_ternary_entry(const ternary_conversion_config_t *config,
+                                                 conversion_runtime_t *runtime,
+                                                 const resume_manifest_entry_t *entry)
+{
+    char *layer_path = NULL;
+    ternary_layer_payload_t payload;
+    uint32_t actual_crc32 = 0u;
+    int rc = -1;
+
+    if (!config || !runtime || !entry) {
+        return -1;
+    }
+
+    memset(&payload, 0, sizeof(payload));
+    layer_path = construct_safe_path(config->output_path, entry->file_name, NULL);
+    if (!layer_path) {
+        return -1;
+    }
+    if (io_load_layer_ternary_payload(layer_path,
+                                      entry->tensor_name,
+                                      entry->rows,
+                                      entry->cols,
+                                      &payload) != 0) {
+        goto cleanup;
+    }
+
+    actual_crc32 = io_crc32_update(0u, payload.packed_weights, payload.packed_weight_bytes);
+    actual_crc32 = io_crc32_update(actual_crc32, payload.scales, payload.scale_bytes);
+    if (actual_crc32 != entry->crc32) {
+        LOG_ERROR("student update: manifest CRC mismatch for %s (expected=%08x actual=%08x)",
+                  entry->tensor_name,
+                  entry->crc32,
+                  actual_crc32);
+        goto cleanup;
+    }
+
+    rc = ternary_validation_apply_proxy_from_payload(&runtime->validation_state,
+                                                     entry->tensor_name,
+                                                     &payload,
+                                                     entry->crc32,
+                                                     0);
+
+cleanup:
+    io_free_layer_ternary_payload(&payload);
+    free(layer_path);
+    return rc;
+}
+
+static int resume_validation_apply_anchor_entry(const ternary_conversion_config_t *config,
+                                                conversion_runtime_t *runtime,
+                                                const resume_manifest_entry_t *entry)
+{
+    char *anchor_path = NULL;
+    char *bulk_path = NULL;
+    ternary_anchor_view_t anchor_view;
+    ternary_layer_payload_t payload;
+    uint32_t actual_crc32 = 0u;
+    int rc = -1;
+
+    if (!config || !runtime || !entry || entry->anchor_file_name[0] == '\0') {
+        return -1;
+    }
+
+    memset(&anchor_view, 0, sizeof(anchor_view));
+    memset(&payload, 0, sizeof(payload));
+    anchor_path = construct_safe_path(config->output_path, entry->anchor_file_name, NULL);
+    if (!anchor_path) {
+        return -1;
+    }
+    if (ternary_anchor_load_for_tensor(anchor_path, entry->tensor_name, &anchor_view) != 0) {
+        goto cleanup;
+    }
+    if (anchor_view.rows != entry->rows || anchor_view.cols != entry->cols) {
+        LOG_ERROR("student update: anchor manifest shape mismatch for %s", entry->tensor_name);
+        goto cleanup;
+    }
+    if (entry->anchor_count > 0u && anchor_view.anchor_count != entry->anchor_count) {
+        LOG_ERROR("student update: anchor manifest count mismatch for %s (expected=%u actual=%u)",
+                  entry->tensor_name,
+                  entry->anchor_count,
+                  anchor_view.anchor_count);
+        goto cleanup;
+    }
+
+    bulk_path = construct_safe_path(config->output_path, entry->file_name, NULL);
+    if (!bulk_path) {
+        goto cleanup;
+    }
+    if (io_load_layer_ternary_payload(bulk_path,
+                                      entry->tensor_name,
+                                      entry->rows,
+                                      entry->cols,
+                                      &payload) != 0) {
+        goto cleanup;
+    }
+
+    actual_crc32 = io_crc32_update(0u, payload.packed_weights, payload.packed_weight_bytes);
+    actual_crc32 = io_crc32_update(actual_crc32, payload.scales, payload.scale_bytes);
+    if (actual_crc32 != entry->crc32) {
+        LOG_ERROR("student update: manifest CRC mismatch for %s (expected=%08x actual=%08x)",
+                  entry->tensor_name,
+                  entry->crc32,
+                  actual_crc32);
+        goto cleanup;
+    }
+
+    rc = ternary_validation_apply_proxy_from_hybrid_payload(&runtime->validation_state,
+                                                            entry->tensor_name,
+                                                            &payload,
+                                                            &anchor_view,
+                                                            entry->crc32,
+                                                            0);
+
+cleanup:
+    io_free_layer_ternary_payload(&payload);
+    ternary_anchor_view_release(&anchor_view);
+    free(bulk_path);
+    free(anchor_path);
+    return rc;
+}
+
+static int resume_validation_apply_mold_entry(const ternary_conversion_config_t *config,
+                                              conversion_runtime_t *runtime,
+                                              const resume_manifest_entry_t *entry)
+{
+    char *layer_path = NULL;
+    ternary_bf16_layer_map_t map;
+    size_t bf16_byte_count = 0u;
+    uint32_t actual_crc32 = 0u;
+    int rc = -1;
+
+    if (!config || !runtime || !entry) {
+        return -1;
+    }
+
+    memset(&map, 0, sizeof(map));
+    layer_path = construct_safe_path(config->output_path, entry->file_name, NULL);
+    if (!layer_path) {
+        return -1;
+    }
+    if (io_mmap_layer_bf16(layer_path, entry->tensor_name, &map) != 0) {
+        goto cleanup;
+    }
+    if (map.rows != entry->rows || map.cols != entry->cols) {
+        LOG_ERROR("student update: mold manifest shape mismatch for %s", entry->tensor_name);
+        goto cleanup;
+    }
+
+    bf16_byte_count = (size_t)map.rows * map.cols * sizeof(uint16_t);
+    actual_crc32 = io_crc32_update(0u, map.bf16_weights, bf16_byte_count);
+    if (actual_crc32 != entry->crc32) {
+        LOG_ERROR("student update: mold manifest CRC mismatch for %s (expected=%08x actual=%08x)",
+                  entry->tensor_name,
+                  entry->crc32,
+                  actual_crc32);
+        goto cleanup;
+    }
+
+    rc = ternary_validation_apply_proxy_from_bf16(&runtime->validation_state,
+                                                  entry->tensor_name,
+                                                  &(ternary_validation_bf16_view_t){
+                                                      .weights = map.bf16_weights,
+                                                      .rows = map.rows,
+                                                      .cols = map.cols,
+                                                  },
+                                                  entry->crc32,
+                                                  0);
+
+cleanup:
+    io_unmap_layer_bf16(&map);
+    free(layer_path);
+    return rc;
+}
+
+static int resume_validation_apply_manifest_entry(const ternary_conversion_config_t *config,
+                                                  conversion_runtime_t *runtime,
+                                                  const resume_manifest_entry_t *entry)
+{
+    if (!entry) {
+        return -1;
+    }
+
+    switch (entry->representation) {
+        case FULL_MODEL_TENSOR_REPRESENTATION_MOLD:
+            return resume_validation_apply_mold_entry(config, runtime, entry);
+        case FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR:
+            return resume_validation_apply_anchor_entry(config, runtime, entry);
+        case FULL_MODEL_TENSOR_REPRESENTATION_TERNARY:
+        default:
+            return resume_validation_apply_ternary_entry(config, runtime, entry);
+    }
+}
+
 static int resume_validation_from_manifest(const ternary_conversion_config_t *config,
                                            conversion_runtime_t *runtime)
 {
@@ -1277,57 +1565,14 @@ static int resume_validation_from_manifest(const ternary_conversion_config_t *co
             *line_end = '\0';
         }
         if (cursor[0] != '\0') {
-            char *layer_path = NULL;
-            ternary_layer_payload_t payload;
-            uint32_t actual_crc32 = 0u;
-
             if (parse_resume_manifest_line(cursor, &entry) != 0) {
                 free(manifest_text);
                 return -1;
             }
-
-            layer_path = construct_safe_path(config->output_path, entry.file_name, NULL);
-            if (!layer_path) {
+            if (resume_validation_apply_manifest_entry(config, runtime, &entry) != 0) {
                 free(manifest_text);
                 return -1;
             }
-
-            if (io_load_layer_ternary_payload(layer_path,
-                                              entry.tensor_name,
-                                              entry.rows,
-                                              entry.cols,
-                                              &payload) != 0) {
-                free(layer_path);
-                free(manifest_text);
-                return -1;
-            }
-
-            actual_crc32 = io_crc32_update(0u, payload.packed_weights, payload.packed_weight_bytes);
-            actual_crc32 = io_crc32_update(actual_crc32, payload.scales, payload.scale_bytes);
-            if (actual_crc32 != entry.crc32) {
-                LOG_ERROR("student update: manifest CRC mismatch for %s (expected=%08x actual=%08x)",
-                          entry.tensor_name,
-                          entry.crc32,
-                          actual_crc32);
-                io_free_layer_ternary_payload(&payload);
-                free(layer_path);
-                free(manifest_text);
-                return -1;
-            }
-
-            if (ternary_validation_apply_proxy_from_payload(&runtime->validation_state,
-                                                            entry.tensor_name,
-                                                            &payload,
-                                                            entry.crc32,
-                                                            0) != 0) {
-                io_free_layer_ternary_payload(&payload);
-                free(layer_path);
-                free(manifest_text);
-                return -1;
-            }
-
-            io_free_layer_ternary_payload(&payload);
-            free(layer_path);
             replayed++;
         }
 
@@ -1427,6 +1672,9 @@ static void seed_checkpoint_state_defaults(const ternary_conversion_config_t *co
         ? (uint32_t)config->checkpoint_every_n_layers
         : 1u;
     runtime->checkpoint_state.validate_every_n = (config->validate_every_n > 0) ? (uint32_t)config->validate_every_n : 0u;
+    runtime->checkpoint_state.use_anchor_mode = config->use_anchor_mode ? 1u : 0u;
+    runtime->checkpoint_state.anchor_budget_ppm = config->anchor_budget_ppm;
+    runtime->checkpoint_state.anchor_saliency_mode = (uint32_t)config->anchor_saliency_mode;
     runtime->checkpoint_state.next_layer_index = 0u;
     runtime->checkpoint_state.last_completed_layer = 0u;
     runtime->checkpoint_state.converted_tensor_count = 0u;
@@ -1446,6 +1694,8 @@ static int validate_loaded_checkpoint_state(const ternary_conversion_config_t *c
                                             uint32_t total_layer_count,
                                             uint32_t config_hash)
 {
+    uint32_t expected_use_anchor_mode = 0u;
+
     if (runtime->checkpoint_state.total_layer_count != total_layer_count) {
         LOG_ERROR("student update: checkpoint total layer count mismatch (checkpoint=%u current=%u)",
                   runtime->checkpoint_state.total_layer_count,
@@ -1459,6 +1709,27 @@ static int validate_loaded_checkpoint_state(const ternary_conversion_config_t *c
     if (runtime->checkpoint_state.config_hash != config_hash) {
         LOG_ERROR("student update: checkpoint config hash mismatch");
         return -1;
+    }
+    expected_use_anchor_mode = config->use_anchor_mode ? 1u : 0u;
+    if (runtime->checkpoint_state.use_anchor_mode != expected_use_anchor_mode) {
+        LOG_ERROR("student update: checkpoint anchor-mode mismatch (checkpoint=%u current=%u)",
+                  runtime->checkpoint_state.use_anchor_mode,
+                  expected_use_anchor_mode);
+        return -1;
+    }
+    if (expected_use_anchor_mode > 0u) {
+        if (runtime->checkpoint_state.anchor_budget_ppm != config->anchor_budget_ppm) {
+            LOG_ERROR("student update: checkpoint anchor budget mismatch (checkpoint=%u current=%u)",
+                      runtime->checkpoint_state.anchor_budget_ppm,
+                      config->anchor_budget_ppm);
+            return -1;
+        }
+        if (runtime->checkpoint_state.anchor_saliency_mode != (uint32_t)config->anchor_saliency_mode) {
+            LOG_ERROR("student update: checkpoint anchor saliency mismatch (checkpoint=%u current=%u)",
+                      runtime->checkpoint_state.anchor_saliency_mode,
+                      (uint32_t)config->anchor_saliency_mode);
+            return -1;
+        }
     }
     if (config->hessian_sidecar_path && config->hessian_sidecar_path[0] != '\0') {
         if (runtime->checkpoint_state.hessian_sidecar_path[0] == '\0' ||
@@ -1531,7 +1802,8 @@ static int init_checkpoint_state(const ternary_conversion_config_t *config,
 
     total_layer_count = conversion_total_progress_steps(config, runtime->model_spec);
     config_hash = config_resume_hash(config,
-                                     runtime->hessian_sidecar ? runtime->hessian_sidecar_crc32 : 0u);
+                                     runtime->hessian_sidecar ? runtime->hessian_sidecar_crc32 : 0u,
+                                     runtime->structural_map_crc32);
     seed_checkpoint_state_defaults(config, runtime, total_layer_count, config_hash);
 
     load_rc = ternary_student_checkpoint_load(runtime->checkpoint_path, &runtime->checkpoint_state);
@@ -1596,6 +1868,9 @@ static int write_student_checkpoint(const ternary_conversion_config_t *config,
     checkpoint.alignment_manifest_crc32 = 0u;
     checkpoint.alignment_tape_provenance_hash = 0u;
     checkpoint.hessian_sidecar_crc32 = runtime->hessian_sidecar_crc32;
+    checkpoint.use_anchor_mode = config->use_anchor_mode ? 1u : 0u;
+    checkpoint.anchor_budget_ppm = config->anchor_budget_ppm;
+    checkpoint.anchor_saliency_mode = (uint32_t)config->anchor_saliency_mode;
 
     if (effective_alignment_manifest_path && effective_alignment_manifest_path[0] != '\0') {
         if (ternary_student_checkpoint_compute_manifest_crc32(effective_alignment_manifest_path,
@@ -1747,7 +2022,7 @@ static transformer_ste_config_t default_runtime_ste_config(const ternary_convers
     const ternary_conversion_config_t *cfg = config ? config : &zero_config;
 
     ste_config.ste_steps = positive_int_or_default(cfg->ste_steps, 3);
-    ste_config.learning_rate = 0.03f;
+    ste_config.learning_rate = cfg->ste_learning_rate > 0.0f ? cfg->ste_learning_rate : 0.03f;
     ste_config.zero_threshold = 0.05f;
     ste_config.momentum = 0.85f;
     ste_config.regularization_strength = 0.01f;
@@ -2271,10 +2546,13 @@ static int init_conversion_runtime(const ternary_conversion_config_t *config,
     conversion_tracy_zone_text_if_present(&tracy_zone, config->model_name);
 
     memset(out_runtime, 0, sizeof(*out_runtime));
-    if (config->structural_map_path && config->structural_map_path[0] != '\0' &&
-        structural_map_load(config->structural_map_path, &out_runtime->structural_map) != 0) {
-        destroy_conversion_runtime(out_runtime);
-        return conversion_tracy_end_status(&tracy_zone, -1);
+    if (config->structural_map_path && config->structural_map_path[0] != '\0') {
+        if (ternary_student_checkpoint_compute_file_crc32(config->structural_map_path,
+                                                          &out_runtime->structural_map_crc32) != 0 ||
+            structural_map_load(config->structural_map_path, &out_runtime->structural_map) != 0) {
+            destroy_conversion_runtime(out_runtime);
+            return conversion_tracy_end_status(&tracy_zone, -1);
+        }
     }
 
     spec = get_model_spec(config->model_name);
@@ -2482,12 +2760,121 @@ static uint32_t single_layer_max_row_nnz(const ternary_calibration_result_t *res
     return max_row_nnz;
 }
 
+static void populate_ternary_layer_from_result(const ternary_calibration_result_t *result,
+                                               ternary_layer_t *out_layer)
+{
+    if (!result || !out_layer) {
+        return;
+    }
+
+    memset(out_layer, 0, sizeof(*out_layer));
+    out_layer->packed_weights = result->packed_weights;
+    out_layer->packed_weight_bytes = result->packed_weight_bytes;
+    out_layer->scales = result->scales;
+    out_layer->scale_count = result->scale_count;
+    out_layer->scale_bytes = result->scale_count * sizeof(float);
+    out_layer->scale_dtype = SAFETENSORS_F32;
+    out_layer->rows = result->rows;
+    out_layer->cols = result->cols;
+    out_layer->scale_group_size = result->scale_group_size;
+    out_layer->groups_per_row = result->rows > 0u ? (uint32_t)(result->scale_count / result->rows) : 0u;
+    out_layer->integrity = TERNARY_IO_INTEGRITY_CRC32;
+}
+
+static void populate_hybrid_layer_from_result(const transformer_ste_config_t *ste_config,
+                                              const ternary_calibration_result_t *result,
+                                              ternary_hybrid_layer_t *out_layer)
+{
+    if (!ste_config || !result || !out_layer) {
+        return;
+    }
+
+    memset(out_layer, 0, sizeof(*out_layer));
+    out_layer->packed_weights = result->packed_weights;
+    out_layer->packed_weight_bytes = result->packed_weight_bytes;
+    out_layer->scales = result->scales;
+    out_layer->scale_count = result->scale_count;
+    out_layer->scale_bytes = result->scale_count * sizeof(float);
+    out_layer->scale_dtype = SAFETENSORS_F32;
+    out_layer->rows = result->rows;
+    out_layer->cols = result->cols;
+    out_layer->scale_group_size = result->scale_group_size;
+    out_layer->groups_per_row = result->rows > 0u ? (uint32_t)(result->scale_count / result->rows) : 0u;
+    out_layer->integrity = TERNARY_IO_INTEGRITY_CRC32;
+    out_layer->anchor_entries = result->anchor_entries;
+    out_layer->anchor_count = result->anchor_count;
+    out_layer->anchor_metadata.magic = TERNARY_ANCHOR_MAGIC;
+    out_layer->anchor_metadata.version = TERNARY_ANCHOR_VERSION;
+    out_layer->anchor_metadata.rows = result->rows;
+    out_layer->anchor_metadata.cols = result->cols;
+    out_layer->anchor_metadata.anchor_count = result->anchor_count;
+    out_layer->anchor_metadata.scale_group_size = result->scale_group_size;
+    out_layer->anchor_metadata.groups_per_row = out_layer->groups_per_row;
+    out_layer->anchor_metadata.saliency_mode = (uint32_t)ste_config->anchor_saliency_mode;
+    out_layer->anchor_metadata.budget_ppm = ste_config->anchor_budget_ppm;
+    out_layer->anchor_metadata.saliency_cutoff = result->anchor_saliency_cutoff;
+    out_layer->anchor_metadata.anchor_value_rms = result->anchor_value_rms;
+    out_layer->anchor_metadata.bulk_gamma_mean = result->bulk_gamma_mean;
+    out_layer->anchor_metadata.max_row_nnz = single_layer_max_row_nnz(result);
+}
+
+static int write_hybrid_output_to_dir(const char *output_dir,
+                                      const char *tensor_name,
+                                      const transformer_ste_config_t *ste_config,
+                                      const ternary_calibration_result_t *result,
+                                      uint32_t *out_crc32)
+{
+    ternary_hybrid_layer_t hybrid_layer;
+    uint32_t crc32 = 0u;
+    int rc = -1;
+
+    if (!output_dir || !tensor_name || !ste_config || !result) {
+        return -1;
+    }
+
+    populate_hybrid_layer_from_result(ste_config, result, &hybrid_layer);
+    rc = ternary_anchor_write_layer(output_dir, tensor_name, &hybrid_layer, &crc32);
+    if (rc == 0) {
+        LOG_INFO("Converted tensor %s as anchor-bearing hybrid (crc32=%08x anchors=%u)",
+                 tensor_name,
+                 crc32,
+                 result->anchor_count);
+    }
+    if (out_crc32) {
+        *out_crc32 = crc32;
+    }
+    return rc;
+}
+
+static int write_ternary_output_to_dir(const char *output_dir,
+                                       const char *tensor_name,
+                                       const ternary_calibration_result_t *result,
+                                       uint32_t *out_crc32)
+{
+    ternary_layer_t layer;
+    uint32_t crc32 = 0u;
+    int rc = -1;
+
+    if (!output_dir || !tensor_name || !result) {
+        return -1;
+    }
+
+    populate_ternary_layer_from_result(result, &layer);
+    rc = io_write_layer_ternary_into_dir(output_dir, tensor_name, &layer, &crc32);
+    if (rc == 0) {
+        LOG_INFO("Converted tensor %s as plain ternary (crc32=%08x)", tensor_name, crc32);
+    }
+    if (out_crc32) {
+        *out_crc32 = crc32;
+    }
+    return rc;
+}
+
 static int write_single_layer_hybrid_output(const ternary_conversion_config_t *config,
                                             const transformer_ste_config_t *ste_config,
                                             const ternary_calibration_result_t *result,
                                             uint32_t *out_crc32)
 {
-    ternary_hybrid_layer_t hybrid_layer;
     uint32_t crc32 = 0u;
     int rc = -1;
 
@@ -2495,35 +2882,11 @@ static int write_single_layer_hybrid_output(const ternary_conversion_config_t *c
         return -1;
     }
 
-    memset(&hybrid_layer, 0, sizeof(hybrid_layer));
-    hybrid_layer.packed_weights = result->packed_weights;
-    hybrid_layer.packed_weight_bytes = result->packed_weight_bytes;
-    hybrid_layer.scales = result->scales;
-    hybrid_layer.scale_count = result->scale_count;
-    hybrid_layer.scale_bytes = result->scale_count * sizeof(float);
-    hybrid_layer.scale_dtype = SAFETENSORS_F32;
-    hybrid_layer.rows = result->rows;
-    hybrid_layer.cols = result->cols;
-    hybrid_layer.scale_group_size = result->scale_group_size;
-    hybrid_layer.groups_per_row = result->rows > 0u ? (uint32_t)(result->scale_count / result->rows) : 0u;
-    hybrid_layer.integrity = TERNARY_IO_INTEGRITY_CRC32;
-    hybrid_layer.anchor_entries = result->anchor_entries;
-    hybrid_layer.anchor_count = result->anchor_count;
-    hybrid_layer.anchor_metadata.magic = TERNARY_ANCHOR_MAGIC;
-    hybrid_layer.anchor_metadata.version = TERNARY_ANCHOR_VERSION;
-    hybrid_layer.anchor_metadata.rows = result->rows;
-    hybrid_layer.anchor_metadata.cols = result->cols;
-    hybrid_layer.anchor_metadata.anchor_count = result->anchor_count;
-    hybrid_layer.anchor_metadata.scale_group_size = result->scale_group_size;
-    hybrid_layer.anchor_metadata.groups_per_row = hybrid_layer.groups_per_row;
-    hybrid_layer.anchor_metadata.saliency_mode = (uint32_t)ste_config->anchor_saliency_mode;
-    hybrid_layer.anchor_metadata.budget_ppm = ste_config->anchor_budget_ppm;
-    hybrid_layer.anchor_metadata.saliency_cutoff = result->anchor_saliency_cutoff;
-    hybrid_layer.anchor_metadata.anchor_value_rms = result->anchor_value_rms;
-    hybrid_layer.anchor_metadata.bulk_gamma_mean = result->bulk_gamma_mean;
-    hybrid_layer.anchor_metadata.max_row_nnz = single_layer_max_row_nnz(result);
-
-    rc = ternary_anchor_write_layer(config->output_path, config->layer_name, &hybrid_layer, &crc32);
+    rc = write_hybrid_output_to_dir(config->output_path,
+                                    config->layer_name,
+                                    ste_config,
+                                    result,
+                                    &crc32);
     if (rc == 0) {
         LOG_INFO("Hybrid ternary conversion complete for %s (crc32=%08x anchors=%u output_dir=%s)",
                  config->layer_name,
@@ -2550,19 +2913,7 @@ static int write_single_layer_ternary_output(const ternary_conversion_config_t *
         return -1;
     }
 
-    memset(&layer, 0, sizeof(layer));
-    layer.packed_weights = result->packed_weights;
-    layer.packed_weight_bytes = result->packed_weight_bytes;
-    layer.scales = result->scales;
-    layer.scale_count = result->scale_count;
-    layer.scale_bytes = result->scale_count * sizeof(float);
-    layer.scale_dtype = SAFETENSORS_F32;
-    layer.rows = result->rows;
-    layer.cols = result->cols;
-    layer.scale_group_size = result->scale_group_size;
-    layer.groups_per_row = result->rows > 0u ? (uint32_t)(result->scale_count / result->rows) : 0u;
-    layer.integrity = TERNARY_IO_INTEGRITY_CRC32;
-
+    populate_ternary_layer_from_result(result, &layer);
     rc = io_write_layer_ternary(config->output_path, config->layer_name, &layer, &crc32);
     if (rc == 0) {
         LOG_INFO("Ternary conversion complete for %s (crc32=%08x)", config->layer_name, crc32);
@@ -2638,7 +2989,7 @@ typedef struct {
     uint32_t *out_crc32;
     int *out_skipped_vector;
     float *out_io_ms;
-    int mold_bf16;
+    full_model_tensor_representation_t representation;
     progressive_calib_stage_t progressive_stage;
 } convert_tensor_job_t;
 
@@ -2660,6 +3011,7 @@ typedef struct {
     progressive_calib_stage_t progressive_stage;
     const char *tensor_name;
     int *last_prefetched_entry_idx;
+    full_model_tensor_representation_t representation;
 } full_model_tensor_task_t;
 
 static int mmap_tensor_for_conversion(const char *model_dir,
@@ -2969,10 +3321,32 @@ static int convert_vector_mold(const convert_tensor_job_t *job,
     return rc;
 }
 
+static float f32_roundtrip_bf16_local(float value)
+{
+    union {
+        uint32_t u32;
+        float f32;
+    } bits;
+
+    bits.f32 = value;
+    bits.u32 &= 0xFFFF0000u;
+    return bits.f32;
+}
+
+static void round_dense_to_bf16_inplace(float *weights, size_t weight_count)
+{
+    if (!weights) {
+        return;
+    }
+
+    for (size_t idx = 0u; idx < weight_count; ++idx) {
+        weights[idx] = f32_roundtrip_bf16_local(weights[idx]);
+    }
+}
+
 static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     ternary_bf16_layer_map_t map;
     ternary_calibration_result_t result;
-    ternary_layer_t layer;
     struct timespec load_start;
     struct timespec load_end;
     int measure_io = 0;
@@ -2996,7 +3370,6 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
 
     memset(&map, 0, sizeof(map));
     memset(&result, 0, sizeof(result));
-    memset(&layer, 0, sizeof(layer));
 
     measure_io = job->out_io_ms ? 1 : 0;
     if (measure_io && clock_gettime(CLOCK_MONOTONIC, &load_start) != 0) {
@@ -3014,7 +3387,7 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
     }
 
     if (map.cols == 1u) {
-        if (job->mold_bf16) {
+        if (job->representation == FULL_MODEL_TENSOR_REPRESENTATION_MOLD) {
             int vrc = convert_vector_mold(job, &map);
             io_unmap_layer_bf16(&map);
             return vrc;
@@ -3065,13 +3438,14 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
         return -1;
     }
 
-    if (job->mold_bf16) {
+    if (job->representation == FULL_MODEL_TENSOR_REPRESENTATION_MOLD) {
         rc = io_write_layer_molded_bf16_into_dir(job->output_dir, job->tensor_name,
                                                  result.latent_weights,
                                                  result.rows, result.cols,
                                                  &crc32);
         if (rc == 0) {
-            LOG_INFO("Molded BF16 tensor %s (crc32=%08x)", job->tensor_name, crc32);
+            round_dense_to_bf16_inplace(result.latent_weights, result.weight_count);
+            LOG_INFO("Converted tensor %s as mold BF16 (crc32=%08x)", job->tensor_name, crc32);
             store_convert_result(job, &result, crc32);
         }
         transformer_free_ternary_calibration_result(&result);
@@ -3079,21 +3453,19 @@ static int convert_tensor_to_dir(const convert_tensor_job_t *job) {
         return rc;
     }
 
-    layer.packed_weights = result.packed_weights;
-    layer.packed_weight_bytes = result.packed_weight_bytes;
-    layer.scales = result.scales;
-    layer.scale_count = result.scale_count;
-    layer.scale_bytes = result.scale_count * sizeof(float);
-    layer.scale_dtype = SAFETENSORS_F32;
-    layer.rows = result.rows;
-    layer.cols = result.cols;
-    layer.scale_group_size = result.scale_group_size;
-    layer.groups_per_row = (uint32_t)(result.scale_count / result.rows);
-    layer.integrity = TERNARY_IO_INTEGRITY_CRC32;
-
-    rc = io_write_layer_ternary_into_dir(job->output_dir, job->tensor_name, &layer, &crc32);
+    if (job->representation == FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR) {
+        rc = write_hybrid_output_to_dir(job->output_dir,
+                                        job->tensor_name,
+                                        job->ste_config,
+                                        &result,
+                                        &crc32);
+    } else {
+        rc = write_ternary_output_to_dir(job->output_dir,
+                                         job->tensor_name,
+                                         &result,
+                                         &crc32);
+    }
     if (rc == 0) {
-        LOG_INFO("Converted tensor %s (crc32=%08x)", job->tensor_name, crc32);
         store_convert_result(job, &result, crc32);
     }
 
@@ -3160,11 +3532,26 @@ static int process_full_model_tensor_complete(const full_model_tensor_task_t *ta
                                               uint32_t crc32)
 {
     if (task->runtime && task->runtime->validation_state.config.sample_count > 0) {
-        if (ternary_validation_apply_proxy(&task->runtime->validation_state,
-                                          task->tensor_name,
-                                          result,
-                                          crc32,
-                                          (int)(converted_count + 1u)) != 0) {
+        int validation_rc = 0;
+
+        if (task->representation == FULL_MODEL_TENSOR_REPRESENTATION_MOLD) {
+            validation_rc = ternary_validation_apply_proxy_from_dense(&task->runtime->validation_state,
+                                                                      task->tensor_name,
+                                                                      &(ternary_validation_dense_view_t){
+                                                                          .weights = result->latent_weights,
+                                                                          .rows = result->rows,
+                                                                          .cols = result->cols,
+                                                                      },
+                                                                      crc32,
+                                                                      (int)(converted_count + 1u));
+        } else {
+            validation_rc = ternary_validation_apply_proxy(&task->runtime->validation_state,
+                                                           task->tensor_name,
+                                                           result,
+                                                           crc32,
+                                                           (int)(converted_count + 1u));
+        }
+        if (validation_rc != 0) {
             LOG_WARN("Validation checkpoint failed after tensor: %s", task->tensor_name);
         }
     }
@@ -3229,17 +3616,37 @@ static int prepare_full_model_layer_ste_config(const full_model_tensor_task_t *t
     return 1;
 }
 
-static int classify_full_model_tensor(const full_model_tensor_task_t *task,
-                                      uint32_t converted_count,
-                                      int *out_is_mold)
+static int full_model_anchor_policy_allows_tensor(const full_model_tensor_task_t *task,
+                                                  const structural_tensor_rule_t *structural_rule)
+{
+    if (!task || !task->config || !task->tensor_name || !full_model_anchor_mode_enabled(task->config)) {
+        return 0;
+    }
+    if (structural_rule_is_mold(structural_rule) || structural_rule_is_pass_through(structural_rule)) {
+        return 0;
+    }
+    if (!tensor_name_is_layer_tensor(task->tensor_name) ||
+        !structural_map_name_matches(task->tensor_name, full_model_anchor_policy_pattern(task->config))) {
+        return 0;
+    }
+    if (full_model_anchor_policy_filter(task->config)[0] != '\0' &&
+        !structural_map_name_matches(task->tensor_name, full_model_anchor_policy_filter(task->config))) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int classify_full_model_tensor(full_model_tensor_task_t *task,
+                                      uint32_t converted_count)
 {
     const structural_tensor_rule_t *structural_rule = NULL;
 
-    if (!task || !out_is_mold) {
+    if (!task) {
         return -1;
     }
 
-    *out_is_mold = 0;
+    task->representation = FULL_MODEL_TENSOR_REPRESENTATION_TERNARY;
     if (!task->tensor_name || task->tensor_name[0] == '\0') {
         return process_full_model_tensor_skip_other(task, converted_count, NULL);
     }
@@ -3271,14 +3678,21 @@ static int classify_full_model_tensor(const full_model_tensor_task_t *task,
         return process_full_model_tensor_skip_other(task, converted_count, NULL);
     }
 
-    *out_is_mold = structural_rule_is_mold(structural_rule);
-    if (!*out_is_mold && tensor_name_is_tied_embedding_tensor(task->tensor_name)) {
+    if (structural_rule_is_mold(structural_rule)) {
+        task->representation = FULL_MODEL_TENSOR_REPRESENTATION_MOLD;
+    } else if (full_model_anchor_policy_allows_tensor(task, structural_rule)) {
+        task->representation = FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR;
+    }
+
+    if (task->representation != FULL_MODEL_TENSOR_REPRESENTATION_MOLD &&
+        tensor_name_is_tied_embedding_tensor(task->tensor_name)) {
         LOG_INFO("Skipping embedding tensor in full conversion: %s", task->tensor_name);
         return process_full_model_tensor_skip_other(task,
                                                     converted_count,
                                                     "Skipping embedding tensor in full conversion: %s");
     }
-    if (!*out_is_mold && tensor_name_is_tied_output_tensor(task->tensor_name)) {
+    if (task->representation != FULL_MODEL_TENSOR_REPRESENTATION_MOLD &&
+        tensor_name_is_tied_output_tensor(task->tensor_name)) {
         LOG_INFO("Skipping tied output tensor in full conversion: %s", task->tensor_name);
         return process_full_model_tensor_skip_other(task,
                                                     converted_count,
@@ -3288,19 +3702,18 @@ static int classify_full_model_tensor(const full_model_tensor_task_t *task,
     return FULL_MODEL_TENSOR_STATUS_CONVERTED;
 }
 
-static int process_full_model_tensor(const full_model_tensor_task_t *task)
+static int process_full_model_tensor(full_model_tensor_task_t *task)
 {
     convert_tensor_job_t job;
     ternary_calibration_corpus_t active_corpus;
     ternary_calibration_result_t result;
     ternary_telemetry_t layer_telemetry;
-    transformer_ste_config_t layer_ste_config;
+    transformer_ste_config_t effective_ste_config;
     uint32_t crc32 = 0u;
     int skipped_vector = 0;
     int rc = 0;
     uint32_t converted_count = 0u;
     int use_layer_telemetry = 0;
-    int is_mold = 0;
     uint32_t layer_index = 0u;
     int has_layer_index = 0;
     SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "process_full_model_tensor");
@@ -3319,9 +3732,9 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
 
     memset(&result, 0, sizeof(result));
     memset(&layer_telemetry, 0, sizeof(layer_telemetry));
-    memset(&layer_ste_config, 0, sizeof(layer_ste_config));
+    memset(&effective_ste_config, 0, sizeof(effective_ste_config));
 
-    rc = classify_full_model_tensor(task, converted_count, &is_mold);
+    rc = classify_full_model_tensor(task, converted_count);
     if (rc != FULL_MODEL_TENSOR_STATUS_CONVERTED) {
         return conversion_tracy_end_status(&tracy_zone, rc);
     }
@@ -3332,8 +3745,13 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     use_layer_telemetry = prepare_full_model_layer_ste_config(task,
                                                               layer_index,
                                                               has_layer_index,
-                                                              &layer_ste_config,
+                                                              &effective_ste_config,
                                                               &layer_telemetry);
+    if (!use_layer_telemetry) {
+        effective_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
+    }
+    effective_ste_config.use_anchor_mode =
+        (task->representation == FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR) ? 1 : 0;
 
     memset(&active_corpus, 0, sizeof(active_corpus));
     if (task->runtime) {
@@ -3350,13 +3768,13 @@ static int process_full_model_tensor(const full_model_tensor_task_t *task)
     job.hessian_sidecar = task->runtime ? task->runtime->hessian_sidecar : NULL;
     job.bf16_io_cache = task->runtime ? &task->runtime->bf16_io_cache : NULL;
     job.hessian_proxy_cache = task->runtime ? &task->runtime->hessian_proxy_cache : NULL;
-    job.ste_config = use_layer_telemetry ? &layer_ste_config : task->ste_config;
+    job.ste_config = &effective_ste_config;
     job.calibration_corpus = task->runtime ? &active_corpus : NULL;
     job.out_result = &result;
     job.out_crc32 = &crc32;
     job.out_skipped_vector = &skipped_vector;
     job.out_io_ms = use_layer_telemetry ? &layer_telemetry.io_ms : NULL;
-    job.mold_bf16 = is_mold;
+    job.representation = task->representation;
     job.progressive_stage = task->progressive_stage;
 
     rc = convert_tensor_to_dir(&job);
@@ -3468,6 +3886,7 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
         task.progressive_stage = stage;
         task.tensor_name = tensor_name;
         task.last_prefetched_entry_idx = &last_prefetched_entry_idx;
+        task.representation = FULL_MODEL_TENSOR_REPRESENTATION_TERNARY;
         status = process_full_model_tensor(&task);
 
         if (status < 0) {
@@ -3572,6 +3991,20 @@ static void log_conversion_config(const ternary_conversion_config_t *config)
              (double)((config->hessian_proxy_floor >= 0.0f) ? config->hessian_proxy_floor : 0.05f));
     LOG_INFO("  layer filter: %s",
              config_has_text(config->layer_name) ? config->layer_name : "<all layers>");
+    LOG_INFO("  anchor_mode: %s", config->use_anchor_mode ? "enabled" : "disabled");
+    if (config->use_anchor_mode) {
+        LOG_INFO("  anchor_budget_ppm: %u", config->anchor_budget_ppm);
+        LOG_INFO("  anchor_saliency_mode: %d", config->anchor_saliency_mode);
+        if (full_model_anchor_mode_enabled(config)) {
+            LOG_INFO("  full_model_anchor_policy: %s pattern=%s artifact_version=%u",
+                     full_model_anchor_policy_name(config),
+                     full_model_anchor_policy_pattern(config),
+                     TERNARY_ANCHOR_VERSION);
+            if (full_model_anchor_policy_filter(config)[0] != '\0') {
+                LOG_INFO("  full_model_anchor_filter: %s", full_model_anchor_policy_filter(config));
+            }
+        }
+    }
 
     if (config_has_text(config->activation_tape_path)) {
         LOG_INFO("  activation_tape: %s", config->activation_tape_path);

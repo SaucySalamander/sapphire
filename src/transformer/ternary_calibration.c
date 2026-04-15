@@ -2365,9 +2365,29 @@ static void ste_build_step_schedule(const ste_calibration_context_t *context,
     out_schedule->regularization_strength *= context->layer_schedule.regularization_scale;
     out_schedule->non_collapse_weight *= context->layer_schedule.non_collapse_scale;
     out_schedule->hessian_scale = context->layer_schedule.hessian_scale;
+    if (context->layer_schedule.prefer_local_scale_floor &&
+        context->layer_schedule.warmup_steps > 0u) {
+        out_schedule->hessian_scale = ste_schedule_lerp(0.0f,
+                                                        context->layer_schedule.hessian_scale,
+                                                        step_index,
+                                                        context->layer_schedule.warmup_steps);
+    }
     if (out_schedule->hessian_proxy_cap <= 0.0f ||
         out_schedule->hessian_proxy_cap > context->layer_schedule.hessian_proxy_cap) {
         out_schedule->hessian_proxy_cap = context->layer_schedule.hessian_proxy_cap;
+    }
+    if (context->layer_schedule.prefer_local_scale_floor &&
+        context->layer_schedule.hessian_proxy_cap > 0.0f &&
+        context->layer_schedule.warmup_steps > 0u) {
+        float warmup_hessian_proxy_cap = ste_schedule_lerp(0.0f,
+                                                           context->layer_schedule.hessian_proxy_cap,
+                                                           step_index,
+                                                           context->layer_schedule.warmup_steps);
+
+        if (out_schedule->hessian_proxy_cap <= 0.0f ||
+            out_schedule->hessian_proxy_cap > warmup_hessian_proxy_cap) {
+            out_schedule->hessian_proxy_cap = warmup_hessian_proxy_cap;
+        }
     }
 }
 
@@ -2405,21 +2425,21 @@ static int ste_low_energy_auto_decay_enabled(const ste_calibration_context_t *co
     return context && context->config && context->layer_schedule.prefer_local_scale_floor;
 }
 
-static void ste_maybe_apply_low_energy_auto_decay(ste_calibration_context_t *context,
-                                                  uint32_t step_index,
-                                                  float current_loss,
-                                                  float previous_loss,
-                                                  float best_loss)
+static int ste_maybe_apply_low_energy_auto_decay(ste_calibration_context_t *context,
+                                                 uint32_t step_index,
+                                                 float current_loss,
+                                                 float previous_loss,
+                                                 float best_loss)
 {
     float min_delta = 0.0f;
     float divergence_ratio = 0.0f;
     float new_scale = 1.0f;
 
     if (!ste_low_energy_auto_decay_enabled(context) || step_index <= 1u) {
-        return;
+        return 0;
     }
     if (!isfinite(previous_loss) || !isfinite(best_loss) || best_loss <= 1e-12f) {
-        return;
+        return 0;
     }
 
     min_delta = context->config->early_stop_min_delta;
@@ -2430,7 +2450,7 @@ static void ste_maybe_apply_low_energy_auto_decay(ste_calibration_context_t *con
 
     if (current_loss <= previous_loss + min_delta ||
         current_loss <= best_loss * divergence_ratio) {
-        return;
+        return 0;
     }
 
     new_scale = context->learning_rate_scale * STE_LOW_ENERGY_AUTO_DECAY_FACTOR;
@@ -2438,7 +2458,7 @@ static void ste_maybe_apply_low_energy_auto_decay(ste_calibration_context_t *con
         new_scale = context->minimum_learning_rate_scale;
     }
     if (new_scale >= context->learning_rate_scale) {
-        return;
+        return 0;
     }
 
     LOG_INFO("STE low-energy auto-decay: tensor=%s step=%u prev_loss=%.6f best_loss=%.6f current_loss=%.6f lr_scale=%.4f->%.4f",
@@ -2450,6 +2470,7 @@ static void ste_maybe_apply_low_energy_auto_decay(ste_calibration_context_t *con
              (double)context->learning_rate_scale,
              (double)new_scale);
     context->learning_rate_scale = new_scale;
+    return 1;
 }
 
 static void ste_quantize_context_latent(const ste_calibration_context_t *context)
@@ -2937,6 +2958,7 @@ static const char *ste_early_stop_reason_name(ste_early_stop_reason_t reason)
 static ste_early_stop_reason_t ste_update_early_stop_state(const ste_calibration_context_t *context,
                                                            uint32_t step_index,
                                                            float current_loss,
+                                                           int auto_decay_applied,
                                                            ste_early_stop_state_t *state)
 {
     float min_delta = 0.0f;
@@ -2956,11 +2978,17 @@ static ste_early_stop_reason_t ste_update_early_stop_state(const ste_calibration
         state->best_step = step_index;
         state->plateau_steps = 0u;
         memcpy(context->best_latent, context->latent, weight_count * sizeof(float));
+    } else if (auto_decay_applied) {
+        state->plateau_steps = 0u;
     } else {
         state->plateau_steps++;
     }
 
-    if (step_index < STE_EARLY_STOP_MIN_STEPS) {
+    if (step_index <= STE_EARLY_STOP_MIN_STEPS) {
+        state->previous_loss = current_loss;
+        return STE_EARLY_STOP_REASON_NONE;
+    }
+    if (auto_decay_applied) {
         state->previous_loss = current_loss;
         return STE_EARLY_STOP_REASON_NONE;
     }
@@ -3012,6 +3040,7 @@ static int run_ste_calibration_steps(ste_calibration_context_t *context,
     for (int step = 0; step < context->config->ste_steps; ++step) {
         ste_step_metrics_t step_metrics;
         ste_step_schedule_t step_schedule;
+        int auto_decay_applied = 0;
         struct timespec step_start;
         struct timespec step_end;
         ste_telemetry_step_t telemetry_step;
@@ -3030,14 +3059,15 @@ static int run_ste_calibration_steps(ste_calibration_context_t *context,
                               (uint32_t)(step + 1),
                               &step_schedule);
         current_loss = (context->rows > 0u) ? (step_metrics.mse_sum / (float)context->rows) : 0.0f;
-        ste_maybe_apply_low_energy_auto_decay(context,
-                              (uint32_t)(step + 1),
-                              current_loss,
-                              previous_loss,
-                              best_loss);
+    auto_decay_applied = ste_maybe_apply_low_energy_auto_decay(context,
+                                   (uint32_t)(step + 1),
+                                   current_loss,
+                                   previous_loss,
+                                   best_loss);
         stop_reason = ste_update_early_stop_state(context,
                                                   (uint32_t)(step + 1),
                                                   current_loss,
+                          auto_decay_applied,
                                                   &early_stop_state);
 
         if (telemetry_runtime && telemetry_runtime->enabled) {

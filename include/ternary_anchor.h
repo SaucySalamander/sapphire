@@ -36,11 +36,14 @@ extern "C" {
 /* Maximum supported anchor budget (10000 ppm = 1.0%). */
 #define TERNARY_ANCHOR_MAX_BUDGET_PPM 10000u
 
-/* Magic number for anchor payload files. */
+/* Legacy binary sidecar magic number. */
 #define TERNARY_ANCHOR_MAGIC 0x414E4331u /* "ANC1" */
 
-/* Current anchor payload version. */
-#define TERNARY_ANCHOR_VERSION 1u
+/* Legacy binary sidecar version. */
+#define TERNARY_ANCHOR_LEGACY_VERSION 1u
+
+/* Current production safetensors anchor contract version. */
+#define TERNARY_ANCHOR_VERSION 2u
 
 /**
  * @brief Saliency score computation mode.
@@ -191,10 +194,10 @@ void ternary_anchor_selection_free(ternary_anchor_selection_t *selection);
 /**
  * @brief Write a hybrid ternary+anchor tensor to a directory.
  *
- * Creates three safetensors payloads:
+ * Creates two payload files:
  * - <tensor_name>.packed : packed ternary symbols
  * - <tensor_name>.scales : grouped FP32 scales
- * - <tensor_name>.anchors : sorted COO anchor entries
+ * - <tensor_name>.anchors.safetensors : explicit anchor COO payload tensors
  *
  * @param output_dir   Output directory path
  * @param tensor_name  Tensor name for file naming
@@ -221,14 +224,31 @@ int ternary_anchor_append_manifest(const char *output_dir,
                                    uint32_t bulk_crc32);
 
 /**
- * @brief Load an anchor patch from a safetensors file.
+ * @brief Load an anchor patch from a production safetensors sidecar or legacy binary sidecar.
  *
- * @param anchor_path  Path to the .anchors.safetensors file
+ * @param anchor_path  Path to the anchor sidecar named in manifest.tsv
  * @param out_view     Output view (caller must release with ternary_anchor_view_release)
  * @return 0 on success, -1 on error
  */
 int ternary_anchor_load(const char *anchor_path,
                         ternary_anchor_view_t *out_view);
+
+/**
+ * @brief Load an anchor patch and validate it belongs to a specific tensor.
+ *
+ * For safetensors sidecars, the loader validates the expected tensor name
+ * against the sidecar metadata and the `<tensor_name>.anchor_entries` tensor.
+ * Legacy binary sidecars do not carry tensor names and are still accepted
+ * during the migration window.
+ *
+ * @param anchor_path            Path to the anchor sidecar named in manifest.tsv
+ * @param expected_tensor_name   Tensor name from manifest.tsv (NULL disables the check)
+ * @param out_view               Output view (caller must release with ternary_anchor_view_release)
+ * @return 0 on success, -1 on error
+ */
+int ternary_anchor_load_for_tensor(const char *anchor_path,
+                                   const char *expected_tensor_name,
+                                   ternary_anchor_view_t *out_view);
 
 /**
  * @brief Release memory owned by an anchor view.

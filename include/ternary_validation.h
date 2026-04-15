@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 #include "inference.h"
+#include "ternary_anchor.h"
 #include "ternary_calibration.h"
 #include "ternary_telemetry.h"
 
@@ -29,6 +30,18 @@ typedef struct tensor_t tensor_t;
 typedef struct ternary_layer_payload_t ternary_layer_payload_t;
 
 typedef struct ternary_validation_patch ternary_validation_patch_t;
+
+typedef struct {
+    const float *weights;
+    uint32_t rows;
+    uint32_t cols;
+} ternary_validation_dense_view_t;
+
+typedef struct {
+    const uint16_t *weights;
+    uint32_t rows;
+    uint32_t cols;
+} ternary_validation_bf16_view_t;
 
 typedef struct {
     char tensor_name[256];
@@ -77,6 +90,25 @@ int ternary_validation_apply_proxy_from_payload(ternary_validation_state_t *stat
                                                 const ternary_layer_payload_t *payload,
                                                 uint32_t crc32,
                                                 int converted_count);
+
+int ternary_validation_apply_proxy_from_hybrid_payload(ternary_validation_state_t *state,
+                                                       const char *tensor_name,
+                                                       const ternary_layer_payload_t *payload,
+                                                       const ternary_anchor_view_t *anchor_view,
+                                                       uint32_t crc32,
+                                                       int converted_count);
+
+int ternary_validation_apply_proxy_from_dense(ternary_validation_state_t *state,
+                                              const char *tensor_name,
+                                              const ternary_validation_dense_view_t *view,
+                                              uint32_t crc32,
+                                              int converted_count);
+
+int ternary_validation_apply_proxy_from_bf16(ternary_validation_state_t *state,
+                                             const char *tensor_name,
+                                             const ternary_validation_bf16_view_t *view,
+                                             uint32_t crc32,
+                                             int converted_count);
 
 int ternary_validation_adopt_patch_records(ternary_validation_state_t *state,
                                            const ternary_validation_patch_record_t *records,

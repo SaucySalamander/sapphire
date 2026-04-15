@@ -37,7 +37,18 @@ METADATA_FILES = (
 CONFIG_OVERRIDE_FILE = "sapphire_config_overrides.json"
 ANCHOR_MAGIC = 0x414E4331
 ANCHOR_VERSION = 1
+ANCHOR_SAFETENSORS_VERSION = 2
 ANCHOR_METADATA_STRUCT = struct.Struct("<IIIIIIIIIfffII")
+PACKAGE_STORAGE_ENCODING = "mixed_bf16_ternary_2bit"
+PACKAGE_FEATURE_CONTRACT_KEY = "sapphire_hybrid_feature_contract"
+PACKAGE_FEATURE_CONTRACT_VALUE = "anchor-bearing-v1"
+PACKAGE_FORMAT_VERSION_KEY = "sapphire_hybrid_package_format_version"
+PACKAGE_FORMAT_VERSION_VALUE = 1
+PACKAGE_STORAGE_ENCODING_KEY = "sapphire_hybrid_storage_encoding"
+MANIFEST_FORM_BULK = 1 << 0
+MANIFEST_FORM_MOLD = 1 << 1
+MANIFEST_FORM_LEGACY_ANCHOR = 1 << 2
+MANIFEST_FORM_UNIFIED_ANCHOR = 1 << 3
 
 
 WriteTensorData = Callable[[BinaryIO], None]
@@ -128,6 +139,68 @@ def _metadata_int(metadata: object, key: str) -> int | None:
     if isinstance(value, str) and value.strip():
         return int(value)
     raise ValueError(f"Invalid metadata value for {key}: {value!r}")
+
+
+def _ordered_unique_ints(values: list[int]) -> list[int]:
+    return sorted(set(values))
+
+
+def _require_bool_override(name: str, value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"Config override {name} must be a JSON boolean, got {value!r}")
+    return value
+
+
+def _require_int_override(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Config override {name} must be a JSON integer, got {value!r}")
+    return int(value)
+
+
+def _require_str_override(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Config override {name} must be a non-empty JSON string, got {value!r}")
+    return value
+
+
+def _expected_anchor_package_overrides(budget_ppm: int) -> OrderedDict[str, object]:
+    expected = OrderedDict()
+    expected["sapphire_mixed_precision_anchors"] = True
+    expected["sapphire_anchor_budget_ppm"] = budget_ppm
+    expected[PACKAGE_FORMAT_VERSION_KEY] = PACKAGE_FORMAT_VERSION_VALUE
+    expected[PACKAGE_FEATURE_CONTRACT_KEY] = PACKAGE_FEATURE_CONTRACT_VALUE
+    expected[PACKAGE_STORAGE_ENCODING_KEY] = PACKAGE_STORAGE_ENCODING
+    return expected
+
+
+def _validate_expected_override_value(name: str, actual_value: object, expected_value: object) -> None:
+    if isinstance(expected_value, bool):
+        if _require_bool_override(name, actual_value) != expected_value:
+            raise ValueError(f"Config override {name}={actual_value!r} does not match required value {expected_value!r}")
+        return
+    if isinstance(expected_value, int):
+        if _require_int_override(name, actual_value) != expected_value:
+            raise ValueError(f"Config override {name}={actual_value!r} does not match required value {expected_value!r}")
+        return
+
+    if _require_str_override(name, actual_value) != expected_value:
+        raise ValueError(f"Config override {name}={actual_value!r} does not match required value {expected_value!r}")
+
+
+def _reject_stray_hybrid_overrides(overrides: OrderedDict[str, object]) -> None:
+    hybrid_keys = [
+        "sapphire_mixed_precision_anchors",
+        "sapphire_anchor_budget_ppm",
+        PACKAGE_FORMAT_VERSION_KEY,
+        PACKAGE_FEATURE_CONTRACT_KEY,
+        PACKAGE_STORAGE_ENCODING_KEY,
+    ]
+    stray_keys = [key for key in hybrid_keys if key in overrides]
+    if stray_keys:
+        raise ValueError(
+            "Config overrides declare hybrid package metadata for a non-anchor artifact: "
+            + ", ".join(stray_keys)
+        )
 
 
 def _read_ternary_payload_layout(payload_path: Path,
@@ -329,6 +402,7 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
         raise FileNotFoundError(f"Missing ternary manifest: {manifest_path}")
 
     entries: OrderedDict[str, TernaryManifestEntry] = OrderedDict()
+    entry_forms: dict[str, int] = {}
     with manifest_path.open("r", encoding="utf-8") as manifest_file:
         for line_number, raw_line in enumerate(manifest_file, start=1):
             line = raw_line.strip()
@@ -340,21 +414,25 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
                 kind = "ternary"
                 anchor_file_name = None
                 anchor_count = 0
+                form = MANIFEST_FORM_BULK
             elif len(parts) == 7:
                 name, file_name, rows, cols, packed_bytes, crc32, kind = parts
                 if kind not in {"mold"}:
                     raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
                 anchor_file_name = None
                 anchor_count = 0
+                form = MANIFEST_FORM_MOLD
             elif len(parts) == 8:
                 name, anchor_file_name, rows, cols, packed_bytes, crc32, kind, anchor_count = parts
                 if kind != "anchor":
                     raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
                 file_name = ""
+                form = MANIFEST_FORM_LEGACY_ANCHOR
             elif len(parts) == 9:
                 name, file_name, rows, cols, packed_bytes, crc32, kind, anchor_file_name, anchor_count = parts
                 if kind != "anchor":
                     raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
+                form = MANIFEST_FORM_UNIFIED_ANCHOR
             else:
                 raise ValueError(f"Invalid manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
 
@@ -372,9 +450,19 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
             existing = entries.get(name)
             if existing is None:
                 entries[name] = entry
+                entry_forms[name] = form
             else:
-                if existing.kind == "mold" or entry.kind == "mold":
-                    raise ValueError(f"Duplicate mold manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
+                existing_forms = entry_forms[name]
+                if (existing_forms & MANIFEST_FORM_MOLD) or (form & MANIFEST_FORM_MOLD):
+                    raise ValueError(f"Invalid mixed or duplicate mold manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
+                if (existing_forms & MANIFEST_FORM_UNIFIED_ANCHOR) or (form & MANIFEST_FORM_UNIFIED_ANCHOR):
+                    raise ValueError(
+                        f"Unified anchor manifest rows cannot be mixed with duplicates for {name} at {manifest_path}:{line_number}"
+                    )
+                if form == MANIFEST_FORM_BULK and (existing_forms & MANIFEST_FORM_BULK):
+                    raise ValueError(f"Duplicate ternary bulk manifest row for {name} at {manifest_path}:{line_number}")
+                if form == MANIFEST_FORM_LEGACY_ANCHOR and (existing_forms & MANIFEST_FORM_LEGACY_ANCHOR):
+                    raise ValueError(f"Duplicate legacy anchor manifest row for {name} at {manifest_path}:{line_number}")
                 if entry.file_name:
                     if existing.file_name and existing.file_name != entry.file_name:
                         raise ValueError(f"Conflicting bulk payload for {name} at {manifest_path}:{line_number}")
@@ -386,10 +474,20 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
                         raise ValueError(f"Conflicting anchor payload for {name} at {manifest_path}:{line_number}")
                     existing.anchor_file_name = entry.anchor_file_name
                     existing.anchor_count = entry.anchor_count
-                if entry.kind == "anchor" or existing.kind == "anchor":
+                if form == MANIFEST_FORM_LEGACY_ANCHOR or existing.kind == "anchor":
                     existing.kind = "anchor"
+                entry_forms[name] = existing_forms | form
 
     for entry in entries.values():
+        forms = entry_forms[entry.name]
+        if forms == MANIFEST_FORM_MOLD:
+            entry.kind = "mold"
+        elif forms == MANIFEST_FORM_BULK:
+            entry.kind = "ternary"
+        elif forms in {MANIFEST_FORM_UNIFIED_ANCHOR, MANIFEST_FORM_BULK | MANIFEST_FORM_LEGACY_ANCHOR}:
+            entry.kind = "anchor"
+        else:
+            raise ValueError(f"Incomplete or ambiguous manifest migration contract for {entry.name} in {manifest_path}")
         if entry.kind in {"ternary", "anchor"}:
             if not entry.file_name:
                 raise ValueError(f"Missing ternary bulk payload for {entry.name} in {manifest_path}")
@@ -416,6 +514,49 @@ def _read_anchor_budget_ppm(ternary_dir: Path, entry: TernaryManifestEntry) -> i
     anchor_path = ternary_dir / entry.anchor_file_name
     if not anchor_path.is_file():
         raise FileNotFoundError(f"Missing anchor payload: {anchor_path}")
+
+    if anchor_path.suffix == ".safetensors":
+        header, data_start = _read_safetensors_header(anchor_path)
+        metadata = header.get("__metadata__")
+        entries_meta = header.get(f"{entry.name}.anchor_entries")
+
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Missing anchor safetensors metadata: {anchor_path}")
+        if not isinstance(entries_meta, dict):
+            raise ValueError(f"Missing anchor_entries tensor for {entry.name}: {anchor_path}")
+        if entries_meta.get("dtype") != "U16":
+            raise ValueError(f"Unsupported anchor_entries dtype in {anchor_path}: {entries_meta.get('dtype')}")
+        if _tensor_shape(entries_meta) != (entry.anchor_count, 4):
+            raise ValueError(
+                f"Anchor entries shape mismatch for {entry.name}: expected {(entry.anchor_count, 4)}, got {_tensor_shape(entries_meta)}"
+            )
+
+        start, end = _tensor_offsets(anchor_path, entries_meta, data_start)
+        if end - start != entry.anchor_count * 8:
+            raise ValueError(
+                f"Anchor entries byte count mismatch for {entry.name}: expected {entry.anchor_count * 8}, got {end - start}"
+            )
+
+        format_version = _metadata_int(metadata, "format_version")
+        rows = _metadata_int(metadata, "rows")
+        cols = _metadata_int(metadata, "cols")
+        anchor_count = _metadata_int(metadata, "anchor_count")
+        budget_ppm = _metadata_int(metadata, "budget_ppm")
+        value_dtype = metadata.get("value_dtype")
+        tensor_name = metadata.get("tensor_name")
+
+        if format_version != ANCHOR_SAFETENSORS_VERSION:
+            raise ValueError(f"Unsupported anchor safetensors format version in {anchor_path}: {format_version}")
+        if rows != entry.rows or cols != entry.cols or anchor_count != entry.anchor_count:
+            raise ValueError(f"Anchor safetensors metadata mismatch for {entry.name}: {anchor_path}")
+        if value_dtype != "BF16":
+            raise ValueError(f"Unsupported anchor value dtype in {anchor_path}: {value_dtype!r}")
+        if tensor_name is not None and tensor_name != entry.name:
+            raise ValueError(f"Anchor safetensors tensor_name mismatch for {entry.name}: {anchor_path}")
+        if budget_ppm is None:
+            raise ValueError(f"Missing anchor budget metadata in {anchor_path}")
+
+        return int(budget_ppm)
 
     with anchor_path.open("rb") as anchor_file:
         header = anchor_file.read(ANCHOR_METADATA_STRUCT.size)
@@ -647,37 +788,49 @@ def _load_config_overrides(ternary_dir: Path) -> OrderedDict[str, object]:
 def _augment_anchor_config_overrides(overrides: OrderedDict[str, object],
                                      manifest: OrderedDict[str, TernaryManifestEntry],
                                      ternary_dir: Path) -> OrderedDict[str, object]:
-    budgets: set[int] = set()
+    budgets: list[int] = []
+    has_anchor_payloads = any(entry.kind == "anchor" for entry in manifest.values())
 
-    if not any(entry.kind == "anchor" for entry in manifest.values()):
+    if not has_anchor_payloads:
+        _reject_stray_hybrid_overrides(overrides)
         return overrides
-
-    if "sapphire_mixed_precision_anchors" in overrides:
-        if not bool(overrides["sapphire_mixed_precision_anchors"]):
-            raise ValueError("Config overrides disable sapphire_mixed_precision_anchors for an anchor-bearing artifact")
-    else:
-        overrides["sapphire_mixed_precision_anchors"] = True
 
     for entry in manifest.values():
         if entry.kind != "anchor":
             continue
         budget_ppm = _read_anchor_budget_ppm(ternary_dir, entry)
         if budget_ppm > 0:
-            budgets.add(budget_ppm)
+            budgets.append(budget_ppm)
 
-    if len(budgets) > 1:
-        raise ValueError(f"Inconsistent anchor budgets in manifest: {sorted(budgets)}")
-    if budgets:
-        budget_ppm = next(iter(budgets))
-        if "sapphire_anchor_budget_ppm" in overrides:
-            if int(overrides["sapphire_anchor_budget_ppm"]) != budget_ppm:
-                raise ValueError(
-                    "Config override sapphire_anchor_budget_ppm does not match anchor payload metadata"
-                )
+    unique_budgets = _ordered_unique_ints(budgets)
+    if len(unique_budgets) > 1:
+        raise ValueError(f"Inconsistent anchor budgets in manifest: {unique_budgets}")
+
+    if not unique_budgets:
+        raise ValueError("Anchor-bearing artifact is missing required anchor budget metadata")
+
+    expected = _expected_anchor_package_overrides(unique_budgets[0])
+    for key, expected_value in expected.items():
+        if key in overrides:
+            _validate_expected_override_value(key, overrides[key], expected_value)
         else:
-            overrides["sapphire_anchor_budget_ppm"] = budget_ppm
+            overrides[key] = expected_value
 
     return overrides
+
+
+def _collect_package_metadata_entries(manifest: OrderedDict[str, TernaryManifestEntry],
+                                      config_overrides: OrderedDict[str, object]) -> tuple[tuple[str, int | str], ...]:
+    if not any(entry.kind == "anchor" for entry in manifest.values()):
+        return ()
+
+    return (
+        ("sapphire_mixed_precision_anchors", "true"),
+        ("sapphire_anchor_budget_ppm", int(config_overrides["sapphire_anchor_budget_ppm"])),
+        (PACKAGE_FORMAT_VERSION_KEY, PACKAGE_FORMAT_VERSION_VALUE),
+        (PACKAGE_FEATURE_CONTRACT_KEY, PACKAGE_FEATURE_CONTRACT_VALUE),
+        (PACKAGE_STORAGE_ENCODING_KEY, PACKAGE_STORAGE_ENCODING),
+    )
 
 
 def _apply_config_overrides(output_dir: Path, overrides: OrderedDict[str, object]) -> None:
@@ -743,6 +896,7 @@ def _write_safetensors_file(
     output_path: Path,
     tensor_items: list[OutputTensorItem],
     total_size: int,
+    package_metadata_entries: tuple[tuple[str, int | str], ...],
     overwrite: bool,
 ) -> None:
     if output_path.exists() and not overwrite:
@@ -752,10 +906,12 @@ def _write_safetensors_file(
     header["__metadata__"] = OrderedDict(
         [
             ("total_size", str(total_size)),
-            ("storage_encoding", "mixed_bf16_ternary_2bit"),
+            ("storage_encoding", PACKAGE_STORAGE_ENCODING),
             ("ternary_manifest", "manifest.tsv"),
         ]
     )
+    for key, value in package_metadata_entries:
+        header["__metadata__"][key] = str(value)
     for tensor in tensor_items:
         for key, value in tensor.metadata_entries:
             header["__metadata__"][key] = value
@@ -996,6 +1152,7 @@ def repack_ternary_model(
         manifest,
         ternary_dir,
     )
+    package_metadata_entries = _collect_package_metadata_entries(manifest, config_overrides)
     _apply_config_overrides(output_dir, config_overrides)
     _copy_anchor_sidecars(ternary_dir, output_dir, manifest, overwrite=overwrite)
 
@@ -1004,7 +1161,7 @@ def repack_ternary_model(
     shard_count = len(shards)
     if shard_count == 1:
         shard_path = output_dir / "model.safetensors"
-        _write_safetensors_file(shard_path, shards[0], total_size, overwrite)
+        _write_safetensors_file(shard_path, shards[0], total_size, package_metadata_entries, overwrite)
         for tensor in shards[0]:
             if tensor.manifest_entry is not None:
                 logical_weight_map[tensor.logical_name] = shard_path.name
@@ -1015,7 +1172,7 @@ def repack_ternary_model(
         for shard_idx, shard in enumerate(shards, start=1):
             shard_name = f"model-{shard_idx:0{shard_name_width}d}-of-{shard_count:0{shard_name_width}d}.safetensors"
             shard_path = output_dir / shard_name
-            _write_safetensors_file(shard_path, shard, total_size, overwrite)
+            _write_safetensors_file(shard_path, shard, total_size, package_metadata_entries, overwrite)
             for tensor in shard:
                 if tensor.manifest_entry is not None:
                     logical_weight_map[tensor.logical_name] = shard_name
@@ -1030,8 +1187,9 @@ def repack_ternary_model(
                 {
                     "metadata": {
                         "total_size": total_size,
-                        "storage_encoding": "mixed_bf16_ternary_2bit",
+                        "storage_encoding": PACKAGE_STORAGE_ENCODING,
                         "ternary_manifest": "manifest.tsv",
+                        **{key: value for key, value in package_metadata_entries},
                     },
                     "weight_map": weight_map,
                 },

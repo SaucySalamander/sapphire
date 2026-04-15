@@ -39,6 +39,7 @@ Engineering Rules
 - Do not collapse distinct workflows into one abstraction just because they all touch tensors. Inference, tape replay, calibration, validation, and conversion have different correctness constraints.
 - Prefer extending the existing backend abstraction or workflow boundaries over duplicating orchestration logic.
 - Keep public APIs and CLI flags stable unless the task explicitly requires a breaking change.
+- Keep the README's 1B teacher to 7B student workflow in sync with the current CLI flags, helper scripts, and validation commands whenever recording, alignment, distillation, packaging, or backend gating behavior changes.
 - When touching lizard-sensitive code, extract helpers instead of adding more nesting.
 - Target CCN less than or equal to 20 when practical. Hard limit is 30.
 - If a function grows beyond roughly 100 to 150 NLOC or exceeds 3 nested levels, split it.
