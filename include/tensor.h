@@ -13,6 +13,7 @@
  * - DTYPE_F16: 16-bit float (half precision)
  * - DTYPE_Q4_0: 4-bit quantized (from Phase 1 quantization)
  * - DTYPE_Q8_0: 8-bit quantized (from Phase 1 quantization)
+ * - DTYPE_TERNARY_2BIT: packed ternary weights with grouped FP32 scales
  */
 typedef enum {
     DTYPE_F32,     // 32-bit float
@@ -20,7 +21,63 @@ typedef enum {
     DTYPE_F16,     // 16-bit float (half precision)
     DTYPE_Q4_0,    // 4-bit quantized (Phase 1)
     DTYPE_Q8_0,    // 8-bit quantized (Phase 1)
+    DTYPE_TERNARY_2BIT,    // 2-bit packed ternary symbols + grouped scales
+    DTYPE_TERNARY_HYBRID,  // 2-bit ternary bulk + BF16 anchor patch
 } tensor_dtype_t;
+
+typedef struct {
+    const uint8_t *packed_weights;
+    const float *scales;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t packed_cols;
+    uint32_t scale_group_size;
+    uint32_t groups_per_row;
+    size_t packed_weight_bytes;
+    size_t scale_count;
+    size_t scale_bytes;
+} tensor_ternary_view_t;
+
+typedef struct {
+    const uint8_t *packed_weights;
+    size_t packed_weight_bytes;
+    const float *scales;
+    size_t scale_count;
+    uint32_t scale_group_size;
+} tensor_ternary_payload_t;
+
+/**
+ * @brief Hybrid ternary + BF16 anchor view for runtime.
+ *
+ * The anchor_entries array is sorted by (row, col).
+ * Row i's anchors span indices [anchor_row_offsets[i], anchor_row_offsets[i+1]).
+ */
+typedef struct {
+    /* Ternary bulk (same as tensor_ternary_view_t) */
+    const uint8_t *packed_weights;
+    const float *scales;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t packed_cols;
+    uint32_t scale_group_size;
+    uint32_t groups_per_row;
+    size_t packed_weight_bytes;
+    size_t scale_count;
+    size_t scale_bytes;
+    /* Anchor patch */
+    const void *anchor_entries;        /* ternary_anchor_entry_t[] or NULL */
+    const uint32_t *anchor_row_offsets; /* CSR-like row offsets (rows+1) or NULL */
+    uint32_t anchor_count;
+    int owns_anchor_memory;
+} tensor_hybrid_view_t;
+
+typedef struct {
+    tensor_ternary_payload_t bulk;
+    const void *anchor_entries;
+    const uint32_t *anchor_row_offsets;
+    uint32_t anchor_count;
+    int owns_anchor_memory;
+} tensor_hybrid_payload_t;
 
 /**
  * @brief Memory layout strategy for tensor storage.
@@ -202,9 +259,56 @@ size_t tensor_nbytes(const tensor_t *t);
 int tensor_ref_count(const tensor_t *t);
 
 /**
+ * @brief Returns non-zero if the tensor's data is externally owned (e.g. mmap).
+ *
+ * Only externally-owned tensors are safe to advise with MADV_DONTNEED because
+ * file-backed pages are re-faulted from the file on next access. Malloc-backed
+ * (non-external) tensors will read back as zeros after MADV_DONTNEED.
+ *
+ * @return 1 if external (mmap-backed), 0 if malloc-owned.
+ */
+int tensor_is_external(const tensor_t *t);
+
+/**
  * @brief Create a tensor that points to existing data (no allocation).
  * Used for memory-mapped weights.
  */
 tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, void *data);
+
+/**
+ * @brief Create an owned tensor wrapper for packed ternary weights.
+ *
+ * The returned tensor stores the logical matrix shape [rows, cols], while its
+ * backing payload points at a packed 2-bit symbol stream plus grouped F32
+ * scales.
+ */
+tensor_t* tensor_create_ternary_view(uint32_t rows,
+                                     uint32_t cols,
+                                     const tensor_ternary_payload_t *payload,
+                                     int is_external);
+
+/**
+ * @brief Return the packed ternary payload for a tensor, or NULL if not ternary.
+ */
+const tensor_ternary_view_t* tensor_data_ternary(const tensor_t *t);
+
+/**
+ * @brief Create a hybrid ternary+anchor tensor view.
+ *
+ * @param rows         Number of rows
+ * @param cols         Number of columns
+ * @param payload      Hybrid payload bundle
+ * @param is_external  If 1, data is externally owned and not freed
+ * @return Tensor or NULL on error
+ */
+tensor_t* tensor_create_hybrid_view(uint32_t rows,
+                                    uint32_t cols,
+                                    const tensor_hybrid_payload_t *payload,
+                                    int is_external);
+
+/**
+ * @brief Return the hybrid ternary+anchor view for a tensor, or NULL if not hybrid.
+ */
+const tensor_hybrid_view_t* tensor_data_hybrid(const tensor_t *t);
 
 #endif // TENSOR_H

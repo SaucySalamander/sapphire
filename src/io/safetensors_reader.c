@@ -26,6 +26,7 @@
 #include "../include/model_spec.h"
 #include "../include/tensor_mapper.h"
 #include "../include/simple_json.h"
+#include "../include/ternary_io.h"
 
 /**
  * @brief Opaque structure managing an open Safetensors file.
@@ -44,6 +45,214 @@ typedef struct safetensors_file_t {
     char *json_header;                 // Allocated copy of JSON (for parsing)
 } safetensors_file_t;
 
+int safetensors_metadata_get_u32(const safetensors_file_t *st,
+                                 const char *key,
+                                 uint32_t *out_value)
+{
+    sjson_cursor_t cursor;
+    char parsed_key[384];
+
+    if (!st || !st->json_header || !key || !out_value) {
+        return 0;
+    }
+
+    cursor = sjson_cursor_init(st->json_header, strlen(st->json_header));
+    if (!sjson_cursor_consume(&cursor, '{')) {
+        return 0;
+    }
+
+    while (sjson_cursor_peek(&cursor) != '\0') {
+        if (sjson_cursor_consume(&cursor, '}')) {
+            break;
+        }
+        if (sjson_cursor_parse_string(&cursor, parsed_key, (int)sizeof(parsed_key)) != 0) {
+            return 0;
+        }
+        if (!sjson_cursor_consume(&cursor, ':')) {
+            return 0;
+        }
+
+        if (strcmp(parsed_key, "__metadata__") == 0) {
+            if (!sjson_cursor_consume(&cursor, '{')) {
+                return 0;
+            }
+            while (sjson_cursor_peek(&cursor) != '\0') {
+                if (sjson_cursor_consume(&cursor, '}')) {
+                    break;
+                }
+                if (sjson_cursor_parse_string(&cursor, parsed_key, (int)sizeof(parsed_key)) != 0) {
+                    return 0;
+                }
+                if (!sjson_cursor_consume(&cursor, ':')) {
+                    return 0;
+                }
+
+                if (strcmp(parsed_key, key) == 0) {
+                    uint64_t parsed_u64 = 0u;
+
+                    if (sjson_cursor_peek(&cursor) == '"') {
+                        char parsed_value[64];
+                        char *end = NULL;
+                        unsigned long parsed = 0ul;
+
+                        if (sjson_cursor_parse_string(&cursor, parsed_value, (int)sizeof(parsed_value)) != 0) {
+                            return 0;
+                        }
+                        errno = 0;
+                        parsed = strtoul(parsed_value,
+                                         &end,
+                                         strpbrk(parsed_value, "abcdefABCDEF") ? 16 : 0);
+                        if (errno != 0 || end == parsed_value || *end != '\0' || parsed > 0xFFFFFFFFul) {
+                            return 0;
+                        }
+                        *out_value = (uint32_t)parsed;
+                        return 1;
+                    }
+
+                    if (sjson_cursor_parse_u64(&cursor, &parsed_u64) != 0 || parsed_u64 > 0xFFFFFFFFu) {
+                        return 0;
+                    }
+                    *out_value = (uint32_t)parsed_u64;
+                    return 1;
+                }
+
+                if (sjson_cursor_skip_value(&cursor) != 0) {
+                    return 0;
+                }
+                (void)sjson_cursor_consume(&cursor, ',');
+            }
+            return 0;
+        }
+
+        if (sjson_cursor_skip_value(&cursor) != 0) {
+            return 0;
+        }
+        (void)sjson_cursor_consume(&cursor, ',');
+    }
+
+    return 0;
+}
+
+int safetensors_metadata_get_string(const safetensors_file_t *st,
+                                    const char *key,
+                                    char *out_value,
+                                    size_t out_value_size)
+{
+    sjson_cursor_t cursor;
+    char parsed_key[384];
+
+    if (!st || !st->json_header || !key || !out_value || out_value_size == 0u) {
+        return 0;
+    }
+
+    out_value[0] = '\0';
+    cursor = sjson_cursor_init(st->json_header, strlen(st->json_header));
+    if (!sjson_cursor_consume(&cursor, '{')) {
+        return 0;
+    }
+
+    while (sjson_cursor_peek(&cursor) != '\0') {
+        if (sjson_cursor_consume(&cursor, '}')) {
+            break;
+        }
+        if (sjson_cursor_parse_string(&cursor, parsed_key, (int)sizeof(parsed_key)) != 0) {
+            return 0;
+        }
+        if (!sjson_cursor_consume(&cursor, ':')) {
+            return 0;
+        }
+
+        if (strcmp(parsed_key, "__metadata__") == 0) {
+            if (!sjson_cursor_consume(&cursor, '{')) {
+                return 0;
+            }
+            while (sjson_cursor_peek(&cursor) != '\0') {
+                if (sjson_cursor_consume(&cursor, '}')) {
+                    break;
+                }
+                if (sjson_cursor_parse_string(&cursor, parsed_key, (int)sizeof(parsed_key)) != 0) {
+                    return 0;
+                }
+                if (!sjson_cursor_consume(&cursor, ':')) {
+                    return 0;
+                }
+
+                if (strcmp(parsed_key, key) == 0) {
+                    if (sjson_cursor_peek(&cursor) != '"') {
+                        return 0;
+                    }
+                    return sjson_cursor_parse_string(&cursor,
+                                                     out_value,
+                                                     (int)out_value_size) == 0;
+                }
+
+                if (sjson_cursor_skip_value(&cursor) != 0) {
+                    return 0;
+                }
+                (void)sjson_cursor_consume(&cursor, ',');
+            }
+            return 0;
+        }
+
+        if (sjson_cursor_skip_value(&cursor) != 0) {
+            return 0;
+        }
+        (void)sjson_cursor_consume(&cursor, ',');
+    }
+
+    return 0;
+}
+
+int safetensors_resolve_ternary_scale_layout(const safetensors_file_t *st,
+                                             const char *tensor_name,
+                                             uint32_t cols,
+                                             uint32_t fallback_groups_per_row,
+                                             uint32_t *out_scale_group_size,
+                                             uint32_t *out_groups_per_row)
+{
+    char groups_key[384];
+    char group_size_key[384];
+    uint32_t groups_per_row = fallback_groups_per_row;
+    uint32_t scale_group_size = 0u;
+    uint32_t metadata_groups = 0u;
+
+    if (!st || !tensor_name || !out_scale_group_size || !out_groups_per_row ||
+        cols == 0u || fallback_groups_per_row == 0u) {
+        return -1;
+    }
+    if (snprintf(groups_key, sizeof(groups_key), "%s.groups_per_row", tensor_name) < 0 ||
+        snprintf(group_size_key, sizeof(group_size_key), "%s.scale_group_size", tensor_name) < 0) {
+        return -1;
+    }
+
+    if (safetensors_metadata_get_u32(st, groups_key, &metadata_groups)) {
+        if (metadata_groups != fallback_groups_per_row) {
+            LOG_ERROR("safetensors ternary scale metadata mismatch for %s: groups=%u shape=%u",
+                      tensor_name,
+                      metadata_groups,
+                      fallback_groups_per_row);
+            return -1;
+        }
+        groups_per_row = metadata_groups;
+    }
+    if (!safetensors_metadata_get_u32(st, group_size_key, &scale_group_size)) {
+        scale_group_size = (uint32_t)(((size_t)cols + groups_per_row - 1u) / groups_per_row);
+    }
+    if (scale_group_size == 0u ||
+        (uint32_t)(((size_t)cols + scale_group_size - 1u) / scale_group_size) != groups_per_row) {
+        LOG_ERROR("safetensors ternary scale layout invalid for %s: cols=%u groups=%u group_size=%u",
+                  tensor_name,
+                  cols,
+                  groups_per_row,
+                  scale_group_size);
+        return -1;
+    }
+
+    *out_scale_group_size = scale_group_size;
+    *out_groups_per_row = groups_per_row;
+    return 0;
+}
+
 /**
  * @brief Convert Safetensors dtype string to enum.
  */
@@ -55,6 +264,9 @@ static safetensors_dtype_t safetensors_dtype_from_string(const char *s) {
     if (strcmp(s, "F16") == 0 || strcmp(s, "float16") == 0) return SAFETENSORS_F16;
     if (strcmp(s, "I32") == 0 || strcmp(s, "int32") == 0) return SAFETENSORS_I32;
     if (strcmp(s, "I64") == 0 || strcmp(s, "int64") == 0) return SAFETENSORS_I64;
+    if (strcmp(s, "U8") == 0 || strcmp(s, "uint8") == 0) return SAFETENSORS_U8;
+    if (strcmp(s, "U16") == 0 || strcmp(s, "uint16") == 0) return SAFETENSORS_U16;
+    if (strcmp(s, "U32") == 0 || strcmp(s, "uint32") == 0) return SAFETENSORS_U32;
     
     return SAFETENSORS_UNKNOWN;
 }
@@ -347,6 +559,13 @@ safetensors_file_t* safetensors_open(const char *path) {
     st->header_size = header_len;
     st->json_header = json_header;
 
+    if (fd >= 0) {
+        if (close(fd) != 0) {
+            LOG_WARN("safetensors_open: close failed for %s: %s", path, strerror(errno));
+        }
+        st->fd = -1;
+    }
+
     LOG_INFO("✓ Safetensors file opened: %s", path);
     LOG_INFO("  - Header size: %lu bytes", (unsigned long)header_len);
     LOG_INFO("  - File size: %zu bytes", mmap_size);
@@ -449,6 +668,117 @@ tensor_t* safetensors_create_tensor_ref(safetensors_file_t *st,
     return t;
 }
 
+tensor_t* safetensors_create_ternary_tensor_ref(const safetensors_file_t *st,
+                                                const char *tensor_name,
+                                                uint32_t rows,
+                                                uint32_t cols,
+                                                size_t packed_weight_bytes,
+                                                uint32_t expected_crc32) {
+    char packed_name[320];
+    char scales_name[320];
+    const safetensors_tensor_meta_t *packed_meta = NULL;
+    const safetensors_tensor_meta_t *scales_meta = NULL;
+    const uint8_t *packed_ptr = NULL;
+    const float *scales_ptr = NULL;
+    size_t packed_cols = 0u;
+    size_t scale_count = 0u;
+    uint32_t groups_per_row = 0u;
+    uint32_t scale_group_size = 0u;
+    tensor_ternary_payload_t payload;
+
+    if (!st || !tensor_name || rows == 0u || cols == 0u) {
+        return NULL;
+    }
+
+    if (snprintf(packed_name, sizeof(packed_name), "%s.packed", tensor_name) < 0 ||
+        snprintf(scales_name, sizeof(scales_name), "%s.scales", tensor_name) < 0) {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: name formatting failed for %s", tensor_name);
+        return NULL;
+    }
+
+    packed_meta = safetensors_get_tensor_by_name(st, packed_name);
+    scales_meta = safetensors_get_tensor_by_name(st, scales_name);
+    if (!packed_meta || !scales_meta) {
+        return NULL;
+    }
+    if (packed_meta->dtype != SAFETENSORS_U8 || scales_meta->dtype != SAFETENSORS_F32) {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: unexpected dtypes for %s", tensor_name);
+        return NULL;
+    }
+
+    packed_cols = ((size_t)cols + (TERNARY_PACKED_WEIGHTS_PER_BYTE - 1u)) / TERNARY_PACKED_WEIGHTS_PER_BYTE;
+    if (packed_meta->ndim != 2 ||
+        packed_meta->shape[0] != rows || packed_meta->shape[1] != packed_cols) {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: shape mismatch for %s", tensor_name);
+        return NULL;
+    }
+    if (scales_meta->ndim == 1) {
+        if (scales_meta->shape[0] != rows) {
+            LOG_ERROR("safetensors_create_ternary_tensor_ref: legacy scale shape mismatch for %s", tensor_name);
+            return NULL;
+        }
+        groups_per_row = 1u;
+    } else if (scales_meta->ndim == 2) {
+        if (scales_meta->shape[0] != rows || scales_meta->shape[1] == 0u) {
+            LOG_ERROR("safetensors_create_ternary_tensor_ref: grouped scale shape mismatch for %s", tensor_name);
+            return NULL;
+        }
+        groups_per_row = scales_meta->shape[1];
+    } else {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: unsupported scale rank=%d for %s",
+                  scales_meta->ndim,
+                  tensor_name);
+        return NULL;
+    }
+    if (safetensors_resolve_ternary_scale_layout(st,
+                                                 tensor_name,
+                                                 cols,
+                                                 groups_per_row,
+                                                 &scale_group_size,
+                                                 &groups_per_row) != 0) {
+        return NULL;
+    }
+    scale_count = (size_t)rows * groups_per_row;
+    if (packed_meta->size_bytes != packed_weight_bytes) {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: packed byte mismatch for %s", tensor_name);
+        return NULL;
+    }
+    if (scales_meta->size_bytes != (uint64_t)scale_count * sizeof(float)) {
+        LOG_ERROR("safetensors_create_ternary_tensor_ref: scale byte mismatch for %s", tensor_name);
+        return NULL;
+    }
+
+    packed_ptr = (const uint8_t *)safetensors_data_ptr(st, packed_meta);
+    scales_ptr = (const float *)safetensors_data_ptr(st, scales_meta);
+    if (!packed_ptr || !scales_ptr) {
+        return NULL;
+    }
+
+    if (expected_crc32 != 0u) {
+        uint32_t actual_crc32 = io_crc32_update(0u, packed_ptr, packed_meta->size_bytes);
+        actual_crc32 = io_crc32_update(actual_crc32, scales_ptr, scales_meta->size_bytes);
+        if (actual_crc32 != expected_crc32) {
+            LOG_ERROR("safetensors_create_ternary_tensor_ref: crc mismatch for %s (expected=%08x actual=%08x)",
+                      tensor_name,
+                      expected_crc32,
+                      actual_crc32);
+            return NULL;
+        }
+    }
+
+    memset(&payload, 0, sizeof(payload));
+    payload.packed_weights = packed_ptr;
+    payload.packed_weight_bytes = packed_meta->size_bytes;
+    payload.scales = scales_ptr;
+    payload.scale_count = scale_count;
+    payload.scale_group_size = scale_group_size;
+
+    return tensor_create_ternary_view(rows,
+                                      cols,
+                                      &payload,
+                                      1);
+}
+
 /**
  * @brief Load tensor data with copy.
  */
@@ -458,6 +788,24 @@ tensor_t* safetensors_load_tensor_copy(const safetensors_file_t *st,
     
     tensor_t *t = safetensors_create_tensor_ref((safetensors_file_t*)st, meta);
     return t;
+}
+
+const void* safetensors_data_ptr(const safetensors_file_t *st,
+                                 const safetensors_tensor_meta_t *meta) {
+    uint64_t data_section_start = 0;
+
+    if (!st || !meta) {
+        LOG_ERROR("safetensors_data_ptr: invalid arguments");
+        return NULL;
+    }
+
+    data_section_start = 8 + st->header_size;
+    if (data_section_start + meta->offset + meta->size_bytes > st->mmap_size) {
+        LOG_ERROR("safetensors_data_ptr: tensor '%s' extends beyond file", meta->name);
+        return NULL;
+    }
+
+    return (const char*)st->mmap_ptr + data_section_start + meta->offset;
 }
 
 /**
@@ -483,6 +831,33 @@ void safetensors_close(safetensors_file_t *st) {
     }
     
     free(st);
+}
+
+/**
+ * @brief Evict resident pages of a safetensors file from RAM without closing.
+ *
+ * Calls madvise(MADV_DONTNEED) on the mmap region.  The file remains open and
+ * can still be accessed (pages will be demand-faulted back in), but the RSS
+ * associated with currently-resident pages is released.  Useful for dropping
+ * weight shards that are no longer actively used.
+ */
+void safetensors_evict_pages(safetensors_file_t *st)
+{
+    if (!st || !st->mmap_ptr || st->mmap_size == 0) {
+        return;
+    }
+    madvise(st->mmap_ptr, st->mmap_size, MADV_DONTNEED);
+}
+
+/**
+ * @brief Get the raw mmap pointer for a safetensors file.
+ */
+const void *safetensors_mmap_ptr(const safetensors_file_t *st)
+{
+    if (!st) {
+        return NULL;
+    }
+    return st->mmap_ptr;
 }
 
 /**
@@ -534,6 +909,9 @@ void safetensors_print_info(const safetensors_file_t *st) {
             case SAFETENSORS_F16: dtype_str = "F16"; break;
             case SAFETENSORS_I32: dtype_str = "I32"; break;
             case SAFETENSORS_I64: dtype_str = "I64"; break;
+            case SAFETENSORS_U8: dtype_str = "U8"; break;
+            case SAFETENSORS_U16: dtype_str = "U16"; break;
+            case SAFETENSORS_U32: dtype_str = "U32"; break;
             default: break;
         }
 

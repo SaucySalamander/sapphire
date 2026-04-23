@@ -26,6 +26,19 @@ extern "C" {
  */
 #define SAPPHIRE_MAX_LAYERS 256
 
+/**
+ * Per-layer memory page tracking for sliding-window eviction.
+ *
+ * When low_memory_mode is enabled, the inference loop uses these ranges
+ * to call madvise(MADV_DONTNEED) on layers outside the window and
+ * madvise(MADV_WILLNEED) on layers about to be processed.
+ */
+typedef struct {
+    int shard_idx;       /**< Index into safetensors_shard_handles[]. */
+    size_t offset;       /**< Byte offset within shard mmap. */
+    size_t size;         /**< Total bytes for this layer's tensors. */
+} model_layer_page_info_t;
+
 
 /**
  * Single transformer layer's weights.
@@ -61,7 +74,12 @@ typedef struct {
     tensor_t *norm_final_weight;             /**< Final layer norm: [d_model]. */
     tensor_t *lm_head_weight;                /**< Logit projection: [vocab_size, d_model]. */
     model_layer_weights_t *layers;           /**< Array of [num_layers]. */
-    void *safetensors_handle;                /**< Opaque handle to safetensors_file_t for cleanup. */
+    int    num_layers;                       /**< Actual number of entries in layers[]. */
+    void  *safetensors_handle;               /**< Single-shard handle (NULL when using shard array). */
+    void **safetensors_shard_handles;        /**< Array of per-shard handles (multi-part safetensors). */
+    int    safetensors_shard_count;          /**< Number of entries in safetensors_shard_handles. */
+    int    low_memory_mode;                  /**< If set, inference uses sliding-window layer eviction. */
+    model_layer_page_info_t *layer_page_info; /**< Per-layer mmap ranges for eviction [num_layers]. */
 } llm_model_t;
 
 /**
@@ -81,6 +99,27 @@ void llm_model_destroy(llm_model_t *model);
  * hard-coded maximum.
  */
 void llm_model_destroy_ex(const model_spec_t *spec);
+
+/**
+ * Evict layer pages from resident memory (MADV_DONTNEED).
+ *
+ * Use this in a sliding-window inference loop to bound RSS. The mmap
+ * stays valid; pages fault back in on next access.
+ *
+ * @param model Loaded model with layer_page_info populated.
+ * @param layer_idx Layer index to evict.
+ */
+void llm_model_evict_layer(llm_model_t *model, int layer_idx);
+
+/**
+ * Prefetch layer pages for upcoming access (MADV_WILLNEED).
+ *
+ * Starts async readahead for the layer's mmapped pages.
+ *
+ * @param model Loaded model with layer_page_info populated.
+ * @param layer_idx Layer index to prefetch.
+ */
+void llm_model_prefetch_layer(llm_model_t *model, int layer_idx);
 
 #ifdef __cplusplus
 }

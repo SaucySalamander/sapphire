@@ -1,0 +1,1305 @@
+/**
+ * @file ternary_io.c
+ * @brief Prompt 1 ternary I/O shell for Sapphire.
+ *
+ * Responsibilities:
+ * - mmap BF16 layer tensors for streaming calibration
+ * - validate staging copies with CRC32 for non-ECC systems
+ * - serialize packed 2-bit weights and row/channel scales to safetensors
+ */
+
+#include "ternary_io.h"
+
+#include "file_reader.h"
+#include "log.h"
+#include "simple_json.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static const uint32_t g_crc32_table[256] = {
+    0x00000000u, 0x77073096u, 0xEE0E612Cu, 0x990951BAu, 0x076DC419u, 0x706AF48Fu, 0xE963A535u, 0x9E6495A3u,
+    0x0EDB8832u, 0x79DCB8A4u, 0xE0D5E91Eu, 0x97D2D988u, 0x09B64C2Bu, 0x7EB17CBDu, 0xE7B82D07u, 0x90BF1D91u,
+    0x1DB71064u, 0x6AB020F2u, 0xF3B97148u, 0x84BE41DEu, 0x1ADAD47Du, 0x6DDDE4EBu, 0xF4D4B551u, 0x83D385C7u,
+    0x136C9856u, 0x646BA8C0u, 0xFD62F97Au, 0x8A65C9ECu, 0x14015C4Fu, 0x63066CD9u, 0xFA0F3D63u, 0x8D080DF5u,
+    0x3B6E20C8u, 0x4C69105Eu, 0xD56041E4u, 0xA2677172u, 0x3C03E4D1u, 0x4B04D447u, 0xD20D85FDu, 0xA50AB56Bu,
+    0x35B5A8FAu, 0x42B2986Cu, 0xDBBBC9D6u, 0xACBCF940u, 0x32D86CE3u, 0x45DF5C75u, 0xDCD60DCFu, 0xABD13D59u,
+    0x26D930ACu, 0x51DE003Au, 0xC8D75180u, 0xBFD06116u, 0x21B4F4B5u, 0x56B3C423u, 0xCFBA9599u, 0xB8BDA50Fu,
+    0x2802B89Eu, 0x5F058808u, 0xC60CD9B2u, 0xB10BE924u, 0x2F6F7C87u, 0x58684C11u, 0xC1611DABu, 0xB6662D3Du,
+    0x76DC4190u, 0x01DB7106u, 0x98D220BCu, 0xEFD5102Au, 0x71B18589u, 0x06B6B51Fu, 0x9FBFE4A5u, 0xE8B8D433u,
+    0x7807C9A2u, 0x0F00F934u, 0x9609A88Eu, 0xE10E9818u, 0x7F6A0DBBu, 0x086D3D2Du, 0x91646C97u, 0xE6635C01u,
+    0x6B6B51F4u, 0x1C6C6162u, 0x856530D8u, 0xF262004Eu, 0x6C0695EDu, 0x1B01A57Bu, 0x8208F4C1u, 0xF50FC457u,
+    0x65B0D9C6u, 0x12B7E950u, 0x8BBEB8EAu, 0xFCB9887Cu, 0x62DD1DDFu, 0x15DA2D49u, 0x8CD37CF3u, 0xFBD44C65u,
+    0x4DB26158u, 0x3AB551CEu, 0xA3BC0074u, 0xD4BB30E2u, 0x4ADFA541u, 0x3DD895D7u, 0xA4D1C46Du, 0xD3D6F4FBu,
+    0x4369E96Au, 0x346ED9FCu, 0xAD678846u, 0xDA60B8D0u, 0x44042D73u, 0x33031DE5u, 0xAA0A4C5Fu, 0xDD0D7CC9u,
+    0x5005713Cu, 0x270241AAu, 0xBE0B1010u, 0xC90C2086u, 0x5768B525u, 0x206F85B3u, 0xB966D409u, 0xCE61E49Fu,
+    0x5EDEF90Eu, 0x29D9C998u, 0xB0D09822u, 0xC7D7A8B4u, 0x59B33D17u, 0x2EB40D81u, 0xB7BD5C3Bu, 0xC0BA6CADu,
+    0xEDB88320u, 0x9ABFB3B6u, 0x03B6E20Cu, 0x74B1D29Au, 0xEAD54739u, 0x9DD277AFu, 0x04DB2615u, 0x73DC1683u,
+    0xE3630B12u, 0x94643B84u, 0x0D6D6A3Eu, 0x7A6A5AA8u, 0xE40ECF0Bu, 0x9309FF9Du, 0x0A00AE27u, 0x7D079EB1u,
+    0xF00F9344u, 0x8708A3D2u, 0x1E01F268u, 0x6906C2FEu, 0xF762575Du, 0x806567CBu, 0x196C3671u, 0x6E6B06E7u,
+    0xFED41B76u, 0x89D32BE0u, 0x10DA7A5Au, 0x67DD4ACCu, 0xF9B9DF6Fu, 0x8EBEEFF9u, 0x17B7BE43u, 0x60B08ED5u,
+    0xD6D6A3E8u, 0xA1D1937Eu, 0x38D8C2C4u, 0x4FDFF252u, 0xD1BB67F1u, 0xA6BC5767u, 0x3FB506DDu, 0x48B2364Bu,
+    0xD80D2BDAu, 0xAF0A1B4Cu, 0x36034AF6u, 0x41047A60u, 0xDF60EFC3u, 0xA867DF55u, 0x316E8EEFu, 0x4669BE79u,
+    0xCB61B38Cu, 0xBC66831Au, 0x256FD2A0u, 0x5268E236u, 0xCC0C7795u, 0xBB0B4703u, 0x220216B9u, 0x5505262Fu,
+    0xC5BA3BBEu, 0xB2BD0B28u, 0x2BB45A92u, 0x5CB36A04u, 0xC2D7FFA7u, 0xB5D0CF31u, 0x2CD99E8Bu, 0x5BDEAE1Du,
+    0x9B64C2B0u, 0xEC63F226u, 0x756AA39Cu, 0x026D930Au, 0x9C0906A9u, 0xEB0E363Fu, 0x72076785u, 0x05005713u,
+    0x95BF4A82u, 0xE2B87A14u, 0x7BB12BAEu, 0x0CB61B38u, 0x92D28E9Bu, 0xE5D5BE0Du, 0x7CDCEFB7u, 0x0BDBDF21u,
+    0x86D3D2D4u, 0xF1D4E242u, 0x68DDB3F8u, 0x1FDA836Eu, 0x81BE16CDu, 0xF6B9265Bu, 0x6FB077E1u, 0x18B74777u,
+    0x88085AE6u, 0xFF0F6A70u, 0x66063BCAu, 0x11010B5Cu, 0x8F659EFFu, 0xF862AE69u, 0x616BFFD3u, 0x166CCF45u,
+    0xA00AE278u, 0xD70DD2EEu, 0x4E048354u, 0x3903B3C2u, 0xA7672661u, 0xD06016F7u, 0x4969474Du, 0x3E6E77DBu,
+    0xAED16A4Au, 0xD9D65ADCu, 0x40DF0B66u, 0x37D83BF0u, 0xA9BCAE53u, 0xDEBB9EC5u, 0x47B2CF7Fu, 0x30B5FFE9u,
+    0xBDBDF21Cu, 0xCABAC28Au, 0x53B39330u, 0x24B4A3A6u, 0xBAD03605u, 0xCDD70693u, 0x54DE5729u, 0x23D967BFu,
+    0xB3667A2Eu, 0xC4614AB8u, 0x5D681B02u, 0x2A6F2B94u, 0xB40BBE37u, 0xC30C8EA1u, 0x5A05DF1Bu, 0x2D02EF8Du
+};
+
+static int io_map_layer_bf16_from_file(safetensors_file_t *file,
+                                       const char *tensor_name,
+                                       ternary_bf16_layer_map_t *out_map,
+                                       int close_file_on_unmap);
+
+static int ternary_validate_tensor_name(const char *tensor_name) {
+    if (!tensor_name || tensor_name[0] == '\0') {
+        LOG_ERROR("ternary I/O: tensor name is NULL or empty");
+        return -1;
+    }
+    if (strlen(tensor_name) >= sizeof(((ternary_bf16_layer_map_t *)0)->tensor_name)) {
+        LOG_ERROR("ternary I/O: tensor name too long: %s", tensor_name);
+        return -1;
+    }
+    return 0;
+}
+
+static void ternary_sanitize_tensor_name(const char *tensor_name,
+                                         char *out_name,
+                                         size_t out_name_size) {
+    size_t i = 0;
+
+    if (!out_name || out_name_size == 0) {
+        return;
+    }
+    out_name[0] = '\0';
+    if (!tensor_name) {
+        return;
+    }
+
+    for (; tensor_name[i] != '\0' && i + 1 < out_name_size; ++i) {
+        char ch = tensor_name[i];
+        if ((ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '-' || ch == '_') {
+            out_name[i] = ch;
+        } else {
+            out_name[i] = '_';
+        }
+    }
+    out_name[i] = '\0';
+}
+
+static int ternary_append_manifest_entry(const char *output_dir,
+                                         const char *tensor_name,
+                                         const char *file_name,
+                                         const ternary_layer_t *layer,
+                                         uint32_t crc32) {
+    char *manifest_path = NULL;
+    char line[1024];
+    int fd = -1;
+    int rc = -1;
+    int n = 0;
+    ssize_t wrote = 0;
+
+    manifest_path = construct_safe_path(output_dir, "manifest.tsv", NULL);
+    if (!manifest_path) {
+        return -1;
+    }
+
+    fd = open(manifest_path, O_CREAT | O_APPEND | O_WRONLY, 0644);
+    if (fd < 0) {
+        LOG_ERROR("ternary manifest: cannot open %s: %s", manifest_path, strerror(errno));
+        free(manifest_path);
+        return -1;
+    }
+
+    n = snprintf(line,
+                 sizeof(line),
+                 "%s\t%s\t%u\t%u\t%zu\t%08x\n",
+                 tensor_name,
+                 file_name,
+                 layer->rows,
+                 layer->cols,
+                 layer->packed_weight_bytes,
+                 crc32);
+    if (n < 0 || (size_t)n >= sizeof(line)) {
+        LOG_ERROR("ternary manifest: line construction failed for %s", tensor_name);
+        goto cleanup;
+    }
+
+    wrote = write(fd, line, (size_t)n);
+    if (wrote != (ssize_t)n) {
+        LOG_ERROR("ternary manifest: write failed for %s: %s", manifest_path, strerror(errno));
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (fd >= 0 && close(fd) != 0) {
+        LOG_ERROR("ternary manifest: close failed for %s: %s", manifest_path, strerror(errno));
+        rc = -1;
+    }
+    free(manifest_path);
+    return rc;
+}
+
+int io_append_validation_checkpoint(const char *output_dir,
+                                    const ternary_validation_checkpoint_t *checkpoint) {
+    char *report_path = NULL;
+    char line[1024];
+    int fd = -1;
+    int rc = -1;
+    int n = 0;
+    ssize_t wrote = 0;
+    struct stat st;
+    int write_header = 0;
+
+    if (!output_dir || !checkpoint || !checkpoint->tensor_name ||
+        checkpoint->converted_count < 0 || checkpoint->sample_count < 0) {
+        LOG_ERROR("validation report: invalid arguments");
+        return -1;
+    }
+
+    report_path = construct_safe_path(output_dir, "validation.tsv", NULL);
+    if (!report_path) {
+        return -1;
+    }
+
+    if (stat(report_path, &st) != 0 || st.st_size == 0) {
+        write_header = 1;
+    }
+
+    fd = open(report_path, O_CREAT | O_APPEND | O_WRONLY, 0644);
+    if (fd < 0) {
+        LOG_ERROR("validation report: cannot open %s: %s", report_path, strerror(errno));
+        free(report_path);
+        return -1;
+    }
+
+    if (write_header) {
+        static const char *header =
+            "converted_count\ttensor_name\tcrc32\tbaseline_mean_nll\tcurrent_mean_nll\tbaseline_ppl\tcurrent_ppl\tmean_kl\tmax_kl\ttop1_agreement\tsample_count\n";
+        wrote = write(fd, header, strlen(header));
+        if (wrote != (ssize_t)strlen(header)) {
+            LOG_ERROR("validation report: failed to write header for %s", report_path);
+            goto cleanup;
+        }
+    }
+
+    n = snprintf(line,
+                 sizeof(line),
+                 "%d\t%s\t%08x\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\n",
+                 checkpoint->converted_count,
+                 checkpoint->tensor_name,
+                 checkpoint->crc32,
+                 checkpoint->baseline_mean_nll,
+                 checkpoint->current_mean_nll,
+                 expf(checkpoint->baseline_mean_nll),
+                 expf(checkpoint->current_mean_nll),
+                 checkpoint->mean_kl,
+                 checkpoint->max_kl,
+                 checkpoint->top1_agreement,
+                 checkpoint->sample_count);
+    if (n < 0 || (size_t)n >= sizeof(line)) {
+        LOG_ERROR("validation report: line construction failed for %s", checkpoint->tensor_name);
+        goto cleanup;
+    }
+
+    wrote = write(fd, line, (size_t)n);
+    if (wrote != (ssize_t)n) {
+        LOG_ERROR("validation report: write failed for %s: %s", report_path, strerror(errno));
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (fd >= 0 && close(fd) != 0) {
+        LOG_ERROR("validation report: close failed for %s: %s", report_path, strerror(errno));
+        rc = -1;
+    }
+    free(report_path);
+    return rc;
+}
+
+static int ternary_get_matrix_shape(const safetensors_tensor_meta_t *meta,
+                                    uint32_t *out_rows,
+                                    uint32_t *out_cols,
+                                    size_t *out_count) {
+    size_t weight_count = 1;
+
+    if (!meta || !out_rows || !out_cols || !out_count) {
+        LOG_ERROR("ternary I/O: invalid matrix shape arguments");
+        return -1;
+    }
+
+    if (meta->ndim <= 0 || meta->ndim > 2) {
+        LOG_ERROR("ternary I/O: expected 1D/2D layer tensor, got ndim=%d for %s",
+                  meta->ndim, meta->name);
+        return -1;
+    }
+
+    for (int i = 0; i < meta->ndim; ++i) {
+        if (meta->shape[i] == 0) {
+            LOG_ERROR("ternary I/O: zero-sized dimension in tensor %s", meta->name);
+            return -1;
+        }
+        weight_count *= meta->shape[i];
+    }
+
+    *out_rows = meta->shape[0];
+    *out_cols = (meta->ndim == 1) ? 1u : meta->shape[1];
+    *out_count = weight_count;
+    return 0;
+}
+
+static const char* ternary_scale_dtype_name(safetensors_dtype_t dtype) {
+    switch (dtype) {
+        case SAFETENSORS_F32: return "F32";
+        case SAFETENSORS_F16: return "F16";
+        default: return NULL;
+    }
+}
+
+static int ternary_validate_layer_payload(const char *tensor_name,
+                                          const ternary_layer_t *layer,
+                                          size_t *out_packed_cols,
+                                          uint32_t *out_groups_per_row,
+                                          uint32_t *out_scale_group_size,
+                                          const char **out_scale_dtype_name) {
+    const char *scale_name = NULL;
+    size_t packed_cols = 0;
+    uint32_t groups_per_row = 0u;
+    uint32_t scale_group_size = 0u;
+
+    if (ternary_validate_tensor_name(tensor_name) != 0 || !layer) {
+        return -1;
+    }
+    if (!layer->packed_weights || !layer->scales) {
+        LOG_ERROR("ternary I/O: layer payload contains NULL buffers");
+        return -1;
+    }
+    if (layer->rows == 0 || layer->cols == 0 || layer->scale_count == 0) {
+        LOG_ERROR("ternary I/O: invalid rows/cols/scale_count for %s", tensor_name);
+        return -1;
+    }
+    if ((layer->scale_count % layer->rows) != 0u) {
+        LOG_ERROR("ternary I/O: scale_count=%zu must be a multiple of rows=%u for %s",
+                  layer->scale_count, layer->rows, tensor_name);
+        return -1;
+    }
+    groups_per_row = (uint32_t)(layer->scale_count / layer->rows);
+    if (groups_per_row == 0u) {
+        LOG_ERROR("ternary I/O: invalid groups_per_row for %s", tensor_name);
+        return -1;
+    }
+    if (layer->groups_per_row != 0u && layer->groups_per_row != groups_per_row) {
+        LOG_ERROR("ternary I/O: groups_per_row mismatch for %s (have=%u inferred=%u)",
+                  tensor_name,
+                  layer->groups_per_row,
+                  groups_per_row);
+        return -1;
+    }
+    scale_group_size = layer->scale_group_size;
+    if (scale_group_size == 0u) {
+        scale_group_size = (uint32_t)(((size_t)layer->cols + groups_per_row - 1u) / groups_per_row);
+    }
+    if (scale_group_size == 0u ||
+        (uint32_t)(((size_t)layer->cols + scale_group_size - 1u) / scale_group_size) != groups_per_row) {
+        LOG_ERROR("ternary I/O: invalid scale layout for %s (cols=%u groups=%u group_size=%u)",
+                  tensor_name,
+                  layer->cols,
+                  groups_per_row,
+                  scale_group_size);
+        return -1;
+    }
+
+    packed_cols = ((size_t)layer->cols + (TERNARY_PACKED_WEIGHTS_PER_BYTE - 1u))
+                  / TERNARY_PACKED_WEIGHTS_PER_BYTE;
+    if (layer->packed_weight_bytes != (size_t)layer->rows * packed_cols) {
+        LOG_ERROR("ternary I/O: packed byte count mismatch for %s (have=%zu expected=%zu)",
+                  tensor_name, layer->packed_weight_bytes, (size_t)layer->rows * packed_cols);
+        return -1;
+    }
+
+    scale_name = ternary_scale_dtype_name(layer->scale_dtype);
+    if (!scale_name) {
+        LOG_ERROR("ternary I/O: unsupported scale dtype=%d for %s", (int)layer->scale_dtype, tensor_name);
+        return -1;
+    }
+
+    if (layer->scale_dtype == SAFETENSORS_F32 && layer->scale_bytes != layer->scale_count * sizeof(float)) {
+        LOG_ERROR("ternary I/O: invalid F32 scale byte count for %s", tensor_name);
+        return -1;
+    }
+    if (layer->scale_dtype == SAFETENSORS_F16 && layer->scale_bytes != layer->scale_count * sizeof(uint16_t)) {
+        LOG_ERROR("ternary I/O: invalid F16 scale byte count for %s", tensor_name);
+        return -1;
+    }
+
+    if (out_packed_cols) *out_packed_cols = packed_cols;
+    if (out_groups_per_row) *out_groups_per_row = groups_per_row;
+    if (out_scale_group_size) *out_scale_group_size = scale_group_size;
+    if (out_scale_dtype_name) *out_scale_dtype_name = scale_name;
+    return 0;
+}
+
+uint32_t io_crc32_update(uint32_t crc, const void *data, size_t size) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint32_t state = crc ^ 0xFFFFFFFFu;
+
+    if (!bytes && size != 0) {
+        LOG_ERROR("io_crc32_update: NULL data with non-zero size");
+        return 0u;
+    }
+
+    for (size_t i = 0; i < size; ++i) {
+        state = g_crc32_table[(state ^ bytes[i]) & 0xFFu] ^ (state >> 8);
+    }
+
+    return state ^ 0xFFFFFFFFu;
+}
+
+int io_mmap_layer_bf16(const char *safetensors_path,
+                       const char *tensor_name,
+                       ternary_bf16_layer_map_t *out_map) {
+    safetensors_file_t *file = NULL;
+    int rc = -1;
+
+    if (!safetensors_path || !out_map || ternary_validate_tensor_name(tensor_name) != 0) {
+        LOG_ERROR("io_mmap_layer_bf16: invalid arguments");
+        return -1;
+    }
+
+    memset(out_map, 0, sizeof(*out_map));
+
+    file = safetensors_open(safetensors_path);
+    if (!file) {
+        LOG_ERROR("io_mmap_layer_bf16: failed to open %s", safetensors_path);
+        return -1;
+    }
+
+    rc = io_map_layer_bf16_from_file(file, tensor_name, out_map, 1);
+    if (rc != 0) {
+        safetensors_close(file);
+    }
+    return rc;
+}
+
+static int io_map_layer_bf16_from_file(safetensors_file_t *file,
+                                       const char *tensor_name,
+                                       ternary_bf16_layer_map_t *out_map,
+                                       int close_file_on_unmap)
+{
+    const safetensors_tensor_meta_t *meta = NULL;
+    const void *raw_ptr = NULL;
+    size_t weight_count = 0;
+
+    if (!file || !out_map || ternary_validate_tensor_name(tensor_name) != 0) {
+        LOG_ERROR("io_map_layer_bf16_from_file: invalid arguments");
+        return -1;
+    }
+
+    memset(out_map, 0, sizeof(*out_map));
+
+    meta = safetensors_get_tensor_by_name(file, tensor_name);
+    if (!meta) {
+        LOG_ERROR("io_mmap_layer_bf16: tensor not found: %s", tensor_name);
+        return -1;
+    }
+    if (meta->dtype != SAFETENSORS_BF16) {
+        LOG_ERROR("io_mmap_layer_bf16: tensor %s has dtype=%d, expected BF16",
+                  tensor_name, (int)meta->dtype);
+        return -1;
+    }
+    if (ternary_get_matrix_shape(meta, &out_map->rows, &out_map->cols, &weight_count) != 0) {
+        return -1;
+    }
+
+    raw_ptr = safetensors_data_ptr(file, meta);
+    if (!raw_ptr) {
+        return -1;
+    }
+
+    out_map->file = file;
+    out_map->bf16_weights = (const uint16_t *)raw_ptr;
+    out_map->weight_count = weight_count;
+    out_map->weight_bytes = meta->size_bytes;
+    out_map->close_file_on_unmap = close_file_on_unmap;
+    memcpy(out_map->tensor_name, tensor_name, strlen(tensor_name) + 1u);
+
+    LOG_INFO("Mapped BF16 layer tensor %s: rows=%u cols=%u bytes=%zu",
+             out_map->tensor_name, out_map->rows, out_map->cols, out_map->weight_bytes);
+    return 0;
+}
+
+void io_unmap_layer_bf16(ternary_bf16_layer_map_t *map) {
+    if (!map) {
+        return;
+    }
+    if (map->file && map->close_file_on_unmap) {
+        safetensors_close(map->file);
+    }
+    memset(map, 0, sizeof(*map));
+}
+
+int io_write_layer_ternary(const char *output_path,
+                           const char *tensor_name,
+                           const ternary_layer_t *layer,
+                           uint32_t *out_crc32) {
+    char header[4096];
+    char scale_shape[64];
+    const char *scale_dtype_name = NULL;
+    size_t packed_cols = 0;
+    uint32_t groups_per_row = 0u;
+    uint32_t scale_group_size = 0u;
+    uint32_t crc32 = 0;
+    uint64_t header_len = 0;
+    uint64_t packed_begin = 0;
+    uint64_t packed_end = 0;
+    uint64_t scale_begin = 0;
+    uint64_t scale_end = 0;
+    int fd = -1;
+    int header_rc = 0;
+    ssize_t wrote = 0;
+
+    if (!output_path || !layer) {
+        LOG_ERROR("io_write_layer_ternary: invalid arguments");
+        return -1;
+    }
+    if (ternary_validate_layer_payload(tensor_name,
+                                       layer,
+                                       &packed_cols,
+                                       &groups_per_row,
+                                       &scale_group_size,
+                                       &scale_dtype_name) != 0) {
+        return -1;
+    }
+    if (groups_per_row == 1u) {
+        if (snprintf(scale_shape, sizeof(scale_shape), "[%u]", layer->rows) < 0) {
+            LOG_ERROR("io_write_layer_ternary: scale shape construction failed for %s", tensor_name);
+            return -1;
+        }
+    } else if (snprintf(scale_shape, sizeof(scale_shape), "[%u,%u]", layer->rows, groups_per_row) < 0) {
+        LOG_ERROR("io_write_layer_ternary: grouped scale shape construction failed for %s", tensor_name);
+        return -1;
+    }
+
+    crc32 = io_crc32_update(0u, layer->packed_weights, layer->packed_weight_bytes);
+    crc32 = io_crc32_update(crc32, layer->scales, layer->scale_bytes);
+    if (out_crc32) {
+        *out_crc32 = crc32;
+    }
+
+    packed_begin = 0;
+    packed_end = (uint64_t)layer->packed_weight_bytes;
+    scale_begin = packed_end;
+    scale_end = scale_begin + (uint64_t)layer->scale_bytes;
+
+    header_rc = snprintf(
+        header,
+        sizeof(header),
+        "{\"__metadata__\":{\"sapphire_quant\":\"ternary-1.58\",\"integrity\":\"crc32\",\"crc32\":\"%08x\",\"rows\":\"%u\",\"cols\":\"%u\",\"%s.groups_per_row\":%u,\"%s.scale_group_size\":%u},"
+        "\"%s.packed\":{\"dtype\":\"U8\",\"shape\":[%u,%zu],\"data_offsets\":[%llu,%llu]},"
+        "\"%s.scales\":{\"dtype\":\"%s\",\"shape\":%s,\"data_offsets\":[%llu,%llu]}}",
+        crc32,
+        layer->rows,
+        layer->cols,
+        tensor_name,
+        groups_per_row,
+        tensor_name,
+        scale_group_size,
+        tensor_name,
+        layer->rows,
+        packed_cols,
+        (unsigned long long)packed_begin,
+        (unsigned long long)packed_end,
+        tensor_name,
+        scale_dtype_name,
+        scale_shape,
+        (unsigned long long)scale_begin,
+        (unsigned long long)scale_end);
+    if (header_rc < 0 || (size_t)header_rc >= sizeof(header)) {
+        LOG_ERROR("io_write_layer_ternary: header construction failed for %s", tensor_name);
+        return -1;
+    }
+    header_len = (uint64_t)header_rc;
+
+    fd = open(output_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) {
+        LOG_ERROR("io_write_layer_ternary: cannot open %s: %s", output_path, strerror(errno));
+        return -1;
+    }
+
+    wrote = write(fd, &header_len, sizeof(header_len));
+    if (wrote != (ssize_t)sizeof(header_len)) {
+        LOG_ERROR("io_write_layer_ternary: failed to write header length: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    wrote = write(fd, header, (size_t)header_len);
+    if (wrote != (ssize_t)header_len) {
+        LOG_ERROR("io_write_layer_ternary: failed to write JSON header: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    wrote = write(fd, layer->packed_weights, layer->packed_weight_bytes);
+    if (wrote != (ssize_t)layer->packed_weight_bytes) {
+        LOG_ERROR("io_write_layer_ternary: failed to write packed weights: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    wrote = write(fd, layer->scales, layer->scale_bytes);
+    if (wrote != (ssize_t)layer->scale_bytes) {
+        LOG_ERROR("io_write_layer_ternary: failed to write scales: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    if (close(fd) != 0) {
+        LOG_ERROR("io_write_layer_ternary: close failed for %s: %s", output_path, strerror(errno));
+        return -1;
+    }
+
+    LOG_INFO("Wrote ternary safetensors layer %s -> %s (packed=%zuB scales=%zuB groups=%u group_size=%u crc32=%08x)",
+             tensor_name,
+             output_path,
+             layer->packed_weight_bytes,
+             layer->scale_bytes,
+             groups_per_row,
+             scale_group_size,
+             crc32);
+    return 0;
+}
+
+int io_prepare_ternary_output_dir(const char *output_dir) {
+    struct stat st;
+
+    if (!output_dir || output_dir[0] == '\0') {
+        LOG_ERROR("io_prepare_ternary_output_dir: invalid output directory");
+        return -1;
+    }
+
+    if (stat(output_dir, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            LOG_ERROR("io_prepare_ternary_output_dir: path exists and is not a directory: %s", output_dir);
+            return -1;
+        }
+        return 0;
+    }
+
+    if (mkdir(output_dir, 0755) != 0) {
+        LOG_ERROR("io_prepare_ternary_output_dir: mkdir failed for %s: %s", output_dir, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+int io_write_layer_ternary_into_dir(const char *output_dir,
+                                    const char *tensor_name,
+                                    const ternary_layer_t *layer,
+                                    uint32_t *out_crc32) {
+    char safe_name[320];
+    char file_name[352];
+    char *output_path = NULL;
+    uint32_t crc32 = 0;
+    int rc = -1;
+
+    if (!output_dir || !tensor_name || !layer) {
+        LOG_ERROR("io_write_layer_ternary_into_dir: invalid arguments");
+        return -1;
+    }
+    if (io_prepare_ternary_output_dir(output_dir) != 0) {
+        return -1;
+    }
+
+    ternary_sanitize_tensor_name(tensor_name, safe_name, sizeof(safe_name));
+    if (safe_name[0] == '\0') {
+        LOG_ERROR("io_write_layer_ternary_into_dir: failed to sanitize tensor name %s", tensor_name);
+        return -1;
+    }
+    if (snprintf(file_name, sizeof(file_name), "%s.safetensors", safe_name) < 0) {
+        LOG_ERROR("io_write_layer_ternary_into_dir: failed to build filename for %s", tensor_name);
+        return -1;
+    }
+
+    output_path = construct_safe_path(output_dir, file_name, NULL);
+    if (!output_path) {
+        return -1;
+    }
+
+    rc = io_write_layer_ternary(output_path, tensor_name, layer, &crc32);
+    if (rc == 0) {
+        if (ternary_append_manifest_entry(output_dir, tensor_name, file_name, layer, crc32) != 0) {
+            rc = -1;
+        }
+    }
+
+    if (rc == 0 && out_crc32) {
+        *out_crc32 = crc32;
+    }
+
+    free(output_path);
+    return rc;
+}
+
+static uint16_t f32_to_bf16_val(float f)
+{
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    return (uint16_t)(bits >> 16);
+}
+
+static int mold_bf16_build_header(char *buf,
+                                  size_t buf_size,
+                                  const char *tensor_name,
+                                  uint32_t rows,
+                                  uint32_t cols,
+                                  uint32_t crc32)
+{
+    size_t byte_count = (size_t)rows * (size_t)cols * sizeof(uint16_t);
+    int rc = 0;
+
+    if (cols == 1u) {
+        rc = snprintf(buf,
+                      buf_size,
+                      "{\"__metadata__\":{\"sapphire_quant\":\"mold-bf16\",\"crc32\":\"%08x\"},"
+                      "\"%s\":{\"dtype\":\"BF16\",\"shape\":[%u],\"data_offsets\":[0,%zu]}}",
+                      crc32,
+                      tensor_name,
+                      rows,
+                      byte_count);
+    } else {
+        rc = snprintf(buf,
+                      buf_size,
+                      "{\"__metadata__\":{\"sapphire_quant\":\"mold-bf16\",\"crc32\":\"%08x\"},"
+                      "\"%s\":{\"dtype\":\"BF16\",\"shape\":[%u,%u],\"data_offsets\":[0,%zu]}}",
+                      crc32,
+                      tensor_name,
+                      rows,
+                      cols,
+                      byte_count);
+    }
+
+    if (rc < 0 || (size_t)rc >= buf_size) {
+        return -1;
+    }
+    return rc;
+}
+
+static int mold_bf16_write_file(const char *output_path,
+                                const char *header,
+                                uint64_t header_len,
+                                const uint16_t *bf16_data,
+                                size_t bf16_byte_count)
+{
+    int fd = -1;
+    ssize_t wrote = 0;
+
+    fd = open(output_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: cannot open %s: %s", output_path, strerror(errno));
+        return -1;
+    }
+
+    wrote = write(fd, &header_len, sizeof(header_len));
+    if (wrote != (ssize_t)sizeof(header_len)) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: failed to write header length: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    wrote = write(fd, header, (size_t)header_len);
+    if (wrote != (ssize_t)header_len) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: failed to write header: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    wrote = write(fd, bf16_data, bf16_byte_count);
+    if (wrote != (ssize_t)bf16_byte_count) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: failed to write BF16 data: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    if (close(fd) != 0) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: close failed for %s: %s", output_path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int ternary_append_mold_manifest_entry(const char *output_dir,
+                                              const char *tensor_name,
+                                              const char *file_name,
+                                              uint32_t rows,
+                                              uint32_t cols,
+                                              uint32_t crc32)
+{
+    char *manifest_path = NULL;
+    char line[1024];
+    int fd = -1;
+    int rc = -1;
+    int n = 0;
+    ssize_t wrote = 0;
+    size_t bf16_byte_count = (size_t)rows * (size_t)cols * sizeof(uint16_t);
+
+    manifest_path = construct_safe_path(output_dir, "manifest.tsv", NULL);
+    if (!manifest_path) {
+        return -1;
+    }
+
+    fd = open(manifest_path, O_CREAT | O_APPEND | O_WRONLY, 0644);
+    if (fd < 0) {
+        LOG_ERROR("ternary manifest: cannot open %s: %s", manifest_path, strerror(errno));
+        free(manifest_path);
+        return -1;
+    }
+
+    n = snprintf(line,
+                 sizeof(line),
+                 "%s\t%s\t%u\t%u\t%zu\t%08x\tmold\n",
+                 tensor_name,
+                 file_name,
+                 rows,
+                 cols,
+                 bf16_byte_count,
+                 crc32);
+    if (n < 0 || (size_t)n >= sizeof(line)) {
+        LOG_ERROR("ternary manifest: mold line construction failed for %s", tensor_name);
+        goto cleanup;
+    }
+
+    wrote = write(fd, line, (size_t)n);
+    if (wrote != (ssize_t)n) {
+        LOG_ERROR("ternary manifest: mold write failed for %s: %s", manifest_path, strerror(errno));
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (fd >= 0 && close(fd) != 0) {
+        LOG_ERROR("ternary manifest: close failed for %s: %s", manifest_path, strerror(errno));
+        rc = -1;
+    }
+    free(manifest_path);
+    return rc;
+}
+
+int io_write_layer_molded_bf16_into_dir(const char *output_dir,
+                                        const char *tensor_name,
+                                        const float *f32_weights,
+                                        uint32_t rows,
+                                        uint32_t cols,
+                                        uint32_t *out_crc32)
+{
+    char safe_name[320];
+    char file_name[352];
+    char header[2048];
+    char *output_path = NULL;
+    uint16_t *bf16_data = NULL;
+    size_t n = 0;
+    size_t bf16_byte_count = 0;
+    uint32_t crc32 = 0;
+    uint64_t header_len = 0;
+    int rc = -1;
+    int hrc = 0;
+    size_t i = 0;
+
+    if (!output_dir || ternary_validate_tensor_name(tensor_name) != 0 ||
+        !f32_weights || rows == 0u || cols == 0u) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: invalid arguments");
+        return -1;
+    }
+    if (io_prepare_ternary_output_dir(output_dir) != 0) {
+        return -1;
+    }
+
+    ternary_sanitize_tensor_name(tensor_name, safe_name, sizeof(safe_name));
+    if (safe_name[0] == '\0') {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: failed to sanitize tensor name %s", tensor_name);
+        return -1;
+    }
+    if (snprintf(file_name, sizeof(file_name), "%s.safetensors", safe_name) < 0) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: failed to build filename for %s", tensor_name);
+        return -1;
+    }
+
+    n = (size_t)rows * (size_t)cols;
+    bf16_byte_count = n * sizeof(uint16_t);
+    bf16_data = (uint16_t *)malloc(bf16_byte_count);
+    if (!bf16_data) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: alloc failed for %s (%zu elements)", tensor_name, n);
+        return -1;
+    }
+
+    for (i = 0; i < n; ++i) {
+        bf16_data[i] = f32_to_bf16_val(f32_weights[i]);
+    }
+
+    crc32 = io_crc32_update(0u, bf16_data, bf16_byte_count);
+
+    hrc = mold_bf16_build_header(header, sizeof(header), tensor_name, rows, cols, crc32);
+    if (hrc < 0) {
+        LOG_ERROR("io_write_layer_molded_bf16_into_dir: header construction failed for %s", tensor_name);
+        free(bf16_data);
+        return -1;
+    }
+    header_len = (uint64_t)hrc;
+
+    output_path = construct_safe_path(output_dir, file_name, NULL);
+    if (!output_path) {
+        free(bf16_data);
+        return -1;
+    }
+
+    rc = mold_bf16_write_file(output_path, header, header_len, bf16_data, bf16_byte_count);
+    if (rc == 0) {
+        rc = ternary_append_mold_manifest_entry(output_dir, tensor_name, file_name,
+                                                rows, cols, crc32);
+    }
+    if (rc == 0) {
+        LOG_INFO("Wrote MOLD BF16 tensor %s -> %s (%zuB crc32=%08x)", tensor_name, output_path, bf16_byte_count, crc32);
+        if (out_crc32) {
+            *out_crc32 = crc32;
+        }
+    }
+
+    free(bf16_data);
+    free(output_path);
+    return rc;
+}
+
+static int load_layer_tensor_copy(const safetensors_file_t *file,
+                                  const char *name,
+                                  const safetensors_tensor_meta_t **out_meta,
+                                  void **out_copy,
+                                  size_t *out_size)
+{
+    const safetensors_tensor_meta_t *meta = NULL;
+    void *copy = NULL;
+    const void *data_ptr = NULL;
+
+    if (!file || !name || !out_meta || !out_copy || !out_size) {
+        return -1;
+    }
+
+    meta = safetensors_get_tensor_by_name(file, name);
+    if (!meta) {
+        LOG_ERROR("ternary I/O: tensor not found: %s", name);
+        return -1;
+    }
+
+    data_ptr = safetensors_data_ptr(file, meta);
+    if (!data_ptr) {
+        return -1;
+    }
+
+    copy = malloc((size_t)meta->size_bytes);
+    if (!copy) {
+        LOG_ERROR("ternary I/O: failed to allocate %zu bytes for %s", (size_t)meta->size_bytes, name);
+        return -1;
+    }
+
+    memcpy(copy, data_ptr, (size_t)meta->size_bytes);
+    *out_meta = meta;
+    *out_copy = copy;
+    *out_size = (size_t)meta->size_bytes;
+    return 0;
+}
+
+int io_load_layer_ternary_payload(const char *layer_path,
+                                  const char *tensor_name,
+                                  uint32_t expected_rows,
+                                  uint32_t expected_cols,
+                                  ternary_layer_payload_t *out_payload) {
+    safetensors_file_t *file = NULL;
+    safetensors_tensor_meta_t packed_meta;
+    safetensors_tensor_meta_t scales_meta;
+    const safetensors_tensor_meta_t *meta = NULL;
+    void *packed_copy = NULL;
+    void *scales_copy = NULL;
+    size_t packed_size = 0u;
+    size_t scales_size = 0u;
+    char packed_name[320];
+    char scales_name[320];
+    size_t packed_cols = 0u;
+    int rc = -1;
+
+    if (!layer_path || !tensor_name || !out_payload || expected_rows == 0u || expected_cols == 0u) {
+        LOG_ERROR("ternary I/O: invalid payload load arguments");
+        return -1;
+    }
+
+    memset(out_payload, 0, sizeof(*out_payload));
+    memset(&packed_meta, 0, sizeof(packed_meta));
+    memset(&scales_meta, 0, sizeof(scales_meta));
+
+    if (snprintf(packed_name, sizeof(packed_name), "%s.packed", tensor_name) < 0 ||
+        snprintf(scales_name, sizeof(scales_name), "%s.scales", tensor_name) < 0) {
+        return -1;
+    }
+
+    file = safetensors_open(layer_path);
+    if (!file) {
+        LOG_ERROR("ternary I/O: failed to open ternary layer file %s", layer_path);
+        return -1;
+    }
+
+    if (load_layer_tensor_copy(file, packed_name, &meta, &packed_copy, &packed_size) != 0) {
+        goto payload_cleanup;
+    }
+    memcpy(&packed_meta, meta, sizeof(packed_meta));
+
+    if (load_layer_tensor_copy(file, scales_name, &meta, &scales_copy, &scales_size) != 0) {
+        goto payload_cleanup;
+    }
+    memcpy(&scales_meta, meta, sizeof(scales_meta));
+
+    if (packed_meta.dtype != SAFETENSORS_U8 || scales_meta.dtype != SAFETENSORS_F32) {
+        LOG_ERROR("ternary I/O: unexpected ternary payload dtypes for %s", tensor_name);
+        goto payload_cleanup;
+    }
+    if (packed_meta.ndim != 2 || (scales_meta.ndim != 1 && scales_meta.ndim != 2)) {
+        LOG_ERROR("ternary I/O: unexpected ternary payload rank for %s", tensor_name);
+        goto payload_cleanup;
+    }
+    if (packed_meta.shape[0] != expected_rows || scales_meta.shape[0] != expected_rows) {
+        LOG_ERROR("ternary I/O: row count mismatch for %s", tensor_name);
+        goto payload_cleanup;
+    }
+
+    packed_cols = ((size_t)expected_cols + (TERNARY_PACKED_WEIGHTS_PER_BYTE - 1u)) / TERNARY_PACKED_WEIGHTS_PER_BYTE;
+    if (packed_meta.shape[1] != packed_cols) {
+        LOG_ERROR("ternary I/O: packed column count mismatch for %s", tensor_name);
+        goto payload_cleanup;
+    }
+    out_payload->groups_per_row = (scales_meta.ndim == 1) ? 1u : scales_meta.shape[1];
+    if (out_payload->groups_per_row == 0u ||
+        safetensors_resolve_ternary_scale_layout(file,
+                                                 tensor_name,
+                                                 expected_cols,
+                                                 out_payload->groups_per_row,
+                                                 &out_payload->scale_group_size,
+                                                 &out_payload->groups_per_row) != 0) {
+        goto payload_cleanup;
+    }
+    out_payload->scale_count = (size_t)expected_rows * out_payload->groups_per_row;
+    if (scales_size != out_payload->scale_count * sizeof(float)) {
+        LOG_ERROR("ternary I/O: scale byte count mismatch for %s", tensor_name);
+        goto payload_cleanup;
+    }
+
+    out_payload->packed_weights = (uint8_t *)packed_copy;
+    out_payload->packed_weight_bytes = packed_size;
+    out_payload->scales = (float *)scales_copy;
+    out_payload->scale_bytes = scales_size;
+    out_payload->rows = expected_rows;
+    out_payload->cols = expected_cols;
+    packed_copy = NULL;
+    scales_copy = NULL;
+    rc = 0;
+
+payload_cleanup:
+    if (rc != 0) {
+        free(packed_copy);
+        free(scales_copy);
+    }
+    safetensors_close(file);
+    return rc;
+}
+
+void io_free_layer_ternary_payload(ternary_layer_payload_t *payload) {
+    if (!payload) {
+        return;
+    }
+
+    free(payload->packed_weights);
+    free(payload->scales);
+    memset(payload, 0, sizeof(*payload));
+}
+
+/* -------------------------------------------------------------------------
+ * Sharded safetensors helpers for multi-file models (e.g. Gemma 3 27B).
+ * model.safetensors.index.json format:
+ *   { "metadata": {...}, "weight_map": { "<tensor>": "<shard>.safetensors", ... } }
+ * -------------------------------------------------------------------------*/
+
+#define SHARD_INDEX_FILENAME "model.safetensors.index.json"
+#define SHARD_FILENAME_MAX   128u
+#define SHARD_KEY_MAX        320
+
+static void io_reset_bf16_io_cache(ternary_bf16_io_cache_t *cache)
+{
+    if (!cache) {
+        return;
+    }
+
+    memset(cache, 0, sizeof(*cache));
+}
+
+void io_release_bf16_io_cache(ternary_bf16_io_cache_t *cache)
+{
+    if (!cache) {
+        return;
+    }
+
+    if (cache->current_shard_file) {
+        safetensors_close(cache->current_shard_file);
+    }
+    free(cache->current_shard_path);
+    free(cache->index_json);
+    free(cache->model_dir);
+    io_reset_bf16_io_cache(cache);
+}
+
+static int io_prepare_bf16_io_cache(const char *model_dir,
+                                    ternary_bf16_io_cache_t *cache)
+{
+    char *index_path = NULL;
+    char *index_json = NULL;
+    char *model_dir_copy = NULL;
+    size_t index_json_len = 0u;
+    size_t model_dir_len = 0u;
+
+    if (!model_dir || !cache) {
+        return -1;
+    }
+    if (cache->index_json && cache->model_dir && strcmp(cache->model_dir, model_dir) == 0) {
+        return 0;
+    }
+
+    io_release_bf16_io_cache(cache);
+    model_dir_len = strlen(model_dir);
+    model_dir_copy = (char *)malloc(model_dir_len + 1u);
+    if (!model_dir_copy) {
+        return -1;
+    }
+    memcpy(model_dir_copy, model_dir, model_dir_len + 1u);
+
+    index_path = construct_safe_path(model_dir, SHARD_INDEX_FILENAME, NULL);
+    if (!index_path) {
+        free(model_dir_copy);
+        return -1;
+    }
+    if (file_read_json(index_path, &index_json, &index_json_len) != 0) {
+        free(index_path);
+        free(model_dir_copy);
+        return -1;
+    }
+    free(index_path);
+
+    cache->model_dir = model_dir_copy;
+    cache->index_json = index_json;
+    cache->index_json_len = index_json_len;
+    return 0;
+}
+
+static int io_open_cached_bf16_shard(ternary_bf16_io_cache_t *cache,
+                                     const char *shard_name)
+{
+    safetensors_file_t *file = NULL;
+    char *shard_path = NULL;
+
+    if (!cache || !cache->model_dir || !shard_name || shard_name[0] == '\0') {
+        return -1;
+    }
+    if (cache->current_shard_file && strcmp(cache->current_shard_name, shard_name) == 0) {
+        return 0;
+    }
+
+    shard_path = construct_safe_path(cache->model_dir, shard_name, NULL);
+    if (!shard_path) {
+        return -1;
+    }
+    file = safetensors_open(shard_path);
+    if (!file) {
+        free(shard_path);
+        return -1;
+    }
+
+    if (cache->current_shard_file) {
+        /* Evict pages before closing so RSS is released immediately */
+        safetensors_evict_pages(cache->current_shard_file);
+        safetensors_close(cache->current_shard_file);
+    }
+    free(cache->current_shard_path);
+
+    cache->current_shard_file = file;
+    cache->current_shard_path = shard_path;
+    memcpy(cache->current_shard_name, shard_name, strlen(shard_name) + 1u);
+    return 0;
+}
+
+/**
+ * Walk model.safetensors.index.json (already loaded into `json`) and copy the
+ * shard filename for `tensor_name` into out_shard.  Returns 0 on success.
+ */
+static int resolve_shard_filename(const char *json,
+                                  size_t json_len,
+                                  const char *tensor_name,
+                                  char *out_shard,
+                                  size_t out_shard_size)
+{
+    sjson_cursor_t c = sjson_cursor_init(json, json_len);
+    char key[SHARD_KEY_MAX];
+    char wkey[SHARD_KEY_MAX];
+
+    if (!sjson_cursor_consume(&c, '{')) {
+        LOG_ERROR("shard resolver: expected '{' at start of index.json");
+        return -1;
+    }
+
+    while (sjson_cursor_peek(&c) != '}' && sjson_cursor_peek(&c) != '\0') {
+        if (sjson_cursor_parse_string(&c, key, (int)sizeof(key)) != 0) {
+            LOG_ERROR("shard resolver: failed to parse top-level key");
+            return -1;
+        }
+        if (!sjson_cursor_consume(&c, ':')) {
+            LOG_ERROR("shard resolver: expected ':' after key %s", key);
+            return -1;
+        }
+
+        if (strcmp(key, "weight_map") == 0) {
+            if (!sjson_cursor_consume(&c, '{')) {
+                LOG_ERROR("shard resolver: expected '{' opening weight_map");
+                return -1;
+            }
+            while (sjson_cursor_peek(&c) != '}' && sjson_cursor_peek(&c) != '\0') {
+                if (sjson_cursor_parse_string(&c, wkey, (int)sizeof(wkey)) != 0) {
+                    LOG_ERROR("shard resolver: failed to parse weight_map key");
+                    return -1;
+                }
+                if (!sjson_cursor_consume(&c, ':')) {
+                    LOG_ERROR("shard resolver: expected ':' in weight_map entry");
+                    return -1;
+                }
+                if (strcmp(wkey, tensor_name) == 0) {
+                    return sjson_cursor_parse_string(&c, out_shard, (int)out_shard_size);
+                }
+                if (sjson_cursor_skip_value(&c) != 0) {
+                    LOG_ERROR("shard resolver: skip_value failed in weight_map");
+                    return -1;
+                }
+                sjson_cursor_consume(&c, ',');
+            }
+            LOG_ERROR("shard resolver: tensor '%s' not found in weight_map", tensor_name);
+            return -1;
+        }
+
+        if (sjson_cursor_skip_value(&c) != 0) {
+            LOG_ERROR("shard resolver: skip_value failed for key %s", key);
+            return -1;
+        }
+        sjson_cursor_consume(&c, ',');
+    }
+
+    LOG_ERROR("shard resolver: weight_map not found in index.json");
+    return -1;
+}
+
+char *io_resolve_shard_path(const char *model_dir, const char *tensor_name)
+{
+    char *index_path = NULL;
+    char *json = NULL;
+    size_t json_len = 0;
+    char shard_filename[SHARD_FILENAME_MAX];
+    char *result = NULL;
+
+    if (!model_dir || !tensor_name) {
+        LOG_ERROR("io_resolve_shard_path: invalid arguments");
+        return NULL;
+    }
+
+    index_path = construct_safe_path(model_dir, SHARD_INDEX_FILENAME, NULL);
+    if (!index_path) {
+        return NULL;
+    }
+
+    if (file_read_json(index_path, &json, &json_len) != 0) {
+        free(index_path);
+        return NULL;
+    }
+    free(index_path);
+
+    shard_filename[0] = '\0';
+    if (resolve_shard_filename(json, json_len, tensor_name,
+                               shard_filename, sizeof(shard_filename)) != 0) {
+        free(json);
+        return NULL;
+    }
+    free(json);
+
+    result = construct_safe_path(model_dir, shard_filename, NULL);
+    if (!result) {
+        LOG_ERROR("io_resolve_shard_path: failed to construct path for shard '%s'", shard_filename);
+    }
+    return result;
+}
+
+int io_mmap_layer_bf16_sharded(const char *model_dir,
+                                const char *tensor_name,
+                                ternary_bf16_layer_map_t *out_map)
+{
+    char *shard_path = NULL;
+    int rc = -1;
+
+    if (!model_dir || !out_map || ternary_validate_tensor_name(tensor_name) != 0) {
+        LOG_ERROR("io_mmap_layer_bf16_sharded: invalid arguments");
+        return -1;
+    }
+
+    shard_path = io_resolve_shard_path(model_dir, tensor_name);
+    if (!shard_path) {
+        return -1;
+    }
+
+    rc = io_mmap_layer_bf16(shard_path, tensor_name, out_map);
+    free(shard_path);
+    return rc;
+}
+
+int io_mmap_layer_bf16_sharded_cached(const char *model_dir,
+                                      const char *tensor_name,
+                                      ternary_bf16_io_cache_t *cache,
+                                      ternary_bf16_layer_map_t *out_map)
+{
+    char shard_filename[SHARD_FILENAME_MAX];
+
+    if (!model_dir || !cache || !out_map || ternary_validate_tensor_name(tensor_name) != 0) {
+        LOG_ERROR("io_mmap_layer_bf16_sharded_cached: invalid arguments");
+        return -1;
+    }
+    if (io_prepare_bf16_io_cache(model_dir, cache) != 0) {
+        return -1;
+    }
+
+    shard_filename[0] = '\0';
+    if (resolve_shard_filename(cache->index_json,
+                               cache->index_json_len,
+                               tensor_name,
+                               shard_filename,
+                               sizeof(shard_filename)) != 0) {
+        return -1;
+    }
+    if (io_open_cached_bf16_shard(cache, shard_filename) != 0) {
+        return -1;
+    }
+
+    return io_map_layer_bf16_from_file(cache->current_shard_file, tensor_name, out_map, 0);
+}

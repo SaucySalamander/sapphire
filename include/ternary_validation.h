@@ -1,0 +1,165 @@
+/**
+ * @file ternary_validation.h
+ * @brief Full-model validation checkpoints for ternary conversion.
+ */
+
+#ifndef TERNARY_VALIDATION_H
+#define TERNARY_VALIDATION_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "inference.h"
+#include "ternary_anchor.h"
+#include "ternary_calibration.h"
+#include "ternary_telemetry.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    int validate_every_n;
+    int student_down_proj_input_rmsnorm;
+    const char *output_dir;
+    const char *telemetry_path;
+    const char *const *sample_texts;
+    int sample_count;
+} ternary_validation_config_t;
+
+typedef struct tensor_t tensor_t;
+typedef struct ternary_layer_payload_t ternary_layer_payload_t;
+typedef struct safetensors_file_t safetensors_file_t;
+
+typedef struct ternary_validation_patch ternary_validation_patch_t;
+
+typedef struct {
+    const float *weights;
+    uint32_t rows;
+    uint32_t cols;
+} ternary_validation_dense_view_t;
+
+typedef struct {
+    const uint16_t *weights;
+    uint32_t rows;
+    uint32_t cols;
+} ternary_validation_bf16_view_t;
+
+typedef struct {
+    char tensor_name[256];
+    tensor_t **slot;
+    tensor_t *original_tensor;
+    tensor_t *proxy_tensor;
+    safetensors_file_t *backing_file;
+    safetensors_file_t *anchor_backing_file;
+    uint32_t *anchor_row_offsets;
+    uint32_t crc32;
+} ternary_validation_patch_record_t;
+
+typedef struct ternary_validation_state {
+    ternary_validation_config_t config;
+    inference_context_t *ctx;
+    float *baseline_logits;
+    float *current_logits;
+    float *baseline_probs;
+    float *current_probs;
+    float *baseline_mean_nll;
+    int *baseline_top1;
+    ternary_validation_patch_t *patches;
+    int patch_count;
+    int patch_capacity;
+    uint32_t last_crc32;
+    char last_tensor_name[256];
+    int last_reported_count;
+    int telemetry_enabled;
+    ternary_telemetry_writer_t telemetry_writer;
+} ternary_validation_state_t;
+
+int ternary_validation_init(ternary_validation_state_t *state,
+                            const ternary_validation_config_t *config,
+                            inference_context_t *ctx);
+
+int ternary_validation_apply_proxy(ternary_validation_state_t *state,
+                                   const char *tensor_name,
+                                   const ternary_calibration_result_t *result,
+                                   uint32_t crc32,
+                                   int converted_count);
+
+int ternary_validation_capture_proxy_record(inference_context_t *ctx,
+                                            const char *tensor_name,
+                                            const ternary_calibration_result_t *result,
+                                            ternary_validation_patch_record_t *out_record);
+
+int ternary_validation_apply_proxy_from_payload(ternary_validation_state_t *state,
+                                                const char *tensor_name,
+                                                const ternary_layer_payload_t *payload,
+                                                uint32_t crc32,
+                                                int converted_count);
+
+int ternary_validation_apply_proxy_from_hybrid_payload(ternary_validation_state_t *state,
+                                                       const char *tensor_name,
+                                                       const ternary_layer_payload_t *payload,
+                                                       const ternary_anchor_view_t *anchor_view,
+                                                       uint32_t crc32,
+                                                       int converted_count);
+
+int ternary_validation_apply_proxy_from_dense(ternary_validation_state_t *state,
+                                              const char *tensor_name,
+                                              const ternary_validation_dense_view_t *view,
+                                              uint32_t crc32,
+                                              int converted_count);
+
+int ternary_validation_apply_proxy_from_bf16(ternary_validation_state_t *state,
+                                             const char *tensor_name,
+                                             const ternary_validation_bf16_view_t *view,
+                                             uint32_t crc32,
+                                             int converted_count);
+
+typedef struct {
+    uint32_t rows;
+    uint32_t cols;
+    size_t   packed_weight_bytes;
+    uint32_t crc32;
+} ternary_proxy_spec_t;
+
+typedef struct {
+    uint32_t rows;
+    uint32_t cols;
+    size_t   packed_weight_bytes;
+    uint32_t anchor_count;
+    uint32_t crc32;
+} hybrid_proxy_spec_t;
+
+int ternary_validation_apply_proxy_from_ternary_file(ternary_validation_state_t *state,
+                                                     const char *tensor_name,
+                                                     const char *layer_path,
+                                                     const ternary_proxy_spec_t *spec,
+                                                     int converted_count);
+
+int ternary_validation_apply_proxy_from_hybrid_files(ternary_validation_state_t *state,
+                                                     const char *tensor_name,
+                                                     const char *bulk_path,
+                                                     const char *anchor_path,
+                                                     const hybrid_proxy_spec_t *spec,
+                                                     int converted_count);
+
+int ternary_validation_apply_proxy_from_bf16_file(ternary_validation_state_t *state,
+                                                  const char *tensor_name,
+                                                  const char *layer_path,
+                                                  uint32_t crc32,
+                                                  int converted_count);
+
+int ternary_validation_adopt_patch_records(ternary_validation_state_t *state,
+                                           const ternary_validation_patch_record_t *records,
+                                           int record_count);
+
+int ternary_validation_finish(ternary_validation_state_t *state,
+                              int converted_count);
+
+void ternary_validation_destroy(ternary_validation_state_t *state);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* TERNARY_VALIDATION_H */

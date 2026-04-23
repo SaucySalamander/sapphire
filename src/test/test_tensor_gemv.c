@@ -2,8 +2,10 @@
 #include <stdlib.h>
 #include <math.h>
 #include <assert.h>
+#include <string.h>
 #include "kernels.h"
 #include "tensor.h"
+#include "ternary_anchor.h"
 #include "test_utils.h"
 
 // Global test counters
@@ -381,6 +383,64 @@ static void test_tensor_gemv_large(void) {
     tests_passed++;
 }
 
+static tensor_t *create_test_hybrid_tensor(void) {
+    static const uint8_t packed_weights[2] = {0x61u, 0x14u};
+    static const float scales[2] = {1.0f, 1.0f};
+    static const ternary_anchor_entry_t anchor_entries[2] = {
+        {.row = 0u, .col = 1u, .value_bf16 = 0x4000u, ._pad = 0u},
+        {.row = 1u, .col = 3u, .value_bf16 = 0xC000u, ._pad = 0u},
+    };
+    static const uint32_t anchor_row_offsets[3] = {0u, 1u, 2u};
+    tensor_hybrid_payload_t payload;
+
+    memset(&payload, 0, sizeof(payload));
+    payload.bulk.packed_weights = packed_weights;
+    payload.bulk.packed_weight_bytes = sizeof(packed_weights);
+    payload.bulk.scales = scales;
+    payload.bulk.scale_count = 2u;
+    payload.bulk.scale_group_size = 4u;
+    payload.anchor_entries = anchor_entries;
+    payload.anchor_row_offsets = anchor_row_offsets;
+    payload.anchor_count = 2u;
+    payload.owns_anchor_memory = 0;
+    return tensor_create_hybrid_view(2u, 4u, &payload, 1);
+}
+
+static void test_tensor_gemv_batch_hybrid(void) {
+    printf("TEST: tensor_gemv_batch hybrid tensor\n");
+
+    tensor_t *A = create_test_hybrid_tensor();
+    float X[] = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        0.5f, -1.0f, 1.0f, 0.0f,
+    };
+    float Y[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float expected[4] = {6.0f, -3.0f, -2.5f, 0.0f};
+    float reference[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    kernel_context_t *ctx = NULL;
+
+    assert(A != NULL);
+    ctx = tensor_gemv_ctx_create(0, 1024);
+    assert(ctx != NULL);
+    assert(kernel_ctx_init(ctx) == 0);
+
+    assert(tensor_gemv_batch_with_ctx(ctx, Y, A, X, 2) == 0);
+
+    assert(tensor_gemv_with_ctx(ctx, reference, A, X) == 0);
+    assert(tensor_gemv_with_ctx(ctx, reference + 2, A, X + 4) == 0);
+
+    for (int idx = 0; idx < 4; ++idx) {
+        assert(fabsf(Y[idx] - expected[idx]) < 1e-5f);
+        assert(fabsf(Y[idx] - reference[idx]) < 1e-5f);
+    }
+
+    tensor_release(A);
+    tensor_gemv_ctx_destroy(ctx);
+
+    printf("  ✓ Hybrid batched GEMV matches expected and per-sample reference\n");
+    tests_passed++;
+}
+
 // ============================================================================
 // Main test runner
 // ============================================================================
@@ -420,6 +480,10 @@ int main(void) {
     
     // Large matrix
     test_tensor_gemv_large();
+    printf("\n");
+
+    // Hybrid tensor paths
+    test_tensor_gemv_batch_hybrid();
     printf("\n");
     
     PRINT_TEST_RESULTS_AND_EXIT();

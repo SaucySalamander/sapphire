@@ -1,0 +1,61 @@
+/**
+ * @file ternary_conversion.h
+ * @brief CLI-facing entry point for ternary model conversion.
+ */
+
+#ifndef TERNARY_CONVERSION_H
+#define TERNARY_CONVERSION_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    const char *model_name;
+    const char *output_path;
+    const char *layer_name;
+    const char *activation_tape_path;
+    const char *hessian_sidecar_path;
+    const char *teacher_model_name;
+    const char *structural_map_path;
+    const char *calibration_corpus_path;
+    const char *calibration_corpus_manifest_path;
+    const char *validation_corpus_path;
+    const char *validation_corpus_manifest_path;
+    int context_len;
+    int calibration_sample_limit;
+    int validation_sample_limit;
+    int checkpoint_every_n_layers;
+    int validate_every_n;
+    int ste_steps;
+    float ste_learning_rate;
+    int progressive_calib;
+    int student_down_proj_input_rmsnorm;
+    float kl_weight;
+    int kl_update_interval;
+    int kl_sample_count;
+    int early_stop_patience;
+    float early_stop_min_delta;
+    float early_stop_divergence_ratio;
+    int disable_hessian_proxy;
+    float hessian_proxy_strength;
+    float hessian_proxy_floor;
+    float max_grad_norm;
+    int emit_spatial_telemetry;
+    int spatial_telemetry_row_bucket_size;
+    /* Mixed-precision anchor mode (Prompt 05) */
+    int use_anchor_mode;              /* Enable hybrid ternary+anchor format */
+    uint32_t anchor_budget_ppm;       /* Anchor budget in parts-per-million (default: 1000 = 0.1%) */
+    int anchor_saliency_mode;         /* 0=none, 1=weight*hessian, 2=hessian, 3=weight */
+    const char *anchor_tensor_pattern; /* Optional pattern to match tensors for anchoring (e.g. "down_proj") */
+} ternary_conversion_config_t;
+
+int transformer_run_ternary_conversion(const ternary_conversion_config_t *config);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* TERNARY_CONVERSION_H */

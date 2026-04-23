@@ -15,8 +15,14 @@ logs/
 ./logs/
 reports/
 docs/
+data/
+corpora/
+configs/
+traces/
 
 # Object and library files
+*.tape
+*.tsv
 *.o
 *.obj
 *.a
@@ -26,6 +32,8 @@ docs/
 *.exe
 *.lo
 *.la
+*.spv
+*.tracy
 
 # Coverage, profiling and sanitizer outputs
 *.gcno
@@ -93,6 +101,18 @@ Thumbs.db
 # Logs and caches
 *.log
 .cache/
+
+# Generated ternary conversion corpora
+corpora/*
+!corpora/README.md
+!corpora/calibration/
+!corpora/calibration/.gitkeep
+!corpora/validation/
+!corpora/validation/.gitkeep
+corpora/calibration/*
+!corpora/calibration/.gitkeep
+corpora/validation/*
+!corpora/validation/.gitkeep
 
 # Archives
 *.tgz

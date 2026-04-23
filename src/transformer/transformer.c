@@ -5,13 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../include/gemma3_270m_config.h"
+#include "../include/gemma3_config.h"
 #include "attention.h"
 #include "inference.h"
 #include "kernels.h"
 #include "log.h"
 #include "rope.h"
 #include "tensor.h"
+#include "tokenizer.h"
 #include "utils.h"
 
 
@@ -75,6 +76,211 @@ layer_buffers_t init_layer_buffers(const struct inference_session_t* session,
     return buf;
 }
 
+static int parse_capture_target(const char* tensor_name,
+                                int* out_layer_idx,
+                                capture_target_t* out_target) {
+    static const char *CAPTURE_PREFIXES[] = {
+        "model.layers.",
+        "language_model.model.layers.",
+        NULL
+    };
+    const char* cursor = NULL;
+    char* endptr = NULL;
+    long parsed_layer = 0;
+
+    if (!tensor_name || !out_layer_idx || !out_target) {
+        return -1;
+    }
+
+    for (int pi = 0; CAPTURE_PREFIXES[pi] != NULL; ++pi) {
+        size_t plen = strlen(CAPTURE_PREFIXES[pi]);
+        if (strncmp(tensor_name, CAPTURE_PREFIXES[pi], plen) == 0) {
+            cursor = tensor_name + plen;
+            break;
+        }
+    }
+    if (!cursor) {
+        return -1;
+    }
+
+    parsed_layer = strtol(cursor, &endptr, 10);
+    if (endptr == cursor || parsed_layer < 0 || strncmp(endptr, ".", 1) != 0) {
+        return -1;
+    }
+
+    if (strstr(tensor_name, ".self_attn.q_proj.weight") ||
+        strstr(tensor_name, ".self_attn.k_proj.weight") ||
+        strstr(tensor_name, ".self_attn.v_proj.weight")) {
+        *out_target = CAPTURE_TARGET_QKV_INPUT;
+    } else if (strstr(tensor_name, ".self_attn.o_proj.weight")) {
+        *out_target = CAPTURE_TARGET_OUT_INPUT;
+    } else if (strstr(tensor_name, ".mlp.gate_proj.weight") ||
+               strstr(tensor_name, ".mlp.up_proj.weight")) {
+        *out_target = CAPTURE_TARGET_FFN_INPUT;
+    } else if (strstr(tensor_name, ".mlp.down_proj.weight")) {
+        *out_target = CAPTURE_TARGET_DOWN_INPUT;
+    } else {
+        *out_target = CAPTURE_TARGET_UNKNOWN;
+        return -1;
+    }
+
+    *out_layer_idx = (int)parsed_layer;
+    return 0;
+}
+
+static transformer_rope_t select_layer_rope(const struct inference_session_t* session,
+                                            int layer_idx) {
+    const sapphire_layer_config_t* layer_cfg = &session->layer_configs[layer_idx];
+    int is_global = layer_cfg->config.attention.is_global;
+    transformer_rope_t rope;
+
+    rope.cos = is_global ? session->rope_freqs_cos_global : session->rope_freqs_cos_local;
+    rope.sin = is_global ? session->rope_freqs_sin_global : session->rope_freqs_sin_local;
+    return rope;
+}
+
+static int capture_target_vector(float* dst, uint32_t out_dim, const float* src, int src_dim) {
+    if (!dst || !src || src_dim <= 0 || out_dim != (uint32_t)src_dim) {
+        return -1;
+    }
+    vec_copy(dst, src, src_dim);
+    return 0;
+}
+
+typedef struct {
+    int layer_idx;
+    int token_pos;
+    float* hidden;
+    transformer_rope_t rope;
+    capture_target_t target;
+    float* out_vector;
+    uint32_t out_dim;
+} capture_layer_input_request_t;
+
+static int capture_layer_tensor_input(struct inference_session_t* session,
+                                      const capture_layer_input_request_t* request) {
+    llm_model_t* model = (llm_model_t*)session->model_spec->llm_model;
+    model_layer_weights_t* layer = &model->layers[request->layer_idx];
+    gemma3_270m_config_t* config = (gemma3_270m_config_t*)session->model_spec->variant_config;
+    int d_model = config->hidden_size;
+    int head_dim = config->head_dim > 0 ? config->head_dim : (d_model / config->num_attention_heads);
+    int d_inner = config->num_attention_heads * head_dim;
+    int d_ff = config->intermediate_size;
+    layer_buffers_t buf = init_layer_buffers(session, config, d_model, head_dim, 1);
+    transformer_layer_ctx_t ctx = {
+        .session = session,
+        .layer = layer,
+        .config = config,
+        .layer_idx = request->layer_idx,
+        .token_pos = request->token_pos,
+        .batch_size = 1,
+        .d_model = d_model,
+        .head_dim = head_dim
+    };
+
+    if (request->target == CAPTURE_TARGET_QKV_INPUT) {
+        const float* norm_attn_data = get_norm_weights(ctx.layer->norm_attn_weight, buf.weight_scratch, d_model);
+        vec_copy(buf.residual, request->hidden, d_model);
+        rmsnorm_delta(buf.norm_buf, request->hidden, norm_attn_data, 1e-6f, d_model);
+        return capture_target_vector(request->out_vector, request->out_dim, buf.norm_buf, d_model);
+    }
+
+    compute_attention_stage(buf, &ctx, request->hidden, request->rope.cos, request->rope.sin);
+    if (request->target == CAPTURE_TARGET_OUT_INPUT) {
+        return capture_target_vector(request->out_vector, request->out_dim, buf.attn_out, d_inner);
+    }
+
+    compute_ffn_stage(buf, &ctx, request->hidden);
+    if (request->target == CAPTURE_TARGET_FFN_INPUT) {
+        return capture_target_vector(request->out_vector, request->out_dim, buf.norm_buf, d_model);
+    }
+    if (request->target == CAPTURE_TARGET_DOWN_INPUT) {
+        return capture_target_vector(request->out_vector, request->out_dim, buf.ffn_gate_buf, d_ff);
+    }
+
+    return -1;
+}
+
+int sapphire_collect_tensor_activation(struct inference_session_t* session,
+                                       struct sapphire_tokenizer_t* tokenizer,
+                                       const transformer_activation_capture_request_t* request) {
+    const gemma3_270m_config_t* config = NULL;
+    capture_target_t target = CAPTURE_TARGET_UNKNOWN;
+    capture_layer_input_request_t capture_request;
+    int layer_idx = 0;
+    int* tokens = NULL;
+    float* hidden = NULL;
+    int token_count = 0;
+    const int max_tokens = 1024;
+    int rc = -1;
+
+    if (!session || !tokenizer || !request || !request->spec || !request->text ||
+        !request->tensor_name || !request->out_vector) {
+        return -1;
+    }
+    if (!session->backend || session->backend->type != SAPPHIRE_BACKEND_TYPE_CPU) {
+        LOG_WARN("Activation replay requires CPU backend; falling back for %s", request->tensor_name);
+        return -1;
+    }
+    if (parse_capture_target(request->tensor_name, &layer_idx, &target) != 0) {
+        return -1;
+    }
+
+    config = (gemma3_270m_config_t*)request->spec->variant_config;
+    if (!config || layer_idx < 0 || layer_idx >= config->num_hidden_layers) {
+        return -1;
+    }
+
+    tokens = (int*)malloc((size_t)max_tokens * sizeof(int));
+    hidden = (float*)malloc((size_t)config->hidden_size * sizeof(float));
+    if (!tokens || !hidden) {
+        LOG_ERROR("sapphire_collect_tensor_activation: allocation failed");
+        goto cleanup;
+    }
+
+    token_count = build_gemma3_prompt(request->spec, request->text, tokens, max_tokens);
+    if (token_count <= 0) {
+        token_count = tokenize(tokenizer, request->text, tokens, max_tokens);
+    }
+    if (token_count <= 0) {
+        LOG_WARN("sapphire_collect_tensor_activation: tokenization failed for tensor %s", request->tensor_name);
+        goto cleanup;
+    }
+
+    memset(&capture_request, 0, sizeof(capture_request));
+    capture_request.layer_idx = layer_idx;
+    capture_request.target = target;
+    capture_request.out_vector = request->out_vector;
+    capture_request.out_dim = request->out_dim;
+
+    inference_session_reset(session);
+    for (int pos = 0; pos < token_count; ++pos) {
+        sapphire_embed_lookup(session, tokens[pos], hidden);
+
+        for (int l = 0; l < layer_idx; ++l) {
+            transformer_rope_t rope = select_layer_rope(session, l);
+            sapphire_transformer_layer(session, l, pos, hidden, rope);
+        }
+
+        if (pos < token_count - 1) {
+            transformer_rope_t rope = select_layer_rope(session, layer_idx);
+            sapphire_transformer_layer(session, layer_idx, pos, hidden, rope);
+            continue;
+        }
+
+        capture_request.token_pos = pos;
+        capture_request.hidden = hidden;
+        capture_request.rope = select_layer_rope(session, layer_idx);
+        rc = capture_layer_tensor_input(session, &capture_request);
+        break;
+    }
+
+cleanup:
+    free(tokens);
+    free(hidden);
+    return rc;
+}
+
 typedef struct {
     float* gate;
     const float* up;
@@ -91,6 +297,12 @@ static void geglu_parallel_fn(void* arg, int idx) {
     for (int i = 0; i < a->size; ++i) {
         g[i] *= u[i];
     }
+}
+
+static int ffn_down_proj_input_rmsnorm_enabled(const transformer_layer_ctx_t *ctx)
+{
+    return ctx && ctx->session &&
+        inference_session_ffn_down_proj_input_rmsnorm_enabled(ctx->session);
 }
 
 void compute_ffn_stage(layer_buffers_t buf,
@@ -161,6 +373,14 @@ void compute_ffn_stage(layer_buffers_t buf,
         float r_a = 0;
         vec_stats(buf.ffn_gate_buf, ctx->config->intermediate_size, NULL, NULL, &r_a);
         LOG_DEBUG("Layer %d Activation RMS: %.3f", ctx->layer_idx, r_a);
+    }
+
+    if (ffn_down_proj_input_rmsnorm_enabled(ctx)) {
+        for (int b = 0; b < ctx->batch_size; b++) {
+            float *down_input = buf.ffn_gate_buf + (size_t)b * buf.pf;
+
+            (void)rmsnorm_unit(down_input, down_input, 1e-6f, ctx->config->intermediate_size);
+        }
     }
 
     if (ctx->batch_size == 1) {
@@ -447,4 +667,78 @@ void compute_ssm_stage(layer_buffers_t buf,
     LOG_WARN("compute_ssm_stage called for layer %d (not yet implemented)", ctx->layer_idx);
     /* TODO: Implement Mamba-style SSM forward pass */
     (void)buf;
+}
+
+int sapphire_record_pass(struct inference_session_t  *session,
+                         struct sapphire_tokenizer_t *tokenizer,
+                         const struct model_spec     *spec,
+                         const char                  *text,
+                         activation_record_slot_t    *slots,
+                         int                          slot_count)
+{
+    const gemma3_270m_config_t *config = NULL;
+    const model_spec_t         *mspec  = (const model_spec_t *)spec;
+    sapphire_tokenizer_t       *tok    = (sapphire_tokenizer_t *)tokenizer;
+    int    *tokens      = NULL;
+    float  *hidden      = NULL;
+    int     token_count = 0;
+    int     rc          = -1;
+    const int max_tokens = 1024;
+
+    if (!session || !tokenizer || !spec || !text || !slots || slot_count <= 0) return -1;
+    if (!session->backend || session->backend->type != SAPPHIRE_BACKEND_TYPE_CPU) {
+        LOG_WARN("sapphire_record_pass: CPU backend required");
+        return -1;
+    }
+    config = (const gemma3_270m_config_t *)mspec->variant_config;
+    if (!config || config->num_hidden_layers <= 0 || config->hidden_size <= 0) return -1;
+
+    tokens = (int *)malloc((size_t)max_tokens * sizeof(int));
+    hidden = (float *)malloc((size_t)config->hidden_size * sizeof(float));
+    if (!tokens || !hidden) {
+        LOG_ERROR("sapphire_record_pass: allocation failed");
+        goto cleanup;
+    }
+
+    token_count = build_gemma3_prompt(mspec, text, tokens, max_tokens);
+    if (token_count <= 0) token_count = tokenize(tok, text, tokens, max_tokens);
+    if (token_count <= 0) {
+        LOG_WARN("sapphire_record_pass: tokenization failed");
+        goto cleanup;
+    }
+
+    inference_session_reset(session);
+    for (int pos = 0; pos < token_count; ++pos) {
+        int is_final = (pos == token_count - 1);
+        sapphire_embed_lookup(session, tokens[pos], hidden);
+        for (int l = 0; l < config->num_hidden_layers; ++l) {
+            transformer_rope_t rope = select_layer_rope(session, l);
+            if (is_final) {
+                if (l == 0 || ((l + 1) % 3) == 0 || (l + 1) == config->num_hidden_layers) {
+                    LOG_INFO("Recording layer %d/%d", l + 1, config->num_hidden_layers);
+                }
+                capture_layer_input_request_t req;
+                req.token_pos  = pos;
+                req.hidden     = hidden;
+                req.rope       = rope;
+                for (int si = 0; si < slot_count; ++si) {
+                    if (slots[si].layer_idx != l || slots[si].captured) continue;
+                    req.layer_idx  = l;
+                    req.target     = slots[si].target;
+                    req.out_vector = slots[si].out_vector;
+                    req.out_dim    = slots[si].out_dim;
+                    if (capture_layer_tensor_input(session, &req) == 0) {
+                        slots[si].captured = 1;
+                    }
+                }
+            }
+            sapphire_transformer_layer(session, l, pos, hidden, rope);
+        }
+    }
+    rc = 0;
+
+cleanup:
+    free(tokens);
+    free(hidden);
+    return rc;
 }

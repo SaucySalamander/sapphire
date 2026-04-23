@@ -121,6 +121,14 @@ float quantized_gemv_q8_0_unaligned(const void *W_row, const float *x, int block
 float quantized_gemv_bf16_avx2(const void *W_row, const float *x, int block_count, int block_size);
 float quantized_gemv_bf16_scalar(const void *W_row, const float *x, int block_count, int block_size);
 
+// Packed ternary kernels
+float quantized_gemv_ternary_scalar(const void *W_row, const float *x, int block_count, int block_size);
+
+// Hybrid ternary + BF16 anchor kernels (AVX2)
+float quantized_gemv_ternary_hybrid_avx2(const void *W_row, const float *x, int block_count, int block_size);
+void gemv_ternary_hybrid_avx2(float *y, const tensor_t *A, const float *x, int m);
+void kernel_gemm_ternary_hybrid_avx2(const gemm_args_t *args);
+
 // F32 kernels
 float quantized_gemv_f32_avx2(const void *W_row, const float *x, int block_count, int block_size);
 float quantized_gemv_f32_scalar(const void *W_row, const float *x, int block_count, int block_size);
@@ -128,6 +136,7 @@ float quantized_gemv_f32_scalar(const void *W_row, const float *x, int block_cou
 // Batched kernels (GEMM)
 void kernel_gemm_f32_avx2(const gemm_args_t* args);
 void kernel_gemm_bf16_avx2(const gemm_args_t* args);
+void kernel_gemm_ternary_scalar(const gemm_args_t* args);
 
 // ============================================================================
 // HIGH-LEVEL TENSOR OPERATIONS (Thread-safe, dtype-aware)
@@ -193,6 +202,9 @@ int sapphire_geglu(float *output, const float *input, size_t size);
 
 /** RMSNorm: out[i] = (in[i] / RMS) * weight[i] */
 int rmsnorm(float *out, const float *in, const float *weight, float epsilon, int dim);
+
+/** Weightless RMSNorm: out[i] = in[i] / RMS */
+int rmsnorm_unit(float *out, const float *in, float epsilon, int dim);
 
 /** RMSNorm (Gemma 3 style): out[i] = (in[i] / RMS) * (1.0 + weight[i]) */
 int rmsnorm_delta(float *out, const float *in, const float *weight, float epsilon, int dim);

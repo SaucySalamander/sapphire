@@ -2,7 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "tensor.h"
+#include "ternary_anchor.h"
 #include "../include/log.h"
+#include "../include/tracy_profile.h"
 
 // Concrete definition of the tensor structure (private to this .c file)
 struct tensor_t {
@@ -15,6 +17,231 @@ struct tensor_t {
     int ref_count;               // Reference count
     int is_external;             // Flag if data is managed elsewhere (e.g. mmap)
 };
+
+static void tensor_ternary_release_payload(tensor_t *t) {
+    tensor_ternary_view_t *view = NULL;
+
+    if (!t || t->dtype != DTYPE_TERNARY_2BIT || !t->data) {
+        return;
+    }
+
+    view = (tensor_ternary_view_t *)t->data;
+    if (!t->is_external) {
+        SAPPHIRE_TRACY_FREE(view->packed_weights);
+        free((void *)view->packed_weights);
+        SAPPHIRE_TRACY_FREE(view->scales);
+        free((void *)view->scales);
+    }
+    free(view);
+}
+
+static void tensor_hybrid_release_payload(tensor_t *t) {
+    tensor_hybrid_view_t *view = NULL;
+
+    if (!t || t->dtype != DTYPE_TERNARY_HYBRID || !t->data) {
+        return;
+    }
+
+    view = (tensor_hybrid_view_t *)t->data;
+    if (!t->is_external) {
+        SAPPHIRE_TRACY_FREE(view->packed_weights);
+        free((void *)view->packed_weights);
+        SAPPHIRE_TRACY_FREE(view->scales);
+        free((void *)view->scales);
+    }
+    if (view->owns_anchor_memory) {
+        SAPPHIRE_TRACY_FREE(view->anchor_entries);
+        free((void *)view->anchor_entries);
+        SAPPHIRE_TRACY_FREE(view->anchor_row_offsets);
+        free((void *)view->anchor_row_offsets);
+    }
+    free(view);
+}
+
+static float tensor_bf16_to_f32_local(uint16_t value) {
+    union {
+        uint32_t u32;
+        float f32;
+    } bits;
+
+    bits.u32 = ((uint32_t)value) << 16u;
+    return bits.f32;
+}
+
+static int tensor_hybrid_validate_anchor_payload_local(uint32_t rows,
+                                                       uint32_t cols,
+                                                       const ternary_anchor_entry_t *entries,
+                                                       const uint32_t *row_offsets,
+                                                       uint32_t anchor_count) {
+    uint32_t row = 0u;
+
+    if (anchor_count == 0u) {
+        if (!row_offsets) {
+            return 0;
+        }
+        for (row = 0u; row <= rows; ++row) {
+            if (row_offsets[row] != 0u) {
+                LOG_ERROR("tensor_create_hybrid_view invalid zero-anchor row_offsets");
+                return -1;
+            }
+        }
+        return 0;
+    }
+    if (!entries || !row_offsets) {
+        LOG_ERROR("tensor_create_hybrid_view anchor_count>0 but missing entries/offsets");
+        return -1;
+    }
+    if (row_offsets[0] != 0u || row_offsets[rows] != anchor_count) {
+        LOG_ERROR("tensor_create_hybrid_view invalid anchor row_offsets terminal range");
+        return -1;
+    }
+
+    for (row = 0u; row < rows; ++row) {
+        uint32_t start = row_offsets[row];
+        uint32_t end = row_offsets[row + 1u];
+        uint16_t prev_col = 0u;
+        int has_prev_col = 0;
+
+        if (end < start || end > anchor_count) {
+            LOG_ERROR("tensor_create_hybrid_view non-monotonic row_offsets at row=%u", row);
+            return -1;
+        }
+        for (uint32_t idx = start; idx < end; ++idx) {
+            if (entries[idx].row != row) {
+                LOG_ERROR("tensor_create_hybrid_view row_offsets/entry row mismatch at index=%u", idx);
+                return -1;
+            }
+            if (entries[idx].col >= cols) {
+                LOG_ERROR("tensor_create_hybrid_view anchor col out of bounds at index=%u", idx);
+                return -1;
+            }
+            if (has_prev_col && entries[idx].col <= prev_col) {
+                LOG_ERROR("tensor_create_hybrid_view anchor entries must be strictly ordered within each row");
+                return -1;
+            }
+            prev_col = entries[idx].col;
+            has_prev_col = 1;
+        }
+    }
+
+    return 0;
+}
+
+static tensor_t* tensor_clone_ternary_local(const tensor_t *src) {
+    const tensor_ternary_view_t *view = NULL;
+    tensor_ternary_payload_t payload;
+    uint8_t *packed_copy = NULL;
+    float *scale_copy = NULL;
+    tensor_t *clone = NULL;
+
+    view = tensor_data_ternary(src);
+    if (!view) {
+        return NULL;
+    }
+
+    packed_copy = (uint8_t *)malloc(view->packed_weight_bytes);
+    scale_copy = (float *)malloc(view->scale_bytes);
+    if (!packed_copy || !scale_copy) {
+        free(packed_copy);
+        free(scale_copy);
+        LOG_ERROR("tensor_clone failed to allocate ternary payload copy");
+        return NULL;
+    }
+
+    memcpy(packed_copy, view->packed_weights, view->packed_weight_bytes);
+    memcpy(scale_copy, view->scales, view->scale_bytes);
+    memset(&payload, 0, sizeof(payload));
+    payload.packed_weights = packed_copy;
+    payload.packed_weight_bytes = view->packed_weight_bytes;
+    payload.scales = scale_copy;
+    payload.scale_count = view->scale_count;
+    payload.scale_group_size = view->scale_group_size;
+
+    clone = tensor_create_ternary_view(view->rows, view->cols, &payload, 0);
+    if (!clone) {
+        free(packed_copy);
+        free(scale_copy);
+        return NULL;
+    }
+    SAPPHIRE_TRACY_ALLOC(packed_copy, view->packed_weight_bytes);
+    SAPPHIRE_TRACY_ALLOC(scale_copy, view->scale_bytes);
+    clone->layout = src->layout;
+    return clone;
+}
+
+static tensor_t* tensor_clone_hybrid_local(const tensor_t *src) {
+    const tensor_hybrid_view_t *view = NULL;
+    tensor_hybrid_payload_t payload;
+    uint8_t *packed_copy = NULL;
+    float *scale_copy = NULL;
+    ternary_anchor_entry_t *anchor_entries_copy = NULL;
+    uint32_t *anchor_row_offsets_copy = NULL;
+    tensor_t *clone = NULL;
+
+    view = tensor_data_hybrid(src);
+    if (!view) {
+        return NULL;
+    }
+
+    packed_copy = (uint8_t *)malloc(view->packed_weight_bytes);
+    scale_copy = (float *)malloc(view->scale_bytes);
+    if (!packed_copy || !scale_copy) {
+        free(packed_copy);
+        free(scale_copy);
+        LOG_ERROR("tensor_clone failed to allocate hybrid bulk payload copy");
+        return NULL;
+    }
+    memcpy(packed_copy, view->packed_weights, view->packed_weight_bytes);
+    memcpy(scale_copy, view->scales, view->scale_bytes);
+
+    if (view->anchor_count > 0u) {
+        const size_t anchor_entry_bytes = (size_t)view->anchor_count * sizeof(ternary_anchor_entry_t);
+        const size_t anchor_row_offsets_bytes = ((size_t)view->rows + 1u) * sizeof(uint32_t);
+
+        anchor_entries_copy = (ternary_anchor_entry_t *)malloc(anchor_entry_bytes);
+        anchor_row_offsets_copy = (uint32_t *)malloc(anchor_row_offsets_bytes);
+        if (!anchor_entries_copy || !anchor_row_offsets_copy) {
+            free(packed_copy);
+            free(scale_copy);
+            free(anchor_entries_copy);
+            free(anchor_row_offsets_copy);
+            LOG_ERROR("tensor_clone failed to allocate hybrid anchor payload copy");
+            return NULL;
+        }
+        memcpy(anchor_entries_copy, view->anchor_entries, anchor_entry_bytes);
+        memcpy(anchor_row_offsets_copy, view->anchor_row_offsets, anchor_row_offsets_bytes);
+    }
+
+    memset(&payload, 0, sizeof(payload));
+    payload.bulk.packed_weights = packed_copy;
+    payload.bulk.packed_weight_bytes = view->packed_weight_bytes;
+    payload.bulk.scales = scale_copy;
+    payload.bulk.scale_count = view->scale_count;
+    payload.bulk.scale_group_size = view->scale_group_size;
+    payload.anchor_entries = anchor_entries_copy;
+    payload.anchor_row_offsets = anchor_row_offsets_copy;
+    payload.anchor_count = view->anchor_count;
+    payload.owns_anchor_memory = 1;
+
+    clone = tensor_create_hybrid_view(view->rows, view->cols, &payload, 0);
+    if (!clone) {
+        free(packed_copy);
+        free(scale_copy);
+        free(anchor_entries_copy);
+        free(anchor_row_offsets_copy);
+        return NULL;
+    }
+    SAPPHIRE_TRACY_ALLOC(packed_copy, view->packed_weight_bytes);
+    SAPPHIRE_TRACY_ALLOC(scale_copy, view->scale_bytes);
+    if (anchor_entries_copy) {
+        const size_t anchor_entry_bytes = (size_t)view->anchor_count * sizeof(ternary_anchor_entry_t);
+        const size_t anchor_row_offsets_bytes = ((size_t)view->rows + 1u) * sizeof(uint32_t);
+        SAPPHIRE_TRACY_ALLOC(anchor_entries_copy, anchor_entry_bytes);
+        SAPPHIRE_TRACY_ALLOC(anchor_row_offsets_copy, anchor_row_offsets_bytes);
+    }
+    clone->layout = src->layout;
+    return clone;
+}
 
 // ============================================================================
 // Helper: Get element size for a dtype
@@ -34,6 +261,8 @@ size_t dtype_element_size(tensor_dtype_t dtype) {
         case DTYPE_F16:   return 2;      // 16-bit float: 2 bytes per element
         case DTYPE_Q4_0:  return 1;      // 4-bit quantized: 2 elements per 1 byte (special handling)
         case DTYPE_Q8_0:  return 1;      // 8-bit quantized: 1 byte per element
+        case DTYPE_TERNARY_2BIT: return 0; // custom packed layout
+        case DTYPE_TERNARY_HYBRID: return 0; // custom packed layout + anchor patch
         default:          return 0;
     }
 }
@@ -45,6 +274,8 @@ const char* dtype_name(tensor_dtype_t dtype) {
         case DTYPE_F16:   return "F16";
         case DTYPE_Q4_0:  return "Q4_0";
         case DTYPE_Q8_0:  return "Q8_0";
+        case DTYPE_TERNARY_2BIT: return "TERNARY_2BIT";
+        case DTYPE_TERNARY_HYBRID: return "TERNARY_HYBRID";
         default:          return "UNKNOWN";
     }
 }
@@ -101,6 +332,11 @@ tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype) {
     // Calculate total elements and required bytes
     size_t numel = shape_product(ndim, shape);
     size_t element_size = dtype_element_size(dtype);
+    if (dtype == DTYPE_TERNARY_2BIT || element_size == 0) {
+        LOG_ERROR("tensor_create unsupported custom dtype=%d", (int)dtype);
+        free(t);
+        return NULL;
+    }
     
     // For Q4_0: 2 elements per byte, so nbytes = numel / 2
     // For Q8_0: 1 element per byte, so nbytes = numel * 1
@@ -118,6 +354,7 @@ tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype) {
         free(t);
         return NULL;
     }
+    SAPPHIRE_TRACY_ALLOC(t->data, t->nbytes);
 
     // Initialize reference count
     t->ref_count = 1;
@@ -146,8 +383,214 @@ tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, v
         t->shape[i] = shape[i];
         elements *= shape[i];
     }
-    t->nbytes = elements * dtype_element_size(dtype);
+    if (dtype == DTYPE_Q4_0) {
+        t->nbytes = (elements + 1) / 2;
+    } else if (dtype == DTYPE_TERNARY_2BIT) {
+        t->nbytes = 0;
+    } else {
+        t->nbytes = elements * dtype_element_size(dtype);
+    }
     
+    return t;
+}
+
+tensor_t* tensor_create_ternary_view(uint32_t rows,
+                                     uint32_t cols,
+                                     const tensor_ternary_payload_t *payload,
+                                     int is_external) {
+    tensor_t *t = NULL;
+    tensor_ternary_view_t *view = NULL;
+    int shape[2] = {0, 0};
+    size_t packed_cols = 0u;
+    size_t scale_bytes = 0u;
+    uint32_t groups_per_row = 0u;
+    const uint8_t *packed_weights = NULL;
+    const float *scales = NULL;
+    size_t packed_weight_bytes = 0u;
+    size_t scale_count = 0u;
+    uint32_t scale_group_size = 0u;
+
+    if (!payload || rows == 0u || cols == 0u) {
+        LOG_ERROR("tensor_create_ternary_view invalid ternary payload");
+        return NULL;
+    }
+    packed_weights = payload->packed_weights;
+    packed_weight_bytes = payload->packed_weight_bytes;
+    scales = payload->scales;
+    scale_count = payload->scale_count;
+    scale_group_size = payload->scale_group_size;
+    if (!packed_weights || !scales) {
+        LOG_ERROR("tensor_create_ternary_view invalid ternary payload buffers");
+        return NULL;
+    }
+    if (scale_count == 0u || (scale_count % rows) != 0u) {
+        LOG_ERROR("tensor_create_ternary_view invalid scale_count=%zu for rows=%u", scale_count, rows);
+        return NULL;
+    }
+    groups_per_row = (uint32_t)(scale_count / rows);
+    if (groups_per_row == 0u) {
+        LOG_ERROR("tensor_create_ternary_view invalid groups_per_row for rows=%u scale_count=%zu", rows, scale_count);
+        return NULL;
+    }
+    if (scale_group_size == 0u) {
+        LOG_ERROR("tensor_create_ternary_view invalid scale_group_size=0");
+        return NULL;
+    }
+
+    packed_cols = ((size_t)cols + 3u) / 4u;
+    if (packed_weight_bytes != (size_t)rows * packed_cols) {
+        LOG_ERROR("tensor_create_ternary_view packed byte mismatch: rows=%u cols=%u packed=%zu", rows, cols, packed_weight_bytes);
+        return NULL;
+    }
+    scale_bytes = scale_count * sizeof(float);
+
+    t = (tensor_t *)malloc(sizeof(tensor_t));
+    if (!t) {
+        LOG_ERROR("tensor_create_ternary_view malloc failed for tensor");
+        return NULL;
+    }
+    memset(t, 0, sizeof(*t));
+
+    view = (tensor_ternary_view_t *)malloc(sizeof(*view));
+    if (!view) {
+        LOG_ERROR("tensor_create_ternary_view malloc failed for payload");
+        free(t);
+        return NULL;
+    }
+
+    memset(view, 0, sizeof(*view));
+    view->packed_weights = packed_weights;
+    view->scales = scales;
+    view->rows = rows;
+    view->cols = cols;
+    view->packed_cols = (uint32_t)packed_cols;
+    view->scale_group_size = scale_group_size;
+    view->groups_per_row = groups_per_row;
+    view->packed_weight_bytes = packed_weight_bytes;
+    view->scale_count = scale_count;
+    view->scale_bytes = scale_bytes;
+
+    shape[0] = (int)rows;
+    shape[1] = (int)cols;
+    t->data = view;
+    t->ndim = 2;
+    memcpy(t->shape, shape, sizeof(shape));
+    t->dtype = DTYPE_TERNARY_2BIT;
+    t->layout = LAYOUT_ROW_MAJOR;
+    t->nbytes = packed_weight_bytes + scale_bytes;
+    t->ref_count = 1;
+    t->is_external = is_external ? 1 : 0;
+    return t;
+}
+
+tensor_t* tensor_create_hybrid_view(uint32_t rows,
+                                    uint32_t cols,
+                                    const tensor_hybrid_payload_t *payload,
+                                    int is_external) {
+    tensor_t *t = NULL;
+    tensor_hybrid_view_t *view = NULL;
+    int shape[2] = {0, 0};
+    size_t packed_cols = 0u;
+    size_t scale_bytes = 0u;
+    uint32_t groups_per_row = 0u;
+    const tensor_ternary_payload_t *bulk = NULL;
+    const uint8_t *packed_weights = NULL;
+    const float *scales = NULL;
+    const void *anchor_entries = NULL;
+    const uint32_t *anchor_row_offsets = NULL;
+    uint32_t anchor_count = 0u;
+    int owns_anchor_memory = 0;
+    size_t packed_weight_bytes = 0u;
+    size_t scale_count = 0u;
+    uint32_t scale_group_size = 0u;
+
+    if (!payload || rows == 0u || cols == 0u) {
+        LOG_ERROR("tensor_create_hybrid_view invalid payload");
+        return NULL;
+    }
+    bulk = &payload->bulk;
+    packed_weights = bulk->packed_weights;
+    packed_weight_bytes = bulk->packed_weight_bytes;
+    scales = bulk->scales;
+    scale_count = bulk->scale_count;
+    scale_group_size = bulk->scale_group_size;
+    anchor_entries = payload->anchor_entries;
+    anchor_row_offsets = payload->anchor_row_offsets;
+    anchor_count = payload->anchor_count;
+    owns_anchor_memory = payload->owns_anchor_memory ? 1 : 0;
+    if (!packed_weights || !scales) {
+        LOG_ERROR("tensor_create_hybrid_view invalid payload buffers");
+        return NULL;
+    }
+    if (scale_count == 0u || (scale_count % rows) != 0u) {
+        LOG_ERROR("tensor_create_hybrid_view invalid scale_count=%zu for rows=%u", scale_count, rows);
+        return NULL;
+    }
+    groups_per_row = (uint32_t)(scale_count / rows);
+    if (groups_per_row == 0u) {
+        LOG_ERROR("tensor_create_hybrid_view invalid groups_per_row");
+        return NULL;
+    }
+    if (scale_group_size == 0u) {
+        LOG_ERROR("tensor_create_hybrid_view invalid scale_group_size=0");
+        return NULL;
+    }
+
+    packed_cols = ((size_t)cols + 3u) / 4u;
+    if (packed_weight_bytes != (size_t)rows * packed_cols) {
+        LOG_ERROR("tensor_create_hybrid_view packed byte mismatch");
+        return NULL;
+    }
+    scale_bytes = scale_count * sizeof(float);
+
+    if (tensor_hybrid_validate_anchor_payload_local(rows,
+                                                    cols,
+                                                    (const ternary_anchor_entry_t *)anchor_entries,
+                                                    anchor_row_offsets,
+                                                    anchor_count) != 0) {
+        return NULL;
+    }
+
+    t = (tensor_t *)malloc(sizeof(tensor_t));
+    if (!t) {
+        LOG_ERROR("tensor_create_hybrid_view malloc failed for tensor");
+        return NULL;
+    }
+    memset(t, 0, sizeof(*t));
+
+    view = (tensor_hybrid_view_t *)malloc(sizeof(*view));
+    if (!view) {
+        LOG_ERROR("tensor_create_hybrid_view malloc failed for payload");
+        free(t);
+        return NULL;
+    }
+
+    memset(view, 0, sizeof(*view));
+    view->packed_weights = packed_weights;
+    view->scales = scales;
+    view->rows = rows;
+    view->cols = cols;
+    view->packed_cols = (uint32_t)packed_cols;
+    view->scale_group_size = scale_group_size;
+    view->groups_per_row = groups_per_row;
+    view->packed_weight_bytes = packed_weight_bytes;
+    view->scale_count = scale_count;
+    view->scale_bytes = scale_bytes;
+    view->anchor_entries = anchor_entries;
+    view->anchor_row_offsets = anchor_row_offsets;
+    view->anchor_count = anchor_count;
+    view->owns_anchor_memory = owns_anchor_memory;
+
+    shape[0] = (int)rows;
+    shape[1] = (int)cols;
+    t->data = view;
+    t->ndim = 2;
+    memcpy(t->shape, shape, sizeof(shape));
+    t->dtype = DTYPE_TERNARY_HYBRID;
+    t->layout = LAYOUT_ROW_MAJOR;
+    t->nbytes = packed_weight_bytes + scale_bytes + anchor_count * 8; /* 8 bytes per anchor entry */
+    t->ref_count = 1;
+    t->is_external = is_external ? 1 : 0;
     return t;
 }
 
@@ -161,10 +604,19 @@ tensor_t* tensor_create_view(tensor_dtype_t dtype, int ndim, const int *shape, v
  * Creates new tensor with identical metadata and data.
  */
 tensor_t* tensor_clone(const tensor_t *src) {
+    tensor_t *clone = NULL;
+
     if (!src) return NULL;
 
+    if (src->dtype == DTYPE_TERNARY_2BIT) {
+        return tensor_clone_ternary_local(src);
+    }
+    if (src->dtype == DTYPE_TERNARY_HYBRID) {
+        return tensor_clone_hybrid_local(src);
+    }
+
     // Create new tensor with same shape and dtype
-    tensor_t *clone = tensor_create(src->ndim, src->shape, src->dtype);
+    clone = tensor_create(src->ndim, src->shape, src->dtype);
     if (!clone) return NULL;
 
     // Copy memory layout
@@ -220,6 +672,7 @@ size_t tensor_numel(const tensor_t *t) {
  * Get element as F32 (with dequantization if needed).
  * 
  * For F32 tensors: direct read
+ * For ternary / hybrid tensors: scalar decode (slow; testing/debug only)
  * For Q4_0/Q8_0: dequantize (slow! use for testing only)
  * 
  * Note: Quantized dequantization is placeholder.
@@ -235,6 +688,90 @@ float tensor_get_f32(const tensor_t *t, size_t idx) {
         // Direct float access
         const float *fdata = (const float *)t->data;
         return fdata[idx];
+    } else if (t->dtype == DTYPE_TERNARY_2BIT) {
+        const tensor_ternary_view_t *view = (const tensor_ternary_view_t *)t->data;
+        size_t row = 0u;
+        size_t col = 0u;
+        size_t packed_idx = 0u;
+        uint32_t lane = 0u;
+        uint8_t packed = 0u;
+        float scale = 0.0f;
+        int8_t symbol = 0;
+
+        if (!view || !view->packed_weights || !view->scales || view->cols == 0u) {
+            return 0.0f;
+        }
+
+        row = idx / view->cols;
+        col = idx % view->cols;
+        packed_idx = row * view->packed_cols + (col / 4u);
+        lane = (uint32_t)(col % 4u);
+        packed = view->packed_weights[packed_idx];
+        {
+            size_t scale_row_base = row * view->groups_per_row;
+            size_t scale_group = col / view->scale_group_size;
+            if (scale_group >= view->groups_per_row) {
+                scale_group = view->groups_per_row - 1u;
+            }
+            scale = view->scales[scale_row_base + scale_group];
+        }
+
+        switch ((packed >> (lane * 2u)) & 0x3u) {
+            case 1u: symbol = 1; break;
+            case 2u: symbol = -1; break;
+            default: symbol = 0; break;
+        }
+        return scale * (float)symbol;
+    } else if (t->dtype == DTYPE_TERNARY_HYBRID) {
+        const tensor_hybrid_view_t *view = (const tensor_hybrid_view_t *)t->data;
+        const ternary_anchor_entry_t *entries = NULL;
+        size_t row = 0u;
+        size_t col = 0u;
+        size_t packed_idx = 0u;
+        uint32_t lane = 0u;
+        uint8_t packed = 0u;
+        float scale = 0.0f;
+        float value = 0.0f;
+        int8_t symbol = 0;
+
+        if (!view || !view->packed_weights || !view->scales || view->cols == 0u) {
+            return 0.0f;
+        }
+
+        row = idx / view->cols;
+        col = idx % view->cols;
+        packed_idx = row * view->packed_cols + (col / 4u);
+        lane = (uint32_t)(col % 4u);
+        packed = view->packed_weights[packed_idx];
+        {
+            size_t scale_row_base = row * view->groups_per_row;
+            size_t scale_group = col / view->scale_group_size;
+            if (scale_group >= view->groups_per_row) {
+                scale_group = view->groups_per_row - 1u;
+            }
+            scale = view->scales[scale_row_base + scale_group];
+        }
+
+        switch ((packed >> (lane * 2u)) & 0x3u) {
+            case 1u: symbol = 1; break;
+            case 2u: symbol = -1; break;
+            default: symbol = 0; break;
+        }
+        value = scale * (float)symbol;
+        if (view->anchor_count == 0u || !view->anchor_entries || !view->anchor_row_offsets) {
+            return value;
+        }
+
+        entries = (const ternary_anchor_entry_t *)view->anchor_entries;
+        for (uint32_t anchor_idx = view->anchor_row_offsets[row];
+             anchor_idx < view->anchor_row_offsets[row + 1u];
+             ++anchor_idx) {
+            if (entries[anchor_idx].col == col) {
+                value += tensor_bf16_to_f32_local(entries[anchor_idx].value_bf16);
+                break;
+            }
+        }
+        return value;
     } else if (t->dtype == DTYPE_Q4_0 || t->dtype == DTYPE_Q8_0) {
         // Placeholder: quantized dequantization
         // TODO: Integrate actual dequantization from Phase 1 (ggml_reader.c)
@@ -280,12 +817,22 @@ void tensor_ref_inc(tensor_t *t) {
     }
 }
 
+int tensor_is_external(const tensor_t *t) {
+    if (!t) return 0;
+    return t->is_external ? 1 : 0;
+}
+
 void tensor_release(tensor_t *t) {
     if (!t) return;
 
     t->ref_count--;
     if (t->ref_count <= 0) {
-        if (t->data && !t->is_external) {
+        if (t->dtype == DTYPE_TERNARY_2BIT) {
+            tensor_ternary_release_payload(t);
+        } else if (t->dtype == DTYPE_TERNARY_HYBRID) {
+            tensor_hybrid_release_payload(t);
+        } else if (t->data && !t->is_external) {
+            SAPPHIRE_TRACY_FREE(t->data);
             free(t->data);
         }
         free(t);
@@ -372,6 +919,20 @@ float* tensor_data_f32(const tensor_t *t) {
 void* tensor_data_mutable(const tensor_t *t) {
     if (!t) return NULL;
     return t->data;
+}
+
+const tensor_ternary_view_t* tensor_data_ternary(const tensor_t *t) {
+    if (!t || t->dtype != DTYPE_TERNARY_2BIT) {
+        return NULL;
+    }
+    return (const tensor_ternary_view_t *)t->data;
+}
+
+const tensor_hybrid_view_t* tensor_data_hybrid(const tensor_t *t) {
+    if (!t || t->dtype != DTYPE_TERNARY_HYBRID) {
+        return NULL;
+    }
+    return (const tensor_hybrid_view_t *)t->data;
 }
 
 tensor_dtype_t tensor_dtype(const tensor_t *t) {

@@ -6,8 +6,12 @@
 #include <stdio.h>
 #include <string.h>
 #include "model_reader.h"
+#include "gemma3_1b_spec.h"
 #include "model_spec.h"
 #include "gemma3_270m_spec.h"
+#include "gemma3_7b_spec.h"
+#include "gemma3_27b_spec.h"
+#include "gemma3_4b_spec.h"
 #include "log.h"
 
 /**
@@ -27,11 +31,20 @@ model_spec_t* get_model_spec(const char *model_name) {
     
     if (strcmp(model_name, "gemma-3-270m-it") == 0) {
         return &GEMMA3_270M_IT_SPEC;
+    } else if (strcmp(model_name, "gemma-3-1b-it") == 0) {
+        return &GEMMA3_1B_IT_SPEC;
     } else if (strcmp(model_name, "gemma-3-270m") == 0) {
         return &GEMMA3_270M_SPEC;
+    } else if (strcmp(model_name, "gemma-3-27b-it") == 0) {
+        return &GEMMA3_27B_IT_SPEC;
+    } else if (strcmp(model_name, "gemma-3-7b-it") == 0 ||
+               strcmp(model_name, "gemma-3-7b-q1.58b") == 0 ||
+               strcmp(model_name, "gemma-3-7b-q1.58b-packed") == 0) {
+        return &GEMMA3_7B_IT_SPEC;
+    } else if (strcmp(model_name, "gemma-3-4b-it") == 0) {
+        return &GEMMA3_4B_IT_SPEC;
     }
-    
-    
+
     LOG_ERROR("Unknown model: %s", model_name);
     return NULL;
 }

@@ -74,7 +74,7 @@ void main() {
     // Phase 2: Compute RMS and normalize
     // Gemma3 uses rmsnorm_delta: output = (input / rms) * (1.0 + weight)
     // Weight stores the delta from 1.0, matching rmsnorm_delta_apply_avx2 in normalization.c
-    float rms = sqrt(shared_sum[0] / float(d_model) + 1e-6);  /* Gemma3: rms_norm_eps=1e-6 */
+    float rms = sqrt(shared_sum[0] / float(d_model) + uintBitsToFloat(pc.reserved[1]));  /* rms_norm_eps from push constants */
 
     for (uint d = local_id; d < d_model; d += 256) {
         float val = inputBuffer.data[base_offset + d];

@@ -2,7 +2,9 @@
 #include <stdlib.h>
 #include <math.h>
 #include <assert.h>
+#include <string.h>
 #include "tensor.h"
+#include "ternary_anchor.h"
 #include "test_utils.h"
 
 // Global test counters
@@ -246,6 +248,87 @@ static void test_tensor_clone(void) {
     tests_passed++;
 }
 
+static void test_tensor_clone_hybrid(void) {
+    printf("TEST: tensor_clone (hybrid ternary+anchor)\n");
+
+    uint8_t packed_weights[2] = {0x01u, 0x00u};
+    float scales[2] = {1.0f, 1.0f};
+    ternary_anchor_entry_t anchor_entries[1];
+    uint32_t anchor_row_offsets[3] = {0u, 0u, 1u};
+    tensor_hybrid_payload_t payload;
+    tensor_t *original = NULL;
+    tensor_t *clone = NULL;
+    const tensor_hybrid_view_t *clone_view = NULL;
+
+    memset(&payload, 0, sizeof(payload));
+    memset(anchor_entries, 0, sizeof(anchor_entries));
+    anchor_entries[0].row = 1u;
+    anchor_entries[0].col = 2u;
+    anchor_entries[0].value_bf16 = 0x4000u;
+
+    payload.bulk.packed_weights = packed_weights;
+    payload.bulk.packed_weight_bytes = sizeof(packed_weights);
+    payload.bulk.scales = scales;
+    payload.bulk.scale_count = 2u;
+    payload.bulk.scale_group_size = 4u;
+    payload.anchor_entries = anchor_entries;
+    payload.anchor_row_offsets = anchor_row_offsets;
+    payload.anchor_count = 1u;
+    payload.owns_anchor_memory = 0;
+
+    original = tensor_create_hybrid_view(2u, 4u, &payload, 1);
+    assert(original != NULL);
+    assert(fabs(tensor_get_f32(original, 0) - 1.0f) < 1e-6f);
+    assert(fabs(tensor_get_f32(original, 6) - 2.0f) < 1e-6f);
+
+    clone = tensor_clone(original);
+    assert(clone != NULL);
+    clone_view = tensor_data_hybrid(clone);
+    assert(clone_view != NULL);
+    assert(clone_view->packed_weights != packed_weights);
+    assert(clone_view->anchor_entries != anchor_entries);
+    assert(fabs(tensor_get_f32(clone, 0) - 1.0f) < 1e-6f);
+    assert(fabs(tensor_get_f32(clone, 6) - 2.0f) < 1e-6f);
+
+    tensor_release(original);
+    tensor_release(clone);
+    printf("  ✓ Hybrid clone deep-copies packed bulk and anchors\n");
+    tests_passed++;
+}
+
+static void test_tensor_hybrid_invalid_offsets(void) {
+    printf("TEST: tensor_create_hybrid_view invalid row offsets\n");
+
+    uint8_t packed_weights[2] = {0x00u, 0x00u};
+    float scales[2] = {1.0f, 1.0f};
+    ternary_anchor_entry_t anchor_entries[1];
+    uint32_t invalid_row_offsets[3] = {1u, 1u, 1u};
+    tensor_hybrid_payload_t payload;
+    tensor_t *tensor = NULL;
+
+    memset(&payload, 0, sizeof(payload));
+    memset(anchor_entries, 0, sizeof(anchor_entries));
+    anchor_entries[0].row = 0u;
+    anchor_entries[0].col = 1u;
+    anchor_entries[0].value_bf16 = 0x3f80u;
+
+    payload.bulk.packed_weights = packed_weights;
+    payload.bulk.packed_weight_bytes = sizeof(packed_weights);
+    payload.bulk.scales = scales;
+    payload.bulk.scale_count = 2u;
+    payload.bulk.scale_group_size = 4u;
+    payload.anchor_entries = anchor_entries;
+    payload.anchor_row_offsets = invalid_row_offsets;
+    payload.anchor_count = 1u;
+    payload.owns_anchor_memory = 0;
+
+    tensor = tensor_create_hybrid_view(2u, 4u, &payload, 1);
+    assert(tensor == NULL);
+
+    printf("  ✓ Hybrid tensor rejects invalid row_offsets invariants\n");
+    tests_passed++;
+}
+
 // ============================================================================
 // Test: Reference counting
 // ============================================================================
@@ -399,6 +482,8 @@ int main(void) {
     
     // Clone
     test_tensor_clone();
+    test_tensor_clone_hybrid();
+    test_tensor_hybrid_invalid_offsets();
     printf("\n");
     
     // Reference counting

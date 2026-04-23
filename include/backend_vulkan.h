@@ -29,6 +29,7 @@ extern "C" {
 #endif
 
 typedef struct inference_session_t inference_session_t;
+typedef struct sapphire_tracy_vk_context_t sapphire_tracy_vk_context_t;
 
 /* ========================================================================
  * P11-04 Pipeline Enumeration
@@ -100,8 +101,9 @@ typedef struct inference_session_t inference_session_t;
 #define SDT_SLOT_FFN_RESIDUAL    16
 #define SDT_KERNELS_PER_LAYER    17
 
-/* Maximum layers supported by the static table. */
-#define SDT_MAX_LAYERS           18
+/* Maximum layers supported by the static table.
+ * Must match or exceed SAPPHIRE_MAX_LAYERS (llm_model.h). */
+#define SDT_MAX_LAYERS           256
 
 /**
  * Per-kernel descriptor set entry: the pipeline that owns the set and
@@ -137,7 +139,31 @@ typedef struct {
 #define PIPELINE_VEC_ADD_F32        14
 #define PIPELINE_ARGMAX_F32         15
 #define PIPELINE_LMHEAD_DECODE_F32  16
-#define NUM_PIPELINES               17
+/* Mixed-precision GEMV: F32 activations × BF16 weights → F32 output.
+ * Used for projection layers when model weights are stored as BF16, cutting
+ * VRAM usage in half vs F32 conversion (critical for 4B+ models on 8 GB GPUs). */
+#define PIPELINE_GEMV_W16A32        17
+/* Mixed-precision tiled GEMM: F32 activations × BF16 weights → F32 output.
+ * Prefill (batch>1) counterpart to PIPELINE_GEMV_W16A32. */
+#define PIPELINE_GEMM_W16A32        18
+#define PIPELINE_LMHEAD_DECODE_W16A32 19
+#define PIPELINE_FFN_GEGLU_W16A32   20
+#define PIPELINE_ORACLE_ACCUM_F32   21
+#define PIPELINE_ORACLE_FINALIZE_F32 22
+#define NUM_PIPELINES               23
+
+#define ORACLE_SRC_SET_NORM_BUF      0
+#define ORACLE_SRC_SET_ATTN_OUTPUT   1
+#define ORACLE_SRC_SET_FFN_GATE      2
+#define ORACLE_SRC_SET_FFN_VALUE     3
+
+typedef struct {
+    uint32_t sample_count;
+    float strength;
+    float floor;
+    void *out_buffer;
+    size_t out_size;
+} backend_vulkan_oracle_finish_config_t;
 
 /**
  * Vulkan backend session data (P11-02 + P11-03 integration).
@@ -197,6 +223,8 @@ typedef struct {
     vk_buffer_t lm_head_logits;         /* [vocab_size] - output buffer for lm_head */
     vk_buffer_t selected_token_ids;     /* [max_batch] int32 selected ids from GPU argmax */
     void *selected_token_ids_mapped;    /* Persistent map of selected_token_ids */
+    vk_buffer_t oracle_hessian_accum;   /* [capture_bytes] float accumulation buffer */
+    int oracle_hessian_active;          /* Non-zero while a tape/oracle recording run is active */
     
     vk_ring_buffer_t input_ring;        /* CPU→GPU token input ring */
     vk_ring_buffer_t output_ring;       /* GPU→CPU logits output ring */
@@ -206,6 +234,7 @@ typedef struct {
     size_t num_pipelines;               /* Number of pipelines */
     
     VkCommandBuffer cmd_buffer;         /* Command buffer for forward pass */
+    sapphire_tracy_vk_context_t *tracy_vk_context; /* Optional Tracy GPU profiling context */
     
     /* Persistent Transfer Resources (Fix for GPU context loss / resource thrashing) */
     VkCommandBuffer transfer_cmd;       /* Dedicated command buffer for embeddings upload */
@@ -226,6 +255,12 @@ typedef struct {
     /* Static Descriptor Table (Vulkan 1.0 – no update-after-bind) */
     VulkanStaticDescriptors sdt;        /* Pre-populated descriptor sets for all kernels */
 
+    /* Non-zero when projection weights are stored as BF16 on GPU (set during weight upload).
+     * Enables the PIPELINE_GEMV_W16A32 path which halves VRAM for projection matrices
+     * and eliminates PCIe spill on GPUs with < 12 GB VRAM (e.g. RX 5700 XT). */
+    int proj_weights_bf16;
+    int emb_weights_bf16;
+
     /* Optional GPU timestamp profiling (SAPPHIRE_VK_PROFILE=1) */
     VkQueryPool timing_query_pool;
     uint32_t timing_query_capacity;
@@ -239,6 +274,15 @@ typedef struct {
 
 int backend_vulkan_save_state(inference_session_t *session, const char *path);
 int backend_vulkan_load_state(inference_session_t *session, const char *path);
+int backend_vulkan_begin_hessian_oracle_capture(inference_session_t *session);
+int backend_vulkan_finish_hessian_oracle_capture(inference_session_t *session,
+                                                 const backend_vulkan_oracle_finish_config_t *config);
+void backend_vulkan_abort_hessian_oracle_capture(inference_session_t *session);
+int backend_vulkan_capture_last_token_activations(inference_session_t *session,
+                                                  const int *token_ids,
+                                                  int token_count,
+                                                  void *out_capture_buffer,
+                                                  size_t out_capture_size);
 
 #ifdef __cplusplus
 }

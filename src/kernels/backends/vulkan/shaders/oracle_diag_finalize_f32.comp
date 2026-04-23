@@ -1,0 +1,77 @@
+#version 450 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) restrict buffer AccumBuffer {
+    float data[];
+} accumBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint layer_idx;
+    uint batch_size;
+    uint seq_pos;
+    uint max_seq_len;
+    uint d_model;
+    uint num_heads;
+    uint head_dim;
+    uint d_ff;
+    uint stride_0;
+    uint stride_1;
+    uint start_pos;
+    uint reserved[5];
+} pc;
+
+shared float shared_sum[256];
+shared float shared_mean_second_moment;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint cols = pc.d_model;
+    uint dst_base = pc.stride_0;
+    uint sample_count = max(pc.reserved[0], 1u);
+    float proxy_floor = max(uintBitsToFloat(pc.reserved[1]), 0.0);
+    float proxy_strength = max(uintBitsToFloat(pc.reserved[2]), 0.0);
+    float local_sum = 0.0;
+
+    for (uint col = lane; col < cols; col += 256u) {
+        local_sum += accumBuffer.data[dst_base + col];
+    }
+    shared_sum[lane] = local_sum;
+    barrier();
+
+    for (uint step = 128u; step > 0u; step >>= 1u) {
+        if (lane < step) {
+            shared_sum[lane] += shared_sum[lane + step];
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        float denom = float(sample_count) * float(cols);
+
+        if (denom <= 0.0 || shared_sum[0] / denom <= 1e-12) {
+            shared_mean_second_moment = -1.0;
+        } else {
+            shared_mean_second_moment = shared_sum[0] / denom;
+        }
+    }
+    barrier();
+
+    if (shared_mean_second_moment < 0.0) {
+        for (uint col = lane; col < cols; col += 256u) {
+            accumBuffer.data[dst_base + col] = 1.0;
+        }
+        return;
+    }
+
+    for (uint col = lane; col < cols; col += 256u) {
+        float sample_mean = accumBuffer.data[dst_base + col] / float(sample_count);
+        float normalized = sample_mean / shared_mean_second_moment;
+        float adjusted = 1.0 + proxy_strength * (normalized - 1.0);
+
+        if (adjusted < proxy_floor) {
+            adjusted = proxy_floor;
+        }
+        accumBuffer.data[dst_base + col] = adjusted;
+    }
+}

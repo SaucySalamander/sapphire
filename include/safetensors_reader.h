@@ -41,6 +41,9 @@ typedef enum {
     SAFETENSORS_F16 = 2,     // float16
     SAFETENSORS_I32 = 3,     // int32
     SAFETENSORS_I64 = 4,     // int64
+    SAFETENSORS_U8 = 5,      // uint8
+    SAFETENSORS_U16 = 6,     // uint16
+    SAFETENSORS_U32 = 7,     // uint32
     SAFETENSORS_UNKNOWN = -1
 } safetensors_dtype_t;
 
@@ -138,6 +141,29 @@ const safetensors_tensor_meta_t* safetensors_get_tensor_by_name(
 tensor_t* safetensors_create_tensor_ref(safetensors_file_t *st,
                                         const safetensors_tensor_meta_t *meta);
 
+tensor_t* safetensors_create_ternary_tensor_ref(const safetensors_file_t *st,
+                                                const char *tensor_name,
+                                                uint32_t rows,
+                                                uint32_t cols,
+                                                size_t packed_weight_bytes,
+                                                uint32_t expected_crc32);
+
+int safetensors_resolve_ternary_scale_layout(const safetensors_file_t *st,
+                                             const char *tensor_name,
+                                             uint32_t cols,
+                                             uint32_t fallback_groups_per_row,
+                                             uint32_t *out_scale_group_size,
+                                             uint32_t *out_groups_per_row);
+
+int safetensors_metadata_get_u32(const safetensors_file_t *st,
+                                 const char *key,
+                                 uint32_t *out_value);
+
+int safetensors_metadata_get_string(const safetensors_file_t *st,
+                                    const char *key,
+                                    char *out_value,
+                                    size_t out_value_size);
+
 /**
  * @brief Load a Safetensors tensor into a freshly allocated tensor_t.
  *
@@ -159,6 +185,22 @@ tensor_t* safetensors_load_tensor_copy(const safetensors_file_t *st,
                                        const safetensors_tensor_meta_t *meta);
 
 /**
+ * @brief Return a raw pointer to tensor bytes inside the mmapped file.
+ *
+ * This is intended for low-level I/O modules that need direct byte access for
+ * custom packed formats without forcing a tensor_t wrapper.
+ *
+ * @param st Safetensors file handle.
+ * @param meta Tensor metadata.
+ *
+ * @return Pointer into the mmapped file on success, NULL on validation failure.
+ *
+ * @note The returned pointer becomes invalid after safetensors_close().
+ */
+const void* safetensors_data_ptr(const safetensors_file_t *st,
+                                 const safetensors_tensor_meta_t *meta);
+
+/**
  * @brief Close a Safetensors file and free all resources.
  *
  * Unmaps memory, closes file descriptor, and frees metadata array.
@@ -170,6 +212,27 @@ tensor_t* safetensors_load_tensor_copy(const safetensors_file_t *st,
  * @note After calling this, st is invalid and must not be used.
  */
 void safetensors_close(safetensors_file_t *st);
+
+/**
+ * @brief Evict resident pages of a safetensors file from RAM.
+ *
+ * Calls madvise(MADV_DONTNEED) on the mmap region without closing the file.
+ * Use this to release RSS for weight shards that are no longer actively needed.
+ *
+ * @param st Safetensors file handle (may be NULL; safe noop).
+ */
+void safetensors_evict_pages(safetensors_file_t *st);
+
+/**
+ * @brief Get the raw mmap pointer for a safetensors file.
+ *
+ * Returns the base pointer to the mmapped file data. This is used by
+ * sliding-window eviction to call madvise on specific byte ranges.
+ *
+ * @param st Safetensors file handle.
+ * @return Base mmap pointer, or NULL if invalid.
+ */
+const void *safetensors_mmap_ptr(const safetensors_file_t *st);
 
 /**
  * @brief Print Safetensors file metadata for debugging.

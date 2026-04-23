@@ -12,9 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>  /* clock_gettime for high-resolution wall-clock timing */
+#include <unistd.h>
 
 #include "../include/attention.h"
-#include "../include/gemma3_270m_config.h"
+#include "../include/gemma3_config.h"
 #include "../include/ggml_model.h"
 #include "../include/kv_cache.h"
 #include "../include/kv_cache_state.h"
@@ -23,12 +24,14 @@
 #include "../include/model_reader.h"
 #include "../include/backend_vulkan.h"
 #include "../include/rope.h"
+#include "../include/simple_json.h"
 #include "../include/tensor.h"
 #include "../include/kernels.h"
 #include "../include/transformer.h"
 #include "../include/utils.h"
 #include "../include/file_reader.h"
 #include "tokenizer.h"
+#include "../include/tracy_profile.h"
 
 /* Note: build_gemma3_prompt moved to tokenizer module (see include/tokenizer.h)
     to centralize tokenization / prompt construction logic. The function intelligently
@@ -41,24 +44,176 @@
  * @returns 0 on success (tokenizer loaded or cached), -1 on error
  */
 static int load_or_reuse_tokenizer(model_spec_t* spec, const char* model_dir) {
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "load_or_reuse_tokenizer");
+
     if (!spec || !model_dir) return -1;
     
     // Tokenizer may already be cached in spec (from previous context)
     if (spec->tokenizer_handle) {
+        sapphire_tracy_plot_i64("inference.tokenizer_reused", 1);
         LOG_INFO("Reusing cached tokenizer for model %s", spec->model_id);
+        sapphire_tracy_zone_end(&tracy_zone);
         return 0;
     }
     
+    sapphire_tracy_plot_i64("inference.tokenizer_reused", 0);
     LOG_INFO("Loading tokenizer from %s", model_dir);
     sapphire_tokenizer_t* tk = tokenizer_load(model_dir);
     if (!tk) {
         LOG_ERROR("Failed to load tokenizer from %s", model_dir);
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
     
     // Cache tokenizer in spec for reuse by future contexts
     spec->tokenizer_handle = (void*)tk;
+    sapphire_tracy_zone_end(&tracy_zone);
     return 0;
+}
+
+static int model_config_has_mixed_precision_anchors(const char *model_dir, bool *enabled)
+{
+    char *config_path = NULL;
+    char *config_json = NULL;
+    size_t config_len = 0u;
+    int token_count = 0;
+    int value_idx = -1;
+    sjson_token_t tokens[512];
+
+    if (!model_dir || !enabled) {
+        return -1;
+    }
+
+    *enabled = false;
+    config_path = construct_safe_path(model_dir, "config.json", NULL);
+    if (!config_path) {
+        return -1;
+    }
+
+    if (access(config_path, R_OK) != 0) {
+        free(config_path);
+        return 0;
+    }
+
+    if (file_read_json(config_path, &config_json, &config_len) != 0) {
+        free(config_path);
+        return -1;
+    }
+
+    (void)config_len;
+    token_count = sjson_tokenize(config_json, tokens, (int)(sizeof(tokens) / sizeof(tokens[0])));
+    if (token_count < 0) {
+        LOG_WARN("Failed to parse %s for backend compatibility preflight", config_path);
+        free(config_json);
+        free(config_path);
+        return -1;
+    }
+
+    value_idx = sjson_find_key(config_json, tokens, token_count, 0, "sapphire_mixed_precision_anchors");
+    if (value_idx >= 0) {
+        int len = tokens[value_idx].end - tokens[value_idx].start;
+        *enabled = (len == 4 && strncmp(config_json + tokens[value_idx].start, "true", 4) == 0);
+    }
+
+    free(config_json);
+    free(config_path);
+    return 0;
+}
+
+static int preflight_model_backend_compatibility(const char *model_name, const char *model_dir)
+{
+    sapphire_backend_type_t backend_type;
+    bool mixed_precision_anchors = false;
+
+    if (!model_name || !model_dir) {
+        return -1;
+    }
+
+    backend_type = backend_detect();
+    if (backend_type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        return 0;
+    }
+
+    if (model_config_has_mixed_precision_anchors(model_dir, &mixed_precision_anchors) != 0) {
+        LOG_WARN("Could not inspect %s/config.json before Vulkan session init; deferring capability validation to backend startup",
+                 model_dir);
+        return 0;
+    }
+
+    if (!mixed_precision_anchors) {
+        return 0;
+    }
+
+    LOG_ERROR("Model %s enables sapphire_mixed_precision_anchors in config.json and cannot run on the Vulkan backend yet; rerun with SAPPHIRE_BACKEND=cpu",
+              model_name);
+    return -1;
+}
+
+static char *prepare_model_directory(const char *model_name)
+{
+    char *model_dir = construct_safe_path("./models", model_name, NULL);
+
+    if (!model_dir) {
+        LOG_ERROR("Failed to construct model directory path");
+        return NULL;
+    }
+    if (preflight_model_backend_compatibility(model_name, model_dir) != 0) {
+        free(model_dir);
+        return NULL;
+    }
+
+    return model_dir;
+}
+
+static int populate_model_from_spec(const char *model_dir, model_spec_t *spec)
+{
+    if (!spec || !spec->loader_hooks || !spec->loader_hooks->populate_from_files) {
+        LOG_ERROR("Model spec has no loader hooks");
+        return -1;
+    }
+
+    SAPPHIRE_TRACY_ZONE_SCOPE(loader_zone, "model_loader_populate");
+    int rc = spec->loader_hooks->populate_from_files(model_dir, spec);
+    sapphire_tracy_zone_end(&loader_zone);
+    if (rc != 0) {
+        LOG_ERROR("Failed to populate model from files");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int resolve_logits_rows(const model_spec_t *spec)
+{
+    const gemma3_270m_config_t *config = (const gemma3_270m_config_t *)spec->variant_config;
+    int logits_rows = config->vocab_size;
+    const llm_model_t *model = (const llm_model_t *)spec->llm_model;
+
+    if (!model || !model->embedding_weight || tensor_ndim(model->embedding_weight) != 2) {
+        return logits_rows;
+    }
+
+    const int *emb_shape = tensor_shape(model->embedding_weight);
+
+    if (emb_shape && emb_shape[0] > logits_rows) {
+        LOG_DEBUG("logits alloc: emb rows %d > vocab_size %d, using emb rows to prevent OOB write",
+                  emb_shape[0], logits_rows);
+        logits_rows = emb_shape[0];
+    }
+
+    return logits_rows;
+}
+
+static int spec_ffn_down_proj_input_rmsnorm_enabled(const model_spec_t *spec)
+{
+    const gemma3_270m_config_t *config = NULL;
+
+    if (!spec || !spec->variant_config) {
+        return 0;
+    }
+
+    config = (const gemma3_270m_config_t *)spec->variant_config;
+    return config->sapphire_ffn_down_proj_input_rmsnorm ? 1 : 0;
 }
 
 /**
@@ -71,21 +226,31 @@ static int load_or_reuse_tokenizer(model_spec_t* spec, const char* model_dir) {
  * - Initializes tokenizer
  */
 inference_context_t* create_inference_context(float temperature, int max_tokens, int context_len, const char* model_name) {
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "create_inference_context");
+
     // Allow max_tokens == 0 for diagnostic-only initialization runs
-    if (!model_name || temperature < 0.0f || max_tokens < 0 || context_len <= 0) return NULL;
+    if (!model_name || temperature < 0.0f || max_tokens < 0 || context_len <= 0) {
+        sapphire_tracy_zone_end(&tracy_zone);
+        return NULL;
+    }
+
+    sapphire_tracy_plot_i64("inference.context_len", context_len);
+    sapphire_tracy_plot_i64("inference.max_tokens", max_tokens);
+    sapphire_tracy_zone_text(&tracy_zone, model_name, strlen(model_name));
 
     // Get the model specification for the requested model
     model_spec_t* spec = get_model_spec(model_name);
     if (!spec) {
         LOG_ERROR("Failed to get spec for model: %s", model_name);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
 
     // Construct the model directory path: ./models/{model_name}
     // construct_safe_path allocates exact size needed and validates all components
-    char *model_dir = construct_safe_path("./models", model_name, NULL);
+    char *model_dir = prepare_model_directory(model_name);
     if (!model_dir) {
-        LOG_ERROR("Failed to construct model directory path");
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
 
@@ -94,26 +259,17 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
     if (!model) {
         LOG_ERROR("Failed to allocate model structure");
         free(model_dir);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
     memset(model, 0, sizeof(llm_model_t));
 
     spec->llm_model = model;
 
-    // Trigger the loader hooks to populate model and config
-    // The loader function logs its own detailed errors; we just check the return code
-    if (spec->loader_hooks && spec->loader_hooks->populate_from_files) {
-        int rc = spec->loader_hooks->populate_from_files(model_dir, spec);
-        if (rc != 0) {
-            LOG_ERROR("Failed to populate model from files");
-            free(model);
-            free(model_dir);
-            return NULL;
-        }
-    } else {
-        LOG_ERROR("Model spec has no loader hooks");
+    if (populate_model_from_spec(model_dir, spec) != 0) {
         free(model);
         free(model_dir);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
 
@@ -127,6 +283,7 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
         LOG_ERROR("Failed to allocate inference context");
         llm_model_destroy(model);
         free(model_dir);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
     memset(ctx, 0, sizeof(inference_context_t));
@@ -137,12 +294,16 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
     ctx->temperature = temperature;
 
     // Allocate logits buffer
-    const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)spec->variant_config;
-    ctx->logits = (float*)malloc(config->vocab_size * sizeof(float));
+    // NOTE: embedding_weight shape[0] may exceed config->vocab_size (e.g. alignment
+    // padding row in sharded safetensors). We must allocate enough for all rows that
+    // lm_head will write, or the kernel pool can overflow adjacent heap memory.
+    int logits_rows = resolve_logits_rows(spec);
+    ctx->logits = (float*)malloc((size_t)logits_rows * sizeof(float));
     if (!ctx->logits) {
         LOG_ERROR("Failed to allocate logits buffer");
         free(ctx);
         free(model_dir);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
 
@@ -152,6 +313,7 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
         free(ctx->logits);
         free(ctx);
         free(model_dir);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
     ctx->conversation_len = 0;
@@ -164,7 +326,12 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
         free(ctx->logits);
         free(ctx);
         free(model_dir);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
+    }
+
+    if (ctx->session->backend && ctx->session->backend->name) {
+        sapphire_tracy_message(ctx->session->backend->name, strlen(ctx->session->backend->name));
     }
 
     // Load tokenizer from model directory or spec
@@ -183,11 +350,13 @@ inference_context_t* create_inference_context(float temperature, int max_tokens,
             free(model);
         }
         free(model_dir);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
     
     free(model_dir);  // We're done with the path
     ctx->tokenizer = (sapphire_tokenizer_t*)spec->tokenizer_handle;
+    sapphire_tracy_zone_end(&tracy_zone);
     return ctx;
 }
 
@@ -328,9 +497,12 @@ static int prepare_turn_and_prefill(inference_context_t *ctx,
                                     inference_session_t *session,
                                     const char *prompt,
                                     inference_run_state_t *st) {
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "prepare_turn_and_prefill");
+
     st->turn_tokens = malloc((size_t)ctx->context_len * sizeof(int));
     if (!st->turn_tokens) {
         LOG_ERROR("Failed to allocate turn token buffer");
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
 
@@ -338,16 +510,24 @@ static int prepare_turn_and_prefill(inference_context_t *ctx,
         LOG_ERROR("Conversation token buffer is not initialized");
         free(st->turn_tokens);
         st->turn_tokens = NULL;
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
 
-    st->prompt_len = build_gemma3_prompt(ctx->spec, prompt, st->turn_tokens, ctx->context_len);
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(prompt_zone, "build_prompt");
+        st->prompt_len = build_gemma3_prompt(ctx->spec, prompt, st->turn_tokens, ctx->context_len);
+        sapphire_tracy_zone_end(&prompt_zone);
+    }
     if (st->prompt_len <= 0) {
         LOG_ERROR("Failed to build prompt");
         free(st->turn_tokens);
         st->turn_tokens = NULL;
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
+
+    sapphire_tracy_plot_i64("inference.prompt_tokens", st->prompt_len);
 
     if (st->is_it_model && ctx->conversation_len > 0) {
         int leading_bos = 0;
@@ -367,6 +547,7 @@ static int prepare_turn_and_prefill(inference_context_t *ctx,
                     LOG_ERROR("Not enough room to normalize continuation boundary");
                     free(st->turn_tokens);
                     st->turn_tokens = NULL;
+                    sapphire_tracy_zone_end(&tracy_zone);
                     return -1;
                 }
                 memmove(st->turn_tokens + 1,
@@ -382,6 +563,7 @@ static int prepare_turn_and_prefill(inference_context_t *ctx,
         LOG_ERROR("Prompt became empty after continuation normalization");
         free(st->turn_tokens);
         st->turn_tokens = NULL;
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
 
@@ -404,6 +586,7 @@ static int prepare_turn_and_prefill(inference_context_t *ctx,
         LOG_ERROR("Prompt too long for available context after reset");
         free(st->turn_tokens);
         st->turn_tokens = NULL;
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
 
@@ -421,7 +604,12 @@ static int prepare_turn_and_prefill(inference_context_t *ctx,
         int b_size = (ctx->conversation_len - 1) - p_idx;
         if (b_size > 32) b_size = 32;
         if (serial_prefill) b_size = 1;
+
+        SAPPHIRE_TRACY_ZONE_SCOPE(prefill_zone, "prefill_batch");
+        sapphire_tracy_zone_value(&prefill_zone, (uint64_t)b_size);
+        sapphire_tracy_plot_i64("inference.prefill_batch_size", b_size);
         inference_forward_batch(session, ctx->conversation_tokens + p_idx, p_idx, b_size, NULL);
+        sapphire_tracy_zone_end(&prefill_zone);
         p_idx += b_size;
     }
 
@@ -429,15 +617,21 @@ static int prepare_turn_and_prefill(inference_context_t *ctx,
 
     free(st->turn_tokens);
     st->turn_tokens = NULL;
+    sapphire_tracy_zone_end(&tracy_zone);
     return 0;
 }
 
 static int run_generation_loop(inference_context_t *ctx,
                                inference_session_t *session,
                                inference_run_state_t *st) {
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "run_generation_loop");
+
     while (st->total_tokens < ctx->context_len && st->generated_count < ctx->max_tokens) {
         int cur_pos = st->total_tokens - 1;
         int next_token = -1;
+
+        SAPPHIRE_TRACY_ZONE_SCOPE(iteration_zone, "decode_iteration");
+        sapphire_tracy_zone_value(&iteration_zone, (uint64_t)st->generated_count);
 
         if (session->backend &&
             session->backend->type == SAPPHIRE_BACKEND_TYPE_VULKAN &&
@@ -446,6 +640,8 @@ static int run_generation_loop(inference_context_t *ctx,
                 session, &st->last_token, cur_pos, 1, &next_token);
             if (rc_sel != 0) {
                 LOG_ERROR("Vulkan GPU token selection failed at pos=%d", cur_pos);
+                sapphire_tracy_zone_end(&iteration_zone);
+                sapphire_tracy_zone_end(&tracy_zone);
                 return -1;
             }
         } else {
@@ -456,20 +652,27 @@ static int run_generation_loop(inference_context_t *ctx,
 
         if (st->total_tokens >= ctx->context_len) {
             LOG_WARN("Reached maximum context length during generation");
+            sapphire_tracy_zone_end(&iteration_zone);
             break;
         }
 
         ctx->conversation_tokens[st->total_tokens++] = next_token;
         ctx->conversation_len = st->total_tokens;
 
-        if (next_token == 1 || (st->is_it_model && next_token == 106)) break;
+        if (next_token == 1 || (st->is_it_model && next_token == 106)) {
+            sapphire_tracy_zone_end(&iteration_zone);
+            break;
+        }
 
         print_decoded_token_chars(decode(ctx->tokenizer, next_token));
 
         st->last_token = next_token;
         st->generated_count++;
+        sapphire_tracy_plot_i64("inference.generated_tokens", st->generated_count);
+        sapphire_tracy_zone_end(&iteration_zone);
     }
 
+    sapphire_tracy_zone_end(&tracy_zone);
     return 0;
 }
 
@@ -500,7 +703,12 @@ static void write_output_text(inference_context_t *ctx,
 }
 
 int perform_inference(inference_context_t* ctx, const char* prompt, char* output, int output_size) {
-    if (!ctx || !prompt || !output) return -1;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "perform_inference");
+
+    if (!ctx || !prompt || !output) {
+        sapphire_tracy_zone_end(&tracy_zone);
+        return -1;
+    }
 
     /* Start high-resolution wall-clock timer for this inference call */
     struct timespec __perf_start_ts;
@@ -517,13 +725,21 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
         .is_it_model = is_instruction_tuned_model(ctx->spec)
     };
 
+    sapphire_tracy_frame_mark("inference-request");
+    sapphire_tracy_plot_i64("inference.prompt_chars", (int64_t)strlen(prompt));
+    if (session && session->backend && session->backend->name) {
+        sapphire_tracy_zone_text(&tracy_zone, session->backend->name, strlen(session->backend->name));
+    }
+
     if (prepare_turn_and_prefill(ctx, session, prompt, &st) != 0) {
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
 
     LOG_INFO("Response generation starting");
 
     if (run_generation_loop(ctx, session, &st) != 0) {
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
 
@@ -542,6 +758,10 @@ int perform_inference(inference_context_t* ctx, const char* prompt, char* output
              (session && session->backend) ? session->backend->name : "unknown");
 
     LOG_DEBUG("Generated %d tokens", st.generated_count);
+
+    sapphire_tracy_plot_i64("inference.generated_tokens", st.generated_count);
+    sapphire_tracy_plot_f64("inference.elapsed_seconds", __elapsed);
+    sapphire_tracy_zone_end(&tracy_zone);
 
     return 0;
 }
@@ -636,8 +856,11 @@ int inference_context_load_state(inference_context_t *ctx, const char *path) {
  * @return Allocated session with backend initialized, or NULL on failure
  */
 inference_session_t* inference_session_create(model_spec_t* spec, int max_context_len) {
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "inference_session_create");
+
     if (!spec) {
         LOG_ERROR("inference_session_create requires model");
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
     LOG_DEBUG("Creating inference session for model: %s", spec->model_id);
@@ -645,23 +868,29 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
     gemma3_270m_config_t* config = (gemma3_270m_config_t*)spec->variant_config;
     if (!config) {
         LOG_ERROR("Model config is NULL in inference_session_create");
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
+
+    sapphire_tracy_plot_i64("inference.num_layers", config->num_hidden_layers);
 
     // Allocate the session structure
     inference_session_t* session = (inference_session_t*)malloc(sizeof(inference_session_t));
     if (!session) {
         LOG_ERROR("Failed to allocate inference session");
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
     memset(session, 0, sizeof(inference_session_t));
 
     session->model_spec = spec;
+    session->ffn_down_proj_input_rmsnorm_default = spec_ffn_down_proj_input_rmsnorm_enabled(spec);
     session->num_layers = config->num_hidden_layers;
     session->layer_configs = (sapphire_layer_config_t*)malloc(session->num_layers * sizeof(sapphire_layer_config_t));
     if (!session->layer_configs) {
         LOG_ERROR("Failed to allocate layer configs array");
         free(session);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
 
@@ -670,6 +899,7 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
         LOG_ERROR("Failed to load layer configurations");
         free(session->layer_configs);
         free(session);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
 
@@ -680,19 +910,25 @@ inference_session_t* inference_session_create(model_spec_t* spec, int max_contex
         LOG_ERROR("Failed to get backend implementation for type %d", (int)backend_type);
         free(session->layer_configs);
         free(session);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
+
+    sapphire_tracy_message(session->backend->name, strlen(session->backend->name));
 
     // Initialize backend-specific session data
     if (session->backend->session_init(session, spec, max_context_len) != 0) {
         LOG_ERROR("Backend initialization failed for type %d", (int)backend_type);
         free(session->layer_configs);
         free(session);
+        sapphire_tracy_zone_end(&tracy_zone);
         return NULL;
     }
 
     LOG_INFO("Inference session created with %d layers, context_len=%d, backend=%s",
              config->num_hidden_layers, max_context_len, session->backend->name);
+
+    sapphire_tracy_zone_end(&tracy_zone);
 
     return session;
 }
@@ -706,6 +942,50 @@ void inference_session_reset(inference_session_t* session) {
     if (!session || !session->backend) return;
 
     session->backend->reset(session);
+}
+
+int inference_session_ffn_down_proj_input_rmsnorm_enabled(const inference_session_t *session)
+{
+    if (!session) {
+        return 0;
+    }
+
+    if (session->ffn_down_proj_input_rmsnorm_override_active) {
+        return session->ffn_down_proj_input_rmsnorm_override ? 1 : 0;
+    }
+
+    return session->ffn_down_proj_input_rmsnorm_default ? 1 : 0;
+}
+
+void inference_session_set_ffn_down_proj_input_rmsnorm_default(inference_session_t *session,
+                                                               int enabled)
+{
+    if (!session) {
+        return;
+    }
+
+    session->ffn_down_proj_input_rmsnorm_default = enabled ? 1 : 0;
+}
+
+void inference_session_set_ffn_down_proj_input_rmsnorm_override(inference_session_t *session,
+                                                                int enabled)
+{
+    if (!session) {
+        return;
+    }
+
+    session->ffn_down_proj_input_rmsnorm_override_active = 1;
+    session->ffn_down_proj_input_rmsnorm_override = enabled ? 1 : 0;
+}
+
+void inference_session_clear_ffn_down_proj_input_rmsnorm_override(inference_session_t *session)
+{
+    if (!session) {
+        return;
+    }
+
+    session->ffn_down_proj_input_rmsnorm_override_active = 0;
+    session->ffn_down_proj_input_rmsnorm_override = 0;
 }
 
 /**
@@ -741,7 +1021,11 @@ void inference_forward_batch(inference_session_t* session, const int* token_ids,
         return;
     }
 
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "inference_forward_batch");
+    sapphire_tracy_zone_value(&tracy_zone, (uint64_t)batch_size);
+
     session->backend->forward_batch(session, token_ids, start_pos, batch_size, logits);
+    sapphire_tracy_zone_end(&tracy_zone);
 }
 
 /**

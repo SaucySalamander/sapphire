@@ -106,6 +106,9 @@ void destroy_inference_context(inference_context_t* ctx);
 typedef struct inference_session_t {
     /* Public model and configuration */
     model_spec_t *model_spec;
+    int ffn_down_proj_input_rmsnorm_default;
+    int ffn_down_proj_input_rmsnorm_override_active;
+    int ffn_down_proj_input_rmsnorm_override;
 
     /* Backend abstraction */
     sapphire_backend_t *backend;      /**< Pointer to selected hardware backend (CPU, Vulkan, etc.). */
@@ -148,6 +151,16 @@ inference_session_t* inference_session_create(model_spec_t *spec, int max_contex
  * @param session Inference session to reset.
  */
 void inference_session_reset(inference_session_t *session);
+
+int inference_session_ffn_down_proj_input_rmsnorm_enabled(const inference_session_t *session);
+
+void inference_session_set_ffn_down_proj_input_rmsnorm_default(inference_session_t *session,
+                                                               int enabled);
+
+void inference_session_set_ffn_down_proj_input_rmsnorm_override(inference_session_t *session,
+                                                                int enabled);
+
+void inference_session_clear_ffn_down_proj_input_rmsnorm_override(inference_session_t *session);
 
 /**
  * Single-token forward pass.

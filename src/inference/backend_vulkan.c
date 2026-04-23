@@ -28,11 +28,13 @@
 #include "../../include/vk_kv_paged.h"
 #include "../../include/kv_cache_state.h"
 #include "../../include/model_spec.h"
-#include "../../include/gemma3_270m_config.h"
+#include "../../include/gemma3_config.h"
 #include "../../include/llm_model.h"
 #include "../../include/rope.h"
 #include "../../include/tensor.h"
 #include "../../include/kernels.h"
+#include "../../include/ternary_hessian_oracle.h"
+#include "../../include/tracy_profile.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +51,8 @@
 
 /* Forward declarations of external transformer functions */
 extern void sapphire_embed_lookup_batch(inference_session_t* session, const int* token_ids, int batch_size, float* dest);
+
+static int setup_oracle_descriptor_sets(backend_vulkan_session_data_t *bd);
 
 /* ========================================================================
  * GPU Debug Probe (SAPPHIRE_DEBUG_GPU=1)
@@ -520,6 +524,9 @@ static vk_kernel_push_constants_t build_push_constants(
     pc.num_heads   = (uint32_t)cfg->num_attention_heads;
     pc.head_dim    = (uint32_t)cfg->head_dim;
     pc.d_ff        = (uint32_t)cfg->intermediate_size;
+    /* Route rms_norm_eps through reserved[1] so shaders read it from push
+     * constants rather than using a hard-coded literal (model-agnostic). */
+    memcpy(&pc.reserved[1], &cfg->rms_norm_eps, sizeof(float));
     return pc;
 }
 
@@ -549,6 +556,10 @@ static void destroy_backend_data(backend_vulkan_session_data_t *bd) {
     if (!bd) return;
     VkDevice dev = bd->device;
     if (!dev) { free(bd); return; }
+    if (bd->tracy_vk_context) {
+        sapphire_tracy_vk_context_destroy(bd->tracy_vk_context);
+        bd->tracy_vk_context = NULL;
+    }
     if (bd->timing_query_pool != VK_NULL_HANDLE)
         vkDestroyQueryPool(dev, bd->timing_query_pool, NULL);
     if (bd->embedding_staging_mapped)
@@ -607,6 +618,16 @@ static void destroy_backend_data(backend_vulkan_session_data_t *bd) {
     free(bd);
 }
 
+static void destroy_tracy_vk_context(backend_vulkan_session_data_t *backend_data)
+{
+    if (!backend_data || !backend_data->tracy_vk_context) {
+        return;
+    }
+
+    sapphire_tracy_vk_context_destroy(backend_data->tracy_vk_context);
+    backend_data->tracy_vk_context = NULL;
+}
+
 /* Allocate KV cache, scratchpad, attn scores, ring buffers, weight buffer arrays. */
 static int init_vk_gpu_buffers(backend_vulkan_session_data_t *bd,
                                 const gemma3_270m_config_t *cfg,
@@ -624,7 +645,11 @@ static int init_vk_gpu_buffers(backend_vulkan_session_data_t *bd,
     {
         vk_kv_pager_config_t pager_cfg;
         if (vk_kv_pager_config_from_env(&pager_cfg, cfg->num_hidden_layers, max_context_len) == 0 && pager_cfg.enabled) {
-            bd->kv_pager = vk_kv_pager_create(&pager_cfg, cfg->num_hidden_layers, max_context_len);
+            bd->kv_pager = vk_kv_pager_create(&pager_cfg,
+                                              cfg->num_hidden_layers,
+                                              max_context_len,
+                                              cfg->layer_types_mask,
+                                              cfg->sliding_window);
             if (!bd->kv_pager) {
                 LOG_WARN("Vulkan KV pager requested but initialization failed; continuing without pager");
             }
@@ -827,10 +852,19 @@ static void pack_weight_layer_data(float *layer_dst, const tensor_t *t,
     }
     size_t payload_bytes;
     if (comp == VK_WGT_QK_NORM_Q && num_src == (size_t)cfg->head_dim) {
+        /* Single-head q_norm weight [head_dim] → tile across num_attention_heads */
         for (int h = 0; h < cfg->num_attention_heads; h++)
             memcpy(layer_dst + h * cfg->head_dim, src_f32,
                    (size_t)cfg->head_dim * sizeof(float));
         payload_bytes = (size_t)cfg->num_attention_heads * cfg->head_dim * sizeof(float);
+    } else if (comp == VK_WGT_QK_NORM_K && num_src == (size_t)cfg->head_dim) {
+        /* Single-head k_norm weight [head_dim] → tile across num_key_value_heads.
+         * Mirrors the CPU path in load_key_vector (attention.c). Without this,
+         * KV heads 1..N-1 read zero scale → zero K vectors → corrupted attention. */
+        for (int h = 0; h < cfg->num_key_value_heads; h++)
+            memcpy(layer_dst + h * cfg->head_dim, src_f32,
+                   (size_t)cfg->head_dim * sizeof(float));
+        payload_bytes = (size_t)cfg->num_key_value_heads * cfg->head_dim * sizeof(float);
     } else {
         if (src_f32 != layer_dst) memcpy(layer_dst, src_f32, num_src * sizeof(float));
         payload_bytes = num_src * sizeof(float);
@@ -854,7 +888,7 @@ static void pack_weight_layer_data(float *layer_dst, const tensor_t *t,
  * Reuses bd->embedding_staging, bd->transfer_cmd, bd->transfer_fence.
  */
 static int chunk_upload_to_device(backend_vulkan_session_data_t *bd,
-                                  const float *packed_data,
+                                  const void *packed_data,
                                   size_t total_size, vk_buffer_t *dst_buf) {
     const size_t STAGINGSZ = bd->embedding_staging.size;
     size_t remaining = total_size, uploaded = 0;
@@ -875,7 +909,7 @@ static int chunk_upload_to_device(backend_vulkan_session_data_t *bd,
                           0, chunk, &mapped) != 0) {
             LOG_ERROR("Failed to map staging buffer for chunk upload"); return -1;
         }
-        memcpy(mapped, (const void *)(packed_data + uploaded / sizeof(float)), chunk);
+        memcpy(mapped, (const uint8_t *)packed_data + uploaded, chunk);
         vk_buffer_unmap(bd->device, &bd->embedding_staging);
         vkResetCommandBuffer(bd->transfer_cmd, 0);
         vkBeginCommandBuffer(bd->transfer_cmd, &beg);
@@ -912,6 +946,9 @@ static int upload_one_weight_type(backend_vulkan_session_data_t *bd,
             : tensor_nbytes(t) / sizeof(uint16_t);
         if (comp == VK_WGT_QK_NORM_Q && ne == (size_t)cfg->head_dim)
             ne = (size_t)cfg->num_attention_heads * cfg->head_dim;
+        /* k_norm is also stored per-head [head_dim]; expand to all KV heads */
+        if (comp == VK_WGT_QK_NORM_K && ne == (size_t)cfg->head_dim)
+            ne = (size_t)cfg->num_key_value_heads * cfg->head_dim;
         layer_stride = ALIGN_UP(ne * sizeof(float), offset_alignment);
         break;
     }
@@ -940,34 +977,107 @@ static int upload_one_weight_type(backend_vulkan_session_data_t *bd,
     return 0;
 }
 
-/* Upload all 13 per-layer weight types to the GPU. */
+/*
+ * Upload one projection weight type as raw BF16 (uint16 packed pairs).
+ * Skips the BF16→F32 conversion done by upload_one_weight_type, halving
+ * VRAM usage for projection matrices (critical for 4B+ models on 8 GB GPUs).
+ * Returns -1 if the source tensor is not BF16; caller falls back to F32 path.
+ */
+static int upload_one_weight_type_bf16(backend_vulkan_session_data_t *bd,
+                                       const llm_model_t *model,
+                                       const gemma3_270m_config_t *cfg,
+                                       int comp, const char *name,
+                                       size_t offset_alignment) {
+    int nl = cfg->num_hidden_layers;
+    const tensor_t *first = NULL;
+    size_t layer_ne = 0;
+    for (int l = 0; l < nl; l++) {
+        const tensor_t *t = get_layer_weight_tensor(&model->layers[l], comp);
+        if (!t || tensor_dtype(t) != DTYPE_BF16) return -1;
+        if (!first) { first = t; layer_ne = tensor_nbytes(t) / sizeof(uint16_t); }
+    }
+    if (!first || layer_ne == 0) return -1;
+
+    size_t layer_stride = ALIGN_UP(layer_ne * sizeof(uint16_t), offset_alignment);
+    size_t total        = layer_stride * (size_t)nl;
+
+    if (vk_buffer_create(bd->device, bd->phys_dev, total,
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                         &bd->weight_buffers[comp]) != 0) {
+        LOG_ERROR("Failed to create BF16 device buffer for %s (%zu B)", name, total);
+        return -1;
+    }
+
+    uint8_t *packed = (uint8_t *)malloc(total);
+    if (!packed) { LOG_ERROR("OOM for BF16 pack buffer %s", name); return -1; }
+    memset(packed, 0, total);
+    for (int l = 0; l < nl; l++) {
+        const tensor_t *t = get_layer_weight_tensor(&model->layers[l], comp);
+        if (!t) continue;
+        memcpy(packed + (size_t)l * layer_stride,
+               tensor_data(t),
+               tensor_nbytes(t) / sizeof(uint16_t) * sizeof(uint16_t));
+    }
+
+    int rc = chunk_upload_to_device(bd, packed, total,
+                                    &bd->weight_buffers[comp]);
+    free(packed);
+    if (rc != 0) { LOG_ERROR("Failed to upload BF16 %s", name); return -1; }
+    bd->weight_layer_strides[comp] = layer_stride;
+    LOG_DEBUG("Uploaded BF16 %s: %d layers × %zu B = %zu total", name, nl, layer_stride, total);
+    return 0;
+}
+
+/* Upload all 13 per-layer weight types to the GPU.
+ * Projection weights (Q/K/V/O/Gate/Up/Down) are uploaded as raw BF16 when
+ * the source tensors are BF16, halving their VRAM footprint and keeping them
+ * resident on GPU instead of spilling over PCIe on 8 GB cards.
+ * Norm weights are always F32 (tiny; used by F32-only norm pipelines). */
 static int upload_vk_layer_weights(backend_vulkan_session_data_t *bd,
                                    const llm_model_t *model,
                                    const gemma3_270m_config_t *cfg,
                                    size_t offset_alignment) {
-    static const struct { int comp; const char *name; } wt[] = {
+    static const struct { int comp; const char *name; } norm_wt[] = {
         {VK_WGT_ATTN_NORM,      "attn_norm"},
-        {VK_WGT_Q_PROJ,         "q_proj"},
-        {VK_WGT_K_PROJ,         "k_proj"},
-        {VK_WGT_V_PROJ,         "v_proj"},
         {VK_WGT_QK_NORM_Q,      "q_norm"},
         {VK_WGT_QK_NORM_K,      "k_norm"},
-        {VK_WGT_O_PROJ,         "o_proj"},
         {VK_WGT_ATTN_NORM_POST, "attn_norm_post"},
         {VK_WGT_FFN_NORM,       "ffn_norm"},
-        {VK_WGT_GATE_PROJ,      "gate_proj"},
-        {VK_WGT_UP_PROJ,        "up_proj"},
-        {VK_WGT_DOWN_PROJ,      "down_proj"},
         {VK_WGT_FFN_NORM_POST,  "ffn_norm_post"},
     };
+    static const struct { int comp; const char *name; } proj_wt[] = {
+        {VK_WGT_Q_PROJ,    "q_proj"},
+        {VK_WGT_K_PROJ,    "k_proj"},
+        {VK_WGT_V_PROJ,    "v_proj"},
+        {VK_WGT_O_PROJ,    "o_proj"},
+        {VK_WGT_GATE_PROJ, "gate_proj"},
+        {VK_WGT_UP_PROJ,   "up_proj"},
+        {VK_WGT_DOWN_PROJ, "down_proj"},
+    };
     int fail = 0;
-    for (size_t w = 0; w < sizeof(wt)/sizeof(wt[0]); w++) {
-        if (upload_one_weight_type(bd, model, cfg, wt[w].comp, wt[w].name,
-                                   offset_alignment) != 0)
+    for (size_t w = 0; w < sizeof(norm_wt)/sizeof(norm_wt[0]); w++) {
+        if (upload_one_weight_type(bd, model, cfg, norm_wt[w].comp,
+                                   norm_wt[w].name, offset_alignment) != 0)
             fail++;
     }
+    int bf16_ok = 0;
+    int total_proj = (int)(sizeof(proj_wt)/sizeof(proj_wt[0]));
+    for (int w = 0; w < total_proj; w++) {
+        if (upload_one_weight_type_bf16(bd, model, cfg, proj_wt[w].comp,
+                                        proj_wt[w].name, offset_alignment) == 0) {
+            bf16_ok++;
+        } else {
+            if (upload_one_weight_type(bd, model, cfg, proj_wt[w].comp,
+                                       proj_wt[w].name, offset_alignment) != 0)
+                fail++;
+        }
+    }
     if (fail > 0) { LOG_ERROR("%d weight upload(s) failed", fail); return -1; }
-    LOG_INFO("Uploaded %d packed weight buffers to GPU", VK_WEIGHTS_PER_LAYER);
+    bd->proj_weights_bf16 = (bf16_ok == total_proj) ? 1 : 0;
+    LOG_INFO("Uploaded %d packed weight buffers to GPU (proj_bf16=%d)",
+             VK_WEIGHTS_PER_LAYER, bd->proj_weights_bf16);
     return 0;
 }
 
@@ -1084,7 +1194,36 @@ static int upload_single_weight_f32(backend_vulkan_session_data_t *bd,
     return rc;
 }
 
-/* Upload final_norm_weight and embedding_weight to the GPU. */
+/**
+ * Upload embedding table as raw BF16 bytes (no conversion) when the source
+ * tensor is already BF16.  Halves VRAM: 1.34 GB for 4B, 2.68 GB for 27B.
+ * Returns 0 on success, -1 when source is not BF16 or allocation fails.
+ */
+static int upload_embedding_bf16(backend_vulkan_session_data_t *bd,
+                                  const tensor_t *tensor,
+                                  vk_buffer_t *dst_buf) {
+    if (!tensor || tensor_dtype(tensor) != DTYPE_BF16) return -1;
+    size_t bf16_bytes = tensor_nbytes(tensor);
+    if (bf16_bytes == 0) return -1;
+    if (vk_buffer_create(bd->device, bd->phys_dev, bf16_bytes,
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, dst_buf) != 0) {
+        LOG_ERROR("Failed to create BF16 embedding buffer (%zu B)", bf16_bytes);
+        return -1;
+    }
+    int rc = chunk_upload_to_device(bd, tensor_data(tensor), bf16_bytes, dst_buf);
+    if (rc != 0) {
+        LOG_ERROR("Failed to upload BF16 embedding");
+        vk_buffer_destroy(bd->device, dst_buf);
+        return -1;
+    }
+    return 0;
+}
+
+/* Upload final_norm_weight and embedding_weight to the GPU.
+ * Attempts BF16 embedding upload first (halves VRAM for 4B/27B models);
+ * falls back to F32 when source tensor is not BF16. */
 static int upload_vk_final_weights(backend_vulkan_session_data_t *bd,
                                    const llm_model_t *model,
                                    const gemma3_270m_config_t *cfg) {
@@ -1093,14 +1232,125 @@ static int upload_vk_final_weights(backend_vulkan_session_data_t *bd,
                                  norm_sz, &bd->final_norm_weight) != 0) {
         LOG_ERROR("Failed to upload final_norm_weight"); return -1;
     }
-    size_t emb_sz = (size_t)cfg->vocab_size * (size_t)cfg->hidden_size * sizeof(float);
-    if (upload_single_weight_f32(bd, model->embedding_weight,
-                                 emb_sz, &bd->embedding_weight) != 0) {
-        LOG_ERROR("Failed to upload embedding_weight"); return -1;
+    if (upload_embedding_bf16(bd, model->embedding_weight,
+                              &bd->embedding_weight) == 0) {
+        bd->emb_weights_bf16 = 1;
+        LOG_INFO("Uploaded embedding as BF16: %zu B (saved %zu B vs F32)",
+                 tensor_nbytes(model->embedding_weight),
+                 tensor_nbytes(model->embedding_weight));
+    } else {
+        size_t emb_sz = (size_t)cfg->vocab_size *
+                        (size_t)cfg->hidden_size * sizeof(float);
+        if (upload_single_weight_f32(bd, model->embedding_weight,
+                                     emb_sz, &bd->embedding_weight) != 0) {
+            LOG_ERROR("Failed to upload embedding_weight"); return -1;
+        }
+        bd->emb_weights_bf16 = 0;
+        LOG_INFO("Uploaded embedding as F32: %zu B", emb_sz);
     }
-    LOG_INFO("Uploaded final weights: norm=%zu B, embedding=%zu B", norm_sz, emb_sz);
+    LOG_INFO("Uploaded final weights: norm=%zu B, emb_bf16=%d",
+             norm_sz, bd->emb_weights_bf16);
     return 0;
 }
+
+static const char *const VK_PIPELINE_SPV_PATHS[NUM_PIPELINES] = {
+    [PIPELINE_RMSNORM_F32]       = "src/kernels/backends/vulkan/shaders/rmsnorm_f32.comp.spv",
+    [PIPELINE_RMSNORM_BF16]      = "src/kernels/backends/vulkan/shaders/rmsnorm_bf16.comp.spv",
+    [PIPELINE_GEMV_F32]          = "src/kernels/backends/vulkan/shaders/gemv_f32.comp.spv",
+    [PIPELINE_GEMV_BF16]         = "src/kernels/backends/vulkan/shaders/gemv_bf16.comp.spv",
+    [PIPELINE_GEMM_F32]          = "src/kernels/backends/vulkan/shaders/gemm_f32.comp.spv",
+    [PIPELINE_GEMM_BF16]         = "src/kernels/backends/vulkan/shaders/gemm_bf16.comp.spv",
+    [PIPELINE_ROPE_F32]          = "src/kernels/backends/vulkan/shaders/rope_apply_f32.comp.spv",
+    [PIPELINE_ROPE_BF16]         = "src/kernels/backends/vulkan/shaders/rope_apply_bf16.comp.spv",
+    [PIPELINE_QK_NORM_F32]       = "src/kernels/backends/vulkan/shaders/qk_norm_f32.comp.spv",
+    [PIPELINE_QK_NORM_BF16]      = "src/kernels/backends/vulkan/shaders/qk_norm_bf16.comp.spv",
+    [PIPELINE_ATTENTION_F32]     = "src/kernels/backends/vulkan/shaders/attention_gqa_f32.comp.spv",
+    [PIPELINE_ATTENTION_BF16]    = "src/kernels/backends/vulkan/shaders/attention_gqa_bf16.comp.spv",
+    [PIPELINE_GELU_F32]          = "src/kernels/backends/vulkan/shaders/gelu_f32.comp.spv",
+    [PIPELINE_GELU_BF16]         = "src/kernels/backends/vulkan/shaders/gelu_bf16.comp.spv",
+    [PIPELINE_VEC_ADD_F32]       = "src/kernels/backends/vulkan/shaders/vec_add_f32.comp.spv",
+    [PIPELINE_ARGMAX_F32]        = "src/kernels/backends/vulkan/shaders/argmax_f32.comp.spv",
+    [PIPELINE_LMHEAD_DECODE_F32] = "src/kernels/backends/vulkan/shaders/lmhead_decode_f32.comp.spv",
+    [PIPELINE_GEMV_W16A32]       = "src/kernels/backends/vulkan/shaders/gemv_w16a32.comp.spv",
+    [PIPELINE_GEMM_W16A32]       = "src/kernels/backends/vulkan/shaders/gemm_w16a32.comp.spv",
+    [PIPELINE_LMHEAD_DECODE_W16A32] = "src/kernels/backends/vulkan/shaders/lmhead_decode_w16a32.comp.spv",
+    [PIPELINE_FFN_GEGLU_W16A32]     = "src/kernels/backends/vulkan/shaders/ffn_geglu_fused_w16a32.comp.spv",
+    [PIPELINE_ORACLE_ACCUM_F32]     = "src/kernels/backends/vulkan/shaders/oracle_diag_accum_f32.comp.spv",
+    [PIPELINE_ORACLE_FINALIZE_F32]  = "src/kernels/backends/vulkan/shaders/oracle_diag_finalize_f32.comp.spv",
+};
+
+static const vk_desc_layout_type_t VK_PIPELINE_LAYOUT_TYPES[NUM_PIPELINES] = {
+    [PIPELINE_RMSNORM_F32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_RMSNORM_BF16] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMV_F32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMV_BF16] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMM_F32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMM_BF16] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_ROPE_F32] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_ROPE_BF16] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_QK_NORM_F32] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_QK_NORM_BF16] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_ATTENTION_F32] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_ATTENTION_BF16] = VK_DESC_LAYOUT_ATTENTION,
+    [PIPELINE_GELU_F32] = VK_DESC_LAYOUT_WEIGHT_ONLY,
+    [PIPELINE_GELU_BF16] = VK_DESC_LAYOUT_WEIGHT_ONLY,
+    [PIPELINE_VEC_ADD_F32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_ARGMAX_F32] = VK_DESC_LAYOUT_CUSTOM,
+    [PIPELINE_LMHEAD_DECODE_F32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMV_W16A32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_GEMM_W16A32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_LMHEAD_DECODE_W16A32] = VK_DESC_LAYOUT_PROJECTION,
+    [PIPELINE_FFN_GEGLU_W16A32] = VK_DESC_LAYOUT_CUSTOM,
+    [PIPELINE_ORACLE_ACCUM_F32] = VK_DESC_LAYOUT_CUSTOM,
+    [PIPELINE_ORACLE_FINALIZE_F32] = VK_DESC_LAYOUT_CUSTOM,
+};
+
+static const uint32_t VK_PIPELINE_DESC_SETS_PER_LAYER[NUM_PIPELINES] = {
+    [PIPELINE_RMSNORM_F32] = 4,
+    [PIPELINE_RMSNORM_BF16] = 4,
+    [PIPELINE_GEMV_F32] = 7,
+    [PIPELINE_GEMV_BF16] = 7,
+    [PIPELINE_GEMM_F32] = 0,
+    [PIPELINE_GEMM_BF16] = 0,
+    [PIPELINE_ROPE_F32] = 1,
+    [PIPELINE_ROPE_BF16] = 1,
+    [PIPELINE_QK_NORM_F32] = 1,
+    [PIPELINE_QK_NORM_BF16] = 1,
+    [PIPELINE_ATTENTION_F32] = 1,
+    [PIPELINE_ATTENTION_BF16] = 1,
+    [PIPELINE_GELU_F32] = 1,
+    [PIPELINE_GELU_BF16] = 1,
+    [PIPELINE_VEC_ADD_F32] = 2,
+    [PIPELINE_ARGMAX_F32] = 0,
+    [PIPELINE_LMHEAD_DECODE_F32] = 0,
+    [PIPELINE_GEMV_W16A32] = 7,
+    [PIPELINE_GEMM_W16A32] = 0,
+    [PIPELINE_LMHEAD_DECODE_W16A32] = 0,
+    [PIPELINE_FFN_GEGLU_W16A32] = 1,
+    [PIPELINE_ORACLE_ACCUM_F32] = 0,
+    [PIPELINE_ORACLE_FINALIZE_F32] = 0,
+};
+
+static const vk_desc_binding_t VK_ARGMAX_BINDINGS[] = {
+    {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+    {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+};
+
+static const vk_desc_binding_t VK_FFN_GEGLU_BINDINGS[] = {
+    {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+    {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+    {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+    {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+};
+
+static const vk_desc_binding_t VK_ORACLE_ACCUM_BINDINGS[] = {
+    {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+    {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+};
+
+static const vk_desc_binding_t VK_ORACLE_FINALIZE_BINDINGS[] = {
+    {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
+};
 
 /* Create all shader pipelines with pre-allocated descriptor sets (SDT). */
 static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
@@ -1108,74 +1358,35 @@ static int create_vk_compute_pipelines(backend_vulkan_session_data_t *bd,
     bd->pipelines = calloc(NUM_PIPELINES, sizeof(vk_compute_pipeline_t));
     if (!bd->pipelines) { LOG_ERROR("Failed to alloc pipeline array"); return -1; }
     bd->num_pipelines = NUM_PIPELINES;
-
-    static const char *spv[NUM_PIPELINES] = {
-        [PIPELINE_RMSNORM_F32]    = "src/kernels/backends/vulkan/shaders/rmsnorm_f32.comp.spv",
-        [PIPELINE_RMSNORM_BF16]   = "src/kernels/backends/vulkan/shaders/rmsnorm_bf16.comp.spv",
-        [PIPELINE_GEMV_F32]       = "src/kernels/backends/vulkan/shaders/gemv_f32.comp.spv",
-        [PIPELINE_GEMV_BF16]      = "src/kernels/backends/vulkan/shaders/gemv_bf16.comp.spv",
-        [PIPELINE_GEMM_F32]       = "src/kernels/backends/vulkan/shaders/gemm_f32.comp.spv",
-        [PIPELINE_GEMM_BF16]      = "src/kernels/backends/vulkan/shaders/gemm_bf16.comp.spv",
-        [PIPELINE_ROPE_F32]       = "src/kernels/backends/vulkan/shaders/rope_apply_f32.comp.spv",
-        [PIPELINE_ROPE_BF16]      = "src/kernels/backends/vulkan/shaders/rope_apply_bf16.comp.spv",
-        [PIPELINE_QK_NORM_F32]    = "src/kernels/backends/vulkan/shaders/qk_norm_f32.comp.spv",
-        [PIPELINE_QK_NORM_BF16]   = "src/kernels/backends/vulkan/shaders/qk_norm_bf16.comp.spv",
-        [PIPELINE_ATTENTION_F32]  = "src/kernels/backends/vulkan/shaders/attention_gqa_f32.comp.spv",
-        [PIPELINE_ATTENTION_BF16] = "src/kernels/backends/vulkan/shaders/attention_gqa_bf16.comp.spv",
-        [PIPELINE_GELU_F32]       = "src/kernels/backends/vulkan/shaders/gelu_f32.comp.spv",
-        [PIPELINE_GELU_BF16]      = "src/kernels/backends/vulkan/shaders/gelu_bf16.comp.spv",
-        [PIPELINE_VEC_ADD_F32]    = "src/kernels/backends/vulkan/shaders/vec_add_f32.comp.spv",
-        [PIPELINE_ARGMAX_F32]     = "src/kernels/backends/vulkan/shaders/argmax_f32.comp.spv",
-        [PIPELINE_LMHEAD_DECODE_F32] = "src/kernels/backends/vulkan/shaders/lmhead_decode_f32.comp.spv",
-    };
-    static const vk_desc_layout_type_t lt[NUM_PIPELINES] = {
-        [PIPELINE_RMSNORM_F32] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_RMSNORM_BF16] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_GEMV_F32] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_GEMV_BF16] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_GEMM_F32] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_GEMM_BF16] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_ROPE_F32] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_ROPE_BF16] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_QK_NORM_F32] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_QK_NORM_BF16] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_ATTENTION_F32] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_ATTENTION_BF16] = VK_DESC_LAYOUT_ATTENTION,
-        [PIPELINE_GELU_F32] = VK_DESC_LAYOUT_WEIGHT_ONLY,
-        [PIPELINE_GELU_BF16] = VK_DESC_LAYOUT_WEIGHT_ONLY,
-        [PIPELINE_VEC_ADD_F32] = VK_DESC_LAYOUT_PROJECTION,
-        [PIPELINE_ARGMAX_F32] = VK_DESC_LAYOUT_CUSTOM,
-        [PIPELINE_LMHEAD_DECODE_F32] = VK_DESC_LAYOUT_PROJECTION,
-    };
-    static const uint32_t spl[NUM_PIPELINES] = {
-        [PIPELINE_RMSNORM_F32] = 4, [PIPELINE_RMSNORM_BF16] = 4,
-        [PIPELINE_GEMV_F32] = 7,    [PIPELINE_GEMV_BF16] = 7,
-        [PIPELINE_GEMM_F32] = 0,    [PIPELINE_GEMM_BF16] = 0,
-        [PIPELINE_ROPE_F32] = 1,    [PIPELINE_ROPE_BF16] = 1,
-        [PIPELINE_QK_NORM_F32] = 1, [PIPELINE_QK_NORM_BF16] = 1,
-        [PIPELINE_ATTENTION_F32] = 1, [PIPELINE_ATTENTION_BF16] = 1,
-        [PIPELINE_GELU_F32] = 1,    [PIPELINE_GELU_BF16] = 1,
-        [PIPELINE_VEC_ADD_F32] = 2, [PIPELINE_ARGMAX_F32] = 0,
-        [PIPELINE_LMHEAD_DECODE_F32] = 0,
-    };
-    static const vk_desc_binding_t argmax_b[] = {
-        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
-        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_COMPUTE_BIT},
-    };
     int fail = 0;
     for (int i = 0; i < NUM_PIPELINES; i++) {
         vk_pipeline_config_t pc = {0};
-        pc.shader_path        = spv[i];
+        pc.shader_path        = VK_PIPELINE_SPV_PATHS[i];
         pc.entry_point        = "main";
-        pc.layout_type        = lt[i];
+        pc.layout_type        = VK_PIPELINE_LAYOUT_TYPES[i];
         pc.push_constant_size = sizeof(vk_kernel_push_constants_t);
         if (i == PIPELINE_ARGMAX_F32) {
-            pc.custom_bindings = argmax_b; pc.num_custom_bindings = 2;
+            pc.custom_bindings = VK_ARGMAX_BINDINGS; pc.num_custom_bindings = 2;
         }
-        pc.num_desc_sets = spl[i] * (uint32_t)cfg->num_hidden_layers;
+        if (i == PIPELINE_FFN_GEGLU_W16A32) {
+            pc.custom_bindings = VK_FFN_GEGLU_BINDINGS; pc.num_custom_bindings = 4;
+        }
+        if (i == PIPELINE_ORACLE_ACCUM_F32) {
+            pc.custom_bindings = VK_ORACLE_ACCUM_BINDINGS; pc.num_custom_bindings = 2;
+        }
+        if (i == PIPELINE_ORACLE_FINALIZE_F32) {
+            pc.custom_bindings = VK_ORACLE_FINALIZE_BINDINGS; pc.num_custom_bindings = 1;
+        }
+        pc.num_desc_sets = VK_PIPELINE_DESC_SETS_PER_LAYER[i] * (uint32_t)cfg->num_hidden_layers;
         if (i == PIPELINE_RMSNORM_F32 || i == PIPELINE_RMSNORM_BF16) pc.num_desc_sets++;
         if (i == PIPELINE_GEMV_F32    || i == PIPELINE_GEMV_BF16)    pc.num_desc_sets++;
-        if (i == PIPELINE_LMHEAD_DECODE_F32) pc.num_desc_sets++;
+        if (i == PIPELINE_GEMV_W16A32)                                pc.num_desc_sets++;
+        if (i == PIPELINE_GEMM_W16A32) pc.num_desc_sets = 1;
+        if (i == PIPELINE_LMHEAD_DECODE_F32)    pc.num_desc_sets++;
+        if (i == PIPELINE_LMHEAD_DECODE_W16A32) pc.num_desc_sets++;
+        if (i == PIPELINE_FFN_GEGLU_W16A32)     pc.num_desc_sets = (uint32_t)cfg->num_hidden_layers;
+        if (i == PIPELINE_ORACLE_ACCUM_F32)     pc.num_desc_sets = 4;
+        if (i == PIPELINE_ORACLE_FINALIZE_F32)  pc.num_desc_sets = 1;
         if (i == PIPELINE_ARGMAX_F32) pc.num_desc_sets = 1;
         if (pc.num_desc_sets == 0)    pc.num_desc_sets = 1;
         if (vk_pipeline_create(bd->device, &pc, &bd->pipelines[i]) != 0) fail++;
@@ -1191,6 +1402,7 @@ static int alloc_vk_inference_bufs(backend_vulkan_session_data_t *bd,
                                    const gemma3_270m_config_t *cfg,
                                    int max_context_len) {
     size_t logits_sz = (size_t)cfg->vocab_size * sizeof(float);
+    size_t oracle_sz = ternary_hessian_oracle_capture_bytes(cfg);
     if (vk_buffer_create(bd->device, bd->phys_dev, logits_sz,
                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -1207,7 +1419,21 @@ static int alloc_vk_inference_bufs(backend_vulkan_session_data_t *bd,
                          &bd->selected_token_ids) != 0) {
         LOG_ERROR("Failed to alloc selected token ids (%zu B)", sel_sz); return -1;
     }
-    LOG_INFO("Alloc'd inference buffers: logits=%zu B, sel_ids=%zu B", logits_sz, sel_sz);
+    if (oracle_sz == 0u ||
+        vk_buffer_create(bd->device, bd->phys_dev, oracle_sz,
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                         &bd->oracle_hessian_accum) != 0) {
+        LOG_ERROR("Failed to alloc oracle Hessian accumulation buffer (%zu B)", oracle_sz);
+        return -1;
+    }
+    bd->oracle_hessian_active = 0;
+    LOG_INFO("Alloc'd inference buffers: logits=%zu B, sel_ids=%zu B, oracle=%zu B",
+             logits_sz,
+             sel_sz,
+             oracle_sz);
     return 0;
 }
 
@@ -1272,6 +1498,27 @@ static int setup_vk_timing_and_staging(backend_vulkan_session_data_t *bd,
     return 0;
 }
 
+static const gemma3_270m_config_t *vulkan_session_config_or_null(const model_spec_t *spec)
+{
+    const gemma3_270m_config_t *cfg = (const gemma3_270m_config_t *)spec->variant_config;
+
+    if (!cfg) {
+        LOG_ERROR("Model config is NULL in vulkan_session_init");
+        return NULL;
+    }
+    if (cfg->sapphire_ffn_down_proj_input_rmsnorm) {
+        LOG_ERROR("Vulkan backend does not yet support models with sapphire_ffn_down_proj_input_rmsnorm enabled");
+        return NULL;
+    }
+    /* Guard for mixed-precision anchor tensors (Prompt 07) */
+    if (cfg->sapphire_mixed_precision_anchors) {
+        LOG_ERROR("Vulkan backend does not yet support models with mixed-precision anchor tensors (sapphire_mixed_precision_anchors enabled)");
+        return NULL;
+    }
+
+    return cfg;
+}
+
 static int vulkan_session_init(inference_session_t* session, const model_spec_t* spec, int max_context_len) {
     if (!session || !spec) {
         LOG_ERROR("session or spec is NULL");
@@ -1313,9 +1560,8 @@ static int vulkan_session_init(inference_session_t* session, const model_spec_t*
         return -1;
     }
 
-    const gemma3_270m_config_t *cfg = (const gemma3_270m_config_t *)spec->variant_config;
+    const gemma3_270m_config_t *cfg = vulkan_session_config_or_null(spec);
     if (!cfg) {
-        LOG_ERROR("Model config is NULL in vulkan_session_init");
         free(bd);
         vk_backend_shutdown(vk_ctx);
         return -1;
@@ -1345,7 +1591,25 @@ static int vulkan_session_init(inference_session_t* session, const model_spec_t*
     if (alloc_vk_inference_bufs(bd, cfg, max_context_len)         != 0) goto fail;
     if (init_vk_kv_pager_resources(bd, cfg)                        != 0) goto fail;
     if (vulkan_prepopulate_descriptors(bd, cfg)                   != 0) goto fail;
+    if (setup_oracle_descriptor_sets(bd)                          != 0) goto fail;
     if (setup_vk_timing_and_staging(bd, cfg)                      != 0) goto fail;
+
+#if defined(SAPPHIRE_ENABLE_TRACY)
+    bd->tracy_vk_context = sapphire_tracy_vk_context_create(vk_instance,
+                                                            bd->phys_dev,
+                                                            bd->device,
+                                                            bd->queue_family_idx,
+                                                            bd->compute_queue,
+                                                            bd->cmd_buffer);
+    if (bd->tracy_vk_context) {
+        static const char tracy_context_name[] = "sapphire-vk-compute";
+        sapphire_tracy_vk_context_name(bd->tracy_vk_context,
+                                       tracy_context_name,
+                                       sizeof(tracy_context_name) - 1u);
+    } else if (sapphire_tracy_enabled() != 0) {
+        LOG_WARN("Failed to initialize Tracy Vulkan context; continuing without GPU zones");
+    }
+#endif
 
     session->backend_data = (void *)bd;
 
@@ -1382,6 +1646,8 @@ static void vulkan_session_destroy(inference_session_t* session) {
     }
 
     backend_vulkan_session_data_t *backend_data = (backend_vulkan_session_data_t *)session->backend_data;
+
+    destroy_tracy_vk_context(backend_data);
 
     if (backend_data->timing_query_pool != VK_NULL_HANDLE) {
         vkDestroyQueryPool(backend_data->device, backend_data->timing_query_pool, NULL);
@@ -1450,6 +1716,7 @@ static void vulkan_session_destroy(inference_session_t* session) {
     vk_buffer_destroy(backend_data->device, &backend_data->embedding_weight);
     vk_buffer_destroy(backend_data->device, &backend_data->selected_token_ids);
     vk_buffer_destroy(backend_data->device, &backend_data->lm_head_logits);
+    vk_buffer_destroy(backend_data->device, &backend_data->oracle_hessian_accum);
 
     /* Destroy KV cache */
     vk_kv_cache_destroy(backend_data->device, &backend_data->kv_cache);
@@ -1580,7 +1847,7 @@ static void setup_qkv_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
     vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
 {
     const int PI_NORM  = PIPELINE_RMSNORM_F32;
-    const int PI_GEMV  = PIPELINE_GEMV_F32;
+    const int PI_GEMV  = bd->proj_weights_bf16 ? PIPELINE_GEMV_W16A32 : PIPELINE_GEMV_F32;
     const int PI_QKNRM = PIPELINE_QK_NORM_F32;
     VkBuffer   wgt_attn_norm   = layer_weight_buffer(bd, VK_WGT_ATTN_NORM)->buffer;
     VkDeviceSize off_attn_norm = layer_weight_offset(bd, VK_WGT_ATTN_NORM, L);
@@ -1625,9 +1892,9 @@ static void setup_qkv_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
 
 /* Setup SDT slots: ROPE, ATTENTION, O_PROJ, POST_ATTN_NORM, ATTN_RESIDUAL */
 static void setup_attn_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
-    vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
+    const gemma3_270m_config_t *cfg, vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
 {
-    const int PI_GEMV  = PIPELINE_GEMV_F32;
+    const int PI_GEMV  = bd->proj_weights_bf16 ? PIPELINE_GEMV_W16A32 : PIPELINE_GEMV_F32;
     const int PI_ROPE  = PIPELINE_ROPE_F32;
     const int PI_ATTN  = PIPELINE_ATTENTION_F32;
     const int PI_NORM  = PIPELINE_RMSNORM_F32;
@@ -1637,7 +1904,9 @@ static void setup_attn_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd
     VkBuffer   wgt_attn_post   = layer_weight_buffer(bd, VK_WGT_ATTN_NORM_POST)->buffer;
     VkDeviceSize off_attn_post = layer_weight_offset(bd, VK_WGT_ATTN_NORM_POST, L);
     VkBuffer input_buf = sp->layer_hidden[L % 2].buffer;
-    bool is_global_rope = ((L + 1) % 6 == 0);
+    /* Use layer_types_mask bit to select the correct RoPE cache (global=1M theta, local=10k theta).
+     * This is authoritative and model-agnostic — supports any global/local attention pattern. */
+    bool is_global_rope = (bool)((cfg->layer_types_mask >> (unsigned)L) & 1ULL);
     VkBuffer cos_buf = is_global_rope ? bd->rope_cos_cache.buffer : bd->rope_cos_cache_local.buffer;
     VkBuffer sin_buf = is_global_rope ? bd->rope_sin_cache.buffer : bd->rope_sin_cache_local.buffer;
     S[SDT_SLOT_ROPE].pipeline_idx = PI_ROPE;
@@ -1673,7 +1942,7 @@ static void setup_attn_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd
 static void setup_ffn_in_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
     vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
 {
-    const int PI_GEMV  = PIPELINE_GEMV_F32;
+    const int PI_GEMV  = bd->proj_weights_bf16 ? PIPELINE_GEMV_W16A32 : PIPELINE_GEMV_F32;
     const int PI_NORM  = PIPELINE_RMSNORM_F32;
     const int PI_GELU  = PIPELINE_GELU_F32;
     VkBuffer   wgt_ffn_norm  = layer_weight_buffer(bd, VK_WGT_FFN_NORM)->buffer;
@@ -1687,27 +1956,50 @@ static void setup_ffn_in_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *
     sdt_write_buf(dev, S[SDT_SLOT_PRE_FFN_NORM].ds, 0, sp->residual.buffer, 0, VK_WHOLE_SIZE);
     sdt_write_buf(dev, S[SDT_SLOT_PRE_FFN_NORM].ds, 1, wgt_ffn_norm, off_ffn_norm, VK_WHOLE_SIZE);
     sdt_write_buf(dev, S[SDT_SLOT_PRE_FFN_NORM].ds, 2, sp->ffn_gate.buffer, 0, VK_WHOLE_SIZE);
-    S[SDT_SLOT_GATE_PROJ].pipeline_idx = PI_GEMV;
-    S[SDT_SLOT_GATE_PROJ].ds = sdt_alloc_ds(bd, PI_GEMV);
-    sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 0, sp->ffn_gate.buffer,  0, VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 1, wgt_gate, off_gate,   VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 2, sp->ffn_value.buffer, 0, VK_WHOLE_SIZE);
-    S[SDT_SLOT_UP_PROJ].pipeline_idx = PI_GEMV;
-    S[SDT_SLOT_UP_PROJ].ds = sdt_alloc_ds(bd, PI_GEMV);
-    sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 0, sp->ffn_gate.buffer,    0, VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 1, wgt_up, off_up,         VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 2, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
-    S[SDT_SLOT_GELU].pipeline_idx = PI_GELU;
-    S[SDT_SLOT_GELU].ds = sdt_alloc_ds(bd, PI_GELU);
-    sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 0, sp->ffn_value.buffer,   0, VK_WHOLE_SIZE);
-    sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 1, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
+    if (bd->proj_weights_bf16) {
+        /* Fused GeGLU path: GATE_PROJ slot holds the 4-binding fused descriptor.
+         * UP_PROJ and GELU are still allocated to preserve SDT cursor integrity,
+         * but they are not dispatched when the fused shader is active. */
+        S[SDT_SLOT_GATE_PROJ].pipeline_idx = PIPELINE_FFN_GEGLU_W16A32;
+        S[SDT_SLOT_GATE_PROJ].ds = sdt_alloc_ds(bd, PIPELINE_FFN_GEGLU_W16A32);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 0, sp->ffn_gate.buffer,  0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 1, wgt_gate, off_gate,   VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 2, wgt_up,   off_up,     VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 3, sp->ffn_value.buffer, 0, VK_WHOLE_SIZE);
+
+        S[SDT_SLOT_UP_PROJ].pipeline_idx = PI_GEMV;
+        S[SDT_SLOT_UP_PROJ].ds = sdt_alloc_ds(bd, PI_GEMV);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 0, sp->ffn_gate.buffer,    0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 1, wgt_up, off_up,         VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 2, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
+
+        S[SDT_SLOT_GELU].pipeline_idx = PI_GELU;
+        S[SDT_SLOT_GELU].ds = sdt_alloc_ds(bd, PI_GELU);
+        sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 0, sp->ffn_value.buffer,   0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 1, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
+    } else {
+        S[SDT_SLOT_GATE_PROJ].pipeline_idx = PI_GEMV;
+        S[SDT_SLOT_GATE_PROJ].ds = sdt_alloc_ds(bd, PI_GEMV);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 0, sp->ffn_gate.buffer,  0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 1, wgt_gate, off_gate,   VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GATE_PROJ].ds, 2, sp->ffn_value.buffer, 0, VK_WHOLE_SIZE);
+        S[SDT_SLOT_UP_PROJ].pipeline_idx = PI_GEMV;
+        S[SDT_SLOT_UP_PROJ].ds = sdt_alloc_ds(bd, PI_GEMV);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 0, sp->ffn_gate.buffer,    0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 1, wgt_up, off_up,         VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_UP_PROJ].ds, 2, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
+        S[SDT_SLOT_GELU].pipeline_idx = PI_GELU;
+        S[SDT_SLOT_GELU].ds = sdt_alloc_ds(bd, PI_GELU);
+        sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 0, sp->ffn_value.buffer,   0, VK_WHOLE_SIZE);
+        sdt_write_buf(dev, S[SDT_SLOT_GELU].ds, 1, sp->attn_output.buffer, 0, VK_WHOLE_SIZE);
+    }
 }
 
 /* Setup SDT slots: DOWN_PROJ, POST_FFN_NORM, FFN_RESIDUAL */
 static void setup_ffn_out_sdt_slots(VkDevice dev, backend_vulkan_session_data_t *bd,
     vk_gpu_scratchpad_t *sp, int L, sdt_entry_t *S)
 {
-    const int PI_GEMV  = PIPELINE_GEMV_F32;
+    const int PI_GEMV  = bd->proj_weights_bf16 ? PIPELINE_GEMV_W16A32 : PIPELINE_GEMV_F32;
     const int PI_NORM  = PIPELINE_RMSNORM_F32;
     const int PI_ADD   = PIPELINE_VEC_ADD_F32;
     VkBuffer   wgt_down     = layer_weight_buffer(bd, VK_WGT_DOWN_PROJ)->buffer;
@@ -1740,9 +2032,8 @@ static void populate_layer_descriptor_slots(
     sdt_entry_t *S)
 {
     VkDevice dev = bd->device;
-    (void)cfg;
     setup_qkv_sdt_slots    (dev, bd, sp, L, S);
-    setup_attn_sdt_slots   (dev, bd, sp, L, S);
+    setup_attn_sdt_slots   (dev, bd, cfg, sp, L, S);
     setup_ffn_in_sdt_slots (dev, bd, sp, L, S);
     setup_ffn_out_sdt_slots(dev, bd, sp, L, S);
 }
@@ -1770,7 +2061,7 @@ static int vulkan_prepopulate_descriptors(backend_vulkan_session_data_t *bd,
     }
 
     /* -- LM-Head: Final RMSNorm + Vocabulary Projection ------------------- */
-    /* After 18 layers, final output is in hidden[(18)%2] = hidden[0] */
+    /* Final output is in hidden[num_layers % 2] (ping-pong result) */
     VkBuffer final_hidden = sp->layer_hidden[num_layers % 2].buffer;
 
     bd->sdt.lmhead_norm.pipeline_idx = PI_NORM;
@@ -1779,11 +2070,19 @@ static int vulkan_prepopulate_descriptors(backend_vulkan_session_data_t *bd,
     sdt_write_buf(dev, bd->sdt.lmhead_norm.ds, 1, bd->final_norm_weight.buffer,     0, VK_WHOLE_SIZE);
     sdt_write_buf(dev, bd->sdt.lmhead_norm.ds, 2, sp->norm_buf.buffer,              0, VK_WHOLE_SIZE);
 
-    bd->sdt.lmhead_proj.pipeline_idx = PI_GEMV;
-    bd->sdt.lmhead_proj.ds = sdt_alloc_ds(bd, PI_GEMV);
+    /* lmhead_proj: use W16A32 pipeline when embedding was uploaded as BF16.
+     * Both F32 and BF16 variants share the PROJECTION descriptor layout
+     * (3 bindings: input, weight, output) so the descriptor set is compatible. */
+    const int PI_LMHEAD_PROJ = bd->emb_weights_bf16
+                               ? PIPELINE_LMHEAD_DECODE_W16A32
+                               : PI_GEMV;
+    bd->sdt.lmhead_proj.pipeline_idx = PI_LMHEAD_PROJ;
+    bd->sdt.lmhead_proj.ds = sdt_alloc_ds(bd, PI_LMHEAD_PROJ);
     sdt_write_buf(dev, bd->sdt.lmhead_proj.ds, 0, sp->norm_buf.buffer,              0, VK_WHOLE_SIZE);
     sdt_write_buf(dev, bd->sdt.lmhead_proj.ds, 1, bd->embedding_weight.buffer,      0, VK_WHOLE_SIZE);
     sdt_write_buf(dev, bd->sdt.lmhead_proj.ds, 2, bd->lm_head_logits.buffer,        0, VK_WHOLE_SIZE);
+    LOG_DEBUG("lmhead_proj pipeline: %s",
+              bd->emb_weights_bf16 ? "LMHEAD_DECODE_W16A32" : "GEMV_F32");
 
     bd->sdt.lmhead_argmax.pipeline_idx = PIPELINE_ARGMAX_F32;
     bd->sdt.lmhead_argmax.ds = sdt_alloc_ds(bd, PIPELINE_ARGMAX_F32);
@@ -1798,6 +2097,79 @@ static int vulkan_prepopulate_descriptors(backend_vulkan_session_data_t *bd,
     LOG_INFO("SDT pre-populated: %d layers × %d kernel slots + 3 lm_head = %d total descriptor sets",
              num_layers, SDT_KERNELS_PER_LAYER,
              num_layers * SDT_KERNELS_PER_LAYER + 3);
+    return 0;
+}
+
+static int setup_oracle_descriptor_sets(backend_vulkan_session_data_t *bd)
+{
+    vk_compute_pipeline_t *accum = NULL;
+    vk_compute_pipeline_t *finalize = NULL;
+
+    if (!bd || !bd->pipelines) {
+        return -1;
+    }
+
+    accum = &bd->pipelines[PIPELINE_ORACLE_ACCUM_F32];
+    finalize = &bd->pipelines[PIPELINE_ORACLE_FINALIZE_F32];
+    if (accum->num_desc_sets < 4u || finalize->num_desc_sets < 1u) {
+        LOG_ERROR("Oracle pipelines were not allocated with the expected descriptor sets");
+        return -1;
+    }
+
+    vk_pipeline_update_descriptor_buffer(bd->device,
+                                         accum->desc_sets[ORACLE_SRC_SET_NORM_BUF],
+                                         0,
+                                         bd->scratchpad.norm_buf.buffer,
+                                         0,
+                                         VK_WHOLE_SIZE);
+    vk_pipeline_update_descriptor_buffer(bd->device,
+                                         accum->desc_sets[ORACLE_SRC_SET_NORM_BUF],
+                                         1,
+                                         bd->oracle_hessian_accum.buffer,
+                                         0,
+                                         VK_WHOLE_SIZE);
+    vk_pipeline_update_descriptor_buffer(bd->device,
+                                         accum->desc_sets[ORACLE_SRC_SET_ATTN_OUTPUT],
+                                         0,
+                                         bd->scratchpad.attn_output.buffer,
+                                         0,
+                                         VK_WHOLE_SIZE);
+    vk_pipeline_update_descriptor_buffer(bd->device,
+                                         accum->desc_sets[ORACLE_SRC_SET_ATTN_OUTPUT],
+                                         1,
+                                         bd->oracle_hessian_accum.buffer,
+                                         0,
+                                         VK_WHOLE_SIZE);
+    vk_pipeline_update_descriptor_buffer(bd->device,
+                                         accum->desc_sets[ORACLE_SRC_SET_FFN_GATE],
+                                         0,
+                                         bd->scratchpad.ffn_gate.buffer,
+                                         0,
+                                         VK_WHOLE_SIZE);
+    vk_pipeline_update_descriptor_buffer(bd->device,
+                                         accum->desc_sets[ORACLE_SRC_SET_FFN_GATE],
+                                         1,
+                                         bd->oracle_hessian_accum.buffer,
+                                         0,
+                                         VK_WHOLE_SIZE);
+    vk_pipeline_update_descriptor_buffer(bd->device,
+                                         accum->desc_sets[ORACLE_SRC_SET_FFN_VALUE],
+                                         0,
+                                         bd->scratchpad.ffn_value.buffer,
+                                         0,
+                                         VK_WHOLE_SIZE);
+    vk_pipeline_update_descriptor_buffer(bd->device,
+                                         accum->desc_sets[ORACLE_SRC_SET_FFN_VALUE],
+                                         1,
+                                         bd->oracle_hessian_accum.buffer,
+                                         0,
+                                         VK_WHOLE_SIZE);
+    vk_pipeline_update_descriptor_buffer(bd->device,
+                                         finalize->desc_sets[0],
+                                         0,
+                                         bd->oracle_hessian_accum.buffer,
+                                         0,
+                                         VK_WHOLE_SIZE);
     return 0;
 }
 
@@ -1880,7 +2252,15 @@ static inline void proj_dispatch(VkCommandBuffer cmd_buf, backend_vulkan_session
     const sdt_entry_t *e, const proj_mode_t *mode,
     uint32_t out_elems, const vk_kernel_push_constants_t *pc)
 {
+    /* When projection weights are BF16 on GPU, route through W16A32 shaders
+     * instead of the F32 GEMV/GEMM pipelines which would read BF16 as garbage. */
     int proj_pipeline = mode->proj_pipeline;
+    if (bd->proj_weights_bf16) {
+        if (!mode->use_gemm && proj_pipeline == PIPELINE_GEMV_F32)
+            proj_pipeline = PIPELINE_GEMV_W16A32;
+        else if (mode->use_gemm && proj_pipeline == PIPELINE_GEMM_F32)
+            proj_pipeline = PIPELINE_GEMM_W16A32;
+    }
     int use_gemm      = mode->use_gemm;
     int batch_size    = mode->batch_size;
     const vk_compute_pipeline_t *pipe = &bd->pipelines[proj_pipeline];
@@ -1899,21 +2279,234 @@ typedef struct {
     int batch_size;
     int start_pos;
     int enable_kernel_timing;
+    int capture_oracle;
     uint32_t *query_idx_io;
     uint32_t query_capacity;
 } record_layer_params_t;
+
+static int oracle_capture_copy_target(VkCommandBuffer cmd_buf,
+                                      backend_vulkan_session_data_t *bd,
+                                      const gemma3_270m_config_t *cfg,
+                                      int layer_idx,
+                                      capture_target_t target,
+                                      const vk_buffer_t *src_buffer);
+
+typedef struct {
+    VkCommandBuffer cmd_buf;
+    backend_vulkan_session_data_t *bd;
+    const gemma3_270m_config_t *cfg;
+    int layer_idx;
+    int capture_oracle;
+} oracle_capture_ctx_t;
+
+typedef struct {
+    VkCommandBuffer cmd_buf;
+    backend_vulkan_session_data_t *bd;
+    const sdt_entry_t *slots;
+    vk_gpu_scratchpad_t *scratchpad;
+    oracle_capture_ctx_t oracle_ctx;
+    proj_mode_t proj_mode;
+    int batch_size;
+    int enable_kernel_timing;
+    uint32_t *query_idx_io;
+    uint32_t query_capacity;
+} ffn_phase_ctx_t;
+
+static int oracle_capture_or_barrier(const oracle_capture_ctx_t *ctx,
+                                     capture_target_t target,
+                                     const vk_buffer_t *src_buffer)
+{
+    if (!ctx || !ctx->cmd_buf || !src_buffer || !src_buffer->buffer) {
+        return -1;
+    }
+    if (ctx->capture_oracle) {
+        return oracle_capture_copy_target(ctx->cmd_buf,
+                                          ctx->bd,
+                                          ctx->cfg,
+                                          ctx->layer_idx,
+                                          target,
+                                          src_buffer);
+    }
+
+    barrier_buf(ctx->cmd_buf,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                src_buffer->buffer);
+    return 0;
+}
+
+static uint32_t oracle_source_desc_set_index(capture_target_t target)
+{
+    switch (target) {
+    case CAPTURE_TARGET_QKV_INPUT:
+        return ORACLE_SRC_SET_NORM_BUF;
+    case CAPTURE_TARGET_OUT_INPUT:
+        return ORACLE_SRC_SET_ATTN_OUTPUT;
+    case CAPTURE_TARGET_FFN_INPUT:
+        return ORACLE_SRC_SET_FFN_GATE;
+    case CAPTURE_TARGET_DOWN_INPUT:
+        return ORACLE_SRC_SET_FFN_VALUE;
+    default:
+        return UINT32_MAX;
+    }
+}
+
+static int oracle_accumulate_capture_target(VkCommandBuffer cmd_buf,
+                                            backend_vulkan_session_data_t *bd,
+                                            const gemma3_270m_config_t *cfg,
+                                            int layer_idx,
+                                            capture_target_t target)
+{
+    vk_kernel_push_constants_t pc = {0};
+    const vk_compute_pipeline_t *pipeline = NULL;
+    size_t dst_offset = 0u;
+    uint32_t vector_dim = 0u;
+    uint32_t desc_set_idx = oracle_source_desc_set_index(target);
+
+    if (!cmd_buf || !bd || !cfg || !bd->oracle_hessian_active ||
+        desc_set_idx == UINT32_MAX) {
+        return -1;
+    }
+    if (ternary_hessian_oracle_capture_view(cfg,
+                                            layer_idx,
+                                            target,
+                                            &dst_offset,
+                                            &vector_dim) != 0) {
+        return -1;
+    }
+    if (dst_offset + (size_t)vector_dim * sizeof(float) > bd->oracle_hessian_accum.size) {
+        return -1;
+    }
+
+    vk_buffer_barrier(cmd_buf,
+                      bd->oracle_hessian_accum.buffer,
+                      VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    pipeline = &bd->pipelines[PIPELINE_ORACLE_ACCUM_F32];
+    vk_pipeline_bind(cmd_buf, pipeline, desc_set_idx);
+    pc.d_model = vector_dim;
+    pc.stride_0 = (uint32_t)(dst_offset / sizeof(float));
+    vk_pipeline_dispatch(cmd_buf,
+                         pipeline,
+                         &pc,
+                         ceil_div(vector_dim, 256),
+                         1,
+                         1);
+    return 0;
+}
+
+static int record_ffn_activation_phase(const ffn_phase_ctx_t *ctx,
+                                       vk_kernel_push_constants_t *pc,
+                                       uint32_t d_model,
+                                       uint32_t d_ff)
+{
+    vk_gpu_scratchpad_t *sp = NULL;
+    const sdt_entry_t *S = NULL;
+    int ekt = 0;
+    uint32_t *qidx = NULL;
+    uint32_t qcap = 0u;
+
+    if (!ctx || !pc) {
+        return -1;
+    }
+
+    sp = ctx->scratchpad;
+    S = ctx->slots;
+    ekt = ctx->enable_kernel_timing;
+    qidx = ctx->query_idx_io;
+    qcap = ctx->query_capacity;
+
+    pc->d_model = d_model;
+    pc->num_heads = d_ff;
+    pc->stride_0 = d_model;
+    pc->stride_1 = ctx->proj_mode.use_gemm ? d_ff : 0;
+    if (ctx->bd->proj_weights_bf16) {
+        const vk_compute_pipeline_t *fused_pipe =
+            &ctx->bd->pipelines[PIPELINE_FFN_GEGLU_W16A32];
+
+        /* The fused shader interprets stride_0/stride_1 as gate/up weight row
+         * strides, not GEMM output strides. Using d_ff here breaks prompt prefill
+         * because the up-projection weights are walked with the wrong row width. */
+        pc->stride_0 = d_model;
+        pc->stride_1 = d_model;
+        vkCmdBindPipeline(ctx->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          fused_pipe->pipeline);
+        vkCmdBindDescriptorSets(ctx->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                fused_pipe->pipeline_layout, 0, 1,
+                                &S[SDT_SLOT_GATE_PROJ].ds, 0, NULL);
+        vk_pipeline_dispatch(ctx->cmd_buf, fused_pipe, pc,
+                             d_ff, (uint32_t)ctx->batch_size, 1);
+        if (oracle_capture_or_barrier(&ctx->oracle_ctx,
+                                      CAPTURE_TARGET_DOWN_INPUT,
+                                      &sp->ffn_value) != 0) {
+            return -1;
+        }
+        kts_maybe(ctx->cmd_buf, ctx->bd, ekt, qidx, qcap); /* stage 12 fused gate_geglu */
+        kts_maybe(ctx->cmd_buf, ctx->bd, ekt, qidx, qcap); /* stage 13 (zero-dur, was geglu) */
+        return 0;
+    }
+
+    proj_dispatch(ctx->cmd_buf,
+                  ctx->bd,
+                  &S[SDT_SLOT_GATE_PROJ],
+                  &ctx->proj_mode,
+                  d_ff,
+                  pc);
+    pc->num_heads = d_ff;
+    proj_dispatch(ctx->cmd_buf,
+                  ctx->bd,
+                  &S[SDT_SLOT_UP_PROJ],
+                  &ctx->proj_mode,
+                  d_ff,
+                  pc);
+    barrier_bufs2(ctx->cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  sp->ffn_value.buffer, sp->attn_output.buffer);
+    kts_maybe(ctx->cmd_buf, ctx->bd, ekt, qidx, qcap); /* stage 12 gate/up proj */
+
+    pc->stride_0 = 0;
+    pc->stride_1 = 0;
+    sdt_bind(ctx->cmd_buf, &S[SDT_SLOT_GELU], ctx->bd);
+    vk_pipeline_dispatch(ctx->cmd_buf,
+                         &ctx->bd->pipelines[S[SDT_SLOT_GELU].pipeline_idx],
+                         pc,
+                         ceil_div((uint32_t)ctx->batch_size * d_ff, 256),
+                         1,
+                         1);
+    if (oracle_capture_or_barrier(&ctx->oracle_ctx,
+                                  CAPTURE_TARGET_DOWN_INPUT,
+                                  &sp->ffn_value) != 0) {
+        return -1;
+    }
+    kts_maybe(ctx->cmd_buf, ctx->bd, ekt, qidx, qcap); /* stage 13 geglu */
+    return 0;
+}
 
 /*
  * record_qkv_attn_phase: pre-attn norm, Q/K/V proj, QK-norm
  * Part of record_transformer_layer (split for complexity compliance).
  */
-static void record_qkv_attn_phase(
+static int record_qkv_attn_phase(
     VkCommandBuffer cmd_buf, backend_vulkan_session_data_t *bd,
     const gemma3_270m_config_t *cfg, int layer_idx,
     const record_layer_params_t *p, vk_kernel_push_constants_t *pc)
 {
+    SAPPHIRE_TRACY_VK_ZONE_SCOPE(tracy_gpu_zone,
+                                 bd ? bd->tracy_vk_context : NULL,
+                                 cmd_buf,
+                                 "vk_qkv_attn_phase");
     vk_gpu_scratchpad_t *sp = &bd->scratchpad;
     const sdt_entry_t   *S  = bd->sdt.layer_sets[layer_idx];
+    const oracle_capture_ctx_t oracle_ctx = {
+        .cmd_buf = cmd_buf,
+        .bd = bd,
+        .cfg = cfg,
+        .layer_idx = layer_idx,
+        .capture_oracle = p->capture_oracle
+    };
     uint32_t d_model = (uint32_t)cfg->hidden_size;
     uint32_t d_inner = (uint32_t)(cfg->num_attention_heads * cfg->head_dim);
     uint32_t d_kv    = (uint32_t)(cfg->num_key_value_heads * cfg->head_dim);
@@ -1933,7 +2526,12 @@ static void record_qkv_attn_phase(
     sdt_bind(cmd_buf, &S[SDT_SLOT_PRE_ATTN_NORM], bd);
     vk_pipeline_dispatch(cmd_buf, &bd->pipelines[S[SDT_SLOT_PRE_ATTN_NORM].pipeline_idx],
                          pc, (uint32_t)batch_size, 1, 1);
-    barrier_buf(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->norm_buf.buffer);
+    if (oracle_capture_or_barrier(&oracle_ctx,
+                                  CAPTURE_TARGET_QKV_INPUT,
+                                  &sp->norm_buf) != 0) {
+        sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+        return -1;
+    }
     kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 1 pre-attn norm */
 
     pc->stride_0 = d_model; pc->stride_1 = use_gemm ? d_inner : 0;
@@ -1952,6 +2550,9 @@ static void record_qkv_attn_phase(
                          pc, num_q + num_kv, (uint32_t)batch_size, 1);
     barrier_bufs2(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->q_proj.buffer, sp->k_proj.buffer);
     kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 3 qk norm */
+
+    sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+    return 0;
 }
 
 static void vk_kv_pager_touch_layer_window(backend_vulkan_session_data_t *bd,
@@ -1984,13 +2585,24 @@ static void vk_kv_pager_touch_layer_window(backend_vulkan_session_data_t *bd,
  * record_rope_attn_phase: RoPE, KV-cache write, attention, O-proj,
  * post-attn norm, and attention residual add.
  */
-static void record_rope_attn_phase(
+static int record_rope_attn_phase(
     VkCommandBuffer cmd_buf, backend_vulkan_session_data_t *bd,
     const gemma3_270m_config_t *cfg, int layer_idx,
     const record_layer_params_t *p, vk_kernel_push_constants_t *pc)
 {
+    SAPPHIRE_TRACY_VK_ZONE_SCOPE(tracy_gpu_zone,
+                                 bd ? bd->tracy_vk_context : NULL,
+                                 cmd_buf,
+                                 "vk_rope_attn_phase");
     vk_gpu_scratchpad_t *sp = &bd->scratchpad;
     const sdt_entry_t   *S  = bd->sdt.layer_sets[layer_idx];
+    const oracle_capture_ctx_t oracle_ctx = {
+        .cmd_buf = cmd_buf,
+        .bd = bd,
+        .cfg = cfg,
+        .layer_idx = layer_idx,
+        .capture_oracle = p->capture_oracle
+    };
     uint32_t d_model  = (uint32_t)cfg->hidden_size;
     uint32_t d_inner  = (uint32_t)(cfg->num_attention_heads * cfg->head_dim);
     uint32_t num_q    = (uint32_t)cfg->num_attention_heads;
@@ -2028,11 +2640,19 @@ static void record_rope_attn_phase(
 
     pc->num_heads = num_q; pc->stride_0 = num_kv;
     pc->stride_1  = (uint32_t)cfg->sliding_window;
-    pc->reserved[0] = (uint32_t)(cfg->layer_types_mask & 0xFFFFFFFF);
+    /* Pass the single precomputed bit for this layer (0=local, 1=global).
+     * Avoids the SPIR-V UB of shifting a 32-bit uint by >= 32 for layer_idx >= 32
+     * (affects 4B layers 32-33 and any model with > 31 layers). */
+    pc->reserved[0] = (uint32_t)((cfg->layer_types_mask >> (unsigned)layer_idx) & 1ULL);
     sdt_bind(cmd_buf, &S[SDT_SLOT_ATTENTION], bd);
     vk_pipeline_dispatch(cmd_buf, &bd->pipelines[S[SDT_SLOT_ATTENTION].pipeline_idx],
                          pc, num_q, (uint32_t)batch_size, 1);
-    barrier_buf(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->attn_output.buffer);
+    if (oracle_capture_or_barrier(&oracle_ctx,
+                                  CAPTURE_TARGET_OUT_INPUT,
+                                  &sp->attn_output) != 0) {
+        sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+        return -1;
+    }
     kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 7 attention */
 
     pc->d_model = d_inner; pc->stride_0 = d_inner; pc->stride_1 = use_gemm ? d_model : 0;
@@ -2054,19 +2674,33 @@ static void record_rope_attn_phase(
                          pc, ceil_div(pc->stride_0, 256), 1, 1);
     barrier_buf(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->residual.buffer);
     kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 10 attn residual */
+
+    sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+    return 0;
 }
 
 /*
  * record_ffn_phase: pre-FFN norm, gate/up proj, GeGLU, down proj,
  * post-FFN norm, and FFN residual add.
  */
-static void record_ffn_phase(
+static int record_ffn_phase(
     VkCommandBuffer cmd_buf, backend_vulkan_session_data_t *bd,
     const gemma3_270m_config_t *cfg, int layer_idx,
     const record_layer_params_t *p, vk_kernel_push_constants_t *pc)
 {
+    SAPPHIRE_TRACY_VK_ZONE_SCOPE(tracy_gpu_zone,
+                                 bd ? bd->tracy_vk_context : NULL,
+                                 cmd_buf,
+                                 "vk_ffn_phase");
     vk_gpu_scratchpad_t *sp = &bd->scratchpad;
     const sdt_entry_t   *S  = bd->sdt.layer_sets[layer_idx];
+    const oracle_capture_ctx_t oracle_ctx = {
+        .cmd_buf = cmd_buf,
+        .bd = bd,
+        .cfg = cfg,
+        .layer_idx = layer_idx,
+        .capture_oracle = p->capture_oracle
+    };
     uint32_t d_model  = (uint32_t)cfg->hidden_size;
     uint32_t d_ff     = (uint32_t)cfg->intermediate_size;
     int batch_size    = p->batch_size;
@@ -2076,28 +2710,35 @@ static void record_ffn_phase(
     bool use_gemm     = (batch_size > 1);
     int proj_pipeline = use_gemm ? PIPELINE_GEMM_F32 : PIPELINE_GEMV_F32;
     const proj_mode_t _pm = { proj_pipeline, (int)use_gemm, batch_size };
+    const ffn_phase_ctx_t ffn_ctx = {
+        .cmd_buf = cmd_buf,
+        .bd = bd,
+        .slots = S,
+        .scratchpad = sp,
+        .oracle_ctx = oracle_ctx,
+        .proj_mode = _pm,
+        .batch_size = batch_size,
+        .enable_kernel_timing = ekt,
+        .query_idx_io = qidx,
+        .query_capacity = qcap
+    };
 
     pc->stride_0 = d_model; pc->d_model = d_model;
     sdt_bind(cmd_buf, &S[SDT_SLOT_PRE_FFN_NORM], bd);
     vk_pipeline_dispatch(cmd_buf, &bd->pipelines[S[SDT_SLOT_PRE_FFN_NORM].pipeline_idx],
                          pc, (uint32_t)batch_size, 1, 1);
-    barrier_buf(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->ffn_gate.buffer);
+    if (oracle_capture_or_barrier(&oracle_ctx,
+                                  CAPTURE_TARGET_FFN_INPUT,
+                                  &sp->ffn_gate) != 0) {
+        sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+        return -1;
+    }
     kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 11 pre-ffn norm */
 
-    pc->d_model = d_model; pc->num_heads = d_ff;
-    pc->stride_0 = d_model; pc->stride_1 = use_gemm ? d_ff : 0;
-    proj_dispatch(cmd_buf, bd, &S[SDT_SLOT_GATE_PROJ], &_pm, d_ff, pc);
-    pc->num_heads = d_ff;
-    proj_dispatch(cmd_buf, bd, &S[SDT_SLOT_UP_PROJ], &_pm, d_ff, pc);
-    barrier_bufs2(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->ffn_value.buffer, sp->attn_output.buffer);
-    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 12 gate/up proj */
-
-    pc->stride_0 = 0; pc->stride_1 = 0;
-    sdt_bind(cmd_buf, &S[SDT_SLOT_GELU], bd);
-    vk_pipeline_dispatch(cmd_buf, &bd->pipelines[S[SDT_SLOT_GELU].pipeline_idx],
-                         pc, ceil_div((uint32_t)batch_size * d_ff, 256), 1, 1);
-    barrier_buf(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, sp->ffn_value.buffer);
-    kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 13 geglu */
+    if (record_ffn_activation_phase(&ffn_ctx, pc, d_model, d_ff) != 0) {
+        sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+        return -1;
+    }
 
     pc->d_model = d_ff; pc->num_heads = d_model;
     pc->stride_0 = d_ff; pc->stride_1 = use_gemm ? d_model : 0;
@@ -2117,6 +2758,9 @@ static void record_ffn_phase(
     vk_pipeline_dispatch(cmd_buf, &bd->pipelines[S[SDT_SLOT_FFN_RESIDUAL].pipeline_idx],
                          pc, ceil_div(pc->stride_0, 256), 1, 1);
     kts_maybe(cmd_buf, bd, ekt, qidx, qcap); /* stage 16 ffn residual/end */
+
+    sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+    return 0;
 }
 
 static int record_transformer_layer(
@@ -2126,15 +2770,21 @@ static int record_transformer_layer(
     int layer_idx,
     const record_layer_params_t *p)
 {
+    SAPPHIRE_TRACY_VK_ZONE_SCOPE(tracy_gpu_zone,
+                                 bd ? bd->tracy_vk_context : NULL,
+                                 cmd_buf,
+                                 "vk_transformer_layer");
     int batch_size           = p->batch_size;
     int start_pos            = p->start_pos;
     if (!cmd_buf || !bd || !cfg) {
         LOG_ERROR("Invalid arguments to record_transformer_layer");
+        sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
         return -1;
     }
 
     if (layer_idx < 0 || layer_idx >= bd->sdt.num_layers) {
         LOG_ERROR("layer_idx=%d out of SDT range [0,%d)", layer_idx, bd->sdt.num_layers);
+        sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
         return -1;
     }
 
@@ -2147,10 +2797,20 @@ static int record_transformer_layer(
     pc.max_seq_len = (uint32_t)bd->kv_cache.max_seq_len;
 
     /* Dispatch attention + FFN via extracted sub-functions */
-    record_qkv_attn_phase(cmd_buf, bd, cfg, layer_idx, p, &pc);
-    record_rope_attn_phase(cmd_buf, bd, cfg, layer_idx, p, &pc);
-    record_ffn_phase(cmd_buf, bd, cfg, layer_idx, p, &pc);
+    if (record_qkv_attn_phase(cmd_buf, bd, cfg, layer_idx, p, &pc) != 0) {
+        sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+        return -1;
+    }
+    if (record_rope_attn_phase(cmd_buf, bd, cfg, layer_idx, p, &pc) != 0) {
+        sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+        return -1;
+    }
+    if (record_ffn_phase(cmd_buf, bd, cfg, layer_idx, p, &pc) != 0) {
+        sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+        return -1;
+    }
 
+    sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
     return 0;
 }
 
@@ -2179,12 +2839,124 @@ typedef struct {
     int emit_lmhead;
     int emit_argmax;
     int copy_embeddings_from_staging;
+    int capture_oracle;
 } vk_fwd_opts_t;
+
+static int oracle_capture_copy_target(VkCommandBuffer cmd_buf,
+                                      backend_vulkan_session_data_t *bd,
+                                      const gemma3_270m_config_t *cfg,
+                                      int layer_idx,
+                                      capture_target_t target,
+                                      const vk_buffer_t *src_buffer)
+{
+    const vk_barrier_cfg_t barrier_cfg = {
+        .src_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        .dst_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        .src_access = VK_ACCESS_SHADER_WRITE_BIT,
+        .dst_access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT
+    };
+    size_t dst_offset = 0u;
+    uint32_t vector_dim = 0u;
+    VkBufferCopy copy_region = {0};
+
+    if (!cmd_buf || !bd || !cfg || !src_buffer || !src_buffer->buffer) {
+        return -1;
+    }
+    const VkBuffer buffers[1] = { src_buffer->buffer };
+    if (ternary_hessian_oracle_capture_view(cfg,
+                                            layer_idx,
+                                            target,
+                                            &dst_offset,
+                                            &vector_dim) != 0) {
+        LOG_ERROR("Vulkan oracle capture: invalid capture target for layer %d", layer_idx);
+        return -1;
+    }
+    if (dst_offset + (size_t)vector_dim * sizeof(float) > bd->download_staging.size) {
+        LOG_ERROR("Vulkan oracle capture: download staging is too small");
+        return -1;
+    }
+
+    vk_pipeline_barrier_compute(cmd_buf, buffers, 1, &barrier_cfg);
+
+    copy_region.srcOffset = 0;
+    copy_region.dstOffset = (VkDeviceSize)dst_offset;
+    copy_region.size = (VkDeviceSize)((size_t)vector_dim * sizeof(float));
+    vkCmdCopyBuffer(cmd_buf,
+                    src_buffer->buffer,
+                    bd->download_staging.buffer,
+                    1,
+                    &copy_region);
+    if (bd->oracle_hessian_active &&
+        oracle_accumulate_capture_target(cmd_buf, bd, cfg, layer_idx, target) != 0) {
+        LOG_ERROR("Vulkan oracle capture: failed to accumulate Hessian target for layer %d", layer_idx);
+        return -1;
+    }
+    return 0;
+}
 
 /**
  * Record the LM-head block (final RMSNorm + vocab projection + optional argmax).
  * Extracted to reduce NLOC and token count of vulkan_record_forward_pass.
  */
+static void record_lmhead_output_block(backend_vulkan_session_data_t *bd,
+                                       const gemma3_270m_config_t *cfg,
+                                       const vk_fwd_opts_t *opts,
+                                       vk_kernel_push_constants_t *pc)
+{
+    if (opts->emit_argmax) {
+        vk_buffer_barrier(bd->cmd_buffer,
+                          bd->lm_head_logits.buffer,
+                          VK_ACCESS_SHADER_WRITE_BIT,
+                          VK_ACCESS_SHADER_READ_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        pc->stride_0 = (uint32_t)cfg->vocab_size;
+        pc->stride_1 = (uint32_t)cfg->vocab_size;
+        sdt_bind(bd->cmd_buffer, &bd->sdt.lmhead_argmax, bd);
+        vk_pipeline_dispatch(bd->cmd_buffer,
+                            &bd->pipelines[bd->sdt.lmhead_argmax.pipeline_idx],
+                            pc, (uint32_t)opts->batch_size, 1, 1);
+
+        vk_buffer_barrier(bd->cmd_buffer,
+                          bd->selected_token_ids.buffer,
+                          VK_ACCESS_SHADER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT);
+        return;
+    }
+
+    vk_buffer_barrier(bd->cmd_buffer,
+                      bd->lm_head_logits.buffer,
+                      VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_ACCESS_TRANSFER_READ_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    size_t logits_bytes = (size_t)cfg->vocab_size * sizeof(float);
+    if (bd->download_staging.buffer != VK_NULL_HANDLE &&
+        logits_bytes <= bd->download_staging.size) {
+        VkBufferCopy logits_copy = {
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = logits_bytes
+        };
+        vkCmdCopyBuffer(bd->cmd_buffer,
+                        bd->lm_head_logits.buffer,
+                        bd->download_staging.buffer,
+                        1,
+                        &logits_copy);
+
+        vk_buffer_barrier(bd->cmd_buffer,
+                          bd->download_staging.buffer,
+                          VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT);
+    }
+}
+
 static void record_lmhead_block(
     backend_vulkan_session_data_t *bd,
     const gemma3_270m_config_t    *cfg,
@@ -2192,6 +2964,7 @@ static void record_lmhead_block(
     int                            timing_active,
     uint32_t                      *query_idx)
 {
+    SAPPHIRE_TRACY_VK_ZONE_SCOPE(tracy_gpu_zone, bd->tracy_vk_context, bd->cmd_buffer, "vk_lmhead_block");
     if (timing_active && (*query_idx + 1) < bd->timing_query_capacity)
         vkCmdWriteTimestamp(bd->cmd_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                             bd->timing_query_pool, (*query_idx)++);
@@ -2208,6 +2981,7 @@ static void record_lmhead_block(
     pc.batch_size = 1;
     pc.d_model    = (uint32_t)cfg->hidden_size;
     pc.stride_0   = (uint32_t)cfg->hidden_size;
+    memcpy(&pc.reserved[1], &cfg->rms_norm_eps, sizeof(float));
 
     sdt_bind(bd->cmd_buffer, &bd->sdt.lmhead_norm, bd);
     vk_pipeline_dispatch(bd->cmd_buffer,
@@ -2227,7 +3001,12 @@ static void record_lmhead_block(
     pc.stride_1  = 0;
     pc.num_heads = (uint32_t)cfg->vocab_size;
     if (opts->emit_argmax && opts->batch_size == 1) {
-        const vk_compute_pipeline_t *decode_pipe = &bd->pipelines[PIPELINE_LMHEAD_DECODE_F32];
+        /* Decode path: one workgroup per vocab row.
+         * Use W16A32 when the embedding table stayed in BF16 on GPU. */
+        const int decode_pipe_idx = bd->emb_weights_bf16
+                                    ? PIPELINE_LMHEAD_DECODE_W16A32
+                                    : PIPELINE_LMHEAD_DECODE_F32;
+        const vk_compute_pipeline_t *decode_pipe = &bd->pipelines[decode_pipe_idx];
         const uint32_t max_groups_x = 65535u;
         const uint32_t groups_x = (uint32_t)cfg->vocab_size < max_groups_x
                                 ? (uint32_t)cfg->vocab_size
@@ -2239,7 +3018,11 @@ static void record_lmhead_block(
                                 decode_pipe->pipeline_layout, 0, 1, &bd->sdt.lmhead_proj.ds, 0, NULL);
         vk_pipeline_dispatch(bd->cmd_buffer, decode_pipe, &pc, groups_x, groups_y, 1);
     } else {
-        const vk_compute_pipeline_t *gemm_pipe = &bd->pipelines[PIPELINE_GEMM_F32];
+        /* Prefill path: tiled GEMM — also select W16A32 when embedding is BF16. */
+        const int gemm_pipe_idx = bd->emb_weights_bf16
+                                  ? PIPELINE_GEMM_W16A32
+                                  : PIPELINE_GEMM_F32;
+        const vk_compute_pipeline_t *gemm_pipe = &bd->pipelines[gemm_pipe_idx];
         vkCmdBindPipeline(bd->cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, gemm_pipe->pipeline);
         vkCmdBindDescriptorSets(bd->cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 gemm_pipe->pipeline_layout, 0, 1, &bd->sdt.lmhead_proj.ds, 0, NULL);
@@ -2248,61 +3031,13 @@ static void record_lmhead_block(
                              ceil_div((uint32_t)pc.batch_size, 16), 1);
     }
 
-    if (opts->emit_argmax) {
-        vk_buffer_barrier(bd->cmd_buffer,
-                          bd->lm_head_logits.buffer,
-                          VK_ACCESS_SHADER_WRITE_BIT,
-                          VK_ACCESS_SHADER_READ_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-        pc.stride_0 = (uint32_t)cfg->vocab_size;
-        pc.stride_1 = (uint32_t)cfg->vocab_size;
-        sdt_bind(bd->cmd_buffer, &bd->sdt.lmhead_argmax, bd);
-        vk_pipeline_dispatch(bd->cmd_buffer,
-                            &bd->pipelines[bd->sdt.lmhead_argmax.pipeline_idx],
-                            &pc, (uint32_t)opts->batch_size, 1, 1);
-
-        vk_buffer_barrier(bd->cmd_buffer,
-                          bd->selected_token_ids.buffer,
-                          VK_ACCESS_SHADER_WRITE_BIT,
-                          VK_ACCESS_HOST_READ_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_HOST_BIT);
-    } else {
-        vk_buffer_barrier(bd->cmd_buffer,
-                          bd->lm_head_logits.buffer,
-                          VK_ACCESS_SHADER_WRITE_BIT,
-                          VK_ACCESS_TRANSFER_READ_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-        size_t logits_bytes = (size_t)cfg->vocab_size * sizeof(float);
-        if (bd->download_staging.buffer != VK_NULL_HANDLE &&
-            logits_bytes <= bd->download_staging.size) {
-            VkBufferCopy logits_copy = {
-                .srcOffset = 0,
-                .dstOffset = 0,
-                .size = logits_bytes
-            };
-            vkCmdCopyBuffer(bd->cmd_buffer,
-                            bd->lm_head_logits.buffer,
-                            bd->download_staging.buffer,
-                            1,
-                            &logits_copy);
-
-            vk_buffer_barrier(bd->cmd_buffer,
-                              bd->download_staging.buffer,
-                              VK_ACCESS_TRANSFER_WRITE_BIT,
-                              VK_ACCESS_HOST_READ_BIT,
-                              VK_PIPELINE_STAGE_TRANSFER_BIT,
-                              VK_PIPELINE_STAGE_HOST_BIT);
-        }
-    }
+    record_lmhead_output_block(bd, cfg, opts, &pc);
 
     if (timing_active && (*query_idx) < bd->timing_query_capacity)
         vkCmdWriteTimestamp(bd->cmd_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                             bd->timing_query_pool, (*query_idx)++);
+
+    sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
 }
 
 static int vulkan_record_forward_pass(
@@ -2310,6 +3045,9 @@ static int vulkan_record_forward_pass(
     const gemma3_270m_config_t    *cfg,
     const vk_fwd_opts_t           *opts)
 {
+    static const sapphire_tracy_source_location_t tracy_vk_forward_srcloc = {
+        "vk_forward_pass", __func__, __FILE__, (uint32_t)__LINE__, 0u
+    };
     int batch_size  = opts->batch_size;
     int start_pos   = opts->start_pos;
     int emit_lmhead = opts->emit_lmhead;
@@ -2328,6 +3066,11 @@ static int vulkan_record_forward_pass(
         LOG_ERROR("Failed to begin command buffer: %d", vr);
         return -1;
     }
+
+    sapphire_tracy_vk_zone_t tracy_gpu_zone =
+        sapphire_tracy_vk_zone_begin_static(bd->tracy_vk_context,
+                                            bd->cmd_buffer,
+                                            &tracy_vk_forward_srcloc);
 
     if (timing_active && bd->timing_query_capacity > 0) {
         vkCmdResetQueryPool(bd->cmd_buffer, bd->timing_query_pool, 0, bd->timing_query_capacity);
@@ -2372,11 +3115,13 @@ static int vulkan_record_forward_pass(
         record_layer_params_t _rlp = {
             .batch_size = batch_size, .start_pos = start_pos,
             .enable_kernel_timing = enable_kernel_timing,
+            .capture_oracle = opts->capture_oracle,
             .query_idx_io = &query_idx, .query_capacity = bd->timing_query_capacity
         };
         int rc = record_transformer_layer(bd->cmd_buffer, bd, cfg, L, &_rlp);
         if (rc != 0) {
             LOG_ERROR("Failed to record layer %d commands", L);
+            sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
             vkEndCommandBuffer(bd->cmd_buffer);
             return -1;
         }
@@ -2406,13 +3151,25 @@ static int vulkan_record_forward_pass(
     /* ----------------------------------------------------------------
      * LM-Head: Final RMSNorm + Vocabulary Projection
      *
-     * After 18 layers the final hidden state lives in:
-     *   hidden[num_layers % 2]  (= hidden[0] for 18 layers)
+     * After num_layers the final hidden state lives in:
+     *   hidden[num_layers % 2]  (ping-pong result)
      * This buffer handle was baked into sdt.lmhead_norm at init time.
      * ---------------------------------------------------------------- */
     if (emit_lmhead) {
         record_lmhead_block(bd, cfg, opts, timing_active, &query_idx);
     }
+
+    if (opts->capture_oracle) {
+        vk_buffer_barrier(bd->cmd_buffer,
+                          bd->download_staging.buffer,
+                          VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT);
+    }
+
+    sapphire_tracy_vk_zone_end(&tracy_gpu_zone);
+    sapphire_tracy_vk_collect(bd->tracy_vk_context, bd->cmd_buffer);
 
     bd->timing_query_last_count = timing_active ? query_idx : 0;
 
@@ -2564,7 +3321,14 @@ static void run_debug_checkpoints(
             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
         };
         vkBeginCommandBuffer(bd->cmd_buffer, &dbg_begin);
-        { record_layer_params_t _cp2p = {1,0,0,NULL,0};
+                { record_layer_params_t _cp2p = {
+                            .batch_size = 1,
+                            .start_pos = 0,
+                            .enable_kernel_timing = 0,
+                            .capture_oracle = 0,
+                            .query_idx_io = NULL,
+                            .query_capacity = 0
+                    };
           record_transformer_layer(bd->cmd_buffer, bd, cfg, 0, &_cp2p); }
         vkEndCommandBuffer(bd->cmd_buffer);
                 vkResetFences(bd->device, 1, &bd->compute_fence);
@@ -2602,7 +3366,14 @@ static void run_debug_checkpoints(
     for (int N = 1; N <= num_layers; N++) {
         cp25_restore_embedding(bd, &lp_begin, &emb_region, emb_barrier_buf);
         for (int l = 0; l < N; l++) {
-            record_layer_params_t _cp25p = {1,0,0,NULL,0};
+            record_layer_params_t _cp25p = {
+                .batch_size = 1,
+                .start_pos = 0,
+                .enable_kernel_timing = 0,
+                .capture_oracle = 0,
+                .query_idx_io = NULL,
+                .query_capacity = 0
+            };
             record_transformer_layer(bd->cmd_buffer, bd, cfg, l, &_cp25p);
         }
         vkEndCommandBuffer(bd->cmd_buffer);
@@ -2768,9 +3539,12 @@ static int submit_embedding_transfer(
     const gemma3_270m_config_t *cfg,
     const int *token_ids, int batch_size)
 {
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "vk_embedding_transfer");
     size_t embed_size = (size_t)batch_size * cfg->hidden_size * sizeof(float);
+    sapphire_tracy_zone_value(&tracy_zone, (uint64_t)batch_size);
     if (!bd->embedding_staging_mapped) {
         LOG_ERROR("Persistent staging mapping is NULL");
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
     sapphire_embed_lookup_batch(session, token_ids, batch_size, (float*)bd->embedding_staging_mapped);
@@ -2778,17 +3552,20 @@ static int submit_embedding_transfer(
     VkResult vr = vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed waiting for transfer fence: %d", (int)vr);
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
     vr = vkResetFences(bd->device, 1, &bd->transfer_fence);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to reset transfer fence: %d", (int)vr);
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
 
     vr = vkResetCommandBuffer(bd->transfer_cmd, 0);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to reset transfer command buffer: %d", (int)vr);
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
     VkCommandBufferBeginInfo begin_xfer = {
@@ -2798,6 +3575,7 @@ static int submit_embedding_transfer(
     vr = vkBeginCommandBuffer(bd->transfer_cmd, &begin_xfer);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to begin transfer command buffer: %d", (int)vr);
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
     VkBufferCopy copy_region = { .srcOffset = 0, .dstOffset = 0, .size = embed_size };
@@ -2815,6 +3593,7 @@ static int submit_embedding_transfer(
     vr = vkEndCommandBuffer(bd->transfer_cmd);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to end transfer command buffer: %d", (int)vr);
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
 
@@ -2844,12 +3623,14 @@ static int submit_embedding_transfer(
     vr = vkQueueSubmit(bd->compute_queue, 1, &submit_xfer, bd->transfer_fence);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to submit transfer command: %d", (int)vr);
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
 
     if (pager_ops > 0u) {
         LOG_DEBUG("Vulkan KV pager transfer ops submitted: %u", pager_ops);
     }
+    sapphire_tracy_zone_end(&tracy_zone);
     return 0;
 }
 
@@ -2884,7 +3665,9 @@ static int execute_gpu_forward(backend_vulkan_session_data_t *bd,
         si.pWaitDstStageMask = &wait_stage;
     }
 
+    SAPPHIRE_TRACY_ZONE_SCOPE(submit_zone, "vk_queue_submit");
     VkResult vr_submit = vkQueueSubmit(bd->compute_queue, 1, &si, bd->compute_fence);
+    sapphire_tracy_zone_end(&submit_zone);
     if (vr_submit != VK_SUCCESS) {
         LOG_ERROR("Failed to submit command buffer to GPU queue: %d", (int)vr_submit);
         return -1;
@@ -2893,8 +3676,10 @@ static int execute_gpu_forward(backend_vulkan_session_data_t *bd,
     *out_record_ms = monotonic_ms() - t_stage_ms;
 
     if (wait_for_fence) {
+        SAPPHIRE_TRACY_ZONE_SCOPE(wait_zone, "vk_compute_fence_wait");
         double t_wait_start = monotonic_ms();
         vr = vkWaitForFences(bd->device, 1, &bd->compute_fence, VK_TRUE, UINT64_MAX);
+        sapphire_tracy_zone_end(&wait_zone);
         if (vr != VK_SUCCESS) {
             LOG_ERROR("GPU execution fence wait failed: %d", (int)vr);
             return -1;
@@ -2910,10 +3695,12 @@ static int download_forward_logits(backend_vulkan_session_data_t *bd,
                                    float                         *logits,
                                    double                        *out_download_ms)
 {
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "vk_download_logits");
     double t0 = monotonic_ms();
     size_t logits_size = (size_t)cfg->vocab_size * sizeof(float);
     if (!bd->download_staging_mapped || logits_size > bd->download_staging.size) {
         LOG_ERROR("Persistent download staging is unavailable or too small");
+        sapphire_tracy_zone_end(&tracy_zone);
         return -1;
     }
     memcpy(logits, bd->download_staging_mapped, logits_size);
@@ -2927,6 +3714,7 @@ static int download_forward_logits(backend_vulkan_session_data_t *bd,
         probe_buf(bd, &bd->scratchpad.norm_buf, 64, "CP3_lmhead_norm_out");
         LOG_INFO("[DBG] CP3: span<1 → final hidden near-zero (residual collapse) | span>100 → activation explosion");
     }
+    sapphire_tracy_zone_end(&tracy_zone);
     return 0;
 }
 
@@ -2944,6 +3732,22 @@ static int vulkan_forward_batch(inference_session_t* session, const int* token_i
     if (!cfg) {
         LOG_ERROR("Model config is NULL in vulkan_forward_batch");
         return -1;
+    }
+
+    /* Batched prefill with Vulkan KV paging is currently unstable on RADV
+     * for longer prompts (device loss during the prefill submit). Fall back
+     * to token-serial prefill when paging is enabled; keep decode (batch=1)
+     * on the fast GPU path. If logits are requested, only the final token's
+     * logits are materialized, which matches current caller expectations. */
+    if (bd->kv_pager && batch_size > 1) {
+        for (int i = 0; i < batch_size; ++i) {
+            float *iter_logits = (logits && i == (batch_size - 1)) ? logits : NULL;
+            if (vulkan_forward_batch(session, token_ids + i, start_pos + i, 1, iter_logits) != 0) {
+                LOG_ERROR("Paged Vulkan serial prefill failed at batch index %d", i);
+                return -1;
+            }
+        }
+        return 0;
     }
 
     /* Verify GPU resources are ready */
@@ -2984,9 +3788,11 @@ static int vulkan_forward_batch(inference_session_t* session, const int* token_i
 
     run_debug_checkpoints(bd, session, cfg, token_ids, start_pos, num_layers);
     /* Reset command buffer before recording the new forward pass */
+    SAPPHIRE_TRACY_ZONE_SCOPE(record_zone, "vk_command_buffer_record");
     VkResult vr = vkResetCommandBuffer(bd->cmd_buffer, 0);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to reset command buffer: %d", (int)vr);
+        sapphire_tracy_zone_end(&record_zone);
         return -1;
     }
 
@@ -3001,13 +3807,16 @@ static int vulkan_forward_batch(inference_session_t* session, const int* token_i
     vk_fwd_opts_t _fwd_opts = {
         .batch_size = batch_size, .start_pos = start_pos,
         .emit_lmhead = (logits != NULL), .emit_argmax = 0,
-        .copy_embeddings_from_staging = 0
+        .copy_embeddings_from_staging = 0,
+        .capture_oracle = 0
     };
     int rc_rec = vulkan_record_forward_pass(bd, cfg, &_fwd_opts);
     if (rc_rec != 0) {
         LOG_ERROR("Failed to record forward pass command buffer");
+        sapphire_tracy_zone_end(&record_zone);
         return -1;
     }
+    sapphire_tracy_zone_end(&record_zone);
 
     /* ========================================================================
      * GPU Execution: Submit & Wait
@@ -3152,26 +3961,33 @@ static int vulkan_forward_select_batch(inference_session_t* session, const int* 
         LOG_ERROR("Persistent staging mapping is NULL");
         return -1;
     }
+    SAPPHIRE_TRACY_ZONE_SCOPE(staging_zone, "vk_select_staging_prep");
     sapphire_embed_lookup_batch(session, token_ids, batch_size, (float*)bd->embedding_staging_mapped);
+    sapphire_tracy_zone_end(&staging_zone);
 
     transfer_submit_ms = 0.0;
 
+    SAPPHIRE_TRACY_ZONE_SCOPE(record_zone, "vk_command_buffer_record");
     vr = vkResetCommandBuffer(bd->cmd_buffer, 0);
     if (vr != VK_SUCCESS) {
         LOG_ERROR("Failed to reset command buffer: %d", (int)vr);
+        sapphire_tracy_zone_end(&record_zone);
         return -1;
     }
 
     vk_fwd_opts_t _sel_opts = {
         .batch_size = batch_size, .start_pos = start_pos,
         .emit_lmhead = 1, .emit_argmax = 1,
-        .copy_embeddings_from_staging = 1
+        .copy_embeddings_from_staging = 1,
+        .capture_oracle = 0
     };
     int rc_rec = vulkan_record_forward_pass(bd, cfg, &_sel_opts);
     if (rc_rec != 0) {
         LOG_ERROR("Failed to record forward+argmax command buffer");
+        sapphire_tracy_zone_end(&record_zone);
         return -1;
     }
+    sapphire_tracy_zone_end(&record_zone);
 
     if (execute_gpu_forward(bd,
                             1,
@@ -3189,9 +4005,11 @@ static int vulkan_forward_select_batch(inference_session_t* session, const int* 
         LOG_ERROR("Persistent selected-token mapping is NULL");
         return -1;
     }
-    memcpy(selected_ids,
-           bd->selected_token_ids_mapped,
-           (size_t)batch_size * sizeof(int32_t));
+        SAPPHIRE_TRACY_ZONE_SCOPE(readback_zone, "vk_download_selected_ids");
+        memcpy(selected_ids,
+            bd->selected_token_ids_mapped,
+            (size_t)batch_size * sizeof(int32_t));
+        sapphire_tracy_zone_end(&readback_zone);
 
     download_ms = monotonic_ms() - t_download_start_ms;
 
@@ -3337,6 +4155,274 @@ static int transfer_region_host_to_device(backend_vulkan_session_data_t *bd,
     vr = vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
     if (vr != VK_SUCCESS) return -1;
 
+    return 0;
+}
+
+static int clear_oracle_hessian_accum_buffer(backend_vulkan_session_data_t *bd)
+{
+    VkResult vr = VK_SUCCESS;
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &bd->transfer_cmd
+    };
+
+    if (!bd || !bd->oracle_hessian_accum.buffer || bd->oracle_hessian_accum.size == 0u) {
+        return -1;
+    }
+
+    vr = vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkResetFences(bd->device, 1, &bd->transfer_fence);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkResetCommandBuffer(bd->transfer_cmd, 0);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkBeginCommandBuffer(bd->transfer_cmd, &begin);
+    if (vr != VK_SUCCESS) return -1;
+
+    vkCmdFillBuffer(bd->transfer_cmd,
+                    bd->oracle_hessian_accum.buffer,
+                    0,
+                    bd->oracle_hessian_accum.size,
+                    0u);
+    vk_buffer_barrier(bd->transfer_cmd,
+                      bd->oracle_hessian_accum.buffer,
+                      VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    vr = vkEndCommandBuffer(bd->transfer_cmd);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkQueueSubmit(bd->compute_queue, 1, &submit, bd->transfer_fence);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkWaitForFences(bd->device, 1, &bd->transfer_fence, VK_TRUE, UINT64_MAX);
+    if (vr != VK_SUCCESS) return -1;
+    return 0;
+}
+
+static int record_oracle_finalize_buffer(backend_vulkan_session_data_t *bd,
+                                         const gemma3_270m_config_t *cfg,
+                                         const backend_vulkan_oracle_finish_config_t *config)
+{
+    const vk_compute_pipeline_t *pipeline = NULL;
+    VkResult vr = VK_SUCCESS;
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+
+    if (!bd || !cfg || !config || config->sample_count == 0u) {
+        return -1;
+    }
+
+    vr = vkResetCommandBuffer(bd->cmd_buffer, 0);
+    if (vr != VK_SUCCESS) return -1;
+    vr = vkBeginCommandBuffer(bd->cmd_buffer, &begin);
+    if (vr != VK_SUCCESS) return -1;
+
+    vk_buffer_barrier(bd->cmd_buffer,
+                      bd->oracle_hessian_accum.buffer,
+                      VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    pipeline = &bd->pipelines[PIPELINE_ORACLE_FINALIZE_F32];
+    for (int layer_idx = 0; layer_idx < cfg->num_hidden_layers; ++layer_idx) {
+        for (capture_target_t target = CAPTURE_TARGET_QKV_INPUT;
+             target <= CAPTURE_TARGET_DOWN_INPUT;
+             target = (capture_target_t)((int)target + 1)) {
+            vk_kernel_push_constants_t pc = {0};
+            size_t dst_offset = 0u;
+            uint32_t vector_dim = 0u;
+
+            if (ternary_hessian_oracle_capture_view(cfg,
+                                                    layer_idx,
+                                                    target,
+                                                    &dst_offset,
+                                                    &vector_dim) != 0) {
+                return -1;
+            }
+
+            vk_pipeline_bind(bd->cmd_buffer, pipeline, 0);
+            pc.d_model = vector_dim;
+            pc.stride_0 = (uint32_t)(dst_offset / sizeof(float));
+            pc.reserved[0] = config->sample_count;
+            memcpy(&pc.reserved[1], &config->floor, sizeof(float));
+            memcpy(&pc.reserved[2], &config->strength, sizeof(float));
+            vk_pipeline_dispatch(bd->cmd_buffer, pipeline, &pc, 1, 1, 1);
+        }
+    }
+
+    vk_buffer_barrier(bd->cmd_buffer,
+                      bd->oracle_hessian_accum.buffer,
+                      VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_ACCESS_TRANSFER_READ_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT);
+    vr = vkEndCommandBuffer(bd->cmd_buffer);
+    if (vr != VK_SUCCESS) return -1;
+    return 0;
+}
+
+int backend_vulkan_begin_hessian_oracle_capture(inference_session_t *session)
+{
+    backend_vulkan_session_data_t *bd = NULL;
+
+    if (!session || !session->backend || !session->backend_data ||
+        session->backend->type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        return -1;
+    }
+
+    bd = (backend_vulkan_session_data_t *)session->backend_data;
+    if (clear_oracle_hessian_accum_buffer(bd) != 0) {
+        LOG_ERROR("Vulkan oracle capture: failed to clear accumulation buffer");
+        return -1;
+    }
+    bd->oracle_hessian_active = 1;
+    return 0;
+}
+
+int backend_vulkan_finish_hessian_oracle_capture(inference_session_t *session,
+                                                 const backend_vulkan_oracle_finish_config_t *config)
+{
+    backend_vulkan_session_data_t *bd = NULL;
+    const gemma3_270m_config_t *cfg = NULL;
+    double record_ms = 0.0;
+    double wait_ms = 0.0;
+    size_t capture_bytes = 0u;
+
+    if (!session || !session->backend || !session->backend_data || !config ||
+        !config->out_buffer || session->backend->type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        return -1;
+    }
+
+    bd = (backend_vulkan_session_data_t *)session->backend_data;
+    cfg = (const gemma3_270m_config_t *)session->model_spec->variant_config;
+    capture_bytes = ternary_hessian_oracle_capture_bytes(cfg);
+    if (!bd->oracle_hessian_active || capture_bytes == 0u || config->out_size < capture_bytes) {
+        return -1;
+    }
+    if (record_oracle_finalize_buffer(bd, cfg, config) != 0) {
+        LOG_ERROR("Vulkan oracle capture: failed to record finalize pass");
+        return -1;
+    }
+    if (execute_gpu_forward(bd, 1, &record_ms, &wait_ms, monotonic_ms()) != 0) {
+        LOG_ERROR("Vulkan oracle capture: failed to execute finalize pass");
+        return -1;
+    }
+    if (transfer_region_device_to_host(bd,
+                                       bd->oracle_hessian_accum.buffer,
+                                       0,
+                                       config->out_buffer,
+                                       capture_bytes) != 0) {
+        LOG_ERROR("Vulkan oracle capture: failed to read back finalized buffer");
+        return -1;
+    }
+
+    bd->oracle_hessian_active = 0;
+    return 0;
+}
+
+void backend_vulkan_abort_hessian_oracle_capture(inference_session_t *session)
+{
+    backend_vulkan_session_data_t *bd = NULL;
+
+    if (!session || !session->backend || !session->backend_data ||
+        session->backend->type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        return;
+    }
+
+    bd = (backend_vulkan_session_data_t *)session->backend_data;
+    bd->oracle_hessian_active = 0;
+}
+
+int backend_vulkan_capture_last_token_activations(inference_session_t *session,
+                                                  const int *token_ids,
+                                                  int token_count,
+                                                  void *out_capture_buffer,
+                                                  size_t out_capture_size)
+{
+    backend_vulkan_session_data_t *bd = NULL;
+    const gemma3_270m_config_t *cfg = NULL;
+    size_t capture_bytes = 0u;
+    int copy_to_host = (out_capture_buffer != NULL);
+
+    if (!session || !session->backend || !session->backend_data ||
+        !token_ids || token_count <= 0) {
+        return -1;
+    }
+    if (session->backend->type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        LOG_ERROR("Vulkan oracle capture requires a Vulkan session");
+        return -1;
+    }
+
+    bd = (backend_vulkan_session_data_t *)session->backend_data;
+    cfg = (const gemma3_270m_config_t *)session->model_spec->variant_config;
+    capture_bytes = ternary_hessian_oracle_capture_bytes(cfg);
+    if (!copy_to_host && !bd->oracle_hessian_active) {
+        LOG_ERROR("Vulkan oracle capture requires a host output buffer or active oracle recording");
+        return -1;
+    }
+    if (!cfg || capture_bytes == 0u ||
+        capture_bytes > bd->download_staging.size || !bd->download_staging_mapped) {
+        LOG_ERROR("Vulkan oracle capture: invalid capture buffer sizing");
+        return -1;
+    }
+    if (copy_to_host && out_capture_size < capture_bytes) {
+        LOG_ERROR("Vulkan oracle capture: host output buffer is too small");
+        return -1;
+    }
+
+    session->backend->reset(session);
+    for (int token_pos = 0; token_pos < token_count; ++token_pos) {
+        double record_submit_ms = 0.0;
+        double compute_wait_ms = 0.0;
+        double t_stage_ms = monotonic_ms();
+        int capture_oracle = (token_pos == token_count - 1);
+        VkResult vr = VK_SUCCESS;
+        vk_fwd_opts_t capture_opts;
+
+        if (submit_embedding_transfer(bd, session, cfg, token_ids + token_pos, 1) != 0) {
+            return -1;
+        }
+
+        vr = vkResetCommandBuffer(bd->cmd_buffer, 0);
+        if (vr != VK_SUCCESS) {
+            LOG_ERROR("Failed to reset command buffer for oracle capture: %d", (int)vr);
+            return -1;
+        }
+
+        memset(&capture_opts, 0, sizeof(capture_opts));
+        capture_opts.batch_size = 1;
+        capture_opts.start_pos = token_pos;
+        capture_opts.emit_lmhead = 0;
+        capture_opts.emit_argmax = 0;
+        capture_opts.copy_embeddings_from_staging = 0;
+        capture_opts.capture_oracle = capture_oracle;
+
+        if (vulkan_record_forward_pass(bd, cfg, &capture_opts) != 0) {
+            LOG_ERROR("Failed to record Vulkan oracle capture pass");
+            return -1;
+        }
+        if (execute_gpu_forward(bd,
+                                1,
+                                &record_submit_ms,
+                                &compute_wait_ms,
+                                t_stage_ms) != 0) {
+            return -1;
+        }
+        vk_kv_cache_set_seq_pos(&bd->kv_cache, token_pos + 1);
+    }
+
+    if (copy_to_host) {
+        memcpy(out_capture_buffer, bd->download_staging_mapped, capture_bytes);
+    }
     return 0;
 }
 

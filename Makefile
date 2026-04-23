@@ -5,21 +5,63 @@ INCDIR = include
 OUTDIR = out
 ASAN_OUTDIR = out/asan
 
+TRACY_ROOT ?=
+TRACY_HEADER_PATH_CANDIDATES = $(TRACY_ROOT) $(INCDIR)/third_party/tracy/public /usr/include/Tracy /usr/local/include/Tracy /opt/tracy/public /opt/tracy/include /usr/include /usr/local/include
+TRACY_CLIENT_PATH_CANDIDATES = $(TRACY_ROOT) $(INCDIR)/third_party/tracy/public /usr/include/Tracy /usr/local/include/Tracy /opt/tracy/public /opt/tracy/include /usr/include /usr/local/include
+TRACY_LIB_PATH_CANDIDATES = $(TRACY_ROOT)/build $(TRACY_ROOT)/lib /usr/lib /usr/lib64 /usr/local/lib
+TRACY_HEADER_ROOT = $(strip $(shell for p in $(TRACY_HEADER_PATH_CANDIDATES); do [ -n "$$p" ] && [ -f "$$p/tracy/TracyC.h" ] && { echo $$p; break; }; done))
+TRACY_CLIENT_ROOT = $(strip $(shell for p in $(TRACY_CLIENT_PATH_CANDIDATES); do [ -n "$$p" ] && [ -f "$$p/tracy/TracyClient.cpp" ] && { echo $$p; break; }; done))
+TRACY_LIB_FILE = $(strip $(shell for p in $(TRACY_LIB_PATH_CANDIDATES); do [ -n "$$p" ] && { [ -f "$$p/libTracyClient.a" ] && { echo $$p/libTracyClient.a; break; }; [ -f "$$p/libTracyClient.so" ] && { echo $$p/libTracyClient.so; break; }; }; done))
+
+ifeq ($(origin SAPPHIRE_ENABLE_TRACY), undefined)
+SAPPHIRE_ENABLE_TRACY := $(if $(strip $(TRACY_HEADER_ROOT)),$(if $(strip $(TRACY_LIB_FILE)$(TRACY_CLIENT_ROOT)),1,0),0)
+endif
+
+ifneq ($(SAPPHIRE_ENABLE_TRACY),0)
+ifeq ($(TRACY_HEADER_ROOT),)
+$(error Tracy requested but headers were not found. Set TRACY_ROOT to a directory containing tracy/TracyC.h)
+endif
+ifeq ($(TRACY_LIB_FILE),)
+ifeq ($(TRACY_CLIENT_ROOT),)
+$(error Tracy headers found at $(TRACY_HEADER_ROOT) but neither libTracyClient nor tracy/TracyClient.cpp was found. Install the Tracy client library or set TRACY_ROOT to a full Tracy source tree)
+endif
+TRACY_NEEDS_CLIENT_IMPL = 1
+endif
+TRACY_DEFS = -DSAPPHIRE_ENABLE_TRACY=1 -DTRACY_ENABLE=1 -I$(TRACY_HEADER_ROOT)
+ifneq ($(TRACY_CLIENT_ROOT),)
+TRACY_DEFS += -I$(TRACY_CLIENT_ROOT)
+endif
+ifneq ($(TRACY_NEEDS_CLIENT_IMPL),)
+TRACY_DEFS += -DSAPPHIRE_TRACY_NEEDS_CLIENT_IMPL=1
+endif
+TRACY_LINK_LIBS = $(TRACY_LIB_FILE)
+endif
+
 # Vulkan SDK detection (find vulkan headers and libraries)
 VK_INCLUDE_PATHS = $(shell for p in /usr/include /usr/local/include /opt/vulkan/include; do [ -f $$p/vulkan/vulkan.h ] && { echo -I$$p; break; }; done)
 VK_LIB_PATHS = $(shell for p in /usr/lib /usr/lib64 /usr/local/lib /opt/vulkan/lib; do [ -f $$p/libvulkan.so ] && { echo -L$$p; break; }; done)
 VMA_INCLUDE_PATHS = $(shell for p in $(INCDIR) $(INCDIR)/third_party/vma /usr/include /usr/local/include; do [ -f $$p/vk_mem_alloc.h ] && { echo -I$$p; break; }; done)
 
+# Optional libcurl detection for remote calibration/validation corpus ingestion
+CURL_PKG_CFLAGS = $(shell pkg-config --cflags libcurl 2>/dev/null)
+CURL_PKG_LIBS = $(shell pkg-config --libs libcurl 2>/dev/null)
+CURL_INCLUDE_PATHS = $(shell if [ -z "$(CURL_PKG_CFLAGS)$(CURL_PKG_LIBS)" ]; then for p in /usr/include /usr/local/include; do [ -f $$p/curl/curl.h ] && { echo -I$$p; break; }; done; fi)
+CURL_LIB_PATHS = $(shell if [ -z "$(CURL_PKG_CFLAGS)$(CURL_PKG_LIBS)" ]; then for p in /usr/lib /usr/lib64 /usr/local/lib; do [ -f $$p/libcurl.so ] && { echo -L$$p -lcurl; break; }; done; fi)
+CURL_DEFS = $(if $(strip $(CURL_PKG_LIBS)$(CURL_LIB_PATHS)),-DSAPPHIRE_HAVE_LIBCURL=1,)
+
 # Compilation flags
-CFLAGS = -O3 -Wall -I. -I$(INCDIR) -mavx2 -mfma $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS)
-LDFLAGS = -lm -pthread -lvulkan -lstdc++ $(VK_LIB_PATHS)
+CFLAGS = -O3 -Wall -std=c18 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -I. -I$(INCDIR) -mavx2 -mfma $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS) $(CURL_PKG_CFLAGS) $(CURL_INCLUDE_PATHS) $(CURL_DEFS) $(TRACY_DEFS)
+CXXFLAGS = $(CFLAGS) -std=c++11
+LDFLAGS = -lm -pthread -lvulkan -lstdc++ $(VK_LIB_PATHS) $(CURL_PKG_LIBS) $(CURL_LIB_PATHS) $(TRACY_LINK_LIBS)
+DEPFLAGS = -MMD -MP
 
 # AddressSanitizer + UndefinedBehaviorSanitizer flags
 # Use -g for debug info (better error messages), -O1 for reasonable speed
 # Include paths (-I. -I$(INCDIR)) must be present for sanitizer builds
 # IMPORTANT: must include -mavx2 -mfma for AVX/FMA intrinsics in kernel code
-SANITIZER_FLAGS = -g -O1 -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS)
-SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined -lvulkan -lstdc++ $(VK_LIB_PATHS)
+SANITIZER_FLAGS = -g -O1 -std=c18 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -I. -I$(INCDIR) -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer $(VK_INCLUDE_PATHS) $(VMA_INCLUDE_PATHS) $(CURL_PKG_CFLAGS) $(CURL_INCLUDE_PATHS) $(CURL_DEFS) $(TRACY_DEFS)
+SANITIZER_CXXFLAGS = $(SANITIZER_FLAGS) -std=c++11
+SANITIZER_LDFLAGS = -lm -pthread -fsanitize=address,undefined -lvulkan -lstdc++ $(VK_LIB_PATHS) $(CURL_PKG_LIBS) $(CURL_LIB_PATHS) $(TRACY_LINK_LIBS)
 
 # HIP configuration (optional ROCm support)
 HIPCC = hipcc
@@ -36,7 +78,11 @@ TARGETS = \
 	$(OUTDIR)/sapphire \
 
 
-.PHONY: all bench check-bench bench_f32 bench_bf16 kv-paging-matrix test clean shaders
+DEPS := $(shell test -d $(OUTDIR) && find $(OUTDIR) -name '*.d' -print; \
+	test -d $(ASAN_OUTDIR) && find $(ASAN_OUTDIR) -name '*.d' -print)
+-include $(DEPS)
+
+.PHONY: all bench check-bench bench_f32 bench_bf16 kv-paging-matrix test clean shaders check-hybrid-packaging-smoke check-hybrid-runtime-smoke
 
 # ============================================================================
 # SPIR-V Shader Compilation (Phase 11-04)
@@ -63,47 +109,47 @@ $(OUTDIR):
 # Generic compilation rule for all C files
 $(OUTDIR)/%.o: $(SRCDIR)/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/inference/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/io/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/kernels/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/kernels/backends/vulkan/%.o: $(SRCDIR)/kernels/backends/vulkan/%.cpp | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CXX) $(CFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/loader/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/memory/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/tensor/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/tokenizer/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/transformer/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Build non-test binary from non-test sources
 # Discover all non-test .c files under $(SRCDIR) (exclude test/)
@@ -111,6 +157,12 @@ $(OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(OUTDIR)
 NON_TEST_SRCS := $(shell find $(SRCDIR) -type f -name '*.c' ! -path '$(SRCDIR)/test/*' ! -name 'test_*.c' ! -name '*_test.c' -print)
 NON_TEST_OBJS := $(patsubst $(SRCDIR)/%.c,$(OUTDIR)/%.o,$(NON_TEST_SRCS))
 NON_TEST_OBJS += $(OUTDIR)/kernels/backends/vulkan/vma_impl.o
+ifneq ($(SAPPHIRE_ENABLE_TRACY),0)
+NON_TEST_OBJS += $(OUTDIR)/kernels/backends/vulkan/tracy_profile_bridge.o
+ifneq ($(TRACY_NEEDS_CLIENT_IMPL),)
+NON_TEST_OBJS += $(OUTDIR)/kernels/backends/vulkan/tracy_client_impl.o
+endif
+endif
 
 # Library objects (non-test objects excluding main.o)
 LIB_OBJS := $(filter-out $(OUTDIR)/main.o, $(NON_TEST_OBJS))
@@ -130,7 +182,7 @@ TEST_BINS := $(patsubst $(SRCDIR)/test/%.c, $(OUTDIR)/test/%, $(TEST_SRCS))
 # Rule for test objects
 $(OUTDIR)/test/%.o: $(SRCDIR)/test/%.c | $(OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Rule for test binaries
 $(OUTDIR)/test/%: $(OUTDIR)/test/%.o $(LIB_OBJS)
@@ -146,6 +198,12 @@ test: $(TEST_BINS)
 	done
 	@echo "----------------------------------------------------------------"
 	@echo "All tests passed!"
+
+check-hybrid-packaging-smoke:
+	python3 scripts/test_hybrid_packaging_smoke.py
+
+check-hybrid-runtime-smoke: bin
+	python3 scripts/run_hybrid_runtime_smoke.py
 
 
 # ============================================================================
@@ -180,51 +238,57 @@ $(ASAN_OUTDIR):
 # Generic rules for sanitizer builds (mirrors normal rules but uses SANITIZER_FLAGS)
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/inference/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/io/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/kernels/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/kernels/backends/vulkan/%.o: $(SRCDIR)/kernels/backends/vulkan/%.cpp | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CXX) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CXX) $(SANITIZER_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/loader/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/memory/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/tensor/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/tokenizer/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/transformer/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASAN_OUTDIR)/%.o: $(SRCDIR)/utils/%.c | $(ASAN_OUTDIR)
 	mkdir -p $(@D)
-	$(CC) $(SANITIZER_FLAGS) -c $< -o $@
+	$(CC) $(SANITIZER_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 # Reuse NON_TEST_SRCS and NON_TEST_OBJS but map to asan directory
 ASAN_TEST_OBJS := $(patsubst $(SRCDIR)/%.c,$(ASAN_OUTDIR)/%.o,$(NON_TEST_SRCS))
 ASAN_TEST_OBJS += $(ASAN_OUTDIR)/kernels/backends/vulkan/vma_impl.o
+ifneq ($(SAPPHIRE_ENABLE_TRACY),0)
+ASAN_TEST_OBJS += $(ASAN_OUTDIR)/kernels/backends/vulkan/tracy_profile_bridge.o
+ifneq ($(TRACY_NEEDS_CLIENT_IMPL),)
+ASAN_TEST_OBJS += $(ASAN_OUTDIR)/kernels/backends/vulkan/tracy_client_impl.o
+endif
+endif
 
 $(ASAN_OUTDIR)/sapphire: $(ASAN_TEST_OBJS)
 	$(CC) $(SANITIZER_FLAGS) $^ -o $@ $(SANITIZER_LDFLAGS)

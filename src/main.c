@@ -1,15 +1,24 @@
 #include <math.h>
+#include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "activation_tape.h"
+#include "calibration_corpus.h"
 #include "ggml_model.h"
 #include "inference.h"
+#include "ternary_hessian_oracle.h"
+#include "ternary_conversion.h"
+#include "ternary_io.h"
 #include "tokenizer.h"
 #include "utils.h"
 #include "log.h"
+#include "tracy_profile.h"
 
 #define MAX_PROMPT_LENGTH 1024
 #define MAX_TOKENS_GENERATE 100
@@ -38,8 +47,45 @@ static void print_help(const char* program_name) {
     printf("  -t, --temp <value>        Temperature for sampling (default: 1.0)\n");
     printf("  -n, --max-tokens <num>    Maximum tokens to generate (default: 100)\n");
     printf("  -p, --prompt <string>     Run a single prompt non-interactively and exit (echoes prompt)\n");
+    printf("  --record-tape <path>      Record a raw activation tape using --calibration-manifest\n");
+    printf("  --record-hessian-sidecar <path>  Record a native Vulkan Hessian sidecar; combine with --record-tape or use with --activation-tape\n");
+    printf("  --convert-ternary         Run ternary conversion mode instead of inference\n");
+    printf("  --output <path>           Output file (single-layer) or output directory (full-model)\n");
+    printf("  --layer <name>            Optional single-layer conversion filter\n");
+    printf("  --teacher-model <name>    Optional teacher model for cross-architecture alignment\n");
+    printf("  --structural-map <path>   Optional structural TSV for alias/direct tensor resolution\n");
+    printf("  --calibration-corpus <p>  Optional text corpus file or URL for tokenized STE calibration\n");
+    printf("  --activation-tape <path>  Optional activation tape for tape-backed calibration\n");
+    printf("  --hessian-sidecar <path>  Optional diagonal curvature sidecar keyed to --activation-tape\n");
+    printf("  --calibration-manifest <p> Optional local corpus manifest file (source<TAB>weight<TAB>quota)\n");
+    printf("  --calibration-samples <n> Calibration sample count per tensor (default: 4)\n");
+    printf("  --ste-steps <n>          STE optimization steps per tensor (default: 3)\n");
+    printf("  --ste-learning-rate <value>  Base STE learning rate before progressive layer scaling (default: 0.03)\n");
+    printf("  --anchor-mode            Enable hybrid ternary + BF16 anchor output\n");
+    printf("  --anchor-budget-ppm <n>  Anchor budget in ppm (default: 1000 = 0.1%%)\n");
+    printf("  --anchor-saliency-mode <n> Anchor saliency: 0=none 1=weight*hessian 2=hessian 3=weight\n");
+    printf("  --progressive-calib      Run 3-stage progressive molding (layers 0-5, 6-12, then full model)\n");
+    printf("  --max-grad-norm <value>  Global gradient norm clip for STE (default: 1.0)\n");
+    printf("  --student-down-proj-rmsnorm  Enable a student-only weightless RMSNorm before FFN down_proj during conversion\n");
+    printf("  --disable-hessian-proxy  Disable tape-derived diagonal Hessian proxying\n");
+    printf("  --hessian-proxy-strength <value>  Diagonal Hessian proxy strength (default: 1.0)\n");
+    printf("  --hessian-proxy-floor <value>     Minimum diagonal Hessian proxy scale (default: 0.05)\n");
+    printf("  --spatial-telemetry     Emit a companion spatial JSONL for block-wise molding plots\n");
+    printf("  --spatial-telemetry-row-bucket <n>  Row bucket size for spatial telemetry (default: 64)\n");
+    printf("  --validation-corpus <p>   Optional held-out text corpus file or URL for checkpoints\n");
+    printf("  --validation-manifest <p> Optional local held-out corpus manifest file\n");
+    printf("  --validation-samples <n>  Held-out prompt count for checkpoint evaluation\n");
+    printf("  --checkpoint-every <n>    Persist student checkpoints every N converted tensors\n");
+    printf("  --validate-every <n>      Run checkpoint validation every N converted tensors\n");
+    printf("  --kl-weight <value>       Optional KL distillation weight (default: 0.05)\n");
+    printf("  --kl-update-freq <n>      Recompute KL sample weights every N STE steps (default: 4)\n");
+    printf("  --kl-samples <n>          Distinct prompts used to compute KL weights (default: 4)\n");
+    printf("  --ste-early-stop-patience <n>  Plateau patience in STE steps (default: 6, 0 disables)\n");
+    printf("  --ste-early-stop-delta <value> Minimum loss improvement for plateau detection (default: 0.0001)\n");
+    printf("  --ste-early-stop-divergence <value>  Divergence ratio over best loss (default: 1.25, 0 disables)\n");
     printf("  --save-state <path>       Save session state to .sapphire file before exit\n");
     printf("  --load-state <path>       Load session state from .sapphire file at startup\n");
+    printf("  --low-memory              Use sliding-window layer eviction to bound RSS\n");
     printf("  -h, --help                Show this help message\n");
     printf("\nModel Directory Structure (required files):\n");
     printf("  model.safetensors (or model.gguf / model.bin)\n");
@@ -56,33 +102,779 @@ static void print_help(const char* program_name) {
     printf("  /help                     Show command help\n");
     printf("\nExample:\n");
     printf("  %s -m gemma3-270m-it -c 4096 -t 0.7 -n 200\n", program_name);
+    printf("  %s -m gemma-3-1b-it --record-tape ./data/1b-teacher-raw.tape --calibration-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
+    printf("  %s -m gemma-3-1b-it --record-tape ./data/1b-teacher-raw.tape --record-hessian-sidecar ./data/1b-teacher.hsc --calibration-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
+    printf("  %s -m gemma-3-1b-it --record-hessian-sidecar ./data/1b-teacher.hsc --activation-tape ./data/1b-teacher-raw.tape --calibration-manifest ./configs/corpus/27b_high_signal_calib_manifest.csv\n", program_name);
+    printf("  %s -m gemma-3-27b-it --convert-ternary --output ./out/model-ternary\n", program_name);
+    printf("  %s -m gemma-3-7b-it --convert-ternary --output ./out/gemma-3-7b-it-ternary\n", program_name);
+    printf("  %s -m gemma-3-270m-it --convert-ternary --layer model.layers.0.self_attn.q_proj.weight --output ./out/layer0-qproj.safetensors\n", program_name);
     printf("\n");
 }
 
+#if !defined(SAPPHIRE_ENABLE_TRACY)
+static int is_truthy_env_value(const char *value)
+{
+    return value && value[0] != '\0' &&
+           (strcmp(value, "1") == 0 ||
+            strcasecmp(value, "true") == 0 ||
+            strcasecmp(value, "yes") == 0 ||
+            strcasecmp(value, "on") == 0);
+}
+
+static void warn_if_tracy_env_is_ignored(void)
+{
+    const char *tracy_env = getenv("SAPPHIRE_TRACY");
+
+    if (!is_truthy_env_value(tracy_env)) {
+        return;
+    }
+
+    LOG_WARN("SAPPHIRE_TRACY=1 is set, but this binary was built without Tracy support. Rebuild with make bin SAPPHIRE_ENABLE_TRACY=1.");
+}
+#endif
+
 typedef struct {
-    const char* model_name;
+    const char *model_name;
     int context_len;
     float temperature;
     int max_tokens;
-    const char* prompt_arg;
-    const char* save_state_path;
-    const char* load_state_path;
+    const char *prompt_arg;
+    const char *record_tape_path;
+    const char *record_hessian_sidecar_path;
+    int convert_ternary;
+    const char *output_path;
+    const char *layer_name;
+    const char *activation_tape_path;
+    const char *hessian_sidecar_path;
+    const char *teacher_model_name;
+    const char *structural_map_path;
+    const char *calibration_corpus_path;
+    const char *calibration_corpus_manifest_path;
+    int calibration_sample_limit;
+    const char *validation_corpus_path;
+    const char *validation_corpus_manifest_path;
+    int validation_sample_limit;
+    int checkpoint_every_n_layers;
+    int validate_every_n;
+    int ste_steps;
+    float ste_learning_rate;
+    int ste_learning_rate_set;
+    int progressive_calib;
+    int student_down_proj_input_rmsnorm;
+    float kl_weight;
+    int kl_update_interval;
+    int kl_sample_count;
+    int early_stop_patience;
+    float early_stop_min_delta;
+    float early_stop_divergence_ratio;
+    int disable_hessian_proxy;
+    float hessian_proxy_strength;
+    float hessian_proxy_floor;
+    float max_grad_norm;
+    int emit_spatial_telemetry;
+    int spatial_telemetry_row_bucket_size;
+    int use_anchor_mode;
+    uint32_t anchor_budget_ppm;
+    int anchor_saliency_mode;
+    const char *save_state_path;
+    const char *load_state_path;
+    int low_memory_mode;
 } cli_args_t;
 
-static void cli_args_init(cli_args_t *args) {
-    if (!args) return;
+static void cli_args_init(cli_args_t *args)
+{
+    if (!args) {
+        return;
+    }
+
     args->model_name = NULL;
     args->context_len = CONTEXT_LEN;
     args->temperature = TEMPERATURE;
     args->max_tokens = MAX_TOKENS_GENERATE;
     args->prompt_arg = NULL;
+    args->record_tape_path = NULL;
+    args->record_hessian_sidecar_path = NULL;
+    args->convert_ternary = 0;
+    args->output_path = NULL;
+    args->layer_name = NULL;
+    args->activation_tape_path = NULL;
+    args->hessian_sidecar_path = NULL;
+    args->teacher_model_name = NULL;
+    args->structural_map_path = NULL;
+    args->calibration_corpus_path = NULL;
+    args->calibration_corpus_manifest_path = NULL;
+    args->calibration_sample_limit = 4;
+    args->validation_corpus_path = NULL;
+    args->validation_corpus_manifest_path = NULL;
+    args->validation_sample_limit = 4;
+    args->checkpoint_every_n_layers = 1;
+    args->validate_every_n = 0;
+    args->ste_steps = 3;
+    args->ste_learning_rate = 0.0f;
+    args->ste_learning_rate_set = 0;
+    args->progressive_calib = 0;
+    args->student_down_proj_input_rmsnorm = 0;
+    args->kl_weight = 0.05f;
+    args->kl_update_interval = 4;
+    args->kl_sample_count = 4;
+    args->early_stop_patience = 6;
+    args->early_stop_min_delta = 1e-4f;
+    args->early_stop_divergence_ratio = 1.25f;
+    args->disable_hessian_proxy = 0;
+    args->hessian_proxy_strength = 1.0f;
+    args->hessian_proxy_floor = 0.05f;
+    args->max_grad_norm = 1.0f;
+    args->emit_spatial_telemetry = 0;
+    args->spatial_telemetry_row_bucket_size = 64;
+    args->use_anchor_mode = 0;
+    args->anchor_budget_ppm = 1000u;
+    args->anchor_saliency_mode = 1;
     args->save_state_path = NULL;
     args->load_state_path = NULL;
+    args->low_memory_mode = 0;
+}
+
+static int cli_is_combined_record_mode(const cli_args_t *args)
+{
+    return args && args->record_tape_path && args->record_hessian_sidecar_path;
+}
+
+static int validate_record_tape_args(const cli_args_t *args)
+{
+    if (!args->record_tape_path) {
+        return 0;
+    }
+
+    if (args->record_tape_path[0] == '\0') {
+        LOG_ERROR("ERROR: --record-tape must not be empty.");
+        return -1;
+    }
+    if (!args->calibration_corpus_manifest_path || args->calibration_corpus_manifest_path[0] == '\0') {
+        LOG_ERROR("ERROR: --record-tape requires --calibration-manifest.");
+        return -1;
+    }
+    if (args->calibration_corpus_path && args->calibration_corpus_path[0] != '\0') {
+        LOG_ERROR("ERROR: --record-tape uses --calibration-manifest, not --calibration-corpus.");
+        return -1;
+    }
+    if (args->convert_ternary || args->output_path || args->layer_name ||
+        args->activation_tape_path || args->hessian_sidecar_path ||
+        args->teacher_model_name ||
+        args->validation_corpus_path || args->validation_corpus_manifest_path ||
+        args->prompt_arg || args->save_state_path || args->load_state_path) {
+        LOG_ERROR("ERROR: --record-tape cannot be combined with conversion, prompt, state, or validation flags.");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int validate_record_hessian_sidecar_args(const cli_args_t *args)
+{
+    int combined_record_mode = 0;
+
+    if (!args->record_hessian_sidecar_path) {
+        return 0;
+    }
+
+    combined_record_mode = cli_is_combined_record_mode(args);
+
+    if (args->record_hessian_sidecar_path[0] == '\0') {
+        LOG_ERROR("ERROR: --record-hessian-sidecar must not be empty.");
+        return -1;
+    }
+    if (combined_record_mode) {
+        if (args->disable_hessian_proxy) {
+            LOG_ERROR("ERROR: --disable-hessian-proxy does not apply when recording a Hessian sidecar.");
+            return -1;
+        }
+        return 0;
+    }
+    if (!args->activation_tape_path || args->activation_tape_path[0] == '\0') {
+        LOG_ERROR("ERROR: --record-hessian-sidecar requires --activation-tape.");
+        return -1;
+    }
+    if ((args->calibration_corpus_path && args->calibration_corpus_path[0] != '\0') &&
+        (args->calibration_corpus_manifest_path && args->calibration_corpus_manifest_path[0] != '\0')) {
+        LOG_ERROR("ERROR: use either --calibration-corpus or --calibration-manifest with --record-hessian-sidecar, not both.");
+        return -1;
+    }
+    if ((!args->calibration_corpus_path || args->calibration_corpus_path[0] == '\0') &&
+        (!args->calibration_corpus_manifest_path || args->calibration_corpus_manifest_path[0] == '\0')) {
+        LOG_ERROR("ERROR: --record-hessian-sidecar requires --calibration-corpus or --calibration-manifest.");
+        return -1;
+    }
+    if (args->record_tape_path || args->convert_ternary || args->output_path || args->layer_name ||
+        args->hessian_sidecar_path || args->teacher_model_name || args->validation_corpus_path ||
+        args->validation_corpus_manifest_path || args->prompt_arg || args->save_state_path ||
+        args->load_state_path || args->disable_hessian_proxy) {
+        LOG_ERROR("ERROR: --record-hessian-sidecar cannot be combined with tape recording, conversion, prompt, validation, state, teacher, or consumer sidecar flags.");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int validate_convert_ternary_mode_args(const cli_args_t *args)
+{
+    if (!args->convert_ternary && args->student_down_proj_input_rmsnorm) {
+        LOG_ERROR("ERROR: --student-down-proj-rmsnorm is only supported with --convert-ternary.");
+        return -1;
+    }
+    if (!args->convert_ternary && args->emit_spatial_telemetry) {
+        LOG_ERROR("ERROR: --spatial-telemetry is only supported with --convert-ternary.");
+        return -1;
+    }
+
+    if (!args->convert_ternary) {
+        return 0;
+    }
+
+    if (!args->output_path) {
+        LOG_ERROR("ERROR: --output is required with --convert-ternary.");
+        return -1;
+    }
+    if (args->prompt_arg) {
+        LOG_ERROR("ERROR: --prompt cannot be combined with --convert-ternary.");
+        return -1;
+    }
+    if (args->save_state_path || args->load_state_path) {
+        LOG_ERROR("ERROR: session state flags are not valid in --convert-ternary mode.");
+        return -1;
+    }
+    if (args->progressive_calib && args->layer_name) {
+        LOG_ERROR("ERROR: --progressive-calib is only supported for full-model ternary conversion.");
+        return -1;
+    }
+    if (args->progressive_calib && (!args->activation_tape_path || args->activation_tape_path[0] == '\0')) {
+        LOG_ERROR("ERROR: --progressive-calib requires --activation-tape so staged calibration can reuse teacher activation statistics.");
+        return -1;
+    }
+    return 0;
+}
+
+static int validate_convert_ternary_tape_args(const cli_args_t *args)
+{
+    if (args->activation_tape_path && args->activation_tape_path[0] == '\0') {
+        LOG_ERROR("ERROR: --activation-tape must not be empty.");
+        return -1;
+    }
+    if (args->hessian_sidecar_path && args->hessian_sidecar_path[0] == '\0') {
+        LOG_ERROR("ERROR: --hessian-sidecar must not be empty.");
+        return -1;
+    }
+    if (args->hessian_sidecar_path && !args->activation_tape_path) {
+        LOG_ERROR("ERROR: --hessian-sidecar requires --activation-tape.");
+        return -1;
+    }
+    if (args->hessian_sidecar_path && args->disable_hessian_proxy) {
+        LOG_ERROR("ERROR: --hessian-sidecar cannot be combined with --disable-hessian-proxy.");
+        return -1;
+    }
+    if (args->teacher_model_name && args->teacher_model_name[0] == '\0') {
+        LOG_ERROR("ERROR: --teacher-model must not be empty.");
+        return -1;
+    }
+    if (args->structural_map_path && args->structural_map_path[0] == '\0') {
+        LOG_ERROR("ERROR: --structural-map must not be empty.");
+        return -1;
+    }
+    if (args->teacher_model_name && !args->activation_tape_path) {
+        LOG_ERROR("ERROR: --teacher-model requires --activation-tape.");
+        return -1;
+    }
+    if (args->teacher_model_name && args->layer_name) {
+        LOG_ERROR("ERROR: --teacher-model is only supported for full-model ternary conversion.");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int validate_convert_ternary_corpus_args(const cli_args_t *args)
+{
+    if (args->calibration_corpus_path && args->calibration_corpus_manifest_path) {
+        LOG_ERROR("ERROR: use either --calibration-corpus or --calibration-manifest, not both.");
+        return -1;
+    }
+    if (args->validation_corpus_path && args->validation_corpus_manifest_path) {
+        LOG_ERROR("ERROR: use either --validation-corpus or --validation-manifest, not both.");
+        return -1;
+    }
+    if (args->layer_name && args->validate_every_n > 0) {
+        LOG_ERROR("ERROR: --validate-every is only supported for full-model ternary conversion.");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int validate_convert_ternary_numeric_args(const cli_args_t *args)
+{
+    if (!args->convert_ternary) {
+        return 0;
+    }
+    if (args->calibration_sample_limit <= 0) {
+        LOG_ERROR("ERROR: --calibration-samples must be > 0.");
+        return -1;
+    }
+    if (args->kl_weight < 0.0f) {
+        LOG_ERROR("ERROR: --kl-weight must be >= 0.");
+        return -1;
+    }
+    if (args->kl_update_interval <= 0) {
+        LOG_ERROR("ERROR: --kl-update-freq must be > 0.");
+        return -1;
+    }
+    if (args->kl_sample_count <= 0) {
+        LOG_ERROR("ERROR: --kl-samples must be > 0.");
+        return -1;
+    }
+    if (args->early_stop_patience < 0) {
+        LOG_ERROR("ERROR: --ste-early-stop-patience must be >= 0.");
+        return -1;
+    }
+    if (args->early_stop_min_delta < 0.0f) {
+        LOG_ERROR("ERROR: --ste-early-stop-delta must be >= 0.");
+        return -1;
+    }
+    if (args->early_stop_divergence_ratio < 0.0f) {
+        LOG_ERROR("ERROR: --ste-early-stop-divergence must be >= 0.");
+        return -1;
+    }
+    if (args->hessian_proxy_strength < 0.0f) {
+        LOG_ERROR("ERROR: --hessian-proxy-strength must be >= 0.");
+        return -1;
+    }
+    if (args->hessian_proxy_floor < 0.0f) {
+        LOG_ERROR("ERROR: --hessian-proxy-floor must be >= 0.");
+        return -1;
+    }
+    if (args->max_grad_norm <= 0.0f) {
+        LOG_ERROR("ERROR: --max-grad-norm must be > 0.");
+        return -1;
+    }
+    if (args->spatial_telemetry_row_bucket_size <= 0) {
+        LOG_ERROR("ERROR: --spatial-telemetry-row-bucket must be > 0.");
+        return -1;
+    }
+    if (args->anchor_budget_ppm == 0u) {
+        LOG_ERROR("ERROR: --anchor-budget-ppm must be > 0.");
+        return -1;
+    }
+    if (args->anchor_saliency_mode < 0 || args->anchor_saliency_mode > 3) {
+        LOG_ERROR("ERROR: --anchor-saliency-mode must be one of 0, 1, 2, or 3.");
+        return -1;
+    }
+    if (args->validation_sample_limit < 0) {
+        LOG_ERROR("ERROR: --validation-samples must be >= 0.");
+        return -1;
+    }
+    if (args->validate_every_n < 0) {
+        LOG_ERROR("ERROR: --validate-every must be >= 0.");
+        return -1;
+    }
+    if (args->ste_steps <= 0) {
+        LOG_ERROR("ERROR: --ste-steps must be > 0.");
+        return -1;
+    }
+    if (args->ste_learning_rate_set && args->ste_learning_rate <= 0.0f) {
+        LOG_ERROR("ERROR: --ste-learning-rate must be > 0.");
+        return -1;
+    }
+    if (args->checkpoint_every_n_layers <= 0) {
+        LOG_ERROR("ERROR: --checkpoint-every must be > 0.");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int validate_convert_ternary_args(const cli_args_t *args)
+{
+    if (validate_convert_ternary_mode_args(args) != 0 ||
+        validate_convert_ternary_tape_args(args) != 0 ||
+        validate_convert_ternary_corpus_args(args) != 0 ||
+        validate_convert_ternary_numeric_args(args) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int validate_cli_args(const cli_args_t *args)
+{
+    if (!args) {
+        return -1;
+    }
+
+    if (!args->model_name) {
+        LOG_ERROR("ERROR: Model name required. Use -m or --model flag.");
+        return -1;
+    }
+
+    if (validate_record_tape_args(args) != 0) {
+        return -1;
+    }
+
+    if (validate_record_hessian_sidecar_args(args) != 0) {
+        return -1;
+    }
+
+    if (validate_convert_ternary_args(args) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int run_ternary_conversion_mode(const cli_args_t *args)
+{
+    ternary_conversion_config_t config;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "run_ternary_conversion_mode");
+
+    if (!args) {
+        LOG_ERROR("ternary conversion mode: args is NULL");
+        sapphire_tracy_zone_end(&tracy_zone);
+        return -1;
+    }
+
+    sapphire_tracy_zone_text(&tracy_zone, args->model_name, args->model_name ? strlen(args->model_name) : 0u);
+
+    config.model_name = args->model_name;
+    config.output_path = args->output_path;
+    config.layer_name = args->layer_name;
+    config.activation_tape_path = args->activation_tape_path;
+    config.hessian_sidecar_path = args->hessian_sidecar_path;
+    config.teacher_model_name = args->teacher_model_name;
+    config.structural_map_path = args->structural_map_path;
+    config.calibration_corpus_path = args->calibration_corpus_path;
+    config.calibration_corpus_manifest_path = args->calibration_corpus_manifest_path;
+    config.validation_corpus_path = args->validation_corpus_path;
+    config.validation_corpus_manifest_path = args->validation_corpus_manifest_path;
+    config.context_len = args->context_len;
+    config.calibration_sample_limit = args->calibration_sample_limit;
+    config.validation_sample_limit = args->validation_sample_limit;
+    config.checkpoint_every_n_layers = args->checkpoint_every_n_layers;
+    config.validate_every_n = args->validate_every_n;
+    config.ste_steps = args->ste_steps;
+    config.ste_learning_rate = args->ste_learning_rate;
+    config.progressive_calib = args->progressive_calib;
+    config.student_down_proj_input_rmsnorm = args->student_down_proj_input_rmsnorm;
+    config.kl_weight = args->kl_weight;
+    config.kl_update_interval = args->kl_update_interval;
+    config.kl_sample_count = args->kl_sample_count;
+    config.early_stop_patience = args->early_stop_patience;
+    config.early_stop_min_delta = args->early_stop_min_delta;
+    config.early_stop_divergence_ratio = args->early_stop_divergence_ratio;
+    config.disable_hessian_proxy = args->disable_hessian_proxy;
+    config.hessian_proxy_strength = args->hessian_proxy_strength;
+    config.hessian_proxy_floor = args->hessian_proxy_floor;
+    config.max_grad_norm = args->max_grad_norm;
+    config.emit_spatial_telemetry = args->emit_spatial_telemetry;
+    config.spatial_telemetry_row_bucket_size = args->spatial_telemetry_row_bucket_size;
+    config.use_anchor_mode = args->use_anchor_mode;
+    config.anchor_budget_ppm = args->anchor_budget_ppm;
+    config.anchor_saliency_mode = args->anchor_saliency_mode;
+    config.anchor_tensor_pattern = NULL;
+    int rc = transformer_run_ternary_conversion(&config);
+    sapphire_tracy_zone_end(&tracy_zone);
+    return rc;
+}
+
+static int load_record_hessian_corpus(const cli_args_t *args,
+                                      calibration_corpus_t *corpus)
+{
+    if (!args || !corpus) {
+        return -1;
+    }
+
+    if (args->calibration_corpus_manifest_path && args->calibration_corpus_manifest_path[0] != '\0') {
+        return calibration_corpus_load_manifest(args->calibration_corpus_manifest_path,
+                                                INT_MAX,
+                                                corpus);
+    }
+
+    return calibration_corpus_load(args->calibration_corpus_path,
+                                   INT_MAX,
+                                   corpus);
+}
+
+static void record_tape_signal_handler(int signum)
+{
+    (void)signum;
+    activation_tape_request_stop();
+}
+
+static int install_record_tape_signal_handlers(struct sigaction *old_int,
+                                               struct sigaction *old_term)
+{
+    struct sigaction action;
+
+    if (!old_int || !old_term) {
+        return -1;
+    }
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = record_tape_signal_handler;
+    sigemptyset(&action.sa_mask);
+
+    if (sigaction(SIGINT, &action, old_int) != 0) {
+        LOG_ERROR("record-tape: failed to install SIGINT handler");
+        return -1;
+    }
+    if (sigaction(SIGTERM, &action, old_term) != 0) {
+        LOG_ERROR("record-tape: failed to install SIGTERM handler");
+        (void)sigaction(SIGINT, old_int, NULL);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void restore_record_tape_signal_handlers(const struct sigaction *old_int,
+                                                const struct sigaction *old_term)
+{
+    if (old_int) {
+        (void)sigaction(SIGINT, old_int, NULL);
+    }
+    if (old_term) {
+        (void)sigaction(SIGTERM, old_term, NULL);
+    }
+}
+
+static int ensure_parent_directory_for_file(const char *path)
+{
+    const char *slash = NULL;
+    char *parent_dir = NULL;
+    size_t parent_len = 0u;
+    int rc = 0;
+
+    if (!path) {
+        return -1;
+    }
+
+    slash = strrchr(path, '/');
+    if (!slash) {
+        return 0;
+    }
+
+    parent_len = (size_t)(slash - path);
+    if (parent_len == 0u) {
+        return 0;
+    }
+
+    parent_dir = (char *)malloc(parent_len + 1u);
+    if (!parent_dir) {
+        LOG_ERROR("record-tape: failed to allocate output directory path");
+        return -1;
+    }
+
+    memcpy(parent_dir, path, parent_len);
+    parent_dir[parent_len] = '\0';
+    rc = io_prepare_ternary_output_dir(parent_dir);
+    free(parent_dir);
+    return rc;
+}
+
+static int run_record_tape_mode(const cli_args_t *args)
+{
+    activation_tape_record_config_t record_config;
+    inference_context_t *ctx = NULL;
+    calibration_corpus_t corpus;
+    struct sigaction old_sigint;
+    struct sigaction old_sigterm;
+    int backend_type = -1;
+    int signal_handlers_installed = 0;
+    int rc = -1;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "run_record_tape_mode");
+
+    if (!args || !args->record_tape_path || !args->model_name) {
+        LOG_ERROR("record-tape mode: invalid arguments");
+        sapphire_tracy_zone_end(&tracy_zone);
+        return -1;
+    }
+
+    sapphire_tracy_zone_text(&tracy_zone, args->record_tape_path, strlen(args->record_tape_path));
+
+    memset(&corpus, 0, sizeof(corpus));
+    activation_tape_clear_stop_request();
+
+    if (install_record_tape_signal_handlers(&old_sigint, &old_sigterm) != 0) {
+        goto cleanup;
+    }
+    signal_handlers_installed = 1;
+
+    if (args->record_hessian_sidecar_path) {
+        LOG_INFO("Recording activation tape to %s and Hessian sidecar to %s",
+                 args->record_tape_path,
+                 args->record_hessian_sidecar_path);
+    } else {
+        LOG_INFO("Recording activation tape to %s", args->record_tape_path);
+    }
+
+    ctx = create_inference_context(0.0f, 0, args->context_len, args->model_name);
+    if (!ctx) {
+        LOG_ERROR("record-tape: failed to create inference context");
+        goto cleanup;
+    }
+    if (!ctx->session || !ctx->session->backend) {
+        LOG_ERROR("record-tape: failed to initialize backend");
+        goto cleanup;
+    }
+    backend_type = ctx->session->backend->type;
+    if (backend_type != SAPPHIRE_BACKEND_TYPE_CPU &&
+        backend_type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        LOG_ERROR("record-tape: backend %s is not supported for tape capture",
+                  ctx->session->backend->name ? ctx->session->backend->name : "unknown");
+        goto cleanup;
+    }
+    if (args->record_hessian_sidecar_path && backend_type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        LOG_ERROR("record-tape: --record-hessian-sidecar requires SAPPHIRE_BACKEND=vulkan");
+        goto cleanup;
+    }
+
+    if (ensure_parent_directory_for_file(args->record_tape_path) != 0) {
+        goto cleanup;
+    }
+    if (args->record_hessian_sidecar_path &&
+        ensure_parent_directory_for_file(args->record_hessian_sidecar_path) != 0) {
+        goto cleanup;
+    }
+
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(load_manifest_zone, "record_tape_load_manifest");
+
+        if (calibration_corpus_load_manifest(args->calibration_corpus_manifest_path,
+                                             INT_MAX,
+                                             &corpus) != 0) {
+            sapphire_tracy_zone_end(&load_manifest_zone);
+            LOG_ERROR("record-tape: failed to load calibration manifest %s",
+                      args->calibration_corpus_manifest_path);
+            goto cleanup;
+        }
+        sapphire_tracy_zone_end(&load_manifest_zone);
+    }
+
+    memset(&record_config, 0, sizeof(record_config));
+    record_config.output_path = args->record_tape_path;
+    record_config.oracle_output_path = args->record_hessian_sidecar_path;
+    record_config.session = ctx->session;
+    record_config.tokenizer = ctx->tokenizer;
+    record_config.spec = ctx->spec;
+    record_config.corpus = (const struct calibration_corpus_t *)&corpus;
+    record_config.sample_limit = 0;
+    record_config.max_prompt_tokens = args->context_len;
+    record_config.hessian_proxy_strength = args->hessian_proxy_strength;
+    record_config.hessian_proxy_floor = args->hessian_proxy_floor;
+
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(record_zone, "activation_tape_record");
+        rc = activation_tape_record_ex(&record_config);
+        sapphire_tracy_zone_end(&record_zone);
+    }
+    if (rc == 0 && activation_tape_stop_requested()) {
+        LOG_WARN("record-tape: interrupted; partial tape saved to %s", args->record_tape_path);
+    } else if (rc == 0) {
+        LOG_INFO("record-tape: completed %s", args->record_tape_path);
+    }
+
+cleanup:
+    calibration_corpus_free(&corpus);
+    if (ctx) {
+        destroy_inference_context(ctx);
+    }
+    if (signal_handlers_installed) {
+        restore_record_tape_signal_handlers(&old_sigint, &old_sigterm);
+    }
+    activation_tape_clear_stop_request();
+    sapphire_tracy_zone_end(&tracy_zone);
+    return rc;
+}
+
+static int run_record_hessian_sidecar_mode(const cli_args_t *args)
+{
+    inference_context_t *ctx = NULL;
+    calibration_corpus_t corpus;
+    activation_tape_t *tape = NULL;
+    int rc = -1;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "run_record_hessian_sidecar_mode");
+
+    if (!args || !args->record_hessian_sidecar_path || !args->model_name) {
+        LOG_ERROR("record-hessian-sidecar mode: invalid arguments");
+        sapphire_tracy_zone_end(&tracy_zone);
+        return -1;
+    }
+
+    memset(&corpus, 0, sizeof(corpus));
+    sapphire_tracy_zone_text(&tracy_zone,
+                             args->record_hessian_sidecar_path,
+                             strlen(args->record_hessian_sidecar_path));
+
+    LOG_INFO("Recording Hessian sidecar to %s", args->record_hessian_sidecar_path);
+
+    ctx = create_inference_context(0.0f, 0, args->context_len, args->model_name);
+    if (!ctx) {
+        LOG_ERROR("record-hessian-sidecar: failed to create inference context");
+        goto cleanup;
+    }
+    if (!ctx->session || !ctx->session->backend || ctx->session->backend->type != SAPPHIRE_BACKEND_TYPE_VULKAN) {
+        LOG_ERROR("record-hessian-sidecar: Vulkan backend is required; set SAPPHIRE_BACKEND=vulkan");
+        goto cleanup;
+    }
+    if (ensure_parent_directory_for_file(args->record_hessian_sidecar_path) != 0) {
+        goto cleanup;
+    }
+
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(open_tape_zone, "record_hessian_open_tape");
+        tape = activation_tape_open(args->activation_tape_path);
+        sapphire_tracy_zone_end(&open_tape_zone);
+    }
+    if (!tape) {
+        LOG_ERROR("record-hessian-sidecar: failed to open activation tape %s", args->activation_tape_path);
+        goto cleanup;
+    }
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(load_corpus_zone, "record_hessian_load_corpus");
+        if (load_record_hessian_corpus(args, &corpus) != 0) {
+            sapphire_tracy_zone_end(&load_corpus_zone);
+            LOG_ERROR("record-hessian-sidecar: failed to load calibration corpus input");
+            goto cleanup;
+        }
+        sapphire_tracy_zone_end(&load_corpus_zone);
+    }
+
+    {
+        SAPPHIRE_TRACY_ZONE_SCOPE(record_zone, "record_hessian_sidecar");
+        rc = ternary_record_hessian_sidecar_vulkan(args->record_hessian_sidecar_path,
+                                                   ctx,
+                                                   &corpus,
+                                                   tape,
+                                                   args->hessian_proxy_strength,
+                                                   args->hessian_proxy_floor);
+        sapphire_tracy_zone_end(&record_zone);
+    }
+    if (rc == 0) {
+        LOG_INFO("record-hessian-sidecar: completed %s", args->record_hessian_sidecar_path);
+    }
+
+cleanup:
+    if (tape) {
+        activation_tape_close(tape);
+    }
+    calibration_corpus_free(&corpus);
+    if (ctx) {
+        destroy_inference_context(ctx);
+    }
+    sapphire_tracy_zone_end(&tracy_zone);
+    return rc;
 }
 
 static void print_session_state(const inference_context_t *ctx,
                                 const char *last_state_op,
-                                const char *last_state_path) {
+                                const char *last_state_path)
+{
     const char *backend_name = (ctx->session && ctx->session->backend && ctx->session->backend->name)
         ? ctx->session->backend->name
         : "unknown";
@@ -90,6 +882,7 @@ static void print_session_state(const inference_context_t *ctx,
         (ctx->session->backend->type == SAPPHIRE_BACKEND_TYPE_CPU ||
          ctx->session->backend->type == SAPPHIRE_BACKEND_TYPE_VULKAN));
     int kv_seq_len = -1;
+
     if (ctx->session && ctx->session->kv_cache) {
         kv_seq_len = kv_cache_get_seq_len(ctx->session->kv_cache);
     }
@@ -199,25 +992,221 @@ static int handle_slash_command(inference_context_t *ctx,
     return 1;
 }
 
-static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args) {
-    if (!args) return -1;
-    for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) && i + 1 < argc) {
-            args->model_name = argv[++i];
-        } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--context") == 0) && i + 1 < argc) {
-            args->context_len = atoi(argv[++i]);
-        } else if ((strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--temp") == 0) && i + 1 < argc) {
-            args->temperature = atof(argv[++i]);
-        } else if ((strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--max-tokens") == 0) && i + 1 < argc) {
-            args->max_tokens = atoi(argv[++i]);
-        } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--prompt") == 0) && i + 1 < argc) {
-            args->prompt_arg = argv[++i];
-        } else if (strcmp(argv[i], "--save-state") == 0 && i + 1 < argc) {
-            args->save_state_path = argv[++i];
-        } else if (strcmp(argv[i], "--load-state") == 0 && i + 1 < argc) {
-            args->load_state_path = argv[++i];
+typedef enum {
+    CLI_OPT_UNKNOWN = 0,
+    CLI_OPT_MODEL,
+    CLI_OPT_CONTEXT,
+    CLI_OPT_TEMP,
+    CLI_OPT_MAX_TOKENS,
+    CLI_OPT_PROMPT,
+    CLI_OPT_RECORD_TAPE,
+    CLI_OPT_RECORD_HESSIAN_SIDECAR,
+    CLI_OPT_CONVERT_TERNARY,
+    CLI_OPT_OUTPUT,
+    CLI_OPT_LAYER,
+    CLI_OPT_ACTIVATION_TAPE,
+    CLI_OPT_HESSIAN_SIDECAR,
+    CLI_OPT_TEACHER_MODEL,
+    CLI_OPT_STRUCTURAL_MAP,
+    CLI_OPT_CALIBRATION_CORPUS,
+    CLI_OPT_CALIBRATION_MANIFEST,
+    CLI_OPT_CALIBRATION_SAMPLES,
+    CLI_OPT_VALIDATION_CORPUS,
+    CLI_OPT_VALIDATION_MANIFEST,
+    CLI_OPT_VALIDATION_SAMPLES,
+    CLI_OPT_CHECKPOINT_EVERY,
+    CLI_OPT_VALIDATE_EVERY,
+    CLI_OPT_STE_STEPS,
+    CLI_OPT_STE_LEARNING_RATE,
+    CLI_OPT_PROGRESSIVE_CALIB,
+    CLI_OPT_ANCHOR_MODE,
+    CLI_OPT_ANCHOR_BUDGET_PPM,
+    CLI_OPT_ANCHOR_SALIENCY_MODE,
+    CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM,
+    CLI_OPT_MAX_GRAD_NORM,
+    CLI_OPT_KL_WEIGHT,
+    CLI_OPT_KL_UPDATE_FREQ,
+    CLI_OPT_KL_SAMPLES,
+    CLI_OPT_STE_EARLY_STOP_PATIENCE,
+    CLI_OPT_STE_EARLY_STOP_DELTA,
+    CLI_OPT_STE_EARLY_STOP_DIVERGENCE,
+    CLI_OPT_DISABLE_HESSIAN_PROXY,
+    CLI_OPT_HESSIAN_PROXY_STRENGTH,
+    CLI_OPT_HESSIAN_PROXY_FLOOR,
+    CLI_OPT_SPATIAL_TELEMETRY,
+    CLI_OPT_SPATIAL_TELEMETRY_ROW_BUCKET,
+    CLI_OPT_SAVE_STATE,
+    CLI_OPT_LOAD_STATE,
+    CLI_OPT_LOW_MEMORY
+} cli_option_t;
+
+typedef struct {
+    const char *name;
+    cli_option_t option;
+} cli_option_alias_t;
+
+static const cli_option_alias_t g_cli_option_aliases[] = {
+    { "-m", CLI_OPT_MODEL },
+    { "--model", CLI_OPT_MODEL },
+    { "-c", CLI_OPT_CONTEXT },
+    { "--context", CLI_OPT_CONTEXT },
+    { "-t", CLI_OPT_TEMP },
+    { "--temp", CLI_OPT_TEMP },
+    { "-n", CLI_OPT_MAX_TOKENS },
+    { "--max-tokens", CLI_OPT_MAX_TOKENS },
+    { "-p", CLI_OPT_PROMPT },
+    { "--prompt", CLI_OPT_PROMPT },
+    { "--record-tape", CLI_OPT_RECORD_TAPE },
+    { "--record-hessian-sidecar", CLI_OPT_RECORD_HESSIAN_SIDECAR },
+    { "--convert-ternary", CLI_OPT_CONVERT_TERNARY },
+    { "--output", CLI_OPT_OUTPUT },
+    { "--layer", CLI_OPT_LAYER },
+    { "--activation-tape", CLI_OPT_ACTIVATION_TAPE },
+    { "--hessian-sidecar", CLI_OPT_HESSIAN_SIDECAR },
+    { "--teacher-model", CLI_OPT_TEACHER_MODEL },
+    { "--structural-map", CLI_OPT_STRUCTURAL_MAP },
+    { "--calibration-corpus", CLI_OPT_CALIBRATION_CORPUS },
+    { "--calibration-manifest", CLI_OPT_CALIBRATION_MANIFEST },
+    { "--calib-manifest", CLI_OPT_CALIBRATION_MANIFEST },
+    { "--calibration-samples", CLI_OPT_CALIBRATION_SAMPLES },
+    { "--validation-corpus", CLI_OPT_VALIDATION_CORPUS },
+    { "--validation-manifest", CLI_OPT_VALIDATION_MANIFEST },
+    { "--validation-samples", CLI_OPT_VALIDATION_SAMPLES },
+    { "--checkpoint-every", CLI_OPT_CHECKPOINT_EVERY },
+    { "--validate-every", CLI_OPT_VALIDATE_EVERY },
+    { "--ste-steps", CLI_OPT_STE_STEPS },
+    { "--ste-learning-rate", CLI_OPT_STE_LEARNING_RATE },
+    { "--progressive-calib", CLI_OPT_PROGRESSIVE_CALIB },
+    { "--anchor-mode", CLI_OPT_ANCHOR_MODE },
+    { "--anchor-budget-ppm", CLI_OPT_ANCHOR_BUDGET_PPM },
+    { "--anchor-saliency-mode", CLI_OPT_ANCHOR_SALIENCY_MODE },
+    { "--student-down-proj-rmsnorm", CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM },
+    { "--max-grad-norm", CLI_OPT_MAX_GRAD_NORM },
+    { "--kl-weight", CLI_OPT_KL_WEIGHT },
+    { "--kl-update-freq", CLI_OPT_KL_UPDATE_FREQ },
+    { "--kl-update-every", CLI_OPT_KL_UPDATE_FREQ },
+    { "--kl-samples", CLI_OPT_KL_SAMPLES },
+    { "--ste-early-stop-patience", CLI_OPT_STE_EARLY_STOP_PATIENCE },
+    { "--ste-early-stop-delta", CLI_OPT_STE_EARLY_STOP_DELTA },
+    { "--ste-early-stop-divergence", CLI_OPT_STE_EARLY_STOP_DIVERGENCE },
+    { "--disable-hessian-proxy", CLI_OPT_DISABLE_HESSIAN_PROXY },
+    { "--hessian-proxy-strength", CLI_OPT_HESSIAN_PROXY_STRENGTH },
+    { "--hessian-proxy-floor", CLI_OPT_HESSIAN_PROXY_FLOOR },
+    { "--spatial-telemetry", CLI_OPT_SPATIAL_TELEMETRY },
+    { "--spatial-telemetry-row-bucket", CLI_OPT_SPATIAL_TELEMETRY_ROW_BUCKET },
+    { "--save-state", CLI_OPT_SAVE_STATE },
+    { "--load-state", CLI_OPT_LOAD_STATE },
+    { "--low-memory", CLI_OPT_LOW_MEMORY }
+};
+
+static cli_option_t parse_cli_option(const char *arg)
+{
+    size_t alias_count = sizeof(g_cli_option_aliases) / sizeof(g_cli_option_aliases[0]);
+
+    if (!arg) {
+        return CLI_OPT_UNKNOWN;
+    }
+
+    for (size_t alias_idx = 0; alias_idx < alias_count; ++alias_idx) {
+        if (strcmp(arg, g_cli_option_aliases[alias_idx].name) == 0) {
+            return g_cli_option_aliases[alias_idx].option;
         }
     }
+
+    return CLI_OPT_UNKNOWN;
+}
+
+static void apply_cli_option(cli_args_t *args, cli_option_t option, const char *value)
+{
+    switch (option) {
+        case CLI_OPT_MODEL: args->model_name = value; break;
+        case CLI_OPT_CONTEXT: args->context_len = atoi(value); break;
+        case CLI_OPT_TEMP: args->temperature = atof(value); break;
+        case CLI_OPT_MAX_TOKENS: args->max_tokens = atoi(value); break;
+        case CLI_OPT_PROMPT: args->prompt_arg = value; break;
+        case CLI_OPT_RECORD_TAPE: args->record_tape_path = value; break;
+        case CLI_OPT_RECORD_HESSIAN_SIDECAR: args->record_hessian_sidecar_path = value; break;
+        case CLI_OPT_OUTPUT: args->output_path = value; break;
+        case CLI_OPT_LAYER: args->layer_name = value; break;
+        case CLI_OPT_ACTIVATION_TAPE: args->activation_tape_path = value; break;
+        case CLI_OPT_HESSIAN_SIDECAR: args->hessian_sidecar_path = value; break;
+        case CLI_OPT_TEACHER_MODEL: args->teacher_model_name = value; break;
+        case CLI_OPT_STRUCTURAL_MAP: args->structural_map_path = value; break;
+        case CLI_OPT_CALIBRATION_CORPUS: args->calibration_corpus_path = value; break;
+        case CLI_OPT_CALIBRATION_MANIFEST: args->calibration_corpus_manifest_path = value; break;
+        case CLI_OPT_CALIBRATION_SAMPLES: args->calibration_sample_limit = atoi(value); break;
+        case CLI_OPT_VALIDATION_CORPUS: args->validation_corpus_path = value; break;
+        case CLI_OPT_VALIDATION_MANIFEST: args->validation_corpus_manifest_path = value; break;
+        case CLI_OPT_VALIDATION_SAMPLES: args->validation_sample_limit = atoi(value); break;
+        case CLI_OPT_CHECKPOINT_EVERY: args->checkpoint_every_n_layers = atoi(value); break;
+        case CLI_OPT_VALIDATE_EVERY: args->validate_every_n = atoi(value); break;
+        case CLI_OPT_STE_STEPS: args->ste_steps = atoi(value); break;
+        case CLI_OPT_STE_LEARNING_RATE:
+            args->ste_learning_rate = (float)atof(value);
+            args->ste_learning_rate_set = 1;
+            break;
+        case CLI_OPT_ANCHOR_BUDGET_PPM: args->anchor_budget_ppm = (uint32_t)strtoul(value, NULL, 10); break;
+        case CLI_OPT_ANCHOR_SALIENCY_MODE: args->anchor_saliency_mode = atoi(value); break;
+        case CLI_OPT_MAX_GRAD_NORM: args->max_grad_norm = (float)atof(value); break;
+        case CLI_OPT_KL_WEIGHT: args->kl_weight = (float)atof(value); break;
+        case CLI_OPT_KL_UPDATE_FREQ: args->kl_update_interval = atoi(value); break;
+        case CLI_OPT_KL_SAMPLES: args->kl_sample_count = atoi(value); break;
+        case CLI_OPT_STE_EARLY_STOP_PATIENCE: args->early_stop_patience = atoi(value); break;
+        case CLI_OPT_STE_EARLY_STOP_DELTA: args->early_stop_min_delta = (float)atof(value); break;
+        case CLI_OPT_STE_EARLY_STOP_DIVERGENCE: args->early_stop_divergence_ratio = (float)atof(value); break;
+        case CLI_OPT_HESSIAN_PROXY_STRENGTH: args->hessian_proxy_strength = (float)atof(value); break;
+        case CLI_OPT_HESSIAN_PROXY_FLOOR: args->hessian_proxy_floor = (float)atof(value); break;
+        case CLI_OPT_SPATIAL_TELEMETRY_ROW_BUCKET: args->spatial_telemetry_row_bucket_size = atoi(value); break;
+        case CLI_OPT_SAVE_STATE: args->save_state_path = value; break;
+        case CLI_OPT_LOAD_STATE: args->load_state_path = value; break;
+        default: break;
+    }
+}
+
+static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
+{
+    if (!args) {
+        return -1;
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        cli_option_t option = parse_cli_option(argv[i]);
+
+        if (option == CLI_OPT_CONVERT_TERNARY) {
+            args->convert_ternary = 1;
+            continue;
+        }
+        if (option == CLI_OPT_DISABLE_HESSIAN_PROXY) {
+            args->disable_hessian_proxy = 1;
+            continue;
+        }
+        if (option == CLI_OPT_PROGRESSIVE_CALIB) {
+            args->progressive_calib = 1;
+            continue;
+        }
+        if (option == CLI_OPT_ANCHOR_MODE) {
+            args->use_anchor_mode = 1;
+            continue;
+        }
+        if (option == CLI_OPT_SPATIAL_TELEMETRY) {
+            args->emit_spatial_telemetry = 1;
+            continue;
+        }
+        if (option == CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM) {
+            args->student_down_proj_input_rmsnorm = 1;
+            continue;
+        }
+        if (option == CLI_OPT_LOW_MEMORY) {
+            args->low_memory_mode = 1;
+            continue;
+        }
+        if (option == CLI_OPT_UNKNOWN || i + 1 >= argc) {
+            continue;
+        }
+
+        apply_cli_option(args, option, argv[++i]);
+    }
+
     return 0;
 }
 
@@ -280,8 +1269,11 @@ static int interactive_loop(inference_context_t* ctx) {
                                        &should_exit);
             if (should_exit) break;
         } else {
+            SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "interactive_request");
+
             // Perform inference
             printf("\n[Generating response...]\n");
+            sapphire_tracy_plot_i64("interactive.prompt_chars", (int64_t)strlen(prompt));
 
             int result = perform_inference(ctx, prompt, output, sizeof(output));
 
@@ -293,6 +1285,8 @@ static int interactive_loop(inference_context_t* ctx) {
             } else {
                 printf("Inference failed\n");
             }
+
+            sapphire_tracy_zone_end(&tracy_zone);
         }
     }
 
@@ -324,6 +1318,9 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
     char *heap_buf = NULL;
     char *output = NULL;
     int use_heap = 0;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "one_shot_inference");
+
+    sapphire_tracy_zone_value(&tracy_zone, (uint64_t)output_size);
 
     if (output_size <= BUFFER_SIZE) {
         output = stack_buf;
@@ -331,6 +1328,7 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
         heap_buf = (char *)malloc((size_t)output_size);
         if (!heap_buf) {
             LOG_ERROR("One-shot inference: failed to allocate output buffer of size %d", output_size);
+            sapphire_tracy_zone_end(&tracy_zone);
             return -1;
         }
         use_heap = 1;
@@ -358,6 +1356,7 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
     }
 
     if (use_heap) free(heap_buf);
+    sapphire_tracy_zone_end(&tracy_zone);
     return rc;
 }
 
@@ -372,6 +1371,8 @@ int one_shot_inference(inference_context_t* ctx, const char* prompt, int output_
  *         failure, or runtime errors).
  */
 int main(int argc, char* argv[]) {
+    sapphire_tracy_name_thread("main");
+
     // Check for help first
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -384,18 +1385,49 @@ int main(int argc, char* argv[]) {
     cli_args_init(&args);
     if (parse_cli_args(argc, (const char * const *)argv, &args) != 0) return 1;
 
-    // Validate that model name was provided
-    if (!args.model_name) {
-        LOG_ERROR("ERROR: Model name required. Use -m or --model flag.\n");
+    if (validate_cli_args(&args) != 0) {
         print_help(argv[0]);
         return 1;
     }
 
+    /* Export low-memory mode so model loader can detect it */
+    if (args.low_memory_mode) {
+        setenv("SAPPHIRE_LOW_MEMORY", "1", 1);
+    }
+
     log_set_level_from_env("SAPPHIRE_LOG_LEVEL");
+
+#if !defined(SAPPHIRE_ENABLE_TRACY)
+    warn_if_tracy_env_is_ignored();
+#endif
 
     printf("================================================================================\n");
     printf("                      SAPPHIRE INFERENCE ENGINE (v1.0)\n");
     printf("================================================================================\n");
+
+    if (args.record_tape_path) {
+        int rc = run_record_tape_mode(&args);
+        printf("\n================================================================================\n");
+        printf("                    Sapphire Inference Engine Closed\n");
+        printf("================================================================================\n");
+        return rc;
+    }
+
+    if (args.record_hessian_sidecar_path) {
+        int rc = run_record_hessian_sidecar_mode(&args);
+        printf("\n================================================================================\n");
+        printf("                    Sapphire Inference Engine Closed\n");
+        printf("================================================================================\n");
+        return rc;
+    }
+
+    if (args.convert_ternary) {
+        int rc = run_ternary_conversion_mode(&args);
+        printf("\n================================================================================\n");
+        printf("                    Sapphire Inference Engine Closed\n");
+        printf("================================================================================\n");
+        return rc;
+    }
 
     // Create inference context with tokenizer
     inference_context_t* ctx = create_inference_context(args.temperature, args.max_tokens, args.context_len, args.model_name);

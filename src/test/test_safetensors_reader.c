@@ -65,6 +65,48 @@ static int create_test_safetensors_file(const char *path) {
     return 0;
 }
 
+static int create_integer_safetensors_file(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "ERROR: Cannot create integer test file %s\n", path);
+        return -1;
+    }
+
+    const char *json =
+        "{"
+        "\"anchor_entries\":{\"dtype\":\"U16\",\"shape\":[2,4],\"data_offsets\":[0,16]},"
+        "\"anchor_row_offsets\":{\"dtype\":\"U32\",\"shape\":[3],\"data_offsets\":[16,28]}"
+        "}";
+    uint64_t json_len = (uint64_t)strlen(json);
+    uint16_t anchor_entries[8] = {0u, 1u, 0x3f80u, 0u, 1u, 2u, 0x4000u, 0u};
+    uint32_t anchor_row_offsets[3] = {0u, 1u, 2u};
+
+    if (fwrite(&json_len, sizeof(uint64_t), 1, f) != 1) {
+        fprintf(stderr, "ERROR: Failed to write integer header length\n");
+        fclose(f);
+        return -1;
+    }
+    if (fwrite(json, 1, json_len, f) != json_len) {
+        fprintf(stderr, "ERROR: Failed to write integer JSON header\n");
+        fclose(f);
+        return -1;
+    }
+    if (fwrite(anchor_entries, sizeof(uint16_t), 8, f) != 8) {
+        fprintf(stderr, "ERROR: Failed to write U16 tensor data\n");
+        fclose(f);
+        return -1;
+    }
+    if (fwrite(anchor_row_offsets, sizeof(uint32_t), 3, f) != 3) {
+        fprintf(stderr, "ERROR: Failed to write U32 tensor data\n");
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    printf("✓ Created integer Safetensors file: %s\n", path);
+    return 0;
+}
+
 /**
  * @brief Test 1: File open and basic metadata reading.
  */
@@ -268,8 +310,81 @@ static int test_tensor_ref() {
     return 0;
 }
 
+static int test_integer_tensor_metadata() {
+    printf("\n--- Test 4: Integer Tensor Metadata ---\n");
+
+    const char *test_file = "/tmp/test_safetensors_int.st";
+
+    if (create_integer_safetensors_file(test_file) < 0) {
+        return -1;
+    }
+
+    safetensors_file_t *st = safetensors_open(test_file);
+    if (!st) {
+        unlink(test_file);
+        return -1;
+    }
+
+    const safetensors_tensor_meta_t *entries_meta = safetensors_get_tensor_by_name(st, "anchor_entries");
+    const safetensors_tensor_meta_t *offsets_meta = safetensors_get_tensor_by_name(st, "anchor_row_offsets");
+    if (!entries_meta || !offsets_meta) {
+        fprintf(stderr, "ERROR: Failed to find integer tensor metadata\n");
+        safetensors_close(st);
+        unlink(test_file);
+        return -1;
+    }
+
+    if (entries_meta->dtype != SAFETENSORS_U16 || offsets_meta->dtype != SAFETENSORS_U32) {
+        fprintf(stderr, "ERROR: Integer tensor dtype mismatch\n");
+        safetensors_close(st);
+        unlink(test_file);
+        return -1;
+    }
+    if (entries_meta->ndim != 2 || entries_meta->shape[0] != 2 || entries_meta->shape[1] != 4) {
+        fprintf(stderr, "ERROR: U16 tensor shape mismatch\n");
+        safetensors_close(st);
+        unlink(test_file);
+        return -1;
+    }
+    if (offsets_meta->ndim != 1 || offsets_meta->shape[0] != 3) {
+        fprintf(stderr, "ERROR: U32 tensor shape mismatch\n");
+        safetensors_close(st);
+        unlink(test_file);
+        return -1;
+    }
+
+    {
+        const uint16_t *entries = (const uint16_t *)safetensors_data_ptr(st, entries_meta);
+        const uint32_t *offsets = (const uint32_t *)safetensors_data_ptr(st, offsets_meta);
+        if (!entries || !offsets) {
+            fprintf(stderr, "ERROR: Failed to get integer tensor data pointers\n");
+            safetensors_close(st);
+            unlink(test_file);
+            return -1;
+        }
+        if (entries[0] != 0u || entries[1] != 1u || entries[6] != 0x4000u) {
+            fprintf(stderr, "ERROR: U16 tensor payload mismatch\n");
+            safetensors_close(st);
+            unlink(test_file);
+            return -1;
+        }
+        if (offsets[0] != 0u || offsets[1] != 1u || offsets[2] != 2u) {
+            fprintf(stderr, "ERROR: U32 tensor payload mismatch\n");
+            safetensors_close(st);
+            unlink(test_file);
+            return -1;
+        }
+    }
+
+    printf("✓ Parsed U16/U32 metadata and raw payloads\n");
+
+    safetensors_close(st);
+    unlink(test_file);
+    return 0;
+}
+
 /**
- * @brief Test 4: Error handling - invalid file.
+ * @brief Test 5: Error handling - invalid file.
  */
 static int test_error_handling() {
     printf("\n--- Test 4: Error Handling ---\n");
@@ -310,7 +425,7 @@ static int test_error_handling() {
 }
 
 /**
- * @brief Test 5: Print info functionality.
+ * @brief Test 6: Print info functionality.
  */
 static int test_print_info() {
     printf("\n--- Test 5: Print Info ---\n");
@@ -364,6 +479,7 @@ int main(int argc, char *argv[]) {
     RUN_TEST(test_file_open);
     RUN_TEST(test_get_by_name);
     RUN_TEST(test_tensor_ref);
+    RUN_TEST(test_integer_tensor_metadata);
     RUN_TEST(test_error_handling);
     RUN_TEST(test_print_info);
     

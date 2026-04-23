@@ -16,16 +16,18 @@
 #include <string.h>
 
 #include "../include/attention.h"
-#include "../include/gemma3_270m_config.h"
+#include "../include/gemma3_config.h"
 #include "../include/ggml_model.h"
 #include "../include/kv_cache.h"
 #include "../include/layer_config_loader.h"
+#include "../include/llm_model.h"
 #include "../include/log.h"
 #include "../include/rope.h"
 #include "../include/tensor.h"
 #include "../include/kernels.h"
 #include "../include/transformer.h"
 #include "../include/utils.h"
+#include "../include/tracy_profile.h"
 
 /* Forward declarations of external functions from inference.c */
 extern void lm_head(inference_session_t* session, const float* hidden, float* logits);
@@ -314,35 +316,72 @@ static int cpu_forward_batch(inference_session_t* session, const int* token_ids,
         return -1;
     }
 
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "cpu_forward_batch");
+    sapphire_tracy_zone_value(&tracy_zone, (uint64_t)batch_size);
+    sapphire_tracy_plot_i64("cpu.forward_batch_size", batch_size);
+
     backend_cpu_session_data_t* cpu_data = (backend_cpu_session_data_t*)session->backend_data;
     const gemma3_270m_config_t* config = (const gemma3_270m_config_t*)session->model_spec->variant_config;
 
-    // 1. Embedding lookup
-    sapphire_embed_lookup_batch(session, token_ids, batch_size, cpu_data->scratch_buffer);
-
-    // 2. Transformer layers with layer-type dispatch
-    for (int l = 0; l < config->num_hidden_layers; l++) {
-        sapphire_layer_config_t* layer_cfg = &session->layer_configs[l];
-        bool is_global = layer_cfg->config.attention.is_global;
-        const float* f_cos = is_global ? cpu_data->rope_freqs_cos_global : cpu_data->rope_freqs_cos_local;
-        const float* f_sin = is_global ? cpu_data->rope_freqs_sin_global : cpu_data->rope_freqs_sin_local;
-
-        /* Dispatch based on layer type */
-        if (layer_cfg->type == LAYER_TYPE_ATTENTION_SOFTMAX || layer_cfg->type == LAYER_TYPE_ATTENTION_LINEAR) {
-            sapphire_transformer_layer_batch(session, l, start_pos, batch_size, cpu_data->scratch_buffer, (transformer_rope_t){f_cos, f_sin});
-        } else {
-            // For non-attention layers, fall back to single-token mode
-            for (int b = 0; b < batch_size; b++) {
-                sapphire_transformer_layer(session, l, start_pos + b, cpu_data->scratch_buffer + b * config->hidden_size, (transformer_rope_t){f_cos, f_sin});
-            }
+    const int max_batch_chunk = 32;
+    for (int processed = 0; processed < batch_size; processed += max_batch_chunk) {
+        int chunk_size = batch_size - processed;
+        if (chunk_size > max_batch_chunk) {
+            chunk_size = max_batch_chunk;
         }
+
+        SAPPHIRE_TRACY_ZONE_SCOPE(chunk_zone, "cpu_forward_batch_chunk");
+        sapphire_tracy_zone_value(&chunk_zone, (uint64_t)chunk_size);
+        sapphire_tracy_plot_i64("cpu.forward_chunk_size", chunk_size);
+
+        // 1. Embedding lookup
+        sapphire_embed_lookup_batch(session, token_ids + processed, chunk_size, cpu_data->scratch_buffer);
+
+        // 2. Transformer layers with layer-type dispatch
+        llm_model_t *model = (llm_model_t *)session->model_spec->llm_model;
+        
+        for (int l = 0; l < config->num_hidden_layers; l++) {
+            SAPPHIRE_TRACY_ZONE_SCOPE(layer_zone, "cpu_forward_batch_layer");
+            sapphire_tracy_zone_value(&layer_zone, (uint64_t)l);
+
+            /* Low-memory mode: prefetch ahead, evict behind */
+            if (model && model->low_memory_mode) {
+                if (l + 2 < config->num_hidden_layers) {
+                    llm_model_prefetch_layer(model, l + 2);
+                }
+                if (l >= 2) {
+                    llm_model_evict_layer(model, l - 2);
+                }
+            }
+
+            sapphire_layer_config_t* layer_cfg = &session->layer_configs[l];
+            bool is_global = layer_cfg->config.attention.is_global;
+            const float* f_cos = is_global ? cpu_data->rope_freqs_cos_global : cpu_data->rope_freqs_cos_local;
+            const float* f_sin = is_global ? cpu_data->rope_freqs_sin_global : cpu_data->rope_freqs_sin_local;
+
+            /* Dispatch based on layer type */
+            if (layer_cfg->type == LAYER_TYPE_ATTENTION_SOFTMAX || layer_cfg->type == LAYER_TYPE_ATTENTION_LINEAR) {
+                sapphire_transformer_layer_batch(session, l, start_pos + processed, chunk_size, cpu_data->scratch_buffer, (transformer_rope_t){f_cos, f_sin});
+            } else {
+                // For non-attention layers, fall back to single-token mode
+                for (int b = 0; b < chunk_size; b++) {
+                    sapphire_transformer_layer(session, l, start_pos + processed + b, cpu_data->scratch_buffer + b * config->hidden_size, (transformer_rope_t){f_cos, f_sin});
+                }
+            }
+
+            sapphire_tracy_zone_end(&layer_zone);
+        }
+
+        // 3. Final norm & LM Head (for the last token in the batch)
+        if (logits && processed + chunk_size == batch_size) {
+            const float* last_hidden = cpu_data->scratch_buffer + (chunk_size - 1) * config->hidden_size;
+            lm_head(session, (float*)last_hidden, logits);
+        }
+
+        sapphire_tracy_zone_end(&chunk_zone);
     }
 
-    // 3. Final norm & LM Head (for the last token in the batch)
-    if (logits) {
-        const float* last_hidden = cpu_data->scratch_buffer + (batch_size - 1) * config->hidden_size;
-        lm_head(session, (float*)last_hidden, logits);
-    }
+    sapphire_tracy_zone_end(&tracy_zone);
 
     return 0;
 }
