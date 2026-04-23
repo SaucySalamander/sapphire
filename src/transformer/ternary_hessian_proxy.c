@@ -6,6 +6,7 @@
 #include "ternary_hessian_proxy.h"
 
 #include "kernels.h"
+#include "tracy_profile.h"
 
 #include <immintrin.h>
 #include <math.h>
@@ -311,6 +312,7 @@ void ternary_hessian_proxy_cache_release(ternary_hessian_proxy_cache_t *cache)
         return;
     }
 
+    SAPPHIRE_TRACY_FREE(cache->diagonal);
     free(cache->diagonal);
     memset(cache, 0, sizeof(*cache));
 }

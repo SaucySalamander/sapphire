@@ -6,6 +6,7 @@
 #include "ternary_calibration.h"
 
 #include "log.h"
+#include "tracy_profile.h"
 #include "activation_tape.h"
 #include "llm_model.h"
 #include "inference.h"
@@ -19,10 +20,13 @@
 #include "tensor.h"
 
 #include <immintrin.h>
+#include <malloc.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 
 #define TERNARY_SYMBOL_ZERO     0u
 #define TERNARY_SYMBOL_POSITIVE 1u
@@ -1288,11 +1292,17 @@ static void spatial_snapshot_buffers_release(spatial_snapshot_buffers_t *buffers
         return;
     }
 
+    SAPPHIRE_TRACY_FREE(buffers->student_bulk_counts);
     free(buffers->student_bulk_counts);
+    SAPPHIRE_TRACY_FREE(buffers->student_counts);
     free(buffers->student_counts);
+    SAPPHIRE_TRACY_FREE(buffers->teacher_counts);
     free(buffers->teacher_counts);
+    SAPPHIRE_TRACY_FREE(buffers->group_hessian_max);
     free(buffers->group_hessian_max);
+    SAPPHIRE_TRACY_FREE(buffers->group_hessian_mean);
     free(buffers->group_hessian_mean);
+    SAPPHIRE_TRACY_FREE(buffers->block_accumulators);
     free(buffers->block_accumulators);
     spatial_snapshot_buffers_reset(buffers);
 }
@@ -1331,6 +1341,12 @@ static int spatial_snapshot_buffers_init(spatial_snapshot_buffers_t *buffers,
         spatial_snapshot_buffers_release(buffers);
         return -1;
     }
+    SAPPHIRE_TRACY_ALLOC(buffers->block_accumulators, buffers->block_count * sizeof(*buffers->block_accumulators));
+    SAPPHIRE_TRACY_ALLOC(buffers->group_hessian_mean, buffers->groups_per_row * sizeof(*buffers->group_hessian_mean));
+    SAPPHIRE_TRACY_ALLOC(buffers->group_hessian_max, buffers->groups_per_row * sizeof(*buffers->group_hessian_max));
+    SAPPHIRE_TRACY_ALLOC(buffers->teacher_counts, TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS * sizeof(*buffers->teacher_counts));
+    SAPPHIRE_TRACY_ALLOC(buffers->student_counts, TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS * sizeof(*buffers->student_counts));
+    SAPPHIRE_TRACY_ALLOC(buffers->student_bulk_counts, TERNARY_SPATIAL_TELEMETRY_HISTOGRAM_BINS * sizeof(*buffers->student_bulk_counts));
 
     return 0;
 }
@@ -1633,6 +1649,7 @@ static float* build_fallback_vectors(uint32_t cols, int sample_count) {
         LOG_ERROR("build_calibration_vectors: allocation failed");
         return NULL;
     }
+    SAPPHIRE_TRACY_ALLOC(vectors, (size_t)sample_count * cols * sizeof(float));
 
     for (int s = 0; s < sample_count; ++s) {
         const char *doc = g_calibration_docs[s % CALIB_DOC_COUNT];
@@ -1704,6 +1721,7 @@ static float *build_tape_calibration_vectors(const ternary_activation_tape_conte
         LOG_ERROR("build_calibration_vectors: tape-backed allocation failed for %s", tensor_name);
         return NULL;
     }
+    SAPPHIRE_TRACY_ALLOC(vectors, (size_t)sample_count * cols * sizeof(float));
 
     for (int s = 0; s < sample_count; ++s) {
         if (activation_tape_get_vector(tape,
@@ -1713,6 +1731,7 @@ static float *build_tape_calibration_vectors(const ternary_activation_tape_conte
             LOG_ERROR("build_calibration_vectors: failed to read %s sample %d from activation tape",
                       tensor_name,
                       s);
+            SAPPHIRE_TRACY_FREE(vectors);
             free(vectors);
             return NULL;
         }
@@ -1722,6 +1741,7 @@ static float *build_tape_calibration_vectors(const ternary_activation_tape_conte
         *out_sample_count = sample_count;
     }
 
+    activation_tape_discard_entry(tape, tensor_name);
     LOG_INFO("Built tape-backed calibration vectors: tensor=%s samples=%d",
              tensor_name,
              sample_count);
@@ -1762,6 +1782,7 @@ static float* build_calibration_vectors(uint32_t cols,
         LOG_ERROR("build_calibration_vectors: allocation failed");
         return NULL;
     }
+    SAPPHIRE_TRACY_ALLOC(vectors, (size_t)sample_count * cols * sizeof(float));
 
     for (int s = 0; s < sample_count; ++s) {
         const char *sample_text = corpus->sample_texts[s % corpus->sample_count];
@@ -1784,6 +1805,7 @@ static float* build_calibration_vectors(uint32_t cols,
             }
         }
         if (build_tokenized_prompt_vector(corpus, sample_text, cols, dst) != 0) {
+            SAPPHIRE_TRACY_FREE(vectors);
             free(vectors);
             return build_fallback_vectors(cols, sample_count);
         }
@@ -2484,6 +2506,7 @@ static void distillation_reference_cache_release(distillation_reference_cache_t 
         return;
     }
 
+    SAPPHIRE_TRACY_FREE(cache->reference_logits);
     free(cache->reference_logits);
     distillation_reference_cache_reset(cache);
 }
@@ -2502,12 +2525,14 @@ static int distillation_reference_cache_prepare(distillation_reference_cache_t *
     }
 
     cache_size = (size_t)sample_count * (size_t)vocab_size * sizeof(float);
+    SAPPHIRE_TRACY_FREE(cache->reference_logits);
     free(cache->reference_logits);
     cache->reference_logits = (float *)malloc(cache_size);
     if (!cache->reference_logits) {
         distillation_reference_cache_reset(cache);
         return -1;
     }
+    SAPPHIRE_TRACY_ALLOC(cache->reference_logits, cache_size);
 
     cache->sample_count = sample_count;
     cache->vocab_size = vocab_size;
@@ -2592,9 +2617,13 @@ static void distillation_runtime_buffers_release(distillation_runtime_buffers_t 
     if (buffers->slot) {
         *buffers->slot = buffers->original_tensor;
     }
+    SAPPHIRE_TRACY_FREE(buffers->reference_logits);
     free(buffers->reference_logits);
+    SAPPHIRE_TRACY_FREE(buffers->proxy_logits);
     free(buffers->proxy_logits);
+    SAPPHIRE_TRACY_FREE(buffers->reference_probs);
     free(buffers->reference_probs);
+    SAPPHIRE_TRACY_FREE(buffers->proxy_probs);
     free(buffers->proxy_probs);
     tensor_release(buffers->proxy_tensor);
     distillation_runtime_buffers_reset(buffers);
@@ -2618,6 +2647,10 @@ static int distillation_alloc_runtime_buffers(distillation_runtime_buffers_t *bu
         !buffers->reference_probs || !buffers->proxy_probs) {
         return -1;
     }
+    SAPPHIRE_TRACY_ALLOC(buffers->reference_logits, logits_size);
+    SAPPHIRE_TRACY_ALLOC(buffers->proxy_logits, logits_size);
+    SAPPHIRE_TRACY_ALLOC(buffers->reference_probs, logits_size);
+    SAPPHIRE_TRACY_ALLOC(buffers->proxy_probs, logits_size);
 
     return 0;
 }
@@ -3477,12 +3510,15 @@ static int hessian_proxy_acquire_buffer(ternary_hessian_proxy_cache_t *cache,
     *out_owned_proxy = NULL;
 
     if (cache) {
-        float *resized = (float *)realloc(cache->diagonal, (size_t)cols * sizeof(float));
+        const size_t proxy_size = (size_t)cols * sizeof(float);
+        float *resized = (float *)realloc(cache->diagonal, proxy_size);
 
         if (!resized) {
             return -1;
         }
+        SAPPHIRE_TRACY_FREE(cache->diagonal);
         cache->diagonal = resized;
+        SAPPHIRE_TRACY_ALLOC(cache->diagonal, proxy_size);
         *out_proxy_buffer = cache->diagonal;
         return 0;
     }
@@ -3491,6 +3527,7 @@ static int hessian_proxy_acquire_buffer(ternary_hessian_proxy_cache_t *cache,
     if (!*out_owned_proxy) {
         return -1;
     }
+    SAPPHIRE_TRACY_ALLOC(*out_owned_proxy, (size_t)cols * sizeof(float));
 
     *out_proxy_buffer = *out_owned_proxy;
     return 0;
@@ -3964,15 +4001,28 @@ static void ste_calibration_workspace_release(ste_calibration_workspace_t *works
         return;
     }
 
+    SAPPHIRE_TRACY_FREE(workspace->first_moment);
     free(workspace->first_moment);
+    SAPPHIRE_TRACY_FREE(workspace->second_moment);
     free(workspace->second_moment);
+    SAPPHIRE_TRACY_FREE(workspace->gradient);
     free(workspace->gradient);
+    SAPPHIRE_TRACY_FREE(workspace->calibration_vectors);
     free(workspace->calibration_vectors);
+    SAPPHIRE_TRACY_FREE(workspace->scale_floor);
     free(workspace->scale_floor);
+    SAPPHIRE_TRACY_FREE(workspace->best_latent);
     free(workspace->best_latent);
+    SAPPHIRE_TRACY_FREE(workspace->hessian_proxy.owned_proxy);
     free(workspace->hessian_proxy.owned_proxy);
     distillation_reference_cache_release(&workspace->distillation_reference_cache);
     ste_calibration_workspace_reset(workspace);
+
+    /* Force return freed STE workspace pages to OS.  The workspace buffers
+     * total ~800 MB for large tensors (e.g., down_proj).  Without this call,
+     * glibc keeps the pages in its arena free-list after MMAP_THRESHOLD is
+     * raised, causing RSS to ratchet upward across the 28-layer run.         */
+    malloc_trim(0);
 }
 
 static int ste_prepare_workspace_buffers(const ste_calibration_workspace_request_t *request,
@@ -3986,10 +4036,14 @@ static int ste_prepare_workspace_buffers(const ste_calibration_workspace_request
     if (request->config->early_stop_patience > 0 &&
         request->config->ste_steps > (int)STE_EARLY_STOP_MIN_STEPS) {
         workspace->best_latent = (float *)malloc(request->weight_count * sizeof(float));
+        SAPPHIRE_TRACY_ALLOC(workspace->best_latent, request->weight_count * sizeof(float));
     }
     workspace->first_moment = (float *)calloc(request->weight_count, sizeof(float));
     workspace->second_moment = (float *)calloc(request->weight_count, sizeof(float));
     workspace->gradient = (float *)malloc(request->weight_count * sizeof(float));
+    SAPPHIRE_TRACY_ALLOC(workspace->first_moment, request->weight_count * sizeof(float));
+    SAPPHIRE_TRACY_ALLOC(workspace->second_moment, request->weight_count * sizeof(float));
+    SAPPHIRE_TRACY_ALLOC(workspace->gradient, request->weight_count * sizeof(float));
     workspace->actual_sample_count = request->config->calibration_samples;
     if (request->layer_schedule) {
         workspace->layer_schedule = *request->layer_schedule;
@@ -4000,6 +4054,9 @@ static int ste_prepare_workspace_buffers(const ste_calibration_workspace_request
         workspace->scale_floor = (float *)malloc(ternary_scale_count(request->rows,
                                                                      request->cols,
                                                                      ternary_default_scale_group_size(request->cols)) * sizeof(float));
+        SAPPHIRE_TRACY_ALLOC(workspace->scale_floor,
+                             ternary_scale_count(request->rows, request->cols,
+                                                 ternary_default_scale_group_size(request->cols)) * sizeof(float));
     }
     if (!workspace->first_moment || !workspace->second_moment || !workspace->gradient ||
         (workspace->layer_schedule.early_layer_warmup && !workspace->scale_floor)) {
@@ -4112,6 +4169,10 @@ static int ste_prepare_output_buffers(ternary_calibration_result_t *out_result,
         transformer_free_ternary_calibration_result(out_result);
         return -1;
     }
+    SAPPHIRE_TRACY_ALLOC(out_result->latent_weights, weight_count * sizeof(float));
+    SAPPHIRE_TRACY_ALLOC(out_result->ternary_weights, weight_count * sizeof(int8_t));
+    SAPPHIRE_TRACY_ALLOC(out_result->packed_weights, packed_bytes);
+    SAPPHIRE_TRACY_ALLOC(out_result->scales, scale_count * sizeof(float));
 
     out_result->weight_count = weight_count;
     out_result->packed_weight_bytes = packed_bytes;
@@ -4341,12 +4402,18 @@ void transformer_free_ternary_calibration_result(ternary_calibration_result_t *r
     if (!result) {
         return;
     }
+    SAPPHIRE_TRACY_FREE(result->latent_weights);
     free(result->latent_weights);
+    SAPPHIRE_TRACY_FREE(result->ternary_weights);
     free(result->ternary_weights);
+    SAPPHIRE_TRACY_FREE(result->packed_weights);
     free(result->packed_weights);
+    SAPPHIRE_TRACY_FREE(result->scales);
     free(result->scales);
     /* Free anchor-mode outputs */
+    SAPPHIRE_TRACY_FREE(result->anchor_entries);
     free(result->anchor_entries);
+    SAPPHIRE_TRACY_FREE(result->anchor_row_offsets);
     free(result->anchor_row_offsets);
     memset(result, 0, sizeof(*result));
 }
@@ -4728,6 +4795,7 @@ int transformer_calibrate_layer_ste_hybrid(const uint16_t *bf16_weights,
         LOG_ERROR("transformer_calibrate_layer_ste_hybrid: failed to allocate masked BF16 buffer");
         goto cleanup;
     }
+    SAPPHIRE_TRACY_ALLOC(masked_bf16_weights, (size_t)rows * (size_t)cols * sizeof(uint16_t));
     hybrid_mask_protected_bf16_weights(masked_bf16_weights,
                                        bf16_weights,
                                        rows,
@@ -4763,6 +4831,7 @@ int transformer_calibrate_layer_ste_hybrid(const uint16_t *bf16_weights,
     
 cleanup:
     ternary_anchor_selection_free(&anchor_selection);
+    SAPPHIRE_TRACY_FREE(masked_bf16_weights);
     free(masked_bf16_weights);
     
     if (status != 0) {

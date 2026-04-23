@@ -109,6 +109,8 @@ int activation_tape_stop_requested(void)
     return g_activation_tape_stop_requested != 0;
 }
 
+static void activation_tape_discard_range(const void *ptr, size_t size);
+
 /* -------------------------------------------------------------------------
  * Small helpers
  * -------------------------------------------------------------------------*/
@@ -1099,6 +1101,34 @@ int activation_tape_get_vector(const activation_tape_t *tape,
     return 0;
 }
 
+void activation_tape_discard_entry(const activation_tape_t *tape,
+                                   const char              *tensor_name)
+{
+    const tape_manifest_entry_t *e = NULL;
+    const uint8_t *base = NULL;
+
+    if (!tape || !tensor_name) {
+        return;
+    }
+
+    e = tape_find_entry_with_alias(tape, tensor_name);
+    if (!e) {
+        return;
+    }
+
+    if (e->alias_of_entry != TAPE_NO_ALIAS) {
+        if (e->alias_of_entry >= tape->entry_count) {
+            return;
+        }
+        e = &tape->manifest[e->alias_of_entry];
+    }
+
+    base = (const uint8_t *)tape->mmap_ptr
+           + tape->header.data_section_offset
+           + e->data_offset;
+    activation_tape_discard_range(base, (size_t)e->data_bytes);
+}
+
 int activation_tape_sample_count(const activation_tape_t *tape)
 {
     return tape ? (int)tape->header.sample_count : -1;
@@ -1124,6 +1154,32 @@ uint32_t activation_tape_crc32(const activation_tape_t *tape)
     }
 
     return io_crc32_update(0u, tape->mmap_ptr, tape->mmap_size);
+}
+
+static void activation_tape_discard_range(const void *ptr, size_t size)
+{
+    long page_size = 0;
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+    uintptr_t page_mask = 0;
+
+    if (!ptr || size == 0u) {
+        return;
+    }
+
+    page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return;
+    }
+
+    start = (uintptr_t)ptr;
+    end = start + size;
+    page_mask = (uintptr_t)page_size - 1u;
+    start &= ~page_mask;
+    end = (end + page_mask) & ~page_mask;
+    if (end > start) {
+        (void)madvise((void *)start, (size_t)(end - start), MADV_DONTNEED);
+    }
 }
 
 void activation_tape_prefetch_entry(const activation_tape_t *tape,

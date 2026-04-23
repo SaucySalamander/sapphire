@@ -68,6 +68,8 @@ void sapphire_tracy_vk_zone_end(sapphire_tracy_vk_zone_t *zone);
 void sapphire_tracy_vk_collect(sapphire_tracy_vk_context_t *context,
                                VkCommandBuffer command_buffer);
 void sapphire_tracy_vk_context_destroy(sapphire_tracy_vk_context_t *context);
+void sapphire_tracy_alloc(const void *ptr, size_t size);
+void sapphire_tracy_free(const void *ptr);
 
 #else
 
@@ -214,6 +216,17 @@ static inline void sapphire_tracy_vk_context_destroy(sapphire_tracy_vk_context_t
     (void)context;
 }
 
+static inline void sapphire_tracy_alloc(const void *ptr, size_t size)
+{
+    (void)ptr;
+    (void)size;
+}
+
+static inline void sapphire_tracy_free(const void *ptr)
+{
+    (void)ptr;
+}
+
 #endif
 
 #define SAPPHIRE_TRACY_CONCAT_INNER(a, b) a##b
@@ -242,6 +255,9 @@ static inline void sapphire_tracy_vk_context_destroy(sapphire_tracy_vk_context_t
 
 #define SAPPHIRE_TRACY_MESSAGE_LITERAL(message) \
     sapphire_tracy_message((message), sizeof(message) - 1u)
+
+#define SAPPHIRE_TRACY_ALLOC(ptr, size) sapphire_tracy_alloc((ptr), (size))
+#define SAPPHIRE_TRACY_FREE(ptr)        sapphire_tracy_free((ptr))
 
 #ifdef __cplusplus
 }

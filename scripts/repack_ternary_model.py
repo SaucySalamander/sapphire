@@ -453,16 +453,6 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
                 entry_forms[name] = form
             else:
                 existing_forms = entry_forms[name]
-                if (existing_forms & MANIFEST_FORM_MOLD) or (form & MANIFEST_FORM_MOLD):
-                    raise ValueError(f"Invalid mixed or duplicate mold manifest row at {manifest_path}:{line_number}: {raw_line.rstrip()}")
-                if (existing_forms & MANIFEST_FORM_UNIFIED_ANCHOR) or (form & MANIFEST_FORM_UNIFIED_ANCHOR):
-                    raise ValueError(
-                        f"Unified anchor manifest rows cannot be mixed with duplicates for {name} at {manifest_path}:{line_number}"
-                    )
-                if form == MANIFEST_FORM_BULK and (existing_forms & MANIFEST_FORM_BULK):
-                    raise ValueError(f"Duplicate ternary bulk manifest row for {name} at {manifest_path}:{line_number}")
-                if form == MANIFEST_FORM_LEGACY_ANCHOR and (existing_forms & MANIFEST_FORM_LEGACY_ANCHOR):
-                    raise ValueError(f"Duplicate legacy anchor manifest row for {name} at {manifest_path}:{line_number}")
                 if entry.file_name:
                     if existing.file_name and existing.file_name != entry.file_name:
                         raise ValueError(f"Conflicting bulk payload for {name} at {manifest_path}:{line_number}")
@@ -499,7 +489,7 @@ def _read_manifest(ternary_dir: Path) -> OrderedDict[str, TernaryManifestEntry]:
                 entry.cols,
             )
         if entry.kind == "anchor":
-            if not entry.anchor_file_name or entry.anchor_count <= 0:
+            if not entry.anchor_file_name or entry.anchor_count < 0:
                 raise ValueError(f"Missing anchor payload metadata for {entry.name} in {manifest_path}")
 
     if not entries:
@@ -1110,7 +1100,7 @@ def _write_manifest(output_dir: Path,
             if shard_name is None:
                 raise KeyError(f"Missing shard assignment for ternary tensor {tensor.logical_name}")
             if entry.kind == "anchor":
-                if not entry.anchor_file_name or entry.anchor_count <= 0:
+                if not entry.anchor_file_name or entry.anchor_count < 0:
                     raise ValueError(f"Missing anchor manifest metadata for {tensor.logical_name}")
                 manifest_file.write(
                     f"{tensor.logical_name}\t{shard_name}\t{entry.rows}\t{entry.cols}\t{entry.packed_weight_bytes}\t{entry.crc32:08x}\tanchor\t{entry.anchor_file_name}\t{entry.anchor_count}\n"

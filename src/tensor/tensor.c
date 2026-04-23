@@ -4,6 +4,7 @@
 #include "tensor.h"
 #include "ternary_anchor.h"
 #include "../include/log.h"
+#include "../include/tracy_profile.h"
 
 // Concrete definition of the tensor structure (private to this .c file)
 struct tensor_t {
@@ -26,7 +27,9 @@ static void tensor_ternary_release_payload(tensor_t *t) {
 
     view = (tensor_ternary_view_t *)t->data;
     if (!t->is_external) {
+        SAPPHIRE_TRACY_FREE(view->packed_weights);
         free((void *)view->packed_weights);
+        SAPPHIRE_TRACY_FREE(view->scales);
         free((void *)view->scales);
     }
     free(view);
@@ -41,11 +44,15 @@ static void tensor_hybrid_release_payload(tensor_t *t) {
 
     view = (tensor_hybrid_view_t *)t->data;
     if (!t->is_external) {
+        SAPPHIRE_TRACY_FREE(view->packed_weights);
         free((void *)view->packed_weights);
+        SAPPHIRE_TRACY_FREE(view->scales);
         free((void *)view->scales);
     }
     if (view->owns_anchor_memory) {
+        SAPPHIRE_TRACY_FREE(view->anchor_entries);
         free((void *)view->anchor_entries);
+        SAPPHIRE_TRACY_FREE(view->anchor_row_offsets);
         free((void *)view->anchor_row_offsets);
     }
     free(view);
@@ -156,6 +163,8 @@ static tensor_t* tensor_clone_ternary_local(const tensor_t *src) {
         free(scale_copy);
         return NULL;
     }
+    SAPPHIRE_TRACY_ALLOC(packed_copy, view->packed_weight_bytes);
+    SAPPHIRE_TRACY_ALLOC(scale_copy, view->scale_bytes);
     clone->layout = src->layout;
     return clone;
 }
@@ -221,6 +230,14 @@ static tensor_t* tensor_clone_hybrid_local(const tensor_t *src) {
         free(anchor_entries_copy);
         free(anchor_row_offsets_copy);
         return NULL;
+    }
+    SAPPHIRE_TRACY_ALLOC(packed_copy, view->packed_weight_bytes);
+    SAPPHIRE_TRACY_ALLOC(scale_copy, view->scale_bytes);
+    if (anchor_entries_copy) {
+        const size_t anchor_entry_bytes = (size_t)view->anchor_count * sizeof(ternary_anchor_entry_t);
+        const size_t anchor_row_offsets_bytes = ((size_t)view->rows + 1u) * sizeof(uint32_t);
+        SAPPHIRE_TRACY_ALLOC(anchor_entries_copy, anchor_entry_bytes);
+        SAPPHIRE_TRACY_ALLOC(anchor_row_offsets_copy, anchor_row_offsets_bytes);
     }
     clone->layout = src->layout;
     return clone;
@@ -337,6 +354,7 @@ tensor_t* tensor_create(int ndim, const int *shape, tensor_dtype_t dtype) {
         free(t);
         return NULL;
     }
+    SAPPHIRE_TRACY_ALLOC(t->data, t->nbytes);
 
     // Initialize reference count
     t->ref_count = 1;
@@ -799,6 +817,11 @@ void tensor_ref_inc(tensor_t *t) {
     }
 }
 
+int tensor_is_external(const tensor_t *t) {
+    if (!t) return 0;
+    return t->is_external ? 1 : 0;
+}
+
 void tensor_release(tensor_t *t) {
     if (!t) return;
 
@@ -809,6 +832,7 @@ void tensor_release(tensor_t *t) {
         } else if (t->dtype == DTYPE_TERNARY_HYBRID) {
             tensor_hybrid_release_payload(t);
         } else if (t->data && !t->is_external) {
+            SAPPHIRE_TRACY_FREE(t->data);
             free(t->data);
         }
         free(t);

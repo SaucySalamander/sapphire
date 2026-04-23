@@ -259,6 +259,17 @@ size_t tensor_nbytes(const tensor_t *t);
 int tensor_ref_count(const tensor_t *t);
 
 /**
+ * @brief Returns non-zero if the tensor's data is externally owned (e.g. mmap).
+ *
+ * Only externally-owned tensors are safe to advise with MADV_DONTNEED because
+ * file-backed pages are re-faulted from the file on next access. Malloc-backed
+ * (non-external) tensors will read back as zeros after MADV_DONTNEED.
+ *
+ * @return 1 if external (mmap-backed), 0 if malloc-owned.
+ */
+int tensor_is_external(const tensor_t *t);
+
+/**
  * @brief Create a tensor that points to existing data (no allocation).
  * Used for memory-mapped weights.
  */

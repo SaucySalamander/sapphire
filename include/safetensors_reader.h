@@ -214,6 +214,27 @@ const void* safetensors_data_ptr(const safetensors_file_t *st,
 void safetensors_close(safetensors_file_t *st);
 
 /**
+ * @brief Evict resident pages of a safetensors file from RAM.
+ *
+ * Calls madvise(MADV_DONTNEED) on the mmap region without closing the file.
+ * Use this to release RSS for weight shards that are no longer actively needed.
+ *
+ * @param st Safetensors file handle (may be NULL; safe noop).
+ */
+void safetensors_evict_pages(safetensors_file_t *st);
+
+/**
+ * @brief Get the raw mmap pointer for a safetensors file.
+ *
+ * Returns the base pointer to the mmapped file data. This is used by
+ * sliding-window eviction to call madvise on specific byte ranges.
+ *
+ * @param st Safetensors file handle.
+ * @return Base mmap pointer, or NULL if invalid.
+ */
+const void *safetensors_mmap_ptr(const safetensors_file_t *st);
+
+/**
  * @brief Print Safetensors file metadata for debugging.
  *
  * Prints all tensor names, shapes, dtypes, and offsets to stdout.

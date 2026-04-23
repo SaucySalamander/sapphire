@@ -559,6 +559,13 @@ safetensors_file_t* safetensors_open(const char *path) {
     st->header_size = header_len;
     st->json_header = json_header;
 
+    if (fd >= 0) {
+        if (close(fd) != 0) {
+            LOG_WARN("safetensors_open: close failed for %s: %s", path, strerror(errno));
+        }
+        st->fd = -1;
+    }
+
     LOG_INFO("✓ Safetensors file opened: %s", path);
     LOG_INFO("  - Header size: %lu bytes", (unsigned long)header_len);
     LOG_INFO("  - File size: %zu bytes", mmap_size);
@@ -824,6 +831,33 @@ void safetensors_close(safetensors_file_t *st) {
     }
     
     free(st);
+}
+
+/**
+ * @brief Evict resident pages of a safetensors file from RAM without closing.
+ *
+ * Calls madvise(MADV_DONTNEED) on the mmap region.  The file remains open and
+ * can still be accessed (pages will be demand-faulted back in), but the RSS
+ * associated with currently-resident pages is released.  Useful for dropping
+ * weight shards that are no longer actively used.
+ */
+void safetensors_evict_pages(safetensors_file_t *st)
+{
+    if (!st || !st->mmap_ptr || st->mmap_size == 0) {
+        return;
+    }
+    madvise(st->mmap_ptr, st->mmap_size, MADV_DONTNEED);
+}
+
+/**
+ * @brief Get the raw mmap pointer for a safetensors file.
+ */
+const void *safetensors_mmap_ptr(const safetensors_file_t *st)
+{
+    if (!st) {
+        return NULL;
+    }
+    return st->mmap_ptr;
 }
 
 /**

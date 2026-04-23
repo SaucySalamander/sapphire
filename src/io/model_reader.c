@@ -4,12 +4,14 @@
 #include "ternary_anchor.h"
 #include "gemma3_config.h"
 #include "tensor_mapper.h"
+#include "tensor.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <limits.h>
 #include <dirent.h>
+#include <sys/mman.h>
 #include <log.h>
 #include <file_reader.h>
 
@@ -512,7 +514,7 @@ static int validate_manifest_entry_local(const ternary_manifest_loader_entry_t *
     }
     if (entry->source_forms == (TERNARY_MANIFEST_FORM_BULK | TERNARY_MANIFEST_FORM_LEGACY_ANCHOR) ||
         entry->source_forms == TERNARY_MANIFEST_FORM_UNIFIED_ANCHOR) {
-        if (entry->anchor_file_name[0] == '\0' || entry->anchor_count == 0u) {
+        if (entry->anchor_file_name[0] == '\0') {
             LOG_ERROR("Invalid anchor manifest entry for %s in %s: missing anchor sidecar metadata",
                       entry->tensor_name,
                       manifest_path);
@@ -1173,6 +1175,14 @@ static llm_model_t *load_model_sharded(const model_spec_t *model_spec,
     shard_paths = NULL;
     shard_count = 0;
 
+    /* Check for low-memory mode (CLI flag exports SAPPHIRE_LOW_MEMORY=1) */
+    const char *low_mem_env = getenv("SAPPHIRE_LOW_MEMORY");
+    if (low_mem_env && (strcmp(low_mem_env, "1") == 0 ||
+                        strcasecmp(low_mem_env, "true") == 0)) {
+        model->low_memory_mode = 1;
+        LOG_INFO("Low-memory mode enabled: inference will use sliding-window layer eviction");
+    }
+
     LOG_INFO("All %d shards loaded successfully", loaded_shard_count);
     return model;
 
@@ -1301,6 +1311,7 @@ void llm_model_destroy(llm_model_t *model) {
         }
         free(model->safetensors_shard_handles);
     }
+    free(model->layer_page_info);
     free(model);
 }
 
@@ -1355,9 +1366,98 @@ void llm_model_destroy_ex(const struct model_spec *spec) {
         }
         free(model->safetensors_shard_handles);
     }
+    free(model->layer_page_info);
 
     /* Null out spec->llm_model to avoid dangling pointer in the spec */
     ((struct model_spec *)spec)->llm_model = NULL;
 
     free(model);
+}
+
+/* Helper: call madvise on a tensor's data if it's mmap-backed.
+ * Only external (file-mmap) tensors are safe: MADV_DONTNEED on anonymous
+ * malloc pages returns zero on next read, permanently corrupting weights. */
+static void madvise_tensor(const tensor_t *t, int advice) {
+    if (!t) return;
+    if (!tensor_is_external(t)) return;   /* malloc-backed: skip */
+
+    const void *data = tensor_data(t);
+    size_t nbytes = tensor_nbytes(t);
+    if (!data || nbytes == 0) return;
+    
+    /* Round to page boundaries */
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t addr = (uintptr_t)data;
+    uintptr_t aligned_addr = (addr / page_size) * page_size;
+    size_t offset_delta = addr - aligned_addr;
+    size_t aligned_size = ((nbytes + offset_delta + page_size - 1) / page_size) * page_size;
+    
+    madvise((void *)aligned_addr, aligned_size, advice);
+}
+
+/**
+ * Evict layer pages from resident memory (MADV_DONTNEED).
+ *
+ * Use this in a sliding-window inference loop to bound RSS. The mmap
+ * stays valid; pages fault back in on next access.
+ */
+void llm_model_evict_layer(llm_model_t *model, int layer_idx) {
+    if (!model || !model->low_memory_mode) {
+        return;
+    }
+    if (layer_idx < 0 || layer_idx >= model->num_layers) {
+        return;
+    }
+    if (!model->layers) {
+        return;
+    }
+
+    const model_layer_weights_t *layer = &model->layers[layer_idx];
+    
+    madvise_tensor(layer->norm_attn_weight, MADV_DONTNEED);
+    madvise_tensor(layer->norm_attn_post_weight, MADV_DONTNEED);
+    madvise_tensor(layer->q_proj_weight, MADV_DONTNEED);
+    madvise_tensor(layer->k_proj_weight, MADV_DONTNEED);
+    madvise_tensor(layer->v_proj_weight, MADV_DONTNEED);
+    madvise_tensor(layer->q_norm_weight, MADV_DONTNEED);
+    madvise_tensor(layer->k_norm_weight, MADV_DONTNEED);
+    madvise_tensor(layer->out_proj_weight, MADV_DONTNEED);
+    madvise_tensor(layer->norm_ffn_weight, MADV_DONTNEED);
+    madvise_tensor(layer->norm_ffn_post_weight, MADV_DONTNEED);
+    madvise_tensor(layer->up_proj_weight, MADV_DONTNEED);
+    madvise_tensor(layer->gate_proj_weight, MADV_DONTNEED);
+    madvise_tensor(layer->down_proj_weight, MADV_DONTNEED);
+}
+
+/**
+ * Prefetch layer pages for upcoming access (MADV_WILLNEED).
+ *
+ * Starts async readahead for the layer's mmapped pages.
+ */
+void llm_model_prefetch_layer(llm_model_t *model, int layer_idx) {
+    if (!model || !model->low_memory_mode) {
+        return;
+    }
+    if (layer_idx < 0 || layer_idx >= model->num_layers) {
+        return;
+    }
+    if (!model->layers) {
+        return;
+    }
+
+    const model_layer_weights_t *layer = &model->layers[layer_idx];
+    
+    madvise_tensor(layer->norm_attn_weight, MADV_WILLNEED);
+    madvise_tensor(layer->norm_attn_post_weight, MADV_WILLNEED);
+    madvise_tensor(layer->q_proj_weight, MADV_WILLNEED);
+    madvise_tensor(layer->k_proj_weight, MADV_WILLNEED);
+    madvise_tensor(layer->v_proj_weight, MADV_WILLNEED);
+    madvise_tensor(layer->q_norm_weight, MADV_WILLNEED);
+    madvise_tensor(layer->k_norm_weight, MADV_WILLNEED);
+    madvise_tensor(layer->out_proj_weight, MADV_WILLNEED);
+    madvise_tensor(layer->norm_ffn_weight, MADV_WILLNEED);
+    madvise_tensor(layer->norm_ffn_post_weight, MADV_WILLNEED);
+    madvise_tensor(layer->up_proj_weight, MADV_WILLNEED);
+    madvise_tensor(layer->gate_proj_weight, MADV_WILLNEED);
+    madvise_tensor(layer->down_proj_weight, MADV_WILLNEED);
 }

@@ -25,9 +25,11 @@
 #include "transformer.h"
 
 #include <errno.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 
@@ -122,6 +124,10 @@ typedef struct {
 } conversion_runtime_t;
 
 static transformer_ste_config_t default_runtime_ste_config(const ternary_conversion_config_t *config);
+static int run_full_model_conversion(const ternary_conversion_config_t *config,
+                                     const char *model_dir,
+                                     const char *model_path,
+                                     conversion_runtime_t *runtime);
 
 static int build_runtime_telemetry_path(const char *base_path,
                                         char *out_path,
@@ -236,6 +242,62 @@ static const char *conversion_runtime_spatial_telemetry_path(const ternary_conve
     }
 
     return NULL;
+}
+
+static int sanitize_tensor_name_for_output(const char *tensor_name,
+                                           char *out_name,
+                                           size_t out_name_size)
+{
+    size_t idx = 0u;
+
+    if (!tensor_name || !out_name || out_name_size == 0u) {
+        return -1;
+    }
+
+    for (; tensor_name[idx] != '\0' && idx + 1u < out_name_size; ++idx) {
+        char ch = tensor_name[idx];
+        if ((ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '-' || ch == '_') {
+            out_name[idx] = ch;
+        } else {
+            out_name[idx] = '_';
+        }
+    }
+    if (tensor_name[idx] != '\0') {
+        out_name[0] = '\0';
+        return -1;
+    }
+
+    out_name[idx] = '\0';
+    return (out_name[0] != '\0') ? 0 : -1;
+}
+
+static int build_tensor_output_path(const char *output_dir,
+                                    const char *tensor_name,
+                                    const char *suffix,
+                                    char **out_path)
+{
+    char safe_name[256];
+    char file_name[352];
+    int written = 0;
+
+    if (!output_dir || !tensor_name || !suffix || !out_path) {
+        return -1;
+    }
+
+    if (sanitize_tensor_name_for_output(tensor_name, safe_name, sizeof(safe_name)) != 0) {
+        return -1;
+    }
+
+    written = snprintf(file_name, sizeof(file_name), "%s%s", safe_name, suffix);
+    if (written < 0 || (size_t)written >= sizeof(file_name)) {
+        return -1;
+    }
+
+    *out_path = construct_safe_path(output_dir, file_name, NULL);
+    return *out_path ? 0 : -1;
 }
 
 static uint32_t config_hash_update_string(uint32_t crc32, const char *value)
@@ -1387,45 +1449,26 @@ static int resume_validation_apply_ternary_entry(const ternary_conversion_config
                                                  const resume_manifest_entry_t *entry)
 {
     char *layer_path = NULL;
-    ternary_layer_payload_t payload;
-    uint32_t actual_crc32 = 0u;
     int rc = -1;
 
     if (!config || !runtime || !entry) {
         return -1;
     }
 
-    memset(&payload, 0, sizeof(payload));
     layer_path = construct_safe_path(config->output_path, entry->file_name, NULL);
     if (!layer_path) {
         return -1;
     }
-    if (io_load_layer_ternary_payload(layer_path,
-                                      entry->tensor_name,
-                                      entry->rows,
-                                      entry->cols,
-                                      &payload) != 0) {
-        goto cleanup;
-    }
-
-    actual_crc32 = io_crc32_update(0u, payload.packed_weights, payload.packed_weight_bytes);
-    actual_crc32 = io_crc32_update(actual_crc32, payload.scales, payload.scale_bytes);
-    if (actual_crc32 != entry->crc32) {
-        LOG_ERROR("student update: manifest CRC mismatch for %s (expected=%08x actual=%08x)",
-                  entry->tensor_name,
-                  entry->crc32,
-                  actual_crc32);
-        goto cleanup;
-    }
-
-    rc = ternary_validation_apply_proxy_from_payload(&runtime->validation_state,
-                                                     entry->tensor_name,
-                                                     &payload,
-                                                     entry->crc32,
-                                                     0);
-
-cleanup:
-    io_free_layer_ternary_payload(&payload);
+    ternary_proxy_spec_t spec;
+    spec.rows                = entry->rows;
+    spec.cols                = entry->cols;
+    spec.packed_weight_bytes = entry->packed_weight_bytes;
+    spec.crc32               = entry->crc32;
+    rc = ternary_validation_apply_proxy_from_ternary_file(&runtime->validation_state,
+                                                           entry->tensor_name,
+                                                           layer_path,
+                                                           &spec,
+                                                           0);
     free(layer_path);
     return rc;
 }
@@ -1436,68 +1479,36 @@ static int resume_validation_apply_anchor_entry(const ternary_conversion_config_
 {
     char *anchor_path = NULL;
     char *bulk_path = NULL;
-    ternary_anchor_view_t anchor_view;
-    ternary_layer_payload_t payload;
-    uint32_t actual_crc32 = 0u;
     int rc = -1;
 
     if (!config || !runtime || !entry || entry->anchor_file_name[0] == '\0') {
         return -1;
     }
 
-    memset(&anchor_view, 0, sizeof(anchor_view));
-    memset(&payload, 0, sizeof(payload));
     anchor_path = construct_safe_path(config->output_path, entry->anchor_file_name, NULL);
     if (!anchor_path) {
         return -1;
     }
-    if (ternary_anchor_load_for_tensor(anchor_path, entry->tensor_name, &anchor_view) != 0) {
-        goto cleanup;
-    }
-    if (anchor_view.rows != entry->rows || anchor_view.cols != entry->cols) {
-        LOG_ERROR("student update: anchor manifest shape mismatch for %s", entry->tensor_name);
-        goto cleanup;
-    }
-    if (entry->anchor_count > 0u && anchor_view.anchor_count != entry->anchor_count) {
-        LOG_ERROR("student update: anchor manifest count mismatch for %s (expected=%u actual=%u)",
-                  entry->tensor_name,
-                  entry->anchor_count,
-                  anchor_view.anchor_count);
-        goto cleanup;
-    }
-
     bulk_path = construct_safe_path(config->output_path, entry->file_name, NULL);
     if (!bulk_path) {
         goto cleanup;
     }
-    if (io_load_layer_ternary_payload(bulk_path,
-                                      entry->tensor_name,
-                                      entry->rows,
-                                      entry->cols,
-                                      &payload) != 0) {
-        goto cleanup;
+    {
+        hybrid_proxy_spec_t hspec;
+        hspec.rows                = entry->rows;
+        hspec.cols                = entry->cols;
+        hspec.packed_weight_bytes = entry->packed_weight_bytes;
+        hspec.anchor_count        = entry->anchor_count;
+        hspec.crc32               = entry->crc32;
+        rc = ternary_validation_apply_proxy_from_hybrid_files(&runtime->validation_state,
+                                                              entry->tensor_name,
+                                                              bulk_path,
+                                                              anchor_path,
+                                                              &hspec,
+                                                              0);
     }
-
-    actual_crc32 = io_crc32_update(0u, payload.packed_weights, payload.packed_weight_bytes);
-    actual_crc32 = io_crc32_update(actual_crc32, payload.scales, payload.scale_bytes);
-    if (actual_crc32 != entry->crc32) {
-        LOG_ERROR("student update: manifest CRC mismatch for %s (expected=%08x actual=%08x)",
-                  entry->tensor_name,
-                  entry->crc32,
-                  actual_crc32);
-        goto cleanup;
-    }
-
-    rc = ternary_validation_apply_proxy_from_hybrid_payload(&runtime->validation_state,
-                                                            entry->tensor_name,
-                                                            &payload,
-                                                            &anchor_view,
-                                                            entry->crc32,
-                                                            0);
 
 cleanup:
-    io_free_layer_ternary_payload(&payload);
-    ternary_anchor_view_release(&anchor_view);
     free(bulk_path);
     free(anchor_path);
     return rc;
@@ -1508,50 +1519,21 @@ static int resume_validation_apply_mold_entry(const ternary_conversion_config_t 
                                               const resume_manifest_entry_t *entry)
 {
     char *layer_path = NULL;
-    ternary_bf16_layer_map_t map;
-    size_t bf16_byte_count = 0u;
-    uint32_t actual_crc32 = 0u;
     int rc = -1;
 
     if (!config || !runtime || !entry) {
         return -1;
     }
 
-    memset(&map, 0, sizeof(map));
     layer_path = construct_safe_path(config->output_path, entry->file_name, NULL);
     if (!layer_path) {
         return -1;
     }
-    if (io_mmap_layer_bf16(layer_path, entry->tensor_name, &map) != 0) {
-        goto cleanup;
-    }
-    if (map.rows != entry->rows || map.cols != entry->cols) {
-        LOG_ERROR("student update: mold manifest shape mismatch for %s", entry->tensor_name);
-        goto cleanup;
-    }
-
-    bf16_byte_count = (size_t)map.rows * map.cols * sizeof(uint16_t);
-    actual_crc32 = io_crc32_update(0u, map.bf16_weights, bf16_byte_count);
-    if (actual_crc32 != entry->crc32) {
-        LOG_ERROR("student update: mold manifest CRC mismatch for %s (expected=%08x actual=%08x)",
-                  entry->tensor_name,
-                  entry->crc32,
-                  actual_crc32);
-        goto cleanup;
-    }
-
-    rc = ternary_validation_apply_proxy_from_bf16(&runtime->validation_state,
-                                                  entry->tensor_name,
-                                                  &(ternary_validation_bf16_view_t){
-                                                      .weights = map.bf16_weights,
-                                                      .rows = map.rows,
-                                                      .cols = map.cols,
-                                                  },
-                                                  entry->crc32,
-                                                  0);
-
-cleanup:
-    io_unmap_layer_bf16(&map);
+    rc = ternary_validation_apply_proxy_from_bf16_file(&runtime->validation_state,
+                                                       entry->tensor_name,
+                                                       layer_path,
+                                                       entry->crc32,
+                                                       0);
     free(layer_path);
     return rc;
 }
@@ -1749,6 +1731,62 @@ static void seed_checkpoint_state_defaults(const ternary_conversion_config_t *co
     copy_text_field_local(runtime->checkpoint_state.validation_corpus_manifest_path, sizeof(runtime->checkpoint_state.validation_corpus_manifest_path), config->validation_corpus_manifest_path);
 }
 
+static int checkpoint_state_needs_seed_backfill(const ternary_student_update_checkpoint_t *checkpoint)
+{
+    return checkpoint &&
+        checkpoint->schema_version == TERNARY_STUDENT_CHECKPOINT_VERSION &&
+        checkpoint->converted_tensor_count > 0u &&
+        checkpoint->config_hash == 0u &&
+        checkpoint->total_layer_count == 0u &&
+        checkpoint->checkpoint_every_n_layers == 0u &&
+        checkpoint->model_name[0] == '\0' &&
+        checkpoint->output_dir[0] == '\0';
+}
+
+static void backfill_seeded_checkpoint_state(ternary_student_update_checkpoint_t *checkpoint,
+                                             const ternary_student_update_checkpoint_t *seeded_defaults)
+{
+    if (!checkpoint || !seeded_defaults || !checkpoint_state_needs_seed_backfill(checkpoint)) {
+        return;
+    }
+
+    LOG_WARN("student update: checkpoint missing seeded defaults; repairing legacy checkpoint state from current config");
+
+    checkpoint->schema_version = seeded_defaults->schema_version;
+    checkpoint->config_hash = seeded_defaults->config_hash;
+    checkpoint->total_layer_count = seeded_defaults->total_layer_count;
+    checkpoint->checkpoint_every_n_layers = seeded_defaults->checkpoint_every_n_layers;
+    checkpoint->validate_every_n = seeded_defaults->validate_every_n;
+    checkpoint->use_anchor_mode = seeded_defaults->use_anchor_mode;
+    checkpoint->anchor_budget_ppm = seeded_defaults->anchor_budget_ppm;
+    checkpoint->anchor_saliency_mode = seeded_defaults->anchor_saliency_mode;
+
+    copy_text_field_local(checkpoint->model_name,
+                          sizeof(checkpoint->model_name),
+                          seeded_defaults->model_name);
+    copy_text_field_local(checkpoint->teacher_model_name,
+                          sizeof(checkpoint->teacher_model_name),
+                          seeded_defaults->teacher_model_name);
+    copy_text_field_local(checkpoint->output_dir,
+                          sizeof(checkpoint->output_dir),
+                          seeded_defaults->output_dir);
+    copy_text_field_local(checkpoint->activation_tape_path,
+                          sizeof(checkpoint->activation_tape_path),
+                          seeded_defaults->activation_tape_path);
+    copy_text_field_local(checkpoint->calibration_corpus_path,
+                          sizeof(checkpoint->calibration_corpus_path),
+                          seeded_defaults->calibration_corpus_path);
+    copy_text_field_local(checkpoint->calibration_corpus_manifest_path,
+                          sizeof(checkpoint->calibration_corpus_manifest_path),
+                          seeded_defaults->calibration_corpus_manifest_path);
+    copy_text_field_local(checkpoint->validation_corpus_path,
+                          sizeof(checkpoint->validation_corpus_path),
+                          seeded_defaults->validation_corpus_path);
+    copy_text_field_local(checkpoint->validation_corpus_manifest_path,
+                          sizeof(checkpoint->validation_corpus_manifest_path),
+                          seeded_defaults->validation_corpus_manifest_path);
+}
+
 static int validate_loaded_checkpoint_state(const ternary_conversion_config_t *config,
                                             const conversion_runtime_t *runtime,
                                             uint32_t total_layer_count,
@@ -1848,6 +1886,7 @@ static int init_checkpoint_state(const ternary_conversion_config_t *config,
     int load_rc = 0;
     uint32_t config_hash = 0u;
     uint32_t total_layer_count = 0u;
+    ternary_student_update_checkpoint_t seeded_checkpoint_state;
 
     if (!config || !runtime) {
         return -1;
@@ -1865,6 +1904,7 @@ static int init_checkpoint_state(const ternary_conversion_config_t *config,
                                      runtime->hessian_sidecar ? runtime->hessian_sidecar_crc32 : 0u,
                                      runtime->structural_map_crc32);
     seed_checkpoint_state_defaults(config, runtime, total_layer_count, config_hash);
+    seeded_checkpoint_state = runtime->checkpoint_state;
 
     load_rc = ternary_student_checkpoint_load(runtime->checkpoint_path, &runtime->checkpoint_state);
     if (load_rc == 1) {
@@ -1878,6 +1918,7 @@ static int init_checkpoint_state(const ternary_conversion_config_t *config,
     if (load_rc != 0) {
         return -1;
     }
+    backfill_seeded_checkpoint_state(&runtime->checkpoint_state, &seeded_checkpoint_state);
     if (validate_loaded_checkpoint_state(config, runtime, total_layer_count, config_hash) != 0) {
         return -1;
     }
@@ -3242,6 +3283,156 @@ typedef struct {
     full_model_tensor_representation_t representation;
 } full_model_tensor_task_t;
 
+static int process_full_model_tensor_skip_other(const full_model_tensor_task_t *task,
+                                                uint32_t converted_count,
+                                                const char *skip_message);
+static int process_full_model_tensor_skipped_vector(const full_model_tensor_task_t *task,
+                                                    ternary_calibration_result_t *result,
+                                                    uint32_t converted_count);
+static int process_full_model_tensor_failed(const full_model_tensor_task_t *task,
+                                            ternary_calibration_result_t *result,
+                                            uint32_t converted_count);
+static int process_full_model_tensor_complete(const full_model_tensor_task_t *task,
+                                              ternary_calibration_result_t *result,
+                                              uint32_t converted_count,
+                                              uint32_t crc32);
+static int process_full_model_tensor(full_model_tensor_task_t *task);
+
+static int prepare_full_model_layer_ste_config(const full_model_tensor_task_t *task,
+                                               uint32_t layer_index,
+                                               int has_layer_index,
+                                               transformer_ste_config_t *out_ste_config,
+                                               ternary_telemetry_t *out_telemetry)
+{
+    progressive_distillation_schedule_t distillation_schedule;
+
+    if (!task || !task->runtime || !task->runtime->activation_tape ||
+        !tensor_name_is_layer_tensor(task->tensor_name) || !out_ste_config || !out_telemetry) {
+        return 0;
+    }
+
+    *out_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
+    out_ste_config->telemetry_path = conversion_runtime_telemetry_path(task->config, task->runtime);
+    out_ste_config->spatial_telemetry_path = conversion_runtime_spatial_telemetry_path(task->config, task->runtime);
+    distillation_schedule = progressive_calib_distillation_schedule(task->config,
+                                                                   task->progressive_stage,
+                                                                   has_layer_index,
+                                                                   layer_index);
+    out_ste_config->kl_weight = distillation_schedule.kl_weight;
+    out_ste_config->kl_temperature = distillation_schedule.kl_temperature;
+    out_ste_config->simulate_activation_a8 = progressive_calib_stage_uses_activation_a8(task->progressive_stage);
+    if (progressive_calib_stage_is_stage3(task->progressive_stage)) {
+        out_ste_config->learning_rate *= PROGRESSIVE_CALIB_STAGE3_LR_SCALE;
+    }
+    out_ste_config->hessian_sidecar_path = task->config->hessian_sidecar_path;
+    out_ste_config->hessian_sidecar_crc32 = task->runtime->hessian_sidecar_crc32;
+    if (task->config->progressive_calib && has_layer_index) {
+        LOG_INFO("Progressive distillation: tensor=%s stage=%s layer=%u kl_weight=%.4f kl_temp=%.2f lr=%.4f a8=%u",
+                 task->tensor_name,
+                 progressive_calib_stage_name(task->progressive_stage),
+                 layer_index,
+                 (double)out_ste_config->kl_weight,
+                 (double)out_ste_config->kl_temperature,
+                 (double)out_ste_config->learning_rate,
+                 (unsigned)out_ste_config->simulate_activation_a8);
+    }
+    telemetry_prepare_layer_context(out_telemetry, task->runtime, task->layer_index);
+    out_ste_config->telemetry = out_telemetry;
+    prefetch_activation_tape_lookahead(task->runtime,
+                                       task->spec,
+                                       task->layer_index,
+                                       2,
+                                       task->last_prefetched_entry_idx,
+                                       &out_telemetry->io_ms);
+    return 1;
+}
+
+static int full_model_anchor_policy_allows_tensor(const full_model_tensor_task_t *task,
+                                                  const structural_tensor_rule_t *structural_rule)
+{
+    if (!task || !task->config || !task->tensor_name || !full_model_anchor_mode_enabled(task->config)) {
+        return 0;
+    }
+    if (structural_rule_is_mold(structural_rule) || structural_rule_is_pass_through(structural_rule)) {
+        return 0;
+    }
+    if (!tensor_name_is_layer_tensor(task->tensor_name) ||
+        !structural_map_name_matches(task->tensor_name, full_model_anchor_policy_pattern(task->config))) {
+        return 0;
+    }
+    if (full_model_anchor_policy_filter(task->config)[0] != '\0' &&
+        !structural_map_name_matches(task->tensor_name, full_model_anchor_policy_filter(task->config))) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int classify_full_model_tensor(full_model_tensor_task_t *task,
+                                      uint32_t converted_count)
+{
+    const structural_tensor_rule_t *structural_rule = NULL;
+
+    if (!task) {
+        return -1;
+    }
+
+    task->representation = FULL_MODEL_TENSOR_REPRESENTATION_TERNARY;
+    if (!task->tensor_name || task->tensor_name[0] == '\0') {
+        return process_full_model_tensor_skip_other(task, converted_count, NULL);
+    }
+    if (task->progressive_stage != PROGRESSIVE_CALIB_STAGE_DISABLED &&
+        !progressive_calib_stage_allows_tensor(task->progressive_stage, task->tensor_name)) {
+        LOG_INFO("Progressive calib %s: freezing tensor outside active window: %s",
+                 progressive_calib_stage_name(task->progressive_stage),
+                 task->tensor_name);
+        return process_full_model_tensor_skip_other(task, converted_count, NULL);
+    }
+
+    structural_rule = runtime_structural_rule_for_tensor(task->runtime, task->tensor_name);
+    if (structural_rule && structural_rule->rule_type == STRUCTURAL_TENSOR_RULE_ALIAS) {
+        if (structural_rule_is_pass_through(structural_rule)) {
+            LOG_INFO("Skipping structural PASS alias tensor in full conversion: %s -> %s",
+                     task->tensor_name,
+                     structural_rule->mapped_tensor_name);
+            return process_full_model_tensor_skip_other(task, converted_count, NULL);
+        }
+        LOG_INFO("Skipping structural alias tensor in full conversion: %s -> %s",
+                 task->tensor_name,
+                 structural_rule->mapped_tensor_name);
+        return process_full_model_tensor_skip_other(task,
+                                                    converted_count,
+                                                    "Skipping structural alias tensor in full conversion: %s");
+    }
+    if (structural_rule_is_pass_through(structural_rule)) {
+        LOG_INFO("Skipping structural PASS tensor in full conversion: %s", task->tensor_name);
+        return process_full_model_tensor_skip_other(task, converted_count, NULL);
+    }
+
+    if (structural_rule_is_mold(structural_rule)) {
+        task->representation = FULL_MODEL_TENSOR_REPRESENTATION_MOLD;
+    } else if (full_model_anchor_policy_allows_tensor(task, structural_rule)) {
+        task->representation = FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR;
+    }
+
+    if (task->representation != FULL_MODEL_TENSOR_REPRESENTATION_MOLD &&
+        tensor_name_is_tied_embedding_tensor(task->tensor_name)) {
+        LOG_INFO("Skipping embedding tensor in full conversion: %s", task->tensor_name);
+        return process_full_model_tensor_skip_other(task,
+                                                    converted_count,
+                                                    "Skipping embedding tensor in full conversion: %s");
+    }
+    if (task->representation != FULL_MODEL_TENSOR_REPRESENTATION_MOLD &&
+        tensor_name_is_tied_output_tensor(task->tensor_name)) {
+        LOG_INFO("Skipping tied output tensor in full conversion: %s", task->tensor_name);
+        return process_full_model_tensor_skip_other(task,
+                                                    converted_count,
+                                                    "Skipping tied output tensor in full conversion: %s");
+    }
+
+    return FULL_MODEL_TENSOR_STATUS_CONVERTED;
+}
+
 static int mmap_tensor_for_conversion(const char *model_dir,
                                       const char *model_path,
                                       ternary_bf16_io_cache_t *bf16_io_cache,
@@ -3391,6 +3582,7 @@ static int mean_tape_activation_variance(const activation_tape_t *tape,
                                                    activation_tape_vector_dim(tape, tensor_name));
     }
 
+    activation_tape_discard_entry(tape, tensor_name);
     *out_variance = variance_sum / (float)sample_count;
     return 0;
 }
@@ -3761,32 +3953,76 @@ static int process_full_model_tensor_complete(const full_model_tensor_task_t *ta
                                               uint32_t converted_count,
                                               uint32_t crc32)
 {
+    char *layer_path = NULL;
+    char *anchor_path = NULL;
+
     if (task->runtime && task->runtime->validation_state.config.sample_count > 0) {
         int validation_rc = 0;
-
-        if (task->representation == FULL_MODEL_TENSOR_REPRESENTATION_MOLD) {
-            validation_rc = ternary_validation_apply_proxy_from_dense(&task->runtime->validation_state,
-                                                                      task->tensor_name,
-                                                                      &(ternary_validation_dense_view_t){
-                                                                          .weights = result->latent_weights,
-                                                                          .rows = result->rows,
-                                                                          .cols = result->cols,
-                                                                      },
-                                                                      crc32,
-                                                                      (int)(converted_count + 1u));
+        if (build_tensor_output_path(task->config->output_path,
+                                     task->tensor_name,
+                                     ".safetensors",
+                                     &layer_path) != 0) {
+            validation_rc = -1;
+        } else if (task->representation == FULL_MODEL_TENSOR_REPRESENTATION_MOLD) {
+            validation_rc = ternary_validation_apply_proxy_from_bf16_file(&task->runtime->validation_state,
+                                                                           task->tensor_name,
+                                                                           layer_path,
+                                                                           crc32,
+                                                                           (int)(converted_count + 1u));
+        } else if (task->representation == FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR) {
+            if (build_tensor_output_path(task->config->output_path,
+                                         task->tensor_name,
+                                         ".anchors.safetensors",
+                                         &anchor_path) != 0) {
+                validation_rc = -1;
+            } else {
+                hybrid_proxy_spec_t hspec;
+                hspec.rows                = result->rows;
+                hspec.cols                = result->cols;
+                hspec.packed_weight_bytes = result->packed_weight_bytes;
+                hspec.anchor_count        = result->anchor_count;
+                hspec.crc32               = crc32;
+                validation_rc = ternary_validation_apply_proxy_from_hybrid_files(
+                    &task->runtime->validation_state,
+                    task->tensor_name, layer_path, anchor_path,
+                    &hspec, (int)(converted_count + 1u));
+            }
         } else {
-            validation_rc = ternary_validation_apply_proxy(&task->runtime->validation_state,
-                                                           task->tensor_name,
-                                                           result,
-                                                           crc32,
-                                                           (int)(converted_count + 1u));
+            ternary_proxy_spec_t tspec;
+            tspec.rows                = result->rows;
+            tspec.cols                = result->cols;
+            tspec.packed_weight_bytes = result->packed_weight_bytes;
+            tspec.crc32               = crc32;
+            validation_rc = ternary_validation_apply_proxy_from_ternary_file(
+                &task->runtime->validation_state,
+                task->tensor_name, layer_path,
+                &tspec, (int)(converted_count + 1u));
         }
+
         if (validation_rc != 0) {
             LOG_WARN("Validation checkpoint failed after tensor: %s", task->tensor_name);
         }
     }
 
+    free(anchor_path);
+    free(layer_path);
+
     transformer_free_ternary_calibration_result(result);
+
+    /* Return freed pages from the STE workspace and result buffers to the OS.
+     * Without this, glibc keeps ~800 MB–1 GB of brk pages warm between tensors,
+     * causing RSS to ratchet upward across the 46-layer conversion run.       */
+    malloc_trim(0);
+
+    {
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) == 0) {
+            LOG_INFO("RSS after tensor %s: %ld MB",
+                     task->tensor_name ? task->tensor_name : "<unknown>",
+                     ru.ru_maxrss / 1024L);
+        }
+    }
+
     if (student_checkpoint_progress(task->config,
                                     task->runtime,
                                     task->progress_index + 1u,
@@ -3798,236 +4034,113 @@ static int process_full_model_tensor_complete(const full_model_tensor_task_t *ta
     return FULL_MODEL_TENSOR_STATUS_CONVERTED;
 }
 
-static int prepare_full_model_layer_ste_config(const full_model_tensor_task_t *task,
-                                               uint32_t layer_index,
-                                               int has_layer_index,
-                                               transformer_ste_config_t *out_ste_config,
-                                               ternary_telemetry_t *out_telemetry)
+static int config_has_text(const char *value)
 {
-    progressive_distillation_schedule_t distillation_schedule;
-
-    if (!task || !task->runtime || !task->runtime->activation_tape ||
-        !tensor_name_is_layer_tensor(task->tensor_name) || !out_ste_config || !out_telemetry) {
-        return 0;
-    }
-
-    *out_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
-    out_ste_config->telemetry_path = conversion_runtime_telemetry_path(task->config, task->runtime);
-    out_ste_config->spatial_telemetry_path = conversion_runtime_spatial_telemetry_path(task->config, task->runtime);
-    distillation_schedule = progressive_calib_distillation_schedule(task->config,
-                                                                   task->progressive_stage,
-                                                                   has_layer_index,
-                                                                   layer_index);
-    out_ste_config->kl_weight = distillation_schedule.kl_weight;
-    out_ste_config->kl_temperature = distillation_schedule.kl_temperature;
-    out_ste_config->simulate_activation_a8 = progressive_calib_stage_uses_activation_a8(task->progressive_stage);
-    if (progressive_calib_stage_is_stage3(task->progressive_stage)) {
-        out_ste_config->learning_rate *= PROGRESSIVE_CALIB_STAGE3_LR_SCALE;
-    }
-    out_ste_config->hessian_sidecar_path = task->config->hessian_sidecar_path;
-    out_ste_config->hessian_sidecar_crc32 = task->runtime->hessian_sidecar_crc32;
-    if (task->config->progressive_calib && has_layer_index) {
-        LOG_INFO("Progressive distillation: tensor=%s stage=%s layer=%u kl_weight=%.4f kl_temp=%.2f lr=%.4f a8=%u",
-                 task->tensor_name,
-                 progressive_calib_stage_name(task->progressive_stage),
-                 layer_index,
-                 (double)out_ste_config->kl_weight,
-                 (double)out_ste_config->kl_temperature,
-             (double)out_ste_config->learning_rate,
-             (unsigned)out_ste_config->simulate_activation_a8);
-    }
-    telemetry_prepare_layer_context(out_telemetry, task->runtime, task->layer_index);
-    out_ste_config->telemetry = out_telemetry;
-    prefetch_activation_tape_lookahead(task->runtime,
-                                       task->spec,
-                                       task->layer_index,
-                                       2,
-                                       task->last_prefetched_entry_idx,
-                                       &out_telemetry->io_ms);
-    return 1;
+    return value && value[0] != '\0';
 }
 
-static int full_model_anchor_policy_allows_tensor(const full_model_tensor_task_t *task,
-                                                  const structural_tensor_rule_t *structural_rule)
+static void log_conversion_corpus_inputs(const ternary_conversion_config_t *config)
 {
-    if (!task || !task->config || !task->tensor_name || !full_model_anchor_mode_enabled(task->config)) {
-        return 0;
-    }
-    if (structural_rule_is_mold(structural_rule) || structural_rule_is_pass_through(structural_rule)) {
-        return 0;
-    }
-    if (!tensor_name_is_layer_tensor(task->tensor_name) ||
-        !structural_map_name_matches(task->tensor_name, full_model_anchor_policy_pattern(task->config))) {
-        return 0;
-    }
-    if (full_model_anchor_policy_filter(task->config)[0] != '\0' &&
-        !structural_map_name_matches(task->tensor_name, full_model_anchor_policy_filter(task->config))) {
-        return 0;
-    }
-
-    return 1;
-}
-
-static int classify_full_model_tensor(full_model_tensor_task_t *task,
-                                      uint32_t converted_count)
-{
-    const structural_tensor_rule_t *structural_rule = NULL;
-
-    if (!task) {
-        return -1;
-    }
-
-    task->representation = FULL_MODEL_TENSOR_REPRESENTATION_TERNARY;
-    if (!task->tensor_name || task->tensor_name[0] == '\0') {
-        return process_full_model_tensor_skip_other(task, converted_count, NULL);
-    }
-    if (task->progressive_stage != PROGRESSIVE_CALIB_STAGE_DISABLED &&
-        !progressive_calib_stage_allows_tensor(task->progressive_stage, task->tensor_name)) {
-        LOG_INFO("Progressive calib %s: freezing tensor outside active window: %s",
-                 progressive_calib_stage_name(task->progressive_stage),
-                 task->tensor_name);
-        return process_full_model_tensor_skip_other(task, converted_count, NULL);
-    }
-
-    structural_rule = runtime_structural_rule_for_tensor(task->runtime, task->tensor_name);
-    if (structural_rule && structural_rule->rule_type == STRUCTURAL_TENSOR_RULE_ALIAS) {
-        if (structural_rule_is_pass_through(structural_rule)) {
-            LOG_INFO("Skipping structural PASS alias tensor in full conversion: %s -> %s",
-                     task->tensor_name,
-                     structural_rule->mapped_tensor_name);
-            return process_full_model_tensor_skip_other(task, converted_count, NULL);
+    if (config_has_text(config->calibration_corpus_manifest_path)) {
+        if (config_has_text(config->calibration_corpus_path)) {
+            LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);
+        } else {
+            LOG_INFO("  calibration_corpus: <loaded from manifest>");
         }
-        LOG_INFO("Skipping structural alias tensor in full conversion: %s -> %s",
-                 task->tensor_name,
-                 structural_rule->mapped_tensor_name);
-        return process_full_model_tensor_skip_other(task,
-                                                    converted_count,
-                                                    "Skipping structural alias tensor in full conversion: %s");
-    }
-    if (structural_rule_is_pass_through(structural_rule)) {
-        LOG_INFO("Skipping structural PASS tensor in full conversion: %s", task->tensor_name);
-        return process_full_model_tensor_skip_other(task, converted_count, NULL);
+        LOG_INFO("  calibration_manifest: %s", config->calibration_corpus_manifest_path);
+        return;
     }
 
-    if (structural_rule_is_mold(structural_rule)) {
-        task->representation = FULL_MODEL_TENSOR_REPRESENTATION_MOLD;
-    } else if (full_model_anchor_policy_allows_tensor(task, structural_rule)) {
-        task->representation = FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR;
+    if (config_has_text(config->calibration_corpus_path)) {
+        LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);
+    } else {
+        LOG_INFO("  calibration_corpus: <built-in fallback>");
     }
-
-    if (task->representation != FULL_MODEL_TENSOR_REPRESENTATION_MOLD &&
-        tensor_name_is_tied_embedding_tensor(task->tensor_name)) {
-        LOG_INFO("Skipping embedding tensor in full conversion: %s", task->tensor_name);
-        return process_full_model_tensor_skip_other(task,
-                                                    converted_count,
-                                                    "Skipping embedding tensor in full conversion: %s");
-    }
-    if (task->representation != FULL_MODEL_TENSOR_REPRESENTATION_MOLD &&
-        tensor_name_is_tied_output_tensor(task->tensor_name)) {
-        LOG_INFO("Skipping tied output tensor in full conversion: %s", task->tensor_name);
-        return process_full_model_tensor_skip_other(task,
-                                                    converted_count,
-                                                    "Skipping tied output tensor in full conversion: %s");
-    }
-
-    return FULL_MODEL_TENSOR_STATUS_CONVERTED;
 }
 
-static int process_full_model_tensor(full_model_tensor_task_t *task)
+static void log_conversion_validation_inputs(const ternary_conversion_config_t *config)
 {
-    convert_tensor_job_t job;
-    ternary_calibration_corpus_t active_corpus;
-    ternary_calibration_result_t result;
-    ternary_telemetry_t layer_telemetry;
-    transformer_ste_config_t effective_ste_config;
-    uint32_t crc32 = 0u;
-    int skipped_vector = 0;
-    int rc = 0;
-    uint32_t converted_count = 0u;
-    int use_layer_telemetry = 0;
-    uint32_t layer_index = 0u;
-    int has_layer_index = 0;
-    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "process_full_model_tensor");
+    if (config_has_text(config->validation_corpus_path)) {
+        LOG_INFO("  validation_corpus: %s", config->validation_corpus_path);
+    }
+    if (config_has_text(config->validation_corpus_manifest_path)) {
+        LOG_INFO("  validation_manifest: %s", config->validation_corpus_manifest_path);
+    }
+}
 
-    if (!task || !task->config) {
-        return conversion_tracy_end_status(&tracy_zone, -1);
+static void log_conversion_config(const ternary_conversion_config_t *config)
+{
+    LOG_INFO("Ternary conversion mode selected");
+    LOG_INFO("  model: %s", config->model_name);
+    LOG_INFO("  output: %s", config->output_path);
+    LOG_INFO("  context_len: %d", config->context_len);
+    LOG_INFO("  calibration_samples: %d",
+             (config->calibration_sample_limit > 0) ? config->calibration_sample_limit : 4);
+    LOG_INFO("  ste_steps: %d", (config->ste_steps > 0) ? config->ste_steps : 3);
+    LOG_INFO("  progressive_calib: %s", config->progressive_calib ? "enabled" : "disabled");
+    LOG_INFO("  student_down_proj_rmsnorm: %s",
+             config->student_down_proj_input_rmsnorm ? "enabled" : "disabled");
+    LOG_INFO("  max_grad_norm: %.4f", (double)((config->max_grad_norm > 0.0f) ? config->max_grad_norm : 1.0f));
+    LOG_INFO("  validate_every: %d", config->validate_every_n);
+    LOG_INFO("  kl_weight: %.4f", (double)((config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f));
+    LOG_INFO("  kl_update_freq: %d", (config->kl_update_interval > 0) ? config->kl_update_interval : 4);
+    LOG_INFO("  kl_samples: %d", (config->kl_sample_count > 0) ? config->kl_sample_count : 4);
+    LOG_INFO("  ste_early_stop: patience=%d delta=%.4f divergence=%.2f",
+             (config->early_stop_patience >= 0) ? config->early_stop_patience : 6,
+             (double)((config->early_stop_min_delta >= 0.0f) ? config->early_stop_min_delta : 1e-4f),
+             (double)((config->early_stop_divergence_ratio >= 0.0f) ? config->early_stop_divergence_ratio : 1.25f));
+    if (config->progressive_calib) {
+        LOG_INFO("  progressive_kl: stage2 layers 6-10 hold, 11-15 ramp to %.4f, stage3 %.4f, stage2 temp=%.2f",
+                 (double)PROGRESSIVE_CALIB_STAGE2_TARGET_KL_WEIGHT,
+                 (double)PROGRESSIVE_CALIB_STAGE3_TARGET_KL_WEIGHT,
+                 (double)PROGRESSIVE_CALIB_STAGE2_KL_TEMPERATURE);
+        LOG_INFO("  progressive_stage3: blocks 0-9, 10-19, 20-27+shared with lr_scale=%.2f",
+                 (double)PROGRESSIVE_CALIB_STAGE3_LR_SCALE);
+    }
+    LOG_INFO("  hessian_proxy: %s", config->disable_hessian_proxy ? "disabled" : "activation-diagonal");
+    LOG_INFO("  hessian_proxy_strength: %.4f",
+             (double)((config->hessian_proxy_strength >= 0.0f) ? config->hessian_proxy_strength : 1.0f));
+    LOG_INFO("  hessian_proxy_floor: %.4f",
+             (double)((config->hessian_proxy_floor >= 0.0f) ? config->hessian_proxy_floor : 0.05f));
+    LOG_INFO("  layer filter: %s",
+             config_has_text(config->layer_name) ? config->layer_name : "<all layers>");
+    LOG_INFO("  anchor_mode: %s", config->use_anchor_mode ? "enabled" : "disabled");
+    if (config->use_anchor_mode) {
+        LOG_INFO("  anchor_budget_ppm: %u", config->anchor_budget_ppm);
+        LOG_INFO("  anchor_saliency_mode: %d", config->anchor_saliency_mode);
+        if (full_model_anchor_mode_enabled(config)) {
+            LOG_INFO("  full_model_anchor_policy: %s pattern=%s artifact_version=%u",
+                     full_model_anchor_policy_name(config),
+                     full_model_anchor_policy_pattern(config),
+                     TERNARY_ANCHOR_VERSION);
+            if (full_model_anchor_policy_filter(config)[0] != '\0') {
+                LOG_INFO("  full_model_anchor_filter: %s", full_model_anchor_policy_filter(config));
+            }
+        }
     }
 
-    conversion_tracy_zone_text_if_present(&tracy_zone, task->tensor_name);
-    sapphire_tracy_plot_i64("conversion.progress_index", (int64_t)task->progress_index);
-
-    if (task->runtime) {
-        converted_count = task->runtime->checkpoint_state.converted_tensor_count;
+    if (config_has_text(config->activation_tape_path)) {
+        LOG_INFO("  activation_tape: %s", config->activation_tape_path);
     }
-    sapphire_tracy_plot_i64("conversion.converted_tensors", (int64_t)converted_count);
-
-    memset(&result, 0, sizeof(result));
-    memset(&layer_telemetry, 0, sizeof(layer_telemetry));
-    memset(&effective_ste_config, 0, sizeof(effective_ste_config));
-
-    rc = classify_full_model_tensor(task, converted_count);
-    if (rc != FULL_MODEL_TENSOR_STATUS_CONVERTED) {
-        return conversion_tracy_end_status(&tracy_zone, rc);
+    if (config_has_text(config->teacher_model_name)) {
+        LOG_INFO("  teacher_model: %s", config->teacher_model_name);
+    }
+    if (config_has_text(config->structural_map_path)) {
+        LOG_INFO("  structural_map: %s", config->structural_map_path);
+    }
+    if (config_has_text(config->hessian_sidecar_path)) {
+        LOG_INFO("  hessian_sidecar: %s", config->hessian_sidecar_path);
     }
 
-    has_layer_index = conversion_try_parse_layer_index(task->tensor_name, &layer_index);
-    conversion_tracy_plot_layer_index(has_layer_index, layer_index);
-
-    use_layer_telemetry = prepare_full_model_layer_ste_config(task,
-                                                              layer_index,
-                                                              has_layer_index,
-                                                              &effective_ste_config,
-                                                              &layer_telemetry);
-    if (!use_layer_telemetry) {
-        effective_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
-    }
-    effective_ste_config.use_anchor_mode =
-        (task->representation == FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR) ? 1 : 0;
-
-    memset(&active_corpus, 0, sizeof(active_corpus));
-    if (task->runtime) {
-        active_corpus = task->runtime->calibration_corpus;
-        active_corpus.tensor_name = task->tensor_name;
-    }
-
-    memset(&job, 0, sizeof(job));
-    job.model_path = task->model_path;
-    job.model_dir = task->model_dir;
-    job.output_dir = task->config->output_path;
-    job.tensor_name = task->tensor_name;
-    job.activation_tape = task->runtime ? task->runtime->activation_tape : NULL;
-    job.activation_tape_crc32 = task->runtime ? task->runtime->activation_tape_hash : 0u;
-    job.hessian_sidecar = task->runtime ? task->runtime->hessian_sidecar : NULL;
-    job.bf16_io_cache = task->runtime ? &task->runtime->bf16_io_cache : NULL;
-    job.hessian_proxy_cache = task->runtime ? &task->runtime->hessian_proxy_cache : NULL;
-    job.ste_config = &effective_ste_config;
-    job.calibration_corpus = task->runtime ? &active_corpus : NULL;
-    job.out_result = &result;
-    job.out_crc32 = &crc32;
-    job.out_skipped_vector = &skipped_vector;
-    job.out_io_ms = use_layer_telemetry ? &layer_telemetry.io_ms : NULL;
-    job.representation = task->representation;
-    job.progressive_stage = task->progressive_stage;
-
-    rc = convert_tensor_to_dir(&job);
-    if (rc != 0) {
-        return conversion_tracy_end_status(&tracy_zone,
-                                           process_full_model_tensor_failed(task, &result, converted_count));
-    }
-
-    if (skipped_vector) {
-        return conversion_tracy_end_status(&tracy_zone,
-                                           process_full_model_tensor_skipped_vector(task, &result, converted_count));
-    }
-
-    return conversion_tracy_end_status(&tracy_zone,
-                                       process_full_model_tensor_complete(task, &result, converted_count, crc32));
+    log_conversion_corpus_inputs(config);
+    log_conversion_validation_inputs(config);
 }
 
 static int run_full_model_conversion(const ternary_conversion_config_t *config,
                                      const char *model_dir,
                                      const char *model_path,
-                                     conversion_runtime_t *runtime) {
+                                     conversion_runtime_t *runtime)
+{
     model_spec_t *spec = NULL;
     transformer_ste_config_t ste_config;
     int converted = 0;
@@ -4154,106 +4267,95 @@ static int run_full_model_conversion(const ternary_conversion_config_t *config,
     return conversion_tracy_end_status(&tracy_zone, (converted > 0) ? 0 : -1);
 }
 
-static int config_has_text(const char *value)
+static int process_full_model_tensor(full_model_tensor_task_t *task)
 {
-    return value && value[0] != '\0';
-}
+    convert_tensor_job_t job;
+    ternary_calibration_corpus_t active_corpus;
+    ternary_calibration_result_t result;
+    ternary_telemetry_t layer_telemetry;
+    transformer_ste_config_t effective_ste_config;
+    uint32_t crc32 = 0u;
+    int skipped_vector = 0;
+    int rc = 0;
+    uint32_t converted_count = 0u;
+    int use_layer_telemetry = 0;
+    uint32_t layer_index = 0u;
+    int has_layer_index = 0;
+    SAPPHIRE_TRACY_ZONE_SCOPE(tracy_zone, "process_full_model_tensor");
 
-static void log_conversion_corpus_inputs(const ternary_conversion_config_t *config)
-{
-    if (config_has_text(config->calibration_corpus_manifest_path)) {
-        if (config_has_text(config->calibration_corpus_path)) {
-            LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);
-        } else {
-            LOG_INFO("  calibration_corpus: <loaded from manifest>");
-        }
-        LOG_INFO("  calibration_manifest: %s", config->calibration_corpus_manifest_path);
-        return;
-    }
-
-    if (config_has_text(config->calibration_corpus_path)) {
-        LOG_INFO("  calibration_corpus: %s", config->calibration_corpus_path);
-    } else {
-        LOG_INFO("  calibration_corpus: <built-in fallback>");
-    }
-}
-
-static void log_conversion_validation_inputs(const ternary_conversion_config_t *config)
-{
-    if (config_has_text(config->validation_corpus_path)) {
-        LOG_INFO("  validation_corpus: %s", config->validation_corpus_path);
-    }
-    if (config_has_text(config->validation_corpus_manifest_path)) {
-        LOG_INFO("  validation_manifest: %s", config->validation_corpus_manifest_path);
-    }
-}
-
-static void log_conversion_config(const ternary_conversion_config_t *config)
-{
-    LOG_INFO("Ternary conversion mode selected");
-    LOG_INFO("  model: %s", config->model_name);
-    LOG_INFO("  output: %s", config->output_path);
-    LOG_INFO("  context_len: %d", config->context_len);
-    LOG_INFO("  calibration_samples: %d",
-             (config->calibration_sample_limit > 0) ? config->calibration_sample_limit : 4);
-    LOG_INFO("  ste_steps: %d", (config->ste_steps > 0) ? config->ste_steps : 3);
-    LOG_INFO("  progressive_calib: %s", config->progressive_calib ? "enabled" : "disabled");
-    LOG_INFO("  student_down_proj_rmsnorm: %s",
-             config->student_down_proj_input_rmsnorm ? "enabled" : "disabled");
-    LOG_INFO("  max_grad_norm: %.4f", (double)((config->max_grad_norm > 0.0f) ? config->max_grad_norm : 1.0f));
-    LOG_INFO("  validate_every: %d", config->validate_every_n);
-    LOG_INFO("  kl_weight: %.4f", (double)((config->kl_weight >= 0.0f) ? config->kl_weight : 0.05f));
-    LOG_INFO("  kl_update_freq: %d", (config->kl_update_interval > 0) ? config->kl_update_interval : 4);
-    LOG_INFO("  kl_samples: %d", (config->kl_sample_count > 0) ? config->kl_sample_count : 4);
-    LOG_INFO("  ste_early_stop: patience=%d delta=%.4f divergence=%.2f",
-             (config->early_stop_patience >= 0) ? config->early_stop_patience : 6,
-             (double)((config->early_stop_min_delta >= 0.0f) ? config->early_stop_min_delta : 1e-4f),
-             (double)((config->early_stop_divergence_ratio >= 0.0f) ? config->early_stop_divergence_ratio : 1.25f));
-    if (config->progressive_calib) {
-        LOG_INFO("  progressive_kl: stage2 layers 6-10 hold, 11-15 ramp to %.4f, stage3 %.4f, stage2 temp=%.2f",
-                 (double)PROGRESSIVE_CALIB_STAGE2_TARGET_KL_WEIGHT,
-                 (double)PROGRESSIVE_CALIB_STAGE3_TARGET_KL_WEIGHT,
-                 (double)PROGRESSIVE_CALIB_STAGE2_KL_TEMPERATURE);
-        LOG_INFO("  progressive_stage3: blocks 0-9, 10-19, 20-27+shared with lr_scale=%.2f",
-                 (double)PROGRESSIVE_CALIB_STAGE3_LR_SCALE);
-    }
-    LOG_INFO("  hessian_proxy: %s", config->disable_hessian_proxy ? "disabled" : "activation-diagonal");
-    LOG_INFO("  hessian_proxy_strength: %.4f",
-             (double)((config->hessian_proxy_strength >= 0.0f) ? config->hessian_proxy_strength : 1.0f));
-    LOG_INFO("  hessian_proxy_floor: %.4f",
-             (double)((config->hessian_proxy_floor >= 0.0f) ? config->hessian_proxy_floor : 0.05f));
-    LOG_INFO("  layer filter: %s",
-             config_has_text(config->layer_name) ? config->layer_name : "<all layers>");
-    LOG_INFO("  anchor_mode: %s", config->use_anchor_mode ? "enabled" : "disabled");
-    if (config->use_anchor_mode) {
-        LOG_INFO("  anchor_budget_ppm: %u", config->anchor_budget_ppm);
-        LOG_INFO("  anchor_saliency_mode: %d", config->anchor_saliency_mode);
-        if (full_model_anchor_mode_enabled(config)) {
-            LOG_INFO("  full_model_anchor_policy: %s pattern=%s artifact_version=%u",
-                     full_model_anchor_policy_name(config),
-                     full_model_anchor_policy_pattern(config),
-                     TERNARY_ANCHOR_VERSION);
-            if (full_model_anchor_policy_filter(config)[0] != '\0') {
-                LOG_INFO("  full_model_anchor_filter: %s", full_model_anchor_policy_filter(config));
-            }
-        }
+    if (!task || !task->config) {
+        return conversion_tracy_end_status(&tracy_zone, -1);
     }
 
-    if (config_has_text(config->activation_tape_path)) {
-        LOG_INFO("  activation_tape: %s", config->activation_tape_path);
+    conversion_tracy_zone_text_if_present(&tracy_zone, task->tensor_name);
+    sapphire_tracy_plot_i64("conversion.progress_index", (int64_t)task->progress_index);
+
+    if (task->runtime) {
+        converted_count = task->runtime->checkpoint_state.converted_tensor_count;
     }
-    if (config_has_text(config->teacher_model_name)) {
-        LOG_INFO("  teacher_model: %s", config->teacher_model_name);
-    }
-    if (config_has_text(config->structural_map_path)) {
-        LOG_INFO("  structural_map: %s", config->structural_map_path);
-    }
-    if (config_has_text(config->hessian_sidecar_path)) {
-        LOG_INFO("  hessian_sidecar: %s", config->hessian_sidecar_path);
+    sapphire_tracy_plot_i64("conversion.converted_tensors", (int64_t)converted_count);
+
+    memset(&result, 0, sizeof(result));
+    memset(&layer_telemetry, 0, sizeof(layer_telemetry));
+    memset(&effective_ste_config, 0, sizeof(effective_ste_config));
+
+    rc = classify_full_model_tensor(task, converted_count);
+    if (rc != FULL_MODEL_TENSOR_STATUS_CONVERTED) {
+        return conversion_tracy_end_status(&tracy_zone, rc);
     }
 
-    log_conversion_corpus_inputs(config);
-    log_conversion_validation_inputs(config);
+    has_layer_index = conversion_try_parse_layer_index(task->tensor_name, &layer_index);
+    conversion_tracy_plot_layer_index(has_layer_index, layer_index);
+
+    use_layer_telemetry = prepare_full_model_layer_ste_config(task,
+                                                              layer_index,
+                                                              has_layer_index,
+                                                              &effective_ste_config,
+                                                              &layer_telemetry);
+    if (!use_layer_telemetry) {
+        effective_ste_config = task->ste_config ? *task->ste_config : default_runtime_ste_config(task->config);
+    }
+    effective_ste_config.use_anchor_mode =
+        (task->representation == FULL_MODEL_TENSOR_REPRESENTATION_ANCHOR) ? 1 : 0;
+
+    memset(&active_corpus, 0, sizeof(active_corpus));
+    if (task->runtime) {
+        active_corpus = task->runtime->calibration_corpus;
+        active_corpus.tensor_name = task->tensor_name;
+    }
+
+    memset(&job, 0, sizeof(job));
+    job.model_path = task->model_path;
+    job.model_dir = task->model_dir;
+    job.output_dir = task->config->output_path;
+    job.tensor_name = task->tensor_name;
+    job.activation_tape = task->runtime ? task->runtime->activation_tape : NULL;
+    job.activation_tape_crc32 = task->runtime ? task->runtime->activation_tape_hash : 0u;
+    job.hessian_sidecar = task->runtime ? task->runtime->hessian_sidecar : NULL;
+    job.bf16_io_cache = task->runtime ? &task->runtime->bf16_io_cache : NULL;
+    job.hessian_proxy_cache = task->runtime ? &task->runtime->hessian_proxy_cache : NULL;
+    job.ste_config = &effective_ste_config;
+    job.calibration_corpus = task->runtime ? &active_corpus : NULL;
+    job.out_result = &result;
+    job.out_crc32 = &crc32;
+    job.out_skipped_vector = &skipped_vector;
+    job.out_io_ms = use_layer_telemetry ? &layer_telemetry.io_ms : NULL;
+    job.representation = task->representation;
+    job.progressive_stage = task->progressive_stage;
+
+    rc = convert_tensor_to_dir(&job);
+    if (rc != 0) {
+        return conversion_tracy_end_status(&tracy_zone,
+                                           process_full_model_tensor_failed(task, &result, converted_count));
+    }
+
+    if (skipped_vector) {
+        return conversion_tracy_end_status(&tracy_zone,
+                                           process_full_model_tensor_skipped_vector(task, &result, converted_count));
+    }
+
+    return conversion_tracy_end_status(&tracy_zone,
+                                       process_full_model_tensor_complete(task, &result, converted_count, crc32));
 }
 
 static int run_requested_conversion(const ternary_conversion_config_t *config,

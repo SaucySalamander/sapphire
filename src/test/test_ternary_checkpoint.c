@@ -138,10 +138,73 @@ static void test_checkpoint_crc_changes_with_anchor_policy(void)
     cleanup_checkpoint_dir(dir_path);
 }
 
+static void test_checkpoint_roundtrip_allows_empty_optional_text_fields(void)
+{
+    char dir_template[] = "/tmp/sapphire_checkpoint_empty_textXXXXXX";
+    char *dir_path = NULL;
+    char checkpoint_path[1024];
+    ternary_student_update_checkpoint_t checkpoint;
+    ternary_student_update_checkpoint_t loaded;
+
+    printf("TEST: ternary checkpoint roundtrip accepts empty optional text fields\n");
+
+    dir_path = mkdtemp(dir_template);
+    assert(dir_path != NULL);
+    snprintf(checkpoint_path, sizeof(checkpoint_path), "%s/%s", dir_path, "checkpoint-a.tsv");
+
+    init_checkpoint(&checkpoint);
+    checkpoint.teacher_model_name[0] = '\0';
+    checkpoint.calibration_corpus_path[0] = '\0';
+    checkpoint.calibration_corpus_manifest_path[0] = '\0';
+    checkpoint.validation_corpus_path[0] = '\0';
+    checkpoint.validation_corpus_manifest_path[0] = '\0';
+
+    assert(ternary_student_checkpoint_write_atomic(checkpoint_path, &checkpoint) == 0);
+
+    memset(&loaded, 0, sizeof(loaded));
+    assert(ternary_student_checkpoint_load(checkpoint_path, &loaded) == 0);
+    assert(strcmp(loaded.model_name, checkpoint.model_name) == 0);
+    assert(loaded.teacher_model_name[0] == '\0');
+    assert(loaded.calibration_corpus_path[0] == '\0');
+    assert(loaded.calibration_corpus_manifest_path[0] == '\0');
+    assert(loaded.validation_corpus_path[0] == '\0');
+    assert(loaded.validation_corpus_manifest_path[0] == '\0');
+    printf("  ✓ Empty optional text fields survive atomic write/load\n");
+
+    cleanup_checkpoint_dir(dir_path);
+}
+
+static void test_missing_checkpoint_does_not_clobber_seeded_state(void)
+{
+    char dir_template[] = "/tmp/sapphire_checkpoint_missingXXXXXX";
+    char *dir_path = NULL;
+    char checkpoint_path[1024];
+    ternary_student_update_checkpoint_t checkpoint;
+
+    printf("TEST: missing checkpoint does not clobber seeded state\n");
+
+    dir_path = mkdtemp(dir_template);
+    assert(dir_path != NULL);
+    snprintf(checkpoint_path, sizeof(checkpoint_path), "%s/%s", dir_path, "missing.tsv");
+
+    init_checkpoint(&checkpoint);
+    assert(ternary_student_checkpoint_load(checkpoint_path, &checkpoint) == 1);
+    assert(checkpoint.schema_version == TERNARY_STUDENT_CHECKPOINT_VERSION);
+    assert(checkpoint.config_hash == 0x1234abcdU);
+    assert(checkpoint.total_layer_count == 18u);
+    assert(strcmp(checkpoint.model_name, "gemma-3-270m-it") == 0);
+    assert(strcmp(checkpoint.output_dir, "/tmp/out-hybrid") == 0);
+    printf("  ✓ Missing checkpoint preserves seeded defaults\n");
+
+    cleanup_checkpoint_dir(dir_path);
+}
+
 int main(void)
 {
     test_checkpoint_roundtrip_anchor_policy();
     test_checkpoint_crc_changes_with_anchor_policy();
+    test_checkpoint_roundtrip_allows_empty_optional_text_fields();
+    test_missing_checkpoint_does_not_clobber_seeded_state();
     printf("PASS: test_ternary_checkpoint\n");
     return 0;
 }

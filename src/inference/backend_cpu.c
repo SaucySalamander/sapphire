@@ -20,6 +20,7 @@
 #include "../include/ggml_model.h"
 #include "../include/kv_cache.h"
 #include "../include/layer_config_loader.h"
+#include "../include/llm_model.h"
 #include "../include/log.h"
 #include "../include/rope.h"
 #include "../include/tensor.h"
@@ -337,9 +338,21 @@ static int cpu_forward_batch(inference_session_t* session, const int* token_ids,
         sapphire_embed_lookup_batch(session, token_ids + processed, chunk_size, cpu_data->scratch_buffer);
 
         // 2. Transformer layers with layer-type dispatch
+        llm_model_t *model = (llm_model_t *)session->model_spec->llm_model;
+        
         for (int l = 0; l < config->num_hidden_layers; l++) {
             SAPPHIRE_TRACY_ZONE_SCOPE(layer_zone, "cpu_forward_batch_layer");
             sapphire_tracy_zone_value(&layer_zone, (uint64_t)l);
+
+            /* Low-memory mode: prefetch ahead, evict behind */
+            if (model && model->low_memory_mode) {
+                if (l + 2 < config->num_hidden_layers) {
+                    llm_model_prefetch_layer(model, l + 2);
+                }
+                if (l >= 2) {
+                    llm_model_evict_layer(model, l - 2);
+                }
+            }
 
             sapphire_layer_config_t* layer_cfg = &session->layer_configs[l];
             bool is_global = layer_cfg->config.attention.is_global;

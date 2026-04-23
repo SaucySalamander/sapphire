@@ -85,6 +85,7 @@ static void print_help(const char* program_name) {
     printf("  --ste-early-stop-divergence <value>  Divergence ratio over best loss (default: 1.25, 0 disables)\n");
     printf("  --save-state <path>       Save session state to .sapphire file before exit\n");
     printf("  --load-state <path>       Load session state from .sapphire file at startup\n");
+    printf("  --low-memory              Use sliding-window layer eviction to bound RSS\n");
     printf("  -h, --help                Show this help message\n");
     printf("\nModel Directory Structure (required files):\n");
     printf("  model.safetensors (or model.gguf / model.bin)\n");
@@ -177,6 +178,7 @@ typedef struct {
     int anchor_saliency_mode;
     const char *save_state_path;
     const char *load_state_path;
+    int low_memory_mode;
 } cli_args_t;
 
 static void cli_args_init(cli_args_t *args)
@@ -229,6 +231,7 @@ static void cli_args_init(cli_args_t *args)
     args->anchor_saliency_mode = 1;
     args->save_state_path = NULL;
     args->load_state_path = NULL;
+    args->low_memory_mode = 0;
 }
 
 static int cli_is_combined_record_mode(const cli_args_t *args)
@@ -1033,7 +1036,8 @@ typedef enum {
     CLI_OPT_SPATIAL_TELEMETRY,
     CLI_OPT_SPATIAL_TELEMETRY_ROW_BUCKET,
     CLI_OPT_SAVE_STATE,
-    CLI_OPT_LOAD_STATE
+    CLI_OPT_LOAD_STATE,
+    CLI_OPT_LOW_MEMORY
 } cli_option_t;
 
 typedef struct {
@@ -1091,7 +1095,8 @@ static const cli_option_alias_t g_cli_option_aliases[] = {
     { "--spatial-telemetry", CLI_OPT_SPATIAL_TELEMETRY },
     { "--spatial-telemetry-row-bucket", CLI_OPT_SPATIAL_TELEMETRY_ROW_BUCKET },
     { "--save-state", CLI_OPT_SAVE_STATE },
-    { "--load-state", CLI_OPT_LOAD_STATE }
+    { "--load-state", CLI_OPT_LOAD_STATE },
+    { "--low-memory", CLI_OPT_LOW_MEMORY }
 };
 
 static cli_option_t parse_cli_option(const char *arg)
@@ -1189,6 +1194,10 @@ static int parse_cli_args(int argc, const char * const argv[], cli_args_t *args)
         }
         if (option == CLI_OPT_STUDENT_DOWN_PROJ_RMSNORM) {
             args->student_down_proj_input_rmsnorm = 1;
+            continue;
+        }
+        if (option == CLI_OPT_LOW_MEMORY) {
+            args->low_memory_mode = 1;
             continue;
         }
         if (option == CLI_OPT_UNKNOWN || i + 1 >= argc) {
@@ -1379,6 +1388,11 @@ int main(int argc, char* argv[]) {
     if (validate_cli_args(&args) != 0) {
         print_help(argv[0]);
         return 1;
+    }
+
+    /* Export low-memory mode so model loader can detect it */
+    if (args.low_memory_mode) {
+        setenv("SAPPHIRE_LOW_MEMORY", "1", 1);
     }
 
     log_set_level_from_env("SAPPHIRE_LOG_LEVEL");

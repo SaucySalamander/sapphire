@@ -6,6 +6,7 @@
 #ifndef TERNARY_VALIDATION_H
 #define TERNARY_VALIDATION_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "inference.h"
@@ -28,6 +29,7 @@ typedef struct {
 
 typedef struct tensor_t tensor_t;
 typedef struct ternary_layer_payload_t ternary_layer_payload_t;
+typedef struct safetensors_file_t safetensors_file_t;
 
 typedef struct ternary_validation_patch ternary_validation_patch_t;
 
@@ -48,6 +50,9 @@ typedef struct {
     tensor_t **slot;
     tensor_t *original_tensor;
     tensor_t *proxy_tensor;
+    safetensors_file_t *backing_file;
+    safetensors_file_t *anchor_backing_file;
+    uint32_t *anchor_row_offsets;
     uint32_t crc32;
 } ternary_validation_patch_record_t;
 
@@ -109,6 +114,40 @@ int ternary_validation_apply_proxy_from_bf16(ternary_validation_state_t *state,
                                              const ternary_validation_bf16_view_t *view,
                                              uint32_t crc32,
                                              int converted_count);
+
+typedef struct {
+    uint32_t rows;
+    uint32_t cols;
+    size_t   packed_weight_bytes;
+    uint32_t crc32;
+} ternary_proxy_spec_t;
+
+typedef struct {
+    uint32_t rows;
+    uint32_t cols;
+    size_t   packed_weight_bytes;
+    uint32_t anchor_count;
+    uint32_t crc32;
+} hybrid_proxy_spec_t;
+
+int ternary_validation_apply_proxy_from_ternary_file(ternary_validation_state_t *state,
+                                                     const char *tensor_name,
+                                                     const char *layer_path,
+                                                     const ternary_proxy_spec_t *spec,
+                                                     int converted_count);
+
+int ternary_validation_apply_proxy_from_hybrid_files(ternary_validation_state_t *state,
+                                                     const char *tensor_name,
+                                                     const char *bulk_path,
+                                                     const char *anchor_path,
+                                                     const hybrid_proxy_spec_t *spec,
+                                                     int converted_count);
+
+int ternary_validation_apply_proxy_from_bf16_file(ternary_validation_state_t *state,
+                                                  const char *tensor_name,
+                                                  const char *layer_path,
+                                                  uint32_t crc32,
+                                                  int converted_count);
 
 int ternary_validation_adopt_patch_records(ternary_validation_state_t *state,
                                            const ternary_validation_patch_record_t *records,

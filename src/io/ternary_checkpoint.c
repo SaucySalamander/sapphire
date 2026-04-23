@@ -464,6 +464,7 @@ write_cleanup:
 int ternary_student_checkpoint_load(const char *checkpoint_path,
                                     ternary_student_update_checkpoint_t *out_checkpoint)
 {
+    ternary_student_update_checkpoint_t parsed_checkpoint;
     char *buffer = NULL;
     size_t buffer_size = 0u;
     char *tmp_path = NULL;
@@ -478,7 +479,7 @@ int ternary_student_checkpoint_load(const char *checkpoint_path,
         return -1;
     }
 
-    memset(out_checkpoint, 0, sizeof(*out_checkpoint));
+    memset(&parsed_checkpoint, 0, sizeof(parsed_checkpoint));
 
     if (build_temp_path(checkpoint_path, &tmp_path) != 0) {
         return -1;
@@ -532,7 +533,7 @@ int ternary_student_checkpoint_load(const char *checkpoint_path,
         }
 
         tab = strchr(line, '\t');
-        if (!tab || tab == line || tab[1] == '\0') {
+        if (!tab || tab == line) {
             LOG_ERROR("checkpoint: malformed line in %s", checkpoint_path);
             free(buffer);
             return -1;
@@ -550,7 +551,7 @@ int ternary_student_checkpoint_load(const char *checkpoint_path,
             continue;
         }
 
-        if (parse_checkpoint_line(out_checkpoint, line, value, &stored_crc32, &seen_crc32) != 0) {
+        if (parse_checkpoint_line(&parsed_checkpoint, line, value, &stored_crc32, &seen_crc32) != 0) {
             LOG_ERROR("checkpoint: failed to parse field %s", line);
             free(buffer);
             return -1;
@@ -563,7 +564,7 @@ int ternary_student_checkpoint_load(const char *checkpoint_path,
         return -1;
     }
 
-    if (!checkpoint_has_required_fields(out_checkpoint)) {
+    if (!checkpoint_has_required_fields(&parsed_checkpoint)) {
         LOG_ERROR("checkpoint: required fields missing or invalid in %s", checkpoint_path);
         free(buffer);
         return -1;
@@ -575,7 +576,8 @@ int ternary_student_checkpoint_load(const char *checkpoint_path,
         return -1;
     }
 
-    out_checkpoint->schema_version = TERNARY_STUDENT_CHECKPOINT_VERSION;
+    parsed_checkpoint.schema_version = TERNARY_STUDENT_CHECKPOINT_VERSION;
+    *out_checkpoint = parsed_checkpoint;
     free(buffer);
     return 0;
 }

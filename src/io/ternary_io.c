@@ -1134,6 +1134,8 @@ static int io_open_cached_bf16_shard(ternary_bf16_io_cache_t *cache,
     }
 
     if (cache->current_shard_file) {
+        /* Evict pages before closing so RSS is released immediately */
+        safetensors_evict_pages(cache->current_shard_file);
         safetensors_close(cache->current_shard_file);
     }
     free(cache->current_shard_path);

@@ -194,6 +194,16 @@ uint32_t activation_tape_crc32(const activation_tape_t *tape);
 void activation_tape_prefetch_entry(const activation_tape_t *tape,
                                     uint32_t                 entry_idx);
 
+/**
+ * @brief Issue MADV_DONTNEED on the data region for tensor_name.
+ *
+ * Call once after all sample vectors for a tensor have been read.
+ * Allows the kernel to reclaim those tape pages, reducing RSS while
+ * leaving other entries resident. No-op if tensor_name is not found.
+ */
+void activation_tape_discard_entry(const activation_tape_t *tape,
+                                   const char              *tensor_name);
+
 /** @brief Unmap and close all resources. */
 void activation_tape_close(activation_tape_t *tape);
 

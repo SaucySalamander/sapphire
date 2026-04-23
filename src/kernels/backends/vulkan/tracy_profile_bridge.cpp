@@ -466,4 +466,22 @@ extern "C" void sapphire_tracy_vk_context_destroy(sapphire_tracy_vk_context_t *c
     delete context;
 }
 
+extern "C" void sapphire_tracy_alloc(const void *ptr, size_t size)
+{
+    if (!ptr || sapphire_tracy_enabled() == 0) {
+        return;
+    }
+
+    ___tracy_emit_memory_alloc(ptr, size, 0);
+}
+
+extern "C" void sapphire_tracy_free(const void *ptr)
+{
+    if (!ptr || sapphire_tracy_enabled() == 0) {
+        return;
+    }
+
+    ___tracy_emit_memory_free(ptr, 0);
+}
+
 #endif
